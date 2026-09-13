@@ -15,6 +15,7 @@
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
 
@@ -713,8 +714,8 @@ RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
  * the one-offs; -DRECOMP_ABI_CHECK only, since it costs three compares on
  * every indirect call.
  */
-extern volatile uint32_t g_icall_trace[16];
-extern volatile uint32_t g_icall_trace_idx;
+extern RECOMP_TLS volatile uint32_t g_icall_trace[16];
+extern RECOMP_TLS volatile uint32_t g_icall_trace_idx;
 
 void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                               uint32_t edi0, uint32_t esp0)
@@ -848,9 +849,9 @@ int recomp_guest_longjmp(uint32_t buf_va, uint32_t value)
  * Off unless RECOMP_WATCHDOG_SECS is set, so it costs a getenv in normal runs.
  */
 /* Defined below, after the watchdog. */
-extern volatile uint32_t g_icall_trace[16];
-extern volatile uint32_t g_icall_trace_idx;
-extern volatile uint64_t g_icall_count;
+extern RECOMP_TLS volatile uint32_t g_icall_trace[16];
+extern RECOMP_TLS volatile uint32_t g_icall_trace_idx;
+extern RECOMP_TLS volatile uint64_t g_icall_count;
 
 static uint32_t *s_watchdog_esp;
 /* The other guest registers are thread-local too, so the watchdog has to be
@@ -859,6 +860,8 @@ static uint32_t *s_watchdog_esp;
  * registers are the thing being asked about. */
 static uint32_t *s_watchdog_regs[6];
 static unsigned  s_watchdog_secs;
+static volatile uint32_t *s_watchdog_trace, *s_watchdog_trace_idx;
+static volatile uint64_t *s_watchdog_count;
 
 static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
 {
@@ -888,11 +891,11 @@ static DWORD WINAPI xbox_watchdog_thread(LPVOID unused)
          * slowness. Kernel calls cannot: a pure CPU loop makes none, so
          * "same count at 20s and 60s" proves nothing about it. */
         fprintf(stderr, "  icalls so far: %llu\n",
-                (unsigned long long)g_icall_count);
+                (unsigned long long)(*s_watchdog_count));
         fprintf(stderr, "  recent ICALL targets:");
         for (k = 0; k < 16; k++)
             fprintf(stderr, " %08X",
-                    g_icall_trace[(g_icall_trace_idx + k) & 15]);
+                    s_watchdog_trace[((*s_watchdog_trace_idx) + k) & 15]);
         fprintf(stderr, "\n");
     }
     /* Guest globals worth seeing at the moment of the hang.
@@ -948,6 +951,9 @@ void xbox_WatchdogStart(void)
      * be handed the address of the one that matters rather than reading its
      * own, which is always zero. */
     s_watchdog_esp = &g_esp;
+    s_watchdog_trace = g_icall_trace;
+    s_watchdog_trace_idx = &g_icall_trace_idx;
+    s_watchdog_count = &g_icall_count;
     s_watchdog_regs[0] = &g_eax; s_watchdog_regs[1] = &g_ecx;
     s_watchdog_regs[2] = &g_edx; s_watchdog_regs[3] = &g_ebx;
     s_watchdog_regs[4] = &g_esi; s_watchdog_regs[5] = &g_edi;
@@ -975,9 +981,9 @@ RECOMP_TLS uint32_t g_ebp = 0;
 RECOMP_TLS int g_df = 0;
 
 /* ICALL trace ring buffer */
-volatile uint32_t g_icall_trace[16] = {0};
-volatile uint32_t g_icall_trace_idx = 0;
-volatile uint64_t g_icall_count = 0;
+RECOMP_TLS volatile uint32_t g_icall_trace[16] = {0};
+RECOMP_TLS volatile uint32_t g_icall_trace_idx = 0;
+RECOMP_TLS volatile uint64_t g_icall_count = 0;
 
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
@@ -2276,4 +2282,16 @@ void xbox_HeapFree(uint32_t xbox_va)
 HANDLE xbox_GetMappingHandle(void)
 {
     return g_mapping_handle;
+}
+
+/* Ordering boundary for guest WBINVD over coherent emulated memory.
+ * This is not a GPU-completion signal or a replacement for DMA/fence handling.
+ * No host cache invalidation is needed because no guest CPU cache is modeled. */
+void recomp_guest_cache_flush(void)
+{
+#ifdef _WIN32
+    MemoryBarrier();
+#else
+    __sync_synchronize();
+#endif
 }

@@ -817,7 +817,7 @@ class FunctionTranslator:
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "lock cmpxchg")
+                                 "lock cmpxchg", "xadd", "lock xadd")
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
@@ -1541,7 +1541,7 @@ class BatchTranslator:
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+                    f"void {unresolved[addr]}(void) {{ recomp_icall_fail_log(0x{addr:08X}u); g_esp += {4 + popped}; "
                     f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")

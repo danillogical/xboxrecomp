@@ -262,14 +262,13 @@ _EFLAGS_SETTERS = frozenset({
     "bsf", "bsr",       # Bit scan sets ZF
     "bt", "bts", "btr", "btc",  # Bit test sets CF
     "cmpxchg",           # Compare-and-exchange sets ZF
-    "xadd",              # Exchange-and-add sets flags
+    "xadd", "lock xadd", "lock cmpxchg",  # Atomic arithmetic flags
 })
 
 # Instructions with undefined/unpredictable flags (clear tracking)
 _FLAGS_UNDEFINED = frozenset({
     "mul", "div", "idiv",  # Flags partially undefined
     "rdtsc", "cpuid",      # Special instructions
-    "lock xadd",           # Lock prefix - complex flag behavior
 })
 
 # Instructions that do NOT modify EFLAGS (preserve flag tracking)
@@ -284,7 +283,7 @@ _EFLAGS_PRESERVE = frozenset({
     "int3", "int", "wait",
     "cld", "std", "cli", "sti",
     "pushfd", "popfd", "pushal",
-    "sgdt", "ljmp", "sfence",
+    "sgdt", "ljmp", "sfence", "wbinvd",
     # SSE scalar float
     "movss", "movsd",
     "addss", "subss", "mulss", "divss",
@@ -338,6 +337,9 @@ def _make_condition(jcc, flag_setter, flag_ops):
     Generate a C condition expression for a jcc based on what set the flags.
     Returns (cond_expr, description) or None.
     """
+    # LOCK affects atomicity, not the arithmetic condition codes.
+    if flag_setter.startswith("lock "):
+        flag_setter = flag_setter[5:]
     cond_info = COND_MAP.get(jcc)
     if not cond_info:
         return None
@@ -698,10 +700,12 @@ def _make_condition(jcc, flag_setter, flag_ops):
 
     # ── xadd: exchange and add, flags from addition ──
     if flag_setter == "xadd":
+        # Snapshot the sum at the atomic operation. Memory can change before
+        # the branch, and the source register now holds the OLD destination.
         if jcc in ("je", "jz"):
-            return f"({lhs} == 0)", desc
+            return "(_fa == 0)", desc
         if jcc in ("jne", "jnz"):
-            return f"({lhs} != 0)", desc
+            return "(_fa != 0)", desc
         return None
 
     # ── repe cmpsb / repne scasb: string comparison ──
@@ -1244,6 +1248,11 @@ class Lifter:
         # Cache hints and store fences: nothing to model on a single-threaded
         # interpreter over coherent host memory. Named so they stop showing up
         # in the unimplemented report as if they were missing work.
+        if m == "wbinvd":
+            # Guest RAM and emulated devices share coherent host memory. No
+            # guest CPU cache is modeled; order writes without executing a
+            # privileged host cache-flush instruction.
+            return ["{ extern void recomp_guest_cache_flush(void); recomp_guest_cache_flush(); } /* wbinvd */"]
         if m.startswith("prefetch") or m in ("sfence", "lfence", "mfence"):
             return [f"(void)0; /* {m}: cache/ordering hint, nothing to model */"]
 
@@ -1335,8 +1344,11 @@ class Lifter:
                 if atomic_m == "xadd":
                     # dst = dst + src, and src receives dst's old value.
                     return [
-                        "{ uint32_t _old = RECOMP_ATOMIC_ADD32("
-                        f"XBOX_PTR({addr}), {src});",
+                        f"{{ uint32_t _add = {src};",
+                        "  uint32_t _old = RECOMP_ATOMIC_ADD32("
+                        f"XBOX_PTR({addr}), _add);",
+                        "  _fa = _old + _add; _fb = 0;",
+                        "  _fas = (int32_t)_fa; _fbs = 0;",
                         "  " + _fmt_operand_write(ops[1], "_old") + " }"
                         f"  /* {m} */",
                     ]
@@ -3114,6 +3126,16 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
+        # REP with ECX=0 performs no comparison and preserves incoming ZF.
+        # Seed the loop's equality state before it can choose not to execute.
+        if (curr.mnemonic.startswith("rep") and
+                any(op in curr.mnemonic for op in
+                    ("cmpsb", "cmpsw", "cmpsd", "scasb", "scasw", "scasd"))
+                and last_flag_setter):
+            prior_zf = _make_condition("je", last_flag_setter, last_flag_ops)
+            if prior_zf:
+                stmts.append(f"_flags = {prior_zf[0]}; /* zero-count REP preserves ZF */")
+
         # NEG sets CF when its operand is nonzero. Preserve that value when
         # a later SBB/ADC consumes it, skipping over EFLAGS-preserving
         # instructions (e.g. neg eax; push edi; sbb eax, eax).
@@ -3169,10 +3191,10 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # repe cmpsb/repne scasb = comparison, sets flags
             rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
             raw_m = curr.mnemonic
-            if "cmpsb" in raw_m or "scasb" in raw_m:
+            if any(op in raw_m for op in ("cmpsb", "cmpsw", "cmpsd", "scasb", "scasw", "scasd")):
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
-            elif "cmpsb" in rest or "scasb" in rest:
+            elif any(op in rest for op in ("cmpsb", "cmpsw", "cmpsd", "scasb", "scasw", "scasd")):
                 last_flag_setter = raw_m
                 last_flag_ops = list(curr.operands)
             else:

@@ -1,3 +1,4 @@
+#include "recomp_diagnostics.h"
 /*
  * kernel_rtl.c - Xbox Runtime Library Functions
  *
@@ -237,7 +238,7 @@ static int          g_cs_table_full;
  */
 static CRITICAL_SECTION g_cs_single;
 static INIT_ONCE g_cs_single_once = INIT_ONCE_STATIC_INIT;
-static int g_cs_single_mode = -1;
+static RECOMP_TLS int g_cs_single_mode = -1;
 
 static BOOL CALLBACK xbox_cs_single_init(PINIT_ONCE o, PVOID p, PVOID *c)
 {
@@ -394,10 +395,10 @@ static int xbox_crt_lock_index(uint32_t guest_va)
  * and the CRT locks are hot. */
 static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
 {
-    static int enabled = -1;
+    static RECOMP_TLS int enabled = -1;
     int idx;
 
-    static int all;
+    static RECOMP_TLS int all;
     uint32_t va;
 
     if (enabled < 0) {
@@ -419,8 +420,8 @@ static void crt_lock_trace(const char *what, PRTL_CRITICAL_SECTION guest)
      * call sites, because the question is whether the guest computed different
      * addresses or we did. */
     {
-        static int watch = -1;
-        static uint32_t watch_va;
+        static RECOMP_TLS int watch = -1;
+        static RECOMP_TLS uint32_t watch_va;
         if (watch < 0) {
             const char *w = getenv("RECOMP_CS_WATCH");
             watch = w != NULL;
@@ -477,10 +478,13 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         return;
     InterlockedIncrement(&g_cs_enters);
     crt_lock_trace("take", CriticalSection);
+    recomp_diag_record(5, (uint32_t)((uintptr_t)CriticalSection - g_xbox_mem_offset), g_xbox_kernel_caller, 0);
     if (TryEnterCriticalSection(cs)) {
         xbox_cs_note_owner(cs);
+        recomp_diag_record(6, (uint32_t)((uintptr_t)CriticalSection - g_xbox_mem_offset), g_xbox_kernel_caller, 0);
         return;
     }
+#ifndef RECOMP_DIAGNOSTICS /* frozen per-thread events supersede racy live owner reports */
     if (InterlockedIncrement(&g_cs_contention_reports) <= 16) {
         fprintf(stderr, "  [CS] thread %lu waiting on guest lock 0x%08X"
                         " (held by thread %lu)\n",
@@ -510,8 +514,11 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         xbox_guest_backtrace(10);
         fflush(stderr);
     }
+#endif
     EnterCriticalSection(cs);
     xbox_cs_note_owner(cs);
+    recomp_diag_record(6, (uint32_t)((uintptr_t)CriticalSection - g_xbox_mem_offset), g_xbox_kernel_caller, 0);
+#ifndef RECOMP_DIAGNOSTICS
     if (g_cs_contention_reports <= 16) {
         fprintf(stderr, "  [CS] thread %lu acquired 0x%08X\n",
                 GetCurrentThreadId(),
@@ -519,6 +526,7 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
                            - (uintptr_t)g_xbox_mem_offset));
         fflush(stderr);
     }
+#endif
 }
 
 VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSection)
@@ -527,6 +535,7 @@ VOID __stdcall xbox_RtlLeaveCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
     if (cs) {
         InterlockedIncrement(&g_cs_leaves);
         crt_lock_trace("drop", CriticalSection);
+        recomp_diag_record(7, (uint32_t)((uintptr_t)CriticalSection - g_xbox_mem_offset), g_xbox_kernel_caller, 0);
         xbox_cs_clear_owner(cs);
         LeaveCriticalSection(cs);
     }

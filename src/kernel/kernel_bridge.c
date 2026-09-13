@@ -1,3 +1,4 @@
+#include "recomp_diagnostics.h"
 /**
  * kernel_bridge.c - Bridge between translated game code and kernel functions
  *
@@ -297,8 +298,8 @@ static ULONG g_slot_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE];
 /* Log counter - limit output to avoid flooding */
 /* Calls per ordinal, for the ranking in the periodic summary. 378 counters
  * is smaller than one of the strings this file prints. */
-static unsigned long long g_ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
-static int g_kernel_call_count = 0;
+static RECOMP_TLS unsigned long long g_ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
+static RECOMP_TLS int g_kernel_call_count = 0;
 
 /* How many kernel calls get logged before the log goes quiet.
  *
@@ -310,7 +311,7 @@ static int g_kernel_call_count = 0;
  */
 static long kernel_log_budget(void)
 {
-    static long budget = -1;
+    static RECOMP_TLS long budget = -1;
 
     if (budget < 0) {
         const char *env = getenv("RECOMP_KERNEL_LOG_BUDGET");
@@ -365,7 +366,7 @@ RECOMP_TLS uint32_t g_xbox_kernel_caller;
  * This is correct because on Xbox, the entry point creates a system
  * thread and returns, and the thread runs the actual game.
  */
-static int g_thread_call_count = 0;
+static volatile LONG g_thread_call_count = 0;
 
 /* Thread entry shim. Sets up the new thread's own simulated stack, pushes the
  * two Xbox start-context arguments plus the dummy return address the callee's
@@ -422,12 +423,16 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     }
     free(s);
 
+    recomp_diag_thread_start(ctx1, g_thread_stack_top + 16 - 512 * 1024,
+                             g_thread_stack_top + 16);
+
     bridge_run_thread_inline(fn, ctx1, ctx2);
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
     /* The routine returned instead of calling PsTerminateSystemThread; the
      * stack is still ours to give back. */
+    recomp_diag_thread_end();
     xbox_FreeThreadStack(g_thread_stack_top);
     g_thread_stack_top = 0;
     return 0;
@@ -474,12 +479,11 @@ static void bridge_PsCreateSystemThreadEx(void)
     uint32_t start_routine   = STACK_ARG(9);
     /* In SPAWN mode there is no privileged "first call": every thread is real,
      * so the entry can return. In INLINE mode the first call runs the game. */
-    int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE)
-                        && (g_thread_call_count == 0);
-    g_thread_call_count++;
+    LONG thread_number = InterlockedIncrement(&g_thread_call_count);
+    int is_first_call = (g_thread_mode == XBOX_THREAD_MODE_INLINE) && thread_number == 1;
 
     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx #%d: routine=0x%08X ctx1=0x%08X ctx2=0x%08X\n",
-            g_thread_call_count, start_routine, start_context1, start_context2);
+            (int)thread_number, start_routine, start_context1, start_context2);
     fflush(stderr);
 
     /* Write a fake handle to the output pointer */
@@ -1310,12 +1314,16 @@ static void bridge_KeSetEvent(void)
     uint32_t increment = STACK_ARG(1);
     uint32_t wait = STACK_ARG(2);
 
+    recomp_diag_record(10, event_ptr, g_xbox_kernel_caller, 0);
     g_eax = (uint32_t)xbox_KeSetEvent(XBOX_TO_NATIVE(event_ptr), increment, (BOOLEAN)wait);
+    recomp_diag_record(10, event_ptr, g_xbox_kernel_caller, g_eax);
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
 static void bridge_KeWaitForSingleObject(void)
 {
+    uint32_t diag_object = STACK_ARG(0);
+    recomp_diag_record(8, diag_object, g_xbox_kernel_caller, 0);
     uint32_t object = STACK_ARG(0);
     uint32_t wait_reason = STACK_ARG(1);
     uint32_t wait_mode = STACK_ARG(2);
@@ -1325,6 +1333,8 @@ static void bridge_KeWaitForSingleObject(void)
     g_eax = (uint32_t)xbox_KeWaitForSingleObject(
         XBOX_TO_NATIVE(object), wait_reason, wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+
+    recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
 }
 
 static HANDLE bridge_resolve_handle(uint32_t token);
@@ -1338,12 +1348,16 @@ static HANDLE bridge_resolve_handle(uint32_t token);
  */
 static void bridge_NtWaitForSingleObject(void)
 {
+    uint32_t diag_object = STACK_ARG(0);
+    recomp_diag_record(8, diag_object, g_xbox_kernel_caller, 0);
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
 
     g_eax = (uint32_t)xbox_NtWaitForSingleObject(
         handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+
+    recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
 }
 
 /* ── NtClearEvent (ordinal 186) ──────────────────────────── */
@@ -1351,8 +1365,12 @@ static void bridge_NtWaitForSingleObject(void)
  * before each async map read; a no-op here left the event stuck signalled. */
 static void bridge_NtClearEvent(void)
 {
+    uint32_t diag_object = STACK_ARG(0);
+    recomp_diag_record(11, diag_object, g_xbox_kernel_caller, 0);
     HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
     g_eax = (uint32_t)xbox_NtClearEvent(handle);
+
+    recomp_diag_record(11, diag_object, g_xbox_kernel_caller, g_eax);
 }
 
 /* ── NtSetEvent (ordinal 225) ────────────────────────────── */
@@ -1362,9 +1380,13 @@ static void bridge_NtClearEvent(void)
  * context's go-event and only the first 14 KB of the map ever loaded. */
 static void bridge_NtSetEvent(void)
 {
+    uint32_t diag_object = STACK_ARG(0);
+    recomp_diag_record(10, diag_object, g_xbox_kernel_caller, 0);
     HANDLE   handle = bridge_resolve_handle(STACK_ARG(0));
     uint32_t prev   = STACK_ARG(1);
     g_eax = (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev));
+
+    recomp_diag_record(10, diag_object, g_xbox_kernel_caller, g_eax);
 }
 
 /* ── NtPulseEvent (ordinal 205) ──────────────────────────── */
@@ -1391,6 +1413,8 @@ static HANDLE bridge_resolve_handle(uint32_t token);
 
 static void bridge_NtWaitForSingleObjectEx(void)
 {
+    uint32_t diag_object = STACK_ARG(0);
+    recomp_diag_record(8, diag_object, g_xbox_kernel_caller, 0);
     HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t wait_mode   = STACK_ARG(1);
     uint32_t alertable   = STACK_ARG(2);
@@ -1407,6 +1431,8 @@ static void bridge_NtWaitForSingleObjectEx(void)
     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
+
+    recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
 }
 
 /* ── MmQueryAddressProtect (ordinal 179) ─────────────────── */
@@ -1446,6 +1472,8 @@ static void bridge_NtWaitForSingleObjectEx(void)
  */
 static void bridge_NtWaitForMultipleObjectsEx(void)
 {
+    uint32_t diag_object = STACK_ARG(0);
+    recomp_diag_record(8, diag_object, g_xbox_kernel_caller, 0);
     uint32_t count       = STACK_ARG(0);
     uint32_t handles_va  = STACK_ARG(1);
     uint32_t wait_type   = STACK_ARG(2);
@@ -1479,6 +1507,8 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
         count, handles, wait_type, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
+
+    recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
 }
 
 /*
@@ -1693,6 +1723,7 @@ static void bridge_PsTerminateSystemThread(void)
         /* The normal exit for a worker, and therefore the one that has to
          * return the stack -- ExitThread never comes back to bridge_thread_main
          * to do it. */
+        recomp_diag_thread_end();
         xbox_FreeThreadStack(g_thread_stack_top);
         g_thread_stack_top = 0;
         ExitThread(exit_status);
@@ -3770,11 +3801,15 @@ static void bridge_NtCreateSemaphore(void)
  * Handle token in, LONG by value, optional 4-byte PLONG out. */
 static void bridge_NtReleaseSemaphore(void)
 {
+    uint32_t diag_object = STACK_ARG(0);
+    recomp_diag_record(10, diag_object, g_xbox_kernel_caller, 0);
     uint32_t count_va = STACK_ARG(2);
 
     g_eax = (uint32_t)xbox_NtReleaseSemaphore(
         bridge_resolve_handle(STACK_ARG(0)), (LONG)STACK_ARG(1),
         count_va ? (PLONG)XBOX_TO_NATIVE(count_va) : NULL);
+
+    recomp_diag_record(10, diag_object, g_xbox_kernel_caller, g_eax);
 }
 
 /* ── KeAlertThread (ordinal 93, 2 args)
@@ -3795,6 +3830,8 @@ static void bridge_KeAlertThread(void)
 
 static void bridge_KeWaitForMultipleObjects(void)
 {
+    uint32_t diag_object = STACK_ARG(0);
+    recomp_diag_record(8, diag_object, g_xbox_kernel_caller, 0);
     uint32_t count      = STACK_ARG(0);
     uint32_t objects_va = STACK_ARG(1);
     uint32_t wait_type  = STACK_ARG(2);
@@ -3818,6 +3855,8 @@ static void bridge_KeWaitForMultipleObjects(void)
         STACK_ARG(3), (KPROCESSOR_MODE)STACK_ARG(4),
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
         XBOX_TO_NATIVE(STACK_ARG(7)));
+
+    recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
 }
 
 #undef BRIDGE_MAXIMUM_WAIT_OBJECTS
@@ -5082,7 +5121,8 @@ static void kernel_watch_arm_once(void)
 }
 
 /* Current dispatching slot */
-static int g_kernel_dispatch_slot = -1;
+/* Lookup and invocation may interleave with another guest thread. */
+static RECOMP_TLS int g_kernel_dispatch_slot = -1;
 
 static void kernel_thunk_dispatch(void)
 {
@@ -5117,7 +5157,7 @@ static void kernel_thunk_dispatch(void)
     }
 
     {
-        static DWORD last_summary_tick = 0;
+        static RECOMP_TLS DWORD last_summary_tick = 0;
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {

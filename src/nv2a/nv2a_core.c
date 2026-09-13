@@ -777,8 +777,9 @@ NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
     pci_set_long(d->parent_obj.config + PCI_CLASS_REVISION, 0x030000A1);
 
     /* Default PLL: 233 MHz core clock (Xbox default) */
-    d->pramdac.core_clock_coeff = 0x00011C01; /* n=0x1C, m=1, p=0 */
-    d->pramdac.core_clock_freq = NV2A_CRYSTAL_FREQ * 0x1C; /* ~233 MHz */
+    /* Use the register write path so reset and a later write of the same
+     * coefficient agree. Here n=0x1C, m=1, p=1: crystal * 28 / 2. */
+    pramdac_write(d, NV_PRAMDAC_NVPLL_COEFF, 0x00011C01, 4);
 
     /* Default timer divisors */
     d->ptimer.numerator = 1;

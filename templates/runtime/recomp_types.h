@@ -260,13 +260,13 @@ extern RECOMP_TLS int g_fp_cmp;
 #define ICALL_TRACE_SIZE 16
 
 /** Ring buffer of recent indirect call target VAs. */
-extern volatile uint32_t g_icall_trace[ICALL_TRACE_SIZE];
+extern RECOMP_TLS volatile uint32_t g_icall_trace[ICALL_TRACE_SIZE];
 
 /** Current write index into the ring buffer. */
-extern volatile uint32_t g_icall_trace_idx;
+extern RECOMP_TLS volatile uint32_t g_icall_trace_idx;
 
 /** Total count of indirect calls executed. */
-extern volatile uint64_t g_icall_count;
+extern RECOMP_TLS volatile uint64_t g_icall_count;
 
 /**
  * Called when an indirect call target cannot be resolved.
@@ -791,11 +791,20 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  * left over from a hardcoded 0x00400000 cutoff that was only ever right for
  * one title. Editing this header per project is no longer a thing.
  */
+
+#ifdef RECOMP_DIAGNOSTICS
+void recomp_diag_record(uint32_t kind, uint32_t target, uint32_t site, uint32_t value);
+#define RECOMP_DIAG_CALL(kind, va) recomp_diag_record((kind), (va), (kind)==1 ? MEM32(g_esp) : 0, 0)
+#else
+#define RECOMP_DIAG_CALL(kind, va) ((void)0)
+#endif
+
 #define RECOMP_ICALL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
+    RECOMP_DIAG_CALL(1, _va); \
     /* Skip garbage VAs outside code section + kernel thunk range */ \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
@@ -823,6 +832,7 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
+    RECOMP_DIAG_CALL(1, _va); \
     if (!RECOMP_ICALL_IS_CODE(_va)) { \
         recomp_icall_not_code_log(_va); \
         g_esp = (saved_esp); eax = 0; break; \
@@ -845,6 +855,7 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
  */
 #define RECOMP_ITAIL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
+    RECOMP_DIAG_CALL(2, _va); \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     if (!_fn) _fn = recomp_lookup(_va); \
     if (!_fn) _fn = recomp_lookup_kernel(_va); \
