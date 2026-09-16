@@ -2056,12 +2056,22 @@ class Lifter:
     def _lift_imul(self, insn, ops):
         nops = len(ops)
         if nops == 1:
-            # One operand: edx:eax = eax * ops[0]
+            w = _operand_width(ops[0]) or 4
             src = _fmt_operand_read(ops[0])
-            return [
-                f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
-                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
-            ]
+            if w == 1:
+                return [
+                    f"SET_LO16(eax, (uint16_t)((int16_t)(int8_t)LO8(eax) * (int16_t)(int8_t){src}));"
+                ]
+            elif w == 2:
+                return [
+                    f"{{ int32_t _r = (int32_t)(int16_t)LO16(eax) * (int32_t)(int16_t){src};",
+                    f"  SET_LO16(eax, (uint16_t)_r); SET_LO16(edx, (uint16_t)(_r >> 16)); }}"
+                ]
+            else:
+                return [
+                    f"{{ int64_t _r = (int64_t)(int32_t)eax * (int64_t)(int32_t){src};",
+                    f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
+                ]
         elif nops == 2:
             # Two operand: dst = dst * src
             dst = _fmt_operand_read(ops[0])
@@ -2077,24 +2087,61 @@ class Lifter:
     def _lift_muldiv(self, insn, ops, m):
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
+        w = _operand_width(ops[0]) or 4
         src = _fmt_operand_read(ops[0])
         if m == "mul":
-            return [
-                f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",
-                f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
-            ]
+            if w == 1:
+                return [
+                    f"SET_LO16(eax, (uint16_t)((uint16_t)LO8(eax) * (uint16_t)(uint8_t){src}));"
+                ]
+            elif w == 2:
+                return [
+                    f"{{ uint32_t _r = (uint32_t)LO16(eax) * (uint32_t)(uint16_t){src};",
+                    f"  SET_LO16(eax, (uint16_t)_r); SET_LO16(edx, (uint16_t)(_r >> 16)); }}"
+                ]
+            else:
+                return [
+                    f"{{ uint64_t _r = (uint64_t)eax * (uint64_t){src};",
+                    f"  eax = (uint32_t)_r; edx = (uint32_t)(_r >> 32); }}"
+                ]
         elif m == "div":
-            return [
-                f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
-                f"  eax = (uint32_t)(_dividend / (uint32_t){src});",
-                f"  edx = (uint32_t)(_dividend % (uint32_t){src}); }}"
-            ]
+            if w == 1:
+                return [
+                    f"{{ uint16_t _dividend = LO16(eax);",
+                    f"  SET_LO8(eax, (uint8_t)(_dividend / (uint8_t){src}));",
+                    f"  SET_HI8(eax, (uint8_t)(_dividend % (uint8_t){src})); }}"
+                ]
+            elif w == 2:
+                return [
+                    f"{{ uint32_t _dividend = ((uint32_t)LO16(edx) << 16) | LO16(eax);",
+                    f"  SET_LO16(eax, (uint16_t)(_dividend / (uint16_t){src}));",
+                    f"  SET_LO16(edx, (uint16_t)(_dividend % (uint16_t){src})); }}"
+                ]
+            else:
+                return [
+                    f"{{ uint64_t _dividend = ((uint64_t)edx << 32) | eax;",
+                    f"  eax = (uint32_t)(_dividend / (uint32_t){src});",
+                    f"  edx = (uint32_t)(_dividend % (uint32_t){src}); }}"
+                ]
         elif m == "idiv":
-            return [
-                f"{{ int64_t _dividend = ((int64_t)(int32_t)edx << 32) | eax;",
-                f"  eax = (uint32_t)((int32_t)(_dividend / (int32_t){src}));",
-                f"  edx = (uint32_t)((int32_t)(_dividend % (int32_t){src})); }}"
-            ]
+            if w == 1:
+                return [
+                    f"{{ int16_t _dividend = (int16_t)LO16(eax);",
+                    f"  SET_LO8(eax, (uint8_t)((int8_t)(_dividend / (int8_t){src})));",
+                    f"  SET_HI8(eax, (uint8_t)((int8_t)(_dividend % (int8_t){src}))); }}"
+                ]
+            elif w == 2:
+                return [
+                    f"{{ int32_t _dividend = ((int32_t)(int16_t)LO16(edx) << 16) | LO16(eax);",
+                    f"  SET_LO16(eax, (uint16_t)((int16_t)(_dividend / (int16_t){src})));",
+                    f"  SET_LO16(edx, (uint16_t)((int16_t)(_dividend % (int16_t){src}))); }}"
+                ]
+            else:
+                return [
+                    f"{{ int64_t _dividend = ((int64_t)(int32_t)edx << 32) | eax;",
+                    f"  eax = (uint32_t)((int32_t)(_dividend / (int32_t){src}));",
+                    f"  edx = (uint32_t)((int32_t)(_dividend % (int32_t){src})); }}"
+                ]
         return [f"/* {m}: unhandled */"]
 
     def _lift_shift(self, insn, ops, c_op):
