@@ -23,6 +23,36 @@ NV2AState *nv2a_get_state(void) {
     return g_nv2a;
 }
 
+static bool pci_config_access_valid(uint32_t offset, uint32_t length)
+{
+    return (length == 1 || length == 2 || length == 4) &&
+           offset < PCI_CONFIG_SPACE_SIZE &&
+           length <= PCI_CONFIG_SPACE_SIZE - offset;
+}
+
+bool nv2a_pci_config_read(NV2AState *d, uint32_t offset,
+                          void *buffer, uint32_t length)
+{
+    if (!d || !buffer || !pci_config_access_valid(offset, length)) return false;
+    memcpy(buffer, d->parent_obj.config + offset, length);
+    return true;
+}
+
+bool nv2a_pci_config_write(NV2AState *d, uint32_t offset,
+                           const void *buffer, uint32_t length)
+{
+    if (!d || !buffer || !pci_config_access_valid(offset, length)) return false;
+    /* Vendor/device and class/revision are immutable PCI identity fields. */
+    const uint8_t *src = (const uint8_t *)buffer;
+    for (uint32_t i = 0; i < length; ++i) {
+        uint32_t byte_offset = offset + i;
+        if ((byte_offset >= 0x00 && byte_offset < 0x04) ||
+            (byte_offset >= 0x08 && byte_offset < 0x0C)) continue;
+        d->parent_obj.config[byte_offset] = src[i];
+    }
+    return true;
+}
+
 /* ============================================================
  * IRQ aggregation (from xemu nv2a.c)
  * ============================================================ */
@@ -48,6 +78,13 @@ void nv2a_update_irq(NV2AState *d)
         d->pmc.pending_interrupts |= NV_PMC_INTR_0_PGRAPH;
     } else {
         d->pmc.pending_interrupts &= ~NV_PMC_INTR_0_PGRAPH;
+    }
+
+    /* PTIMER */
+    if (d->ptimer.pending_interrupts & d->ptimer.enabled_interrupts) {
+        d->pmc.pending_interrupts |= NV_PMC_INTR_0_PTIMER;
+    } else {
+        d->pmc.pending_interrupts &= ~NV_PMC_INTR_0_PTIMER;
     }
 
     if (d->pmc.pending_interrupts && d->pmc.enabled_interrupts) {
@@ -146,24 +183,25 @@ void pmc_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
  * PBUS - bus control (from xemu pbus.c)
  * ============================================================ */
 
+static bool pbus_pci_access_valid(hwaddr addr, unsigned int size,
+                                  uint32_t *config_offset)
+{
+    uint64_t offset;
+    if (addr < NV_PBUS_PCI_NV_0 ||
+        (size != 1 && size != 2 && size != 4)) return false;
+    offset = addr - NV_PBUS_PCI_NV_0;
+    if (offset >= 0x80 || size > 0x80 - offset) return false;
+    *config_offset = (uint32_t)offset;
+    return true;
+}
+
 uint64_t pbus_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *s = (NV2AState *)opaque;
-    PCIDevice *d = PCI_DEVICE(s);
-
     uint64_t r = 0;
-    switch (addr) {
-    case NV_PBUS_PCI_NV_0:
-        r = pci_get_long(d->config + PCI_VENDOR_ID);
-        break;
-    case NV_PBUS_PCI_NV_1:
-        r = pci_get_long(d->config + PCI_COMMAND);
-        break;
-    case NV_PBUS_PCI_NV_2:
-        r = pci_get_long(d->config + PCI_CLASS_REVISION);
-        break;
-    default:
-        break;
+    uint32_t config_offset;
+    if (pbus_pci_access_valid(addr, size, &config_offset)) {
+        nv2a_pci_config_read(s, config_offset, &r, size);
     }
 
     nv2a_reg_log_read(NV_PBUS, addr, size, r);
@@ -173,37 +211,113 @@ uint64_t pbus_read(void *opaque, hwaddr addr, unsigned int size)
 void pbus_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     NV2AState *s = (NV2AState *)opaque;
-    PCIDevice *d = PCI_DEVICE(s);
-
+    uint32_t config_offset;
     nv2a_reg_log_write(NV_PBUS, addr, size, val);
-
-    switch (addr) {
-    case NV_PBUS_PCI_NV_1:
-        pci_set_long(d->config + PCI_COMMAND, val);
-        break;
-    default:
-        break;
+    if (pbus_pci_access_valid(addr, size, &config_offset)) {
+        nv2a_pci_config_write(s, config_offset, &val, size);
     }
 }
 
 /* ============================================================
- * PTIMER - time measurement (from xemu ptimer.c)
+ * PTIMER - time measurement (compatible with xemu ptimer.c)
+ *
+ * Behavioral reference: xemu f9b14039e5bb56ae2d8f028e31e7cc19f13f7e12,
+ * hw/xbox/nv2a/ptimer.c. The standalone owner supplies the host timer queue.
  * ============================================================ */
+
+#define PTIMER_CLOCK_HIGH_MASK 0x1fffffffULL
+#define PTIMER_ALARM_MASK      0xffffffe0ULL
+#define PTIMER_REG_TIME_MASK   ((PTIMER_CLOCK_HIGH_MASK << 32) | PTIMER_ALARM_MASK)
+#define PTIMER_INTERNAL_TIME_MASK (PTIMER_REG_TIME_MASK >> 5)
+
+static uint64_t ptimer_absolute_clock(NV2AState *d)
+{
+    if (d->ptimer.numerator == 0 || d->ptimer.denominator == 0 ||
+        d->pramdac.core_clock_freq == 0) return 0;
+    uint64_t now_ns = d->ptimer.clock_ns ?
+        d->ptimer.clock_ns(d->ptimer.clock_opaque) :
+        (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    return muldiv64(muldiv64(now_ns,
+                             (uint32_t)d->pramdac.core_clock_freq,
+                             NANOSECONDS_PER_SECOND),
+                    d->ptimer.denominator, d->ptimer.numerator);
+}
+
+static uint64_t ptimer_internal_clock(NV2AState *d)
+{
+    return (ptimer_absolute_clock(d) + d->ptimer.time_offset) &
+           PTIMER_INTERNAL_TIME_MASK;
+}
+
+static uint64_t ptimer_reg_clock(NV2AState *d)
+{
+    return (ptimer_internal_clock(d) << 5) & PTIMER_REG_TIME_MASK;
+}
+
+static uint64_t ptimer_alarm_distance(uint64_t now, uint64_t alarm)
+{
+    uint64_t diff = (alarm - now) & PTIMER_REG_TIME_MASK;
+    return diff > (PTIMER_REG_TIME_MASK >> 1) ? 0 : diff;
+}
+
+static uint64_t ptimer_next_alarm_time(uint64_t now, uint64_t alarm)
+{
+    uint64_t target = (now & ~0xffffffffULL) | (alarm & PTIMER_ALARM_MASK);
+    if ((alarm & PTIMER_ALARM_MASK) <= (now & PTIMER_ALARM_MASK))
+        target += 1ULL << 32;
+    return target & PTIMER_REG_TIME_MASK;
+}
+
+void nv2a_ptimer_service(NV2AState *d)
+{
+    if (!(d->ptimer.enabled_interrupts & NV_PTIMER_INTR_0_ALARM) ||
+        ptimer_alarm_distance(ptimer_reg_clock(d), d->ptimer.alarm_time) != 0)
+        return;
+    d->ptimer.pending_interrupts |= NV_PTIMER_INTR_0_ALARM;
+    /* Select the first matching low-word epoch after now in one step. This
+     * consumes any number of missed periods, so W1C remains clear. */
+    uint64_t now = ptimer_reg_clock(d);
+    d->ptimer.alarm_time = ptimer_next_alarm_time(now, d->ptimer.alarm_time);
+    nv2a_update_irq(d);
+}
+
+uint64_t nv2a_ptimer_next_alarm_ns(NV2AState *d)
+{
+    uint64_t diff_reg, internal_ticks;
+    long double ns;
+    if (!(d->ptimer.enabled_interrupts & NV_PTIMER_INTR_0_ALARM))
+        return UINT64_MAX;
+    diff_reg = ptimer_alarm_distance(ptimer_reg_clock(d), d->ptimer.alarm_time);
+    if (!diff_reg) return 0;
+    if (!d->ptimer.numerator || !d->ptimer.denominator ||
+        !d->pramdac.core_clock_freq)
+        return UINT64_MAX;
+    internal_ticks = (diff_reg + 31) >> 5;
+    ns = (long double)internal_ticks * d->ptimer.numerator *
+         NANOSECONDS_PER_SECOND /
+         ((long double)d->ptimer.denominator * d->pramdac.core_clock_freq);
+    if (ns >= (long double)UINT64_MAX) return UINT64_MAX;
+    uint64_t rounded = (uint64_t)ns;
+    return rounded + ((long double)rounded < ns);
+}
+
+void nv2a_ptimer_set_clock(NV2AState *d, uint64_t (*clock_ns)(void *),
+                           void *opaque)
+{
+    d->ptimer.clock_ns = clock_ns;
+    d->ptimer.clock_opaque = opaque;
+}
 
 static uint64_t ptimer_get_clock(NV2AState *d)
 {
-    if (d->ptimer.numerator == 0) return 0;
-    return muldiv64(muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                             d->pramdac.core_clock_freq,
-                             NANOSECONDS_PER_SECOND),
-                    d->ptimer.denominator,
-                    d->ptimer.numerator);
+    return ptimer_internal_clock(d);
 }
 
 uint64_t ptimer_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
 
+    nv2a_ptimer_service(d);
     uint64_t r = 0;
     switch (addr) {
     case NV_PTIMER_INTR_0:
@@ -219,10 +333,13 @@ uint64_t ptimer_read(void *opaque, hwaddr addr, unsigned int size)
         r = d->ptimer.denominator;
         break;
     case NV_PTIMER_TIME_0:
-        r = (ptimer_get_clock(d) & 0x7ffffff) << 5;
+        r = ptimer_reg_clock(d) & 0xffffffffULL;
         break;
     case NV_PTIMER_TIME_1:
-        r = (ptimer_get_clock(d) >> 27) & 0x1fffffff;
+        r = (ptimer_reg_clock(d) >> 32) & PTIMER_CLOCK_HIGH_MASK;
+        break;
+    case NV_PTIMER_ALARM_0:
+        r = d->ptimer.alarm_time & 0xffffffffULL;
         break;
     default:
         break;
@@ -238,6 +355,8 @@ void ptimer_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     nv2a_reg_log_write(NV_PTIMER, addr, size, val);
 
+    nv2a_ptimer_service(d);
+
     switch (addr) {
     case NV_PTIMER_INTR_0:
         d->ptimer.pending_interrupts &= ~val;
@@ -245,6 +364,8 @@ void ptimer_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         break;
     case NV_PTIMER_INTR_EN_0:
         d->ptimer.enabled_interrupts = val;
+        /* xemu evaluates a late enable against the current time. */
+        nv2a_ptimer_service(d);
         nv2a_update_irq(d);
         break;
     case NV_PTIMER_DENOMINATOR:
@@ -254,8 +375,29 @@ void ptimer_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         d->ptimer.numerator = val;
         break;
     case NV_PTIMER_ALARM_0:
-        d->ptimer.alarm_time = val;
+    {
+        uint64_t now = ptimer_reg_clock(d);
+        d->ptimer.alarm_time = ptimer_next_alarm_time(now, val);
+        nv2a_ptimer_service(d);
         break;
+    }
+    case NV_PTIMER_TIME_0:
+    {
+        uint64_t now = ptimer_reg_clock(d);
+        uint64_t target = (now & ~0xffffffffULL) | (val & PTIMER_ALARM_MASK);
+        d->ptimer.time_offset =
+            ((target >> 5) & PTIMER_INTERNAL_TIME_MASK) - ptimer_absolute_clock(d);
+        break;
+    }
+    case NV_PTIMER_TIME_1:
+    {
+        uint64_t now = ptimer_reg_clock(d);
+        uint64_t target = ((val & PTIMER_CLOCK_HIGH_MASK) << 32) |
+                          (now & 0xffffffffULL);
+        d->ptimer.time_offset =
+            ((target >> 5) & PTIMER_INTERNAL_TIME_MASK) - ptimer_absolute_clock(d);
+        break;
+    }
     default:
         break;
     }
@@ -604,9 +746,273 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
 }
 
 /* ============================================================
- * PFIFO - command FIFO (stub for Phase 1)
- * Full PFIFO with push buffer processing comes in Phase 2-3.
+ * PFIFO - bounded USER submission (11b4)
  * ============================================================ */
+
+enum {
+    NV2A_SUBMIT_OK = 0,
+    NV2A_SUBMIT_UNMAPPED = 1,
+    NV2A_SUBMIT_UNREADABLE = 2,
+    NV2A_SUBMIT_RESERVED = 3,
+    NV2A_SUBMIT_TRUNCATED = 4,
+    NV2A_SUBMIT_BUDGET = 5,
+    NV2A_SUBMIT_LOOP = 6,
+    NV2A_SUBMIT_BAD_TARGET = 7,
+    NV2A_SUBMIT_METHOD_RANGE = 8,
+    NV2A_SUBMIT_SINK_FULL = 9,
+    NV2A_SUBMIT_BAD_POINTER = 10,
+    NV2A_SUBMIT_UNSUPPORTED_METHOD = 11,
+};
+
+/* NV01_SUBC_SET_OBJECT is the common PFIFO binding method.  The original
+ * stream uses an object handle, whose class normally comes from RAMIN.  RAMIN
+ * lookup is not wired into this standalone owner yet, so only an explicit
+ * fixture binding may consume it. */
+#define M_SET_OBJECT 0x0000u
+#define NV097_CLASS  0x97u
+
+const char *nv2a_submit_diagnostic(uint32_t code)
+{
+    switch (code) {
+    case NV2A_SUBMIT_OK: return "ok";
+    case NV2A_SUBMIT_UNMAPPED: return "unmapped_pushbuffer";
+    case NV2A_SUBMIT_UNREADABLE: return "unreadable_pushbuffer";
+    case NV2A_SUBMIT_RESERVED: return "reserved_opcode";
+    case NV2A_SUBMIT_TRUNCATED: return "truncated_packet";
+    case NV2A_SUBMIT_BUDGET: return "budget_exhausted";
+    case NV2A_SUBMIT_LOOP: return "control_flow_loop";
+    case NV2A_SUBMIT_BAD_TARGET: return "invalid_target";
+    case NV2A_SUBMIT_METHOD_RANGE: return "method_range_overflow";
+    case NV2A_SUBMIT_SINK_FULL: return "sink_capacity";
+    case NV2A_SUBMIT_BAD_POINTER: return "invalid_get_put";
+    case NV2A_SUBMIT_UNSUPPORTED_METHOD: return "unsupported_method";
+    default: return "unknown";
+    }
+}
+
+bool nv2a_set_pushbuffer_window(NV2AState *d, uint8_t *base,
+                                uint32_t guest_base, uint32_t size)
+{
+    if (!d || !base || !size || (guest_base & 3) || (size & 3) ||
+        guest_base + size < guest_base) return false;
+    qemu_mutex_lock(&d->pfifo.lock);
+    d->pfifo.pushbuffer = base;
+    d->pfifo.pushbuffer_base = guest_base;
+    d->pfifo.pushbuffer_size = size;
+    qemu_mutex_unlock(&d->pfifo.lock);
+    return true;
+}
+
+bool nv2a_set_fixture_binding(NV2AState *d, uint32_t subchannel,
+                              uint32_t object, uint32_t class_id)
+{
+    if (!d || subchannel >= 8 || !object || !class_id) return false;
+    qemu_mutex_lock(&d->pfifo.lock);
+    d->pfifo.fixture_object[subchannel] = object;
+    d->pfifo.fixture_class[subchannel] = class_id;
+    qemu_mutex_unlock(&d->pfifo.lock);
+    return true;
+}
+
+bool nv2a_set_fixture_execution(NV2AState *d, bool enabled)
+{
+    if (!d) return false;
+    qemu_mutex_lock(&d->pfifo.lock);
+    d->pfifo.fixture_execution = enabled;
+    qemu_mutex_unlock(&d->pfifo.lock);
+    return true;
+}
+
+static bool submit_read_word(NV2AState *d, uint32_t address, uint32_t *word)
+{
+    uint32_t end = d->pfifo.pushbuffer_base + d->pfifo.pushbuffer_size;
+    if (!d->pfifo.pushbuffer || address < d->pfifo.pushbuffer_base ||
+        address >= end || (address & 3)) return false;
+#if defined(_WIN32)
+    MEMORY_BASIC_INFORMATION mbi;
+    uint8_t *host = d->pfifo.pushbuffer + (address - d->pfifo.pushbuffer_base);
+    if (VirtualQuery(host, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+        mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+        !((mbi.Protect & 0xffu) == PAGE_READONLY ||
+          (mbi.Protect & 0xffu) == PAGE_READWRITE ||
+          (mbi.Protect & 0xffu) == PAGE_WRITECOPY ||
+          (mbi.Protect & 0xffu) == PAGE_EXECUTE_READ ||
+          (mbi.Protect & 0xffu) == PAGE_EXECUTE_READWRITE ||
+          (mbi.Protect & 0xffu) == PAGE_EXECUTE_WRITECOPY) ||
+        host + sizeof(*word) > (uint8_t *)mbi.BaseAddress + mbi.RegionSize)
+        return false;
+#endif
+    memcpy(word, d->pfifo.pushbuffer + (address - d->pfifo.pushbuffer_base), 4);
+    return true;
+}
+
+static uint32_t submit_advance(NV2AState *d, uint32_t address)
+{
+    uint32_t end = d->pfifo.pushbuffer_base + d->pfifo.pushbuffer_size;
+    return address + 4 == end ? d->pfifo.pushbuffer_base : address + 4;
+}
+
+bool nv2a_submit_pending(NV2AState *d)
+{
+    uint32_t get, put, pc, ret = 0, words = 0, packets = 0;
+    uint32_t seen[1024]; unsigned seen_count = 0;
+    struct { uint32_t subchannel, method, param; } staged[256];
+    uint32_t staged_count = 0;
+    uint32_t staged_class[8], staged_object[8];
+    bool ok = true;
+    if (!d) return false;
+    qemu_mutex_lock(&d->pfifo.lock);
+    memcpy(staged_class, d->pfifo.binding_class, sizeof(staged_class));
+    memcpy(staged_object, d->pfifo.binding_object, sizeof(staged_object));
+    get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
+    put = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
+    if (!d->pfifo.pushbuffer) { d->pfifo.submit_diag = NV2A_SUBMIT_UNMAPPED; ok = false; goto done; }
+    uint32_t begin = d->pfifo.pushbuffer_base;
+    uint32_t end = begin + d->pfifo.pushbuffer_size;
+    if ((get & 3u) || (put & 3u) || get < begin || put < begin ||
+        get > end || put > end) {
+        d->pfifo.submit_diag = NV2A_SUBMIT_BAD_POINTER;
+        ok = false;
+        goto done;
+    }
+    if (get == end) get = begin;
+    if (put == end) put = begin;
+    pc = get;
+    while (pc != put) {
+        uint32_t h, address = pc;
+        if (words >= 1024 || packets >= 256) { d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false; break; }
+        for (unsigned i = 0; i < seen_count; ++i) if (seen[i * 2] == pc && seen[i * 2 + 1] == ret) { d->pfifo.submit_diag = NV2A_SUBMIT_LOOP; ok = false; goto done; }
+        if (seen_count < 512) { seen[seen_count * 2] = pc; seen[seen_count * 2 + 1] = ret; ++seen_count; }
+        if (!submit_read_word(d, pc, &h)) { d->pfifo.submit_diag = NV2A_SUBMIT_UNREADABLE; ok = false; break; }
+        pc = submit_advance(d, pc); ++words; ++packets;
+        if ((h & 0xe0000003u) == 0x20000000u || (h & 3u) == 1u || (h & 3u) == 2u || h == 0x00020000u) {
+            uint32_t target;
+            if ((h & 3u) == 2u) { if (ret) { d->pfifo.submit_diag = NV2A_SUBMIT_LOOP; ok = false; break; } ret = pc; }
+            if (h == 0x00020000u) { if (!ret) { d->pfifo.submit_diag = NV2A_SUBMIT_BAD_TARGET; ok = false; break; } pc = ret; ret = 0; continue; }
+            target = (h & 3u) == 1u || (h & 3u) == 2u ? h & 0xfffffffcu : h & 0x1fffffffu;
+            if (target < d->pfifo.pushbuffer_base || target >= d->pfifo.pushbuffer_base + d->pfifo.pushbuffer_size || (target & 3u)) {
+                d->pfifo.submit_diag = NV2A_SUBMIT_BAD_TARGET; ok = false; break;
+            }
+            pc = target;
+            continue;
+        }
+        if ((h & 0xe0030003u) == 0u || (h & 0xe0030003u) == 0x40000000u) {
+            uint32_t count = (h >> 18) & 0x7ffu, method = h & 0x1ffcu, subchannel = (h >> 13) & 7u;
+            if (!(h & 0x40000000u) && count && method + 4u * (count - 1u) > 0x1ffcu) { d->pfifo.submit_diag = NV2A_SUBMIT_METHOD_RANGE; ok = false; break; }
+            if (d->pfifo.sink_count + staged_count + count > 256) { d->pfifo.submit_diag = NV2A_SUBMIT_SINK_FULL; ok = false; break; }
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t param;
+                if (words >= 1024) { d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false; goto done; }
+                if (pc == put || !submit_read_word(d, pc, &param)) { d->pfifo.submit_diag = pc == put ? NV2A_SUBMIT_TRUNCATED : NV2A_SUBMIT_UNREADABLE; ok = false; goto done; }
+                pc = submit_advance(d, pc); ++words;
+                /* Object binding is accepted only through the explicit
+                 * fixture seam.  A real RAMIN/DMA lookup remains a hard
+                 * dependency for game acceptance. */
+                if (method == M_SET_OBJECT) {
+                    if (!d->pfifo.fixture_execution || !param ||
+                        d->pfifo.fixture_object[subchannel] != param ||
+                        d->pfifo.fixture_class[subchannel] != NV097_CLASS) {
+                        d->pfifo.submit_diag = NV2A_SUBMIT_UNSUPPORTED_METHOD;
+                        d->pfifo.submit_diag_get = address;
+                        d->pfifo.submit_diag_subchannel = subchannel;
+                        d->pfifo.submit_diag_method = method;
+                        d->pfifo.submit_diag_param = param;
+                        ok = false; goto done;
+                    }
+                    staged_class[subchannel] = d->pfifo.fixture_class[subchannel];
+                    staged_object[subchannel] = param;
+                } else if (method != 0x0100u &&
+                           !(staged_class[subchannel] == NV097_CLASS &&
+                             (method == M_SET_SURFACE_CLIP_H ||
+                              method == M_SET_SURFACE_CLIP_V))) {
+                    if (method != 0x0100u || subchannel != 0) {
+                        d->pfifo.submit_diag = NV2A_SUBMIT_UNSUPPORTED_METHOD;
+                        d->pfifo.submit_diag_get = address;
+                        d->pfifo.submit_diag_subchannel = subchannel;
+                        d->pfifo.submit_diag_method = method;
+                        d->pfifo.submit_diag_param = param;
+                        ok = false;
+                        goto done;
+                    }
+                }
+                if (method != M_SET_OBJECT && method != 0x0100u &&
+                    staged_class[subchannel] != NV097_CLASS) {
+                    d->pfifo.submit_diag = NV2A_SUBMIT_UNSUPPORTED_METHOD;
+                    d->pfifo.submit_diag_get = address;
+                    d->pfifo.submit_diag_subchannel = subchannel;
+                    d->pfifo.submit_diag_method = method;
+                    d->pfifo.submit_diag_param = param;
+                    ok = false;
+                    goto done;
+                }
+                staged[staged_count].subchannel = subchannel;
+                staged[staged_count].method = method;
+                staged[staged_count].param = param;
+                ++staged_count;
+                if (!(h & 0x40000000u)) method += 4;
+            }
+            continue;
+        }
+        d->pfifo.submit_diag = NV2A_SUBMIT_RESERVED; d->pfifo.submit_diag_get = address; ok = false; break;
+    }
+    if (ok) {
+        for (uint32_t i = 0; i < staged_count; ++i) {
+            d->pfifo.sink[d->pfifo.sink_count].subchannel = staged[i].subchannel;
+            d->pfifo.sink[d->pfifo.sink_count].method = staged[i].method;
+            d->pfifo.sink[d->pfifo.sink_count].param = staged[i].param;
+            ++d->pfifo.sink_count;
+            /* These two NV097 words are fully defined as pairs of unsigned
+             * 16-bit fields (X/WIDTH and Y/HEIGHT), so every 32-bit parameter
+             * has a defined capture representation and no reserved bits.
+             * Other surface methods remain unsupported until their enum,
+             * alignment and DMA bounds contracts are implemented. */
+            if (staged[i].method == M_SET_SURFACE_CLIP_H ||
+                staged[i].method == M_SET_SURFACE_CLIP_V) {
+                d->pgraph.regs[staged[i].method / 4] = staged[i].param;
+            }
+        }
+        memcpy(d->pfifo.binding_class, staged_class, sizeof(staged_class));
+        memcpy(d->pfifo.binding_object, staged_object, sizeof(staged_object));
+        if (staged_count) {
+            d->pfifo.submit_last_method = staged[staged_count - 1].method;
+            d->pfifo.submit_last_param = staged[staged_count - 1].param;
+        }
+        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = pc;
+        ++d->pfifo.submit_successes;
+        d->pfifo.submit_diag = NV2A_SUBMIT_OK;
+    }
+done:
+    d->pfifo.submit_words += words;
+    d->pfifo.submit_packets += packets;
+    d->pfifo.submit_diag_get = (d->pfifo.submit_diag == NV2A_SUBMIT_OK) ? pc : d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
+    qemu_mutex_unlock(&d->pfifo.lock);
+    return ok;
+}
+
+static uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    NV2AState *d = (NV2AState *)opaque;
+    if (size != 4) return 0;
+    if (addr == NV_USER_DMA_PUT) return d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
+    if (addr == NV_USER_DMA_GET) return d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
+    return 0;
+}
+
+static void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
+{
+    NV2AState *d = (NV2AState *)opaque;
+    if (size != 4) return;
+    if (addr == NV_USER_DMA_GET) {
+        qemu_mutex_lock(&d->pfifo.lock);
+        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = (uint32_t)val;
+        qemu_mutex_unlock(&d->pfifo.lock);
+    } else if (addr == NV_USER_DMA_PUT) {
+        qemu_mutex_lock(&d->pfifo.lock);
+        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = (uint32_t)val;
+        qemu_mutex_unlock(&d->pfifo.lock);
+        nv2a_submit_pending(d);
+    }
+}
 
 uint64_t pfifo_read(void *opaque, hwaddr addr, unsigned int size)
 {
@@ -643,6 +1049,10 @@ void pfifo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     case NV_PFIFO_INTR_EN_0:
         d->pfifo.enabled_interrupts = val;
         nv2a_update_irq(d);
+        break;
+    case NV_PFIFO_CACHE1_DMA_PUT:
+        d->pfifo.regs[addr] = (uint32_t)val;
+        nv2a_submit_pending(d);
         break;
     default:
         d->pfifo.regs[addr] = val;
@@ -709,7 +1119,7 @@ const NV2ABlockInfo blocktable[NV_NUM_BLOCKS] = {
     /* NV_PRAMIN = 19 */
     { .name = NULL },
     /* NV_USER = 20 */
-    STUB_ENTRY(USER,          0x800000, 0x800000),
+    ENTRY(USER,      user,      0x800000, 0x800000),
 };
 
 #undef ENTRY

@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "nv2a/nv2a_mmio_hook.h"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -209,8 +210,8 @@ VOID __stdcall xbox_KeBugCheckEx(
 /* ============================================================================
  * HAL PCI Access
  *
- * HalReadWritePCISpace reads/writes PCI configuration space. The Xbox uses
- * this for GPU and southbridge setup. Not needed on Windows - stub it.
+ * HalReadWritePCISpace reads/writes PCI configuration space. The NV2A endpoint
+ * (bus 1, slot 0) shares its backing with the PBUS 0x800 mirror.
  * ============================================================================ */
 
 VOID __stdcall xbox_HalReadWritePCISpace(
@@ -221,20 +222,20 @@ VOID __stdcall xbox_HalReadWritePCISpace(
     ULONG Length,
     BOOLEAN WritePCISpace)
 {
-    (void)BusNumber;
-    (void)SlotNumber;
-    (void)RegisterNumber;
-    (void)Length;
-    (void)WritePCISpace;
-
-    /* Return zeroed buffer for reads */
-    if (!WritePCISpace && Buffer)
+    bool handled = false;
+    if (!WritePCISpace && Buffer && Length)
         memset(Buffer, 0, Length);
+    if (BusNumber == 1 && SlotNumber == 0 && Buffer &&
+        (Length == 1 || Length == 2 || Length == 4)) {
+        handled = WritePCISpace
+            ? nv2a_hook_pci_config_write(RegisterNumber, Buffer, Length)
+            : nv2a_hook_pci_config_read(RegisterNumber, Buffer, Length);
+    }
 
     xbox_log(XBOX_LOG_TRACE, XBOX_LOG_HAL,
-        "HalReadWritePCISpace: bus=%u slot=%u reg=0x%X len=%u %s (stubbed)",
+        "HalReadWritePCISpace: bus=%u slot=%u reg=0x%X len=%u %s (%s)",
         BusNumber, SlotNumber, RegisterNumber, Length,
-        WritePCISpace ? "WRITE" : "READ");
+        WritePCISpace ? "WRITE" : "READ", handled ? "NV2A" : "ignored");
 }
 
 /* ============================================================================

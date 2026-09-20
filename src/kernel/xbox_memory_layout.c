@@ -134,6 +134,19 @@ static size_t xbox_TiledApertureSize(void)
 
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
+/* Read at worker start; diagnostic fixtures may disable GPU mutations while
+ * retaining the same worker's kernel/APU clock updates. Frozen collectors
+ * read this exported value to identify the active model. */
+volatile LONG g_nv2a_ack_enabled = 1;
+static volatile LONG g_nv2a_ack_active = 0;
+
+void xbox_Nv2aClaimRegisterOwner(void)
+{
+    InterlockedExchange(&g_nv2a_ack_enabled, 0);
+    while (InterlockedCompareExchange(&g_nv2a_ack_active, 0, 0))
+        SwitchToThread();
+    MemoryBarrier();
+}
 
 /*
  * NV2A busy-bit acknowledgement.
@@ -527,6 +540,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
+        if (InterlockedCompareExchange(&g_nv2a_ack_enabled, 0, 0)) {
+        InterlockedIncrement(&g_nv2a_ack_active);
+        if (InterlockedCompareExchange(&g_nv2a_ack_enabled, 0, 0)) {
         for (size_t i = 0; i < sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]); i++) {
             volatile uint32_t *r =
                 (volatile uint32_t *)((char *)regs + NV2A_ACK[i].offset);
@@ -632,6 +648,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
             }
         }
 
+        } /* ownership recheck */
+        InterlockedDecrement(&g_nv2a_ack_active);
+        } /* GPU acknowledgement, mirrors and optional executor */
         if (g_mcpx_regs && !g_apu_mmio_trapped) {
             for (size_t i = 0; i < sizeof(MCPX_COUNTERS) / sizeof(MCPX_COUNTERS[0]); i++) {
                 volatile uint32_t *c =
@@ -656,12 +675,18 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 
 static void xbox_Nv2aAckStart(void)
 {
+    const char *ack = getenv("RECOMP_GPU_ACK");
+    InterlockedExchange(&g_nv2a_ack_enabled,
+                        !(ack && strcmp(ack, "0") == 0));
+    fprintf(stderr, "  NV2A GPU acknowledgement mutations: %s (kernel/APU clock worker retained)\n",
+            g_nv2a_ack_enabled ? "enabled" : "disabled");
     g_nv2a_ack_stop = 0;
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {
-        fprintf(stderr, "  NV2A busy-bit ack: %zu register(s) acknowledged\n",
-                sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]));
+        fprintf(stderr, "  NV2A busy-bit ack table: %zu register(s) (%s)\n",
+                sizeof(NV2A_ACK) / sizeof(NV2A_ACK[0]),
+                g_nv2a_ack_enabled ? "enabled" : "disabled");
     }
 }
 
@@ -1504,7 +1529,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     || getenv("RECOMP_PB_EXEC") != NULL;
         if (g_nv2a_memory) {
             fprintf(stderr, "  NV2A register aperture: %u MB at Xbox VA "
-                    "0x%08X (zeroed, no register semantics)\n",
+                    "0x%08X (backing allocated; register owner pending)\n",
                     XBOX_NV2A_SIZE / (1024 * 1024), XBOX_NV2A_BASE);
         } else {
             fprintf(stderr, "  WARNING: NV2A aperture at 0x%08X failed "

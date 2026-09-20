@@ -106,6 +106,30 @@ typedef struct NV2AState {
         QemuCond fifo_idle_cond;
         bool fifo_kick;
         bool halt;
+        /* Bounded 11b4 submission state. The pointer is the physical
+         * contiguous window, never canonical guest RAM or detached VRAM. */
+        uint8_t *pushbuffer;
+        uint32_t pushbuffer_base;
+        uint32_t pushbuffer_size;
+        uint32_t submit_words;
+        uint32_t submit_packets;
+        uint32_t submit_last_method;
+        uint32_t submit_last_param;
+        uint32_t submit_diag;
+        uint32_t submit_diag_get;
+        uint32_t submit_diag_subchannel;
+        uint32_t submit_diag_method;
+        uint32_t submit_diag_param;
+        uint32_t submit_successes;
+        /* PFIFO object bindings.  RAMIN object lookup is intentionally not
+         * guessed yet; fixture_binding is an explicit test-only seam. */
+        uint32_t binding_class[8];
+        uint32_t binding_object[8];
+        uint32_t fixture_class[8];
+        uint32_t fixture_object[8];
+        bool fixture_execution;
+        uint32_t sink_count;
+        struct { uint32_t subchannel, method, param; } sink[256];
     } pfifo;
 
     struct {
@@ -117,7 +141,10 @@ typedef struct NV2AState {
         uint32_t enabled_interrupts;
         uint32_t numerator;
         uint32_t denominator;
-        uint32_t alarm_time;
+        uint64_t alarm_time;
+        uint64_t time_offset;
+        uint64_t (*clock_ns)(void *opaque);
+        void *clock_opaque;
     } ptimer;
 
     struct {
@@ -227,7 +254,31 @@ NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
 uint64_t nv2a_mmio_read(NV2AState *d, hwaddr addr, unsigned int size);
 void nv2a_mmio_write(NV2AState *d, hwaddr addr, uint64_t val, unsigned int size);
 
+/* Register the physical contiguous pushbuffer window used by USER DMA.
+ * `base` is the host mapping of guest VA `guest_base`; no address masking or
+ * fallback mapping is performed. */
+bool nv2a_set_pushbuffer_window(NV2AState *d, uint8_t *base,
+                                uint32_t guest_base, uint32_t size);
+/* Test-only binding seam until the guest RAMIN/DMA object path is recovered. */
+bool nv2a_set_fixture_binding(NV2AState *d, uint32_t subchannel,
+                              uint32_t object, uint32_t class_id);
+bool nv2a_set_fixture_execution(NV2AState *d, bool enabled);
+bool nv2a_submit_pending(NV2AState *d);
+const char *nv2a_submit_diagnostic(uint32_t code);
+
 /* Get the global NV2A state instance */
 NV2AState *nv2a_get_state(void);
+
+/* Service and schedule PTIMER alarms without requiring a PTIMER MMIO access. */
+void nv2a_ptimer_service(NV2AState *d);
+uint64_t nv2a_ptimer_next_alarm_ns(NV2AState *d);
+void nv2a_ptimer_set_clock(NV2AState *d, uint64_t (*clock_ns)(void *),
+                           void *opaque);
+
+/* PBUS 0x800..0x87f and HAL bus 1/slot 0 deliberately share this backing. */
+bool nv2a_pci_config_read(NV2AState *d, uint32_t offset,
+                          void *buffer, uint32_t length);
+bool nv2a_pci_config_write(NV2AState *d, uint32_t offset,
+                           const void *buffer, uint32_t length);
 
 #endif /* BURNOUT3_NV2A_STATE_H */

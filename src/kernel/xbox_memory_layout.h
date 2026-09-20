@@ -445,6 +445,10 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va);
  */
 HANDLE xbox_GetMappingHandle(void);
 
+/* Atomically retire the legacy NV2A register mutator and wait for any
+ * in-flight iteration before a serialized register owner protects the BAR. */
+void xbox_Nv2aClaimRegisterOwner(void);
+
 #ifdef __cplusplus
 }
 #endif

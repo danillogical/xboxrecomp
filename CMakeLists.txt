@@ -46,6 +46,11 @@ add_subdirectory(src/apu)
 # GPU: NV2A hardware emulation (register handlers, MMIO, push buffer)
 add_subdirectory(src/nv2a)
 
+# HAL PCI access routes the NV2A endpoint through its shared configuration
+# backing.  Keep this dependency explicit at the umbrella level so the kernel
+# remains independently organized while the final runtime links both owners.
+target_link_libraries(xbox_kernel PUBLIC xbox_nv2a)
+
 # USB: MCPX OHCI host controllers. A title's XAPI is statically linked and
 # drives these registers directly, so a pad only exists if they do.
 add_subdirectory(src/usb)
