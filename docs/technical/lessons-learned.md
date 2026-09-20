@@ -172,3 +172,44 @@ We should have classified all 22,097 functions early: game logic, CRT, RenderWar
     ```
 
 5. **The map file is your best friend.** MSVC's linker map (burnout3.map) maps native addresses to function names. When a crash backtrace shows address 0x00007FF6A1234567, subtract the image base and look up the offset in the map to find which recompiled function is faulting. Combined with `_ReturnAddress()` in ICALL diagnostics, this is the primary debugging technique.
+
+## JSRF Recovery Lessons
+
+### Preserve x86 overflow semantics explicitly
+
+A translated two-operand `imul` originally used signed 32-bit C multiplication.
+That appears equivalent for ordinary inputs, but signed overflow is undefined in
+C while x86 always keeps the low 32 bits. A compiler can therefore optimize the
+translated expression in ways the guest CPU would never allow.
+
+**Fix**: use widened unsigned multiplication and explicitly truncate to
+`uint32_t`, then add a fixture whose operands actually overflow. Keep a
+translation correction in the generator so production and focused-test bodies
+cannot diverge. Apply the same rule to shifts, additions and address arithmetic
+whenever guest wraparound is part of the instruction contract.
+
+### Isolate dependency seams from production routing
+
+A recovered leaf can be behavior-tested before all of its callees are recovered.
+For JSRF's GPU instance-memory setup, the focused executable supplies a fake
+kernel allocation import and a small direct-call helper. The production build
+still routes those dependencies normally and retains fatal unresolved traps.
+
+**Fix**: compile the same rendered recovered body into a focused test target and
+provide dependency overrides only in that target. Verify that production still
+contains the unresolved trap, that the focused and production bodies are
+identical, and that the fixture checks arguments, stack cleanup, output state and
+memory boundaries. Never turn a test seam into a production success stub.
+
+### Publish related timing state as one unit
+
+Initializing a shared clock with separate unsynchronized statics can look safe in
+single-thread tests. If frequency becomes visible before origin, another thread
+can compute one enormous timestamp from a zero origin and then observe time move
+backward after origin publication.
+
+**Fix**: initialize and publish all related timing fields through one once-only
+synchronization primitive. Test the first-call race deterministically by pausing
+inside initialization and proving competing callers cannot escape. Separately use
+a fixed 64-bit test value to verify register-half assignment; monotonic samples
+alone cannot detect swapped halves or an always-zero implementation.

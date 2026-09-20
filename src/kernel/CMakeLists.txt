@@ -55,3 +55,19 @@ else()
 endif()
 
 target_compile_definitions(xbox_kernel PRIVATE $<$<CONFIG:Debug>:_DEBUG>)
+
+if(BUILD_TESTING AND WIN32)
+    add_executable(xbox_timestamp_test
+        kernel_hal.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/kernel_timestamp_test.c
+    )
+    target_compile_definitions(xbox_timestamp_test PRIVATE
+        XBOXRECOMP_TIMESTAMP_TEST_BUILD)
+    target_include_directories(xbox_timestamp_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${XBOXRECOMP_SRC_DIR}
+    )
+    target_link_libraries(xbox_timestamp_test PRIVATE platform kernel32)
+    add_test(NAME xbox_timestamp_publication COMMAND xbox_timestamp_test)
+    set_tests_properties(xbox_timestamp_publication PROPERTIES TIMEOUT 20)
+endif()

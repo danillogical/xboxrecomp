@@ -18,6 +18,137 @@
 #endif
 
 /* ============================================================================
+ * Time stamp counter
+ *
+ * Xbox's QueryPerformanceCounter is a bare `rdtsc`, and its
+ * QueryPerformanceFrequency returns the CPU clock as a constant the title
+ * compiles in: Half-Life 2's is 0x2BB5C755 (733,333,333 Hz) at 0x0059C6C7.
+ * Scale the host performance counter to that rate so guest time arithmetic
+ * remains correct.
+ *
+ * INIT_ONCE is the publication boundary for both fields.  Publishing the
+ * frequency before the origin lets a competing first caller observe a partial
+ * state and return a host-uptime-sized value before later calls return near
+ * zero.  InitOnceExecuteOnce blocks those callers until the pair is complete.
+ * ============================================================================ */
+#define XBOX_TSC_HZ 733333333ull
+
+typedef struct XBOX_TSC_STATE {
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER origin;
+} XBOX_TSC_STATE;
+
+static INIT_ONCE g_tsc_once = INIT_ONCE_STATIC_INIT;
+static XBOX_TSC_STATE g_tsc_state;
+
+#if defined(XBOXRECOMP_TIMESTAMP_TEST_BUILD)
+static BOOL g_tsc_test_use_host_counter;
+static LONGLONG g_tsc_test_frequency;
+static LONGLONG g_tsc_test_origin;
+static HANDLE g_tsc_test_frequency_ready;
+static HANDLE g_tsc_test_allow_origin;
+static volatile LONG g_tsc_test_now_index;
+
+void xbox_timestamp_test_reset(LONGLONG frequency, LONGLONG origin,
+                               HANDLE frequency_ready, HANDLE allow_origin)
+{
+    InitOnceInitialize(&g_tsc_once);
+    ZeroMemory(&g_tsc_state, sizeof(g_tsc_state));
+    g_tsc_test_use_host_counter = FALSE;
+    g_tsc_test_frequency = frequency;
+    g_tsc_test_origin = origin;
+    g_tsc_test_frequency_ready = frequency_ready;
+    g_tsc_test_allow_origin = allow_origin;
+    InterlockedExchange(&g_tsc_test_now_index, 0);
+}
+
+void xbox_timestamp_test_use_host_counter(void)
+{
+    InitOnceInitialize(&g_tsc_once);
+    ZeroMemory(&g_tsc_state, sizeof(g_tsc_state));
+    g_tsc_test_use_host_counter = TRUE;
+    g_tsc_test_frequency_ready = NULL;
+    g_tsc_test_allow_origin = NULL;
+    InterlockedExchange(&g_tsc_test_now_index, 0);
+}
+
+static BOOL xbox_tsc_query_frequency(LARGE_INTEGER *frequency)
+{
+    if (g_tsc_test_use_host_counter)
+        return QueryPerformanceFrequency(frequency);
+    frequency->QuadPart = g_tsc_test_frequency;
+    if (g_tsc_test_frequency_ready)
+        SetEvent(g_tsc_test_frequency_ready);
+    if (g_tsc_test_allow_origin)
+        WaitForSingleObject(g_tsc_test_allow_origin, INFINITE);
+    return TRUE;
+}
+
+static BOOL xbox_tsc_query_counter(LARGE_INTEGER *counter)
+{
+    if (g_tsc_test_use_host_counter)
+        return QueryPerformanceCounter(counter);
+    if (InterlockedCompareExchange(&g_tsc_test_now_index, 0, 0) == 0) {
+        counter->QuadPart = g_tsc_test_origin;
+        InterlockedIncrement(&g_tsc_test_now_index);
+    } else {
+        counter->QuadPart = g_tsc_test_origin
+                          + InterlockedIncrement(&g_tsc_test_now_index) - 1;
+    }
+    return TRUE;
+}
+#else
+static BOOL xbox_tsc_query_frequency(LARGE_INTEGER *frequency)
+{
+    return QueryPerformanceFrequency(frequency);
+}
+
+static BOOL xbox_tsc_query_counter(LARGE_INTEGER *counter)
+{
+    return QueryPerformanceCounter(counter);
+}
+#endif
+
+static BOOL CALLBACK xbox_tsc_initialize(PINIT_ONCE once, PVOID parameter,
+                                         PVOID *context)
+{
+    XBOX_TSC_STATE state = {0};
+    (void)once;
+    (void)parameter;
+    (void)context;
+
+    xbox_tsc_query_frequency(&state.frequency);
+    xbox_tsc_query_counter(&state.origin);
+    if (state.frequency.QuadPart == 0)
+        state.frequency.QuadPart = 1;
+    g_tsc_state = state;
+    return TRUE;
+}
+
+uint64_t xbox_ReadTimeStampCounter(void)
+{
+    LARGE_INTEGER now = {0};
+    uint64_t ticks;
+    uint64_t frequency;
+    uint64_t seconds;
+    uint64_t remainder;
+
+    InitOnceExecuteOnce(&g_tsc_once, xbox_tsc_initialize, NULL, NULL);
+    xbox_tsc_query_counter(&now);
+
+    ticks = (uint64_t)(now.QuadPart - g_tsc_state.origin.QuadPart);
+    frequency = (uint64_t)g_tsc_state.frequency.QuadPart;
+    /* Split the scaling so a long run cannot overflow: whole seconds first,
+     * then the remainder. */
+    seconds = ticks / frequency;
+    remainder = ticks % frequency;
+    return seconds * XBOX_TSC_HZ
+         + (remainder * XBOX_TSC_HZ) / frequency;
+}
+
+#if !defined(XBOXRECOMP_TIMESTAMP_TEST_BUILD)
+
+/* ============================================================================
  * IRQL Simulation
  *
  * Xbox uses IRQL (Interrupt Request Level) for synchronization:
@@ -734,46 +865,4 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
     return (ULONGLONG)GetTickCount64() * 10000ULL;
 }
 
-/* ============================================================================
- * Time stamp counter
- *
- * Xbox's QueryPerformanceCounter is a bare `rdtsc`, and its
- * QueryPerformanceFrequency returns the CPU clock as a constant the title
- * compiles in: Half-Life 2's is 0x2BB5C755 (733,333,333 Hz) at 0x0059C6C7.
- * So a frame timer computes seconds as counter / 733333333.
- *
- * Returning the host's own TSC would make that division wrong by the ratio of
- * the two clocks -- a 3.5 GHz host would have the guest believe nearly five
- * seconds had passed for every real one. Scaling the host's performance
- * counter to the console's rate keeps the guest's arithmetic honest.
- *
- * Monotonic and shared by every thread, which is what a TSC is. The first
- * call establishes the origin so the counter starts near zero rather than at
- * whatever the host had been running for.
- * ========================================================================= */
-#define XBOX_TSC_HZ 733333333ull
-
-uint64_t xbox_ReadTimeStampCounter(void)
-{
-    static LARGE_INTEGER freq;
-    static LARGE_INTEGER origin;
-    LARGE_INTEGER now;
-
-    if (freq.QuadPart == 0) {
-        QueryPerformanceFrequency(&freq);
-        QueryPerformanceCounter(&origin);
-        if (freq.QuadPart == 0)
-            freq.QuadPart = 1;
-    }
-    QueryPerformanceCounter(&now);
-
-    {
-        uint64_t ticks = (uint64_t)(now.QuadPart - origin.QuadPart);
-        /* Split the scaling so a long run cannot overflow: whole seconds
-         * first, then the remainder. */
-        uint64_t secs = ticks / (uint64_t)freq.QuadPart;
-        uint64_t rem  = ticks % (uint64_t)freq.QuadPart;
-        return secs * XBOX_TSC_HZ
-             + (rem * XBOX_TSC_HZ) / (uint64_t)freq.QuadPart;
-    }
-}
+#endif /* !XBOXRECOMP_TIMESTAMP_TEST_BUILD */
