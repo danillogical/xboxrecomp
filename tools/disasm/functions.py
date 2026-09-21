@@ -160,6 +160,16 @@ class FunctionDetector:
         # Seeds that landed inside a function rather than on its start.
         self._pass_seed_aliases()
 
+        # Conditional branches into another function's interior. Runs here --
+        # after every body-creating pass -- because the sets it needs are only
+        # final now: `bodies` must contain the target's enclosing function, and
+        # the source's own function must exist to be tested against. JSRF's
+        # sub_0002DBE0 is a tail_jump_alias whose *target* (0x2E00C) sits in
+        # sub_0002DF76, and sub_0002DF76 itself is found by _pass_gap_prologues
+        # a few lines above. Run any earlier and the pass sees
+        # `src not inside any known function` for every one of its branches.
+        self._pass_cond_branch_orphans_after(sections)
+
         self._build_alias_entries()
 
         # Populate call graph
@@ -636,8 +646,51 @@ class FunctionDetector:
                                 "tail_jump_target")
             added = True
 
-        added = self._pass_cond_branch_orphans(bodies, starts) or added
         return added
+
+    def _pass_cond_branch_orphans_after(self, sections) -> bool:
+        """
+        Run the conditional-branch orphan pass once, after every boundary is
+        final.
+
+        It cannot live inside _pass_tail_jump_targets. That pass runs in a loop
+        that rebuilds `functions` each round, so a body discovered in round N is
+        invisible to the round-N call -- and a body discovered by a *later*
+        round is never seen at all. JSRF's sub_0002DBE0 is exactly that: it is
+        itself a tail_jump_alias found by the tail-jump loop, and its three
+        outgoing branches into sub_0002DF76 (0x2DDF2->0x2E00C,
+        0x2DF1F->0x2DF76, 0x2DF4B->0x2E026) were therefore never examined. The
+        pass saw `src not inside any known function` and skipped every one.
+
+        Running it here costs one rebuild and makes the input the final set of
+        bodies, which is the only input that makes its `inside_a_function` test
+        meaningful.
+
+        The body list includes **aliases**, not just `self.functions`. An alias
+        is a real span that owns real bytes, and the source of a branch can live
+        in one: JSRF's sub_0002DBE0 is a tail_jump_alias, so `self.functions`
+        omits it, and the lookup bisected straight past it onto sub_0002DA70
+        (which ends at 0x2DBD2) and concluded the source was outside any
+        function. Including aliases is the whole reason this pass can see the
+        branches it is looking for.
+
+        Note what this does and does not buy. It makes the *entries* correct:
+        JSRF went 8,742 entries / 3,045 aliases to 8,848 / 3,151, and 0x2E00C
+        and 0x2E026 now exist with sub_0002DF76's end. It does not reduce the
+        deleted-jump count, which stayed at 309, because those targets were
+        already classed non-external and the `goto` was already correct -- the
+        label is emitted in a different `void sub_*(void)`. Kept because the
+        entries are right and the next fix depends on them existing.
+        """
+        bodies = sorted(set(
+            [(f.start, f.end) for f in self.functions.values()]
+            + [(a, e) for a, e in self._alias_entries.items() if e > a]))
+        starts = [b[0] for b in bodies]
+        if not self._pass_cond_branch_orphans(bodies, starts):
+            return False
+        self.functions.clear()
+        self._build_functions(sections)
+        return True
 
     def _pass_data_ptr_targets(self, sections: List[SectionInfo]) -> bool:
         """
@@ -819,7 +872,45 @@ class FunctionDetector:
 
             j = bisect.bisect_right(starts, target) - 1
             if j >= 0 and bodies[j][0] <= target < bodies[j][1]:
-                continue                    # inside a function: handled above
+                # Inside another function. This used to say "handled above" and
+                # skip, which was wrong: _pass_data_ptr_targets only creates
+                # aliases for targets it found in a *data table*, and a
+                # conditional branch target is not one. Nothing created an
+                # alias for it, so the jump was lifted as `goto loc_X` against
+                # a label the enclosing body emits in a *different* function --
+                # invalid C, deleted by the label validator.
+                #
+                # JSRF has 309 such deleted jumps, spread over 322 jcc and
+                # 34 jmp instructions; the worked example is sub_0002DBE0
+                # branching to 0x2E00C, a shared epilogue block inside
+                # sub_0002DF76. Two of its three outgoing branches land past
+                # that function's entry.
+                #
+                # Measured effect on that number: none. Creating the alias is
+                # necessary but not sufficient -- the `goto` was already the
+                # right instruction and this pass already classifies the target
+                # as non-external; the label is simply emitted by a different
+                # `void sub_*(void)`. The entries this pass now creates are
+                # correct and are kept, but the deletions go away only once the
+                # body that owns the target is folded with the body that jumps
+                # to it. See translate_batch_split's parent selection.
+                #
+                # An alias is still the right mechanism: a callable entry
+                # sharing the enclosing body's end, built after every boundary
+                # is measured so it cannot clamp anyone. It is what
+                # _pass_data_ptr_targets does for a table entry and
+                # _pass_seed_aliases does for a seeded address; a branch is the
+                # same evidence, and stronger -- the instruction provably
+                # transfers control there.
+                #
+                # The target must still be a decoded instruction start, or the
+                # branch points into the middle of an instruction and the bytes
+                # are not code at all.
+                if target not in self.engine.instructions:
+                    continue
+                self._alias_entries[target] = bodies[j][1]
+                added = True
+                continue
 
             section = self.image.get_section_at_va(target)
             if section is None or not section.executable:
