@@ -168,3 +168,76 @@ class SehPrologueShapeTest(unittest.TestCase):
         code = bytes.fromhex("6a18") + bytes.fromhex("c3") + bytes([0x90]) * 8
         self.assertFalse(self._probe(code))
 
+
+class MovEdiEdiShapeTest(unittest.TestCase):
+    """`8b ff` is the hot-patch pad, and it is also a jump-table tail.
+
+        mov edi, edi            ; 8b ff, 2 bytes
+        <32-bit code addresses> ; the switch table, starting at +2
+
+    Accepting `mov edi,edi` on the first instruction alone claims the table as
+    code. JSRF has 71 `gap_prologue` entries created that way -- 64 of the
+    deleted cross-function gotos in the generated C come from these false
+    functions. The test is the table signature: a run of consecutive dwords
+    that are each the start of a decoded instruction, immediately after the
+    two pad bytes.
+    """
+
+    SECTION_VA = 0x002E0000
+
+    def _probe(self, code, insn_starts, entry_off=0x2E13A):
+        from capstone import Cs, CS_ARCH_X86, CS_MODE_32
+        from tools.disasm.engine import DisasmEngine
+
+        sec_va = self.SECTION_VA
+
+        class _Sec:
+            virtual_addr = sec_va
+            virtual_size = 0x4000
+            executable = True
+
+        class _Img:
+            def get_section_at_va(self, addr):
+                return _Sec()
+
+            def get_section_data(self, sec):
+                return bytes([0x90]) * entry_off + code
+
+        eng = DisasmEngine.__new__(DisasmEngine)
+        eng.image = _Img()
+        eng._cs = Cs(CS_ARCH_X86, CS_MODE_32)
+        eng._cs.detail = True
+        eng.instructions = {a: object() for a in insn_starts}
+        return eng.probes_as_prologue(sec_va + entry_off)
+
+    def test_pad_followed_by_a_code_pointer_table_is_not_a_prologue(self):
+        # The 0x2E13A shape: 8b ff, then 10 code addresses.
+        table = [0x2DC04, 0x2DC44, 0x2DC76, 0x2DCB6, 0x2DCE6, 0x2DE02]
+        code = bytes.fromhex("8bff") + b"".join(
+            v.to_bytes(4, "little") for v in table)
+        self.assertFalse(self._probe(code, insn_starts=set(table)))
+
+    def test_pad_alone_is_still_a_prologue(self):
+        # No table follows: the frameless case the pad rule was written for.
+        code = bytes.fromhex("8bff") + bytes([0x55, 0x8b, 0xec, 0xc3])
+        self.assertTrue(self._probe(code, insn_starts=set()))
+
+    def test_a_three_dword_run_is_below_the_threshold(self):
+        # Short runs occur inside real code; the threshold is four.
+        table = [0x2DC04, 0x2DC44, 0x2DC76]
+        code = bytes.fromhex("8bff") + b"".join(
+            v.to_bytes(4, "little") for v in table)
+        self.assertTrue(self._probe(code, insn_starts=set(table)))
+
+    def test_a_dword_that_is_not_an_instruction_start_breaks_the_run(self):
+        table = [0x2DC04, 0x2DC44, 0x2DC76, 0x2DCB6, 0x2DCE6]
+        code = bytes.fromhex("8bff") + b"".join(
+            v.to_bytes(4, "little") for v in table)
+        starts = set(table)
+        starts.discard(0x2DC76)          # the third value never decoded
+        self.assertTrue(self._probe(code, insn_starts=starts))
+
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -558,7 +558,8 @@ class DisasmEngine:
         if m == "sub" and ops.startswith("esp,"):
             return True
         if m == "mov" and ops.replace(" ", "") == "edi,edi":
-            return True   # hot-patch pad
+            return self._mov_edi_edi_is_a_prologue(addr, data,
+                                                   section.virtual_addr)
 
         # A function whose frame __SEH_prolog builds:
         #
@@ -586,6 +587,42 @@ class DisasmEngine:
                     return True
 
         return False
+
+    def _mov_edi_edi_is_a_prologue(self, addr: int, data: bytes,
+                                   section_va: int) -> bool:
+        """Is a `mov edi,edi` at `addr` a hot-patch pad, or a jump-table tail?
+
+        `8b ff` is the two-byte MSVC hot-patch pad, and it is *also* the two
+        bytes MSVC leaves in front of a switch table:
+
+            mov edi, edi            ; 8b ff
+            <32-bit code addresses> ; the table, starting at +2
+
+        Accepting it on the first instruction alone therefore claims the table
+        as code. JSRF has 71 `gap_prologue` entries created that way; the
+        largest run of code-pointer dwords starting at `+2` is >= 4 for 60 of
+        them, against 0 of the 292 genuine `gap_prologue` entries.
+
+        The discriminator is that table signature, not "the bytes decode":
+        inside `.text` almost any window decodes, and almost any dword is a
+        plausible address, so both weaker tests saturate on the control group
+        as well as on the suspect one. What is distinctive is a *run* of
+        consecutive dwords that are each the start of a decoded instruction,
+        beginning immediately after the two pad bytes.
+
+        The pad is still accepted when no such run follows, which keeps the
+        frameless two-byte-prefixed functions the original rule was written
+        for. Measured on JSRF: 60 of the 71 are rejected, 11 are kept.
+        """
+        run = 0
+        for i in range(8):
+            rel = (addr - section_va) + 2 + i * 4
+            if rel < 0 or rel + 4 > len(data):
+                break
+            if int.from_bytes(data[rel:rel + 4], "little") not in self.instructions:
+                break
+            run += 1
+        return run < 4
 
     def probes_as_constant_stub(self, addr: int) -> bool:
         """Is this the whole of a constant-returning accessor?
