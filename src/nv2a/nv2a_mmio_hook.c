@@ -8,6 +8,7 @@
 #include "nv2a_mmio_hook.h"
 #include "nv2a_state.h"
 #include <stdio.h>
+#include <stdlib.h>   /* getenv: without this the declaration is implicit on x64 */
 
 /* NV2A MMIO base in Xbox VA space */
 #define NV2A_MMIO_BASE  0xFD000000u
@@ -813,6 +814,49 @@ bool nv2a_hook_run_decoder_tests(void)
     return ok;
 }
 
+/* ── MMIO access trace (RECOMP_MMIO_TRACE=1) ───────────────────────────────
+ * A polled register is otherwise invisible: the hook handles the fault and
+ * returns CONTINUE_EXECUTION, so neither the game log nor any other
+ * diagnostic ever sees the address. That makes "which register is this guest
+ * loop waiting on" unanswerable without recording it here. Off unless the
+ * environment variable is set, so ordinary runs are unaffected. */
+#define MMIO_TRACE_SLOTS 96
+static struct { uint32_t offset; uint32_t count; uint64_t rip; } g_mmio_trace[MMIO_TRACE_SLOTS];
+static int g_mmio_trace_used = 0;
+static int g_mmio_trace_enabled = -1;
+static unsigned long g_mmio_trace_total = 0;
+
+static void mmio_trace_record(uint32_t offset, uint64_t rip)
+{
+    int i;
+    if (g_mmio_trace_enabled < 0)
+        g_mmio_trace_enabled = getenv("RECOMP_MMIO_TRACE") ? 1 : 0;
+    if (!g_mmio_trace_enabled) return;
+    g_mmio_trace_total++;
+    for (i = 0; i < g_mmio_trace_used; i++) {
+        if (g_mmio_trace[i].offset == offset) { g_mmio_trace[i].count++; break; }
+    }
+    if (i == g_mmio_trace_used && g_mmio_trace_used < MMIO_TRACE_SLOTS) {
+        g_mmio_trace[g_mmio_trace_used].offset = offset;
+        g_mmio_trace[g_mmio_trace_used].count = 1;
+        g_mmio_trace[g_mmio_trace_used].rip = rip;
+        g_mmio_trace_used++;
+        fprintf(stderr, "  [NV2A-TRACE] new offset=0x%06X first_rip=0x%llX (total=%lu)\n",
+                offset, (unsigned long long)rip, g_mmio_trace_total);
+        fflush(stderr);
+    }
+    if (g_mmio_trace_total % 200000u == 0u) {
+        int best = -1;
+        for (i = 0; i < g_mmio_trace_used; i++)
+            if (best < 0 || g_mmio_trace[i].count > g_mmio_trace[best].count) best = i;
+        if (best >= 0)
+            fprintf(stderr, "  [NV2A-TRACE] total=%lu hottest offset=0x%06X count=%u rip=0x%llX\n",
+                    g_mmio_trace_total, g_mmio_trace[best].offset,
+                    g_mmio_trace[best].count, (unsigned long long)g_mmio_trace[best].rip);
+        fflush(stderr);
+    }
+}
+
 bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                            uint32_t fault_xbox_va, int is_write)
 {
@@ -823,6 +867,8 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
         !g_mmio_aperture || fault_addr < (uintptr_t)g_mmio_aperture ||
         fault_addr >= (uintptr_t)g_mmio_aperture + NV2A_MMIO_SIZE)
         return false;
+
+    mmio_trace_record(mmio_offset, ctx->Rip);
 
     AcquireSRWLockExclusive(&g_mmio_owner_lock);
     if (!InterlockedCompareExchange(&g_mmio_owner_active, 0, 0)) {
