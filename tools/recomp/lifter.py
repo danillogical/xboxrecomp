@@ -970,6 +970,21 @@ class Lifter:
         self.SETJMP_FN = setjmp_fn
         self.LONGJMP_FN = longjmp_fn
         self.jump_table_targets = {}
+        # Spans of every entry this batch will emit, as (start, end), sorted by
+        # start. A jump target that is outside the *current* function but inside
+        # one of these is an intra-batch branch, not a tail call: the enclosing
+        # body is translated into the same C file, so `goto loc_X` is valid and
+        # a call to a nonexistent sub_X(); return; is not.
+        #
+        # This matters because the database contains tail_jump_alias entries
+        # that begin *inside* a function (a tail jump in the CRT lands mid-body
+        # to share a tail, so the detector records the target as its own entry
+        # with the enclosing end). When such an alias is translated, its own
+        # span starts late, so jumps back into the parent's earlier blocks look
+        # external to _is_external_target. Emitting them as tail calls abandons
+        # the frame and names a function that does not exist.
+        self.batch_spans = []
+        self._batch_span_starts = []
 
     def _call_target_name(self, addr):
         """Get the name for a call target address.
@@ -1920,9 +1935,63 @@ class Lifter:
             return [f"{prefix}esp += {4 + n}; return; /* ret {n} */"]
         return [f"{prefix}esp += 4; return; /* ret */"]
 
+    def set_batch_spans(self, spans):
+        """Install the sorted (start, end) spans of every entry in this batch.
+
+        Call once before translating a batch. Without it _is_external_target
+        falls back to the single-function test and mid-body alias jumps are
+        mis-emitted as tail calls.
+        """
+        cleaned = sorted((int(s), int(e)) for s, e in spans if int(e) > int(s))
+        self.batch_spans = cleaned
+        self._batch_span_starts = [s for s, _ in cleaned]
+
+    def _enclosing_batch_span(self, addr):
+        """Return the batch span containing addr, or None.
+
+        Used to decide whether a jump that leaves the current function still
+        lands inside a body this batch translates. bisect over sorted starts.
+        """
+        if not self.batch_spans:
+            return None
+        import bisect as _bisect
+        starts = self._batch_span_starts
+        i = _bisect.bisect_right(starts, addr) - 1
+        if i < 0:
+            return None
+        start, end = self.batch_spans[i]
+        if start <= addr < end:
+            return (start, end)
+        return None
+
     def _is_external_target(self, addr):
-        """Check if a jump target is outside the current function."""
-        return not (self.func_start <= addr < self.func_end)
+        """Check if a jump target is outside the current function.
+
+        A target inside another function *in the same batch* is not an external
+        tail call. The enclosing body is translated into the same C file, its
+        `loc_<addr>:` label exists there, and a `goto` reaches it. Treating it
+        as external emitted `g_seh_ebp = ebp; sub_<addr>(); return;` -- which
+        both abandons the current frame (the guest expects to continue with it)
+        and names a symbol that is not a function and is never defined. On JSRF
+        that was 267 of the 541 unresolved targets, and it is why the generated
+        tree would not link.
+
+        The case that produces it: tail_jump_alias entries begin mid-body, so a
+        jump back into the parent's earlier blocks is outside the alias span but
+        well inside the parent.
+
+        The lift-time decision made here and the label validator in
+        translator.translate_function are independent guards. This one decides
+        whether to emit a `goto` at all; the validator then drops a `goto` whose
+        label it cannot find. A target owned by another function survives this
+        check and is still discarded there, which is correct -- C has no
+        cross-function goto.
+        """
+        if self.func_start <= addr < self.func_end:
+            return False
+        if self._enclosing_batch_span(addr) is not None:
+            return False
+        return True
 
     def _read_jump_table(self, table_va, max_entries=256):
         """Read 32-bit jump table entries from the XBE at a given VA.

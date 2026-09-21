@@ -692,7 +692,19 @@ class FunctionTranslator:
         fallthrough_target = None
         if (continues_past_end and end in self.func_db
                 and end not in self.owned_function_starts):
-            fallthrough_target = end
+            # An entry at `end` is not automatically a callable function. If it
+            # is a tail_jump_alias it is a fragment of the very routine that is
+            # falling into it: `translate_batch_split` folds it into this body
+            # and defines no symbol for it, so emitting
+            # `sub_00040004(); return;` leaves the build with `unresolved
+            # external symbol sub_00040004 referenced in function sub_00040000`.
+            # The bytes are already here -- this body continues into them -- so
+            # the fall-through is the correct behavior and no bridge is needed.
+            _next = self.func_db.get(end, {})
+            if _next.get("detection_method") == "tail_jump_alias":
+                fallthrough_target = None
+            else:
+                fallthrough_target = end
 
         # Ensure ebp tracked if function has tail jumps (lifter emits
         # g_seh_ebp = ebp before external jmp, external jcc, and indirect jmp,
@@ -976,6 +988,17 @@ class FunctionTranslator:
 
         # Validate: comment out goto targets that reference missing labels
         # (dead code after unconditional jumps may reference non-existent labels)
+        #
+        # This has to be a two-pass check. Collecting labels and gotos in one
+        # pass only sees labels that appear *before* a given goto, but a
+        # forward `goto loc_X` is ordinary C -- the label is emitted later in
+        # the same body.
+        #
+        # Note on the numbers: measured against JSRF this change moved no
+        # rewrite, because the labels these gotos name are owned by *other*
+        # functions and no ordering fix can reach them. It is here because it
+        # is correct, not because it was the fix. See the batch-span and
+        # alias-folding passes above, which are.
         import re
         defined_labels = set()
         goto_lines = []
@@ -1324,6 +1347,116 @@ class BatchTranslator:
             "total_lines": 0,
         }
 
+        # Give the lifter the spans of every entry this pass will emit, so a
+        # jump that leaves one entry but lands inside another is lifted as an
+        # intra-chunk `goto` instead of a tail call. Without this, mid-body
+        # tail_jump_alias entries emit `g_seh_ebp = ebp; sub_X(); return;` for
+        # a target that is inside the parent body translated right beside them:
+        # 267 of JSRF's 541 unresolved targets, and a frame abandoned at
+        # runtime even once it links. See _is_external_target.
+        #
+        # Spans are batch-wide because the decision needs the parent's extent,
+        # and the parent may begin before the alias. The chunk writer below
+        # then checks that no goto crosses a chunk boundary, because a label is
+        # only in scope in its own file.
+        #
+        # The precedence mirrors translate_function: a recovered entry's
+        # reviewed end wins, then the database end, then start + size. Using a
+        # different rule here would install a span the emitted body disagrees
+        # with, which is exactly the mismatch this is meant to prevent.
+        def _batch_span(item):
+            addr, info = item
+            # BatchTranslator holds the FunctionTranslator on .translator; a
+            # direct caller of translate_batch_split on a FunctionTranslator
+            # has the cfg on itself. Accept either so the helper cannot be the
+            # reason a batch fails to translate.
+            inner = getattr(self, "translator", self)
+            end = (getattr(inner, "_recovered_cfg", None) or {}).get(
+                addr, {}).get("end")
+            if end is None:
+                end = info.get("end")
+            if isinstance(end, str):
+                end = int(end, 16)
+            if not end:
+                end = addr + int(info.get("size") or 0)
+            return (addr, int(end))
+
+        self.translator.lifter.set_batch_spans(
+            [_batch_span(item) for item in func_list])
+
+        # A tail_jump_alias entry is not a function. It exists because some
+        # tail jump landed part-way into a body, and the detector recorded the
+        # landing site with the *enclosing* function's end -- so the entry and
+        # its parent cover the same bytes and differ only in where they start.
+        # Emitting it as its own `void sub_X(void)` therefore duplicates the
+        # parent's tail as a second body, which is wrong in two separate ways:
+        #
+        #   * The duplicate is a real function to the linker and to a caller,
+        #     so a tail jump into the middle of a routine becomes a *call* that
+        #     returns to a frame the guest expected to keep using.
+        #   * Worse, the duplicate's body can still contain `goto loc_<addr>`
+        #     for a label that lives in the parent's body, not in this one. The
+        #     label validator at the end of this method cannot resolve it and
+        #     rewrites the jump to `(void)0`. On JSRF that silently deleted
+        #     1032 live jumps, every one of them inside a taken `if`.
+        #
+        # The entry still has to be *dispatched*, because an indirect branch can
+        # name the alias address. It must not be a second definition, and it
+        # must not be declared either: the dispatch entry is an address
+        # `(recomp_func_t)sub_X`, so it has to name a symbol that a body defines.
+        # An alias is therefore dispatched under its owner's symbol while
+        # keeping its own VA, and is kept out of the header entirely. Declaring
+        # it there instead cost 1666 unresolved externals across every unit that
+        # includes the header. Nothing calls an alias directly -- the lifter
+        # emits `goto loc_X` for it -- so no declaration is wanted.
+        #
+        # The parent is chosen by the entry whose span has the same end and an
+        # earlier start, which is the shape _build_alias_entries produces.
+        alias_parent = {}
+        # alias VA -> the symbol its dispatch entry must name, i.e. the parent.
+        # Kept separate from alias_parent so the dispatch writer can rewrite the
+        # pointer without re-deriving the parent from the address.
+        _alias_dispatch = {}
+        # The parent's *name* is needed for the dispatch tuple, and func_list is
+        # consumed as an iterator below, so index it first.
+        func_list_by_addr = {a: i for a, i in func_list}
+        _candidate_parents = {}
+        for _addr, _info in func_list:
+            _end = _batch_span((_addr, _info))[1]
+            _candidate_parents.setdefault(_end, []).append(_addr)
+        for _end in _candidate_parents:
+            _candidate_parents[_end].sort()
+        for _addr, _info in func_list:
+            if _info.get("detection_method") != "tail_jump_alias":
+                continue
+            _end = _batch_span((_addr, _info))[1]
+            # The *nearest* earlier start is the parent. Taking the first one
+            # would fold the alias into an unrelated body that merely happens
+            # to end at the same address -- a different routine, whose label
+            # does not exist at this offset.
+            _earlier = [p for p in _candidate_parents.get(_end, ())
+                        if p < _addr]
+            if _earlier:
+                alias_parent[_addr] = max(_earlier)
+
+        # Resolve each parent to a symbol that actually has a body. An alias's
+        # parent can itself be an alias -- several fragments of one original
+        # function share an end, so folding into the nearest earlier start can
+        # land on another fragment. Redirecting to that fragment would name a
+        # symbol that is never defined (sub_0002B340, from sub_0002B81F), so
+        # follow the chain until it reaches a real body. The visited set also
+        # makes a cycle impossible to hang on.
+        def _resolve_owner(addr):
+            seen = {addr}
+            cur = addr
+            while cur in alias_parent:
+                nxt = alias_parent[cur]
+                if nxt in seen:
+                    return None
+                seen.add(nxt)
+                cur = nxt
+            return cur
+
         for i, (addr, func_info) in enumerate(func_list):
             name = func_info.get("name", f"sub_{addr:08X}")
             if verbose and (i % 500 == 0 or i == len(func_list) - 1):
@@ -1333,6 +1466,25 @@ class BatchTranslator:
             if addr in manual:
                 # Hand-written elsewhere: declare it, emit nothing.
                 manual_decls[addr] = name
+                continue
+
+            if addr in alias_parent:
+                # Declared and dispatched, but never emitted as its own body.
+                # The dispatch entry must point at a symbol that *has* a body,
+                # because an entry is `(recomp_func_t)<symbol>` -- an address.
+                # Declaring the alias without defining it does not link, and
+                # naming the alias itself is what produced the second body in
+                # the first place. _resolve_owner walks any alias-to-alias chain
+                # to the real body; the VA stays the alias's, which is the
+                # point: an indirect branch to 0x0011105 must enter the owner's
+                # body at 0x0011105.
+                _owner = _resolve_owner(addr)
+                if _owner is not None:
+                    _parent_info = func_list_by_addr.get(_owner, {})
+                    _alias_dispatch[addr] = _parent_info.get(
+                        "name", f"sub_{_owner:08X}")
+                manual_decls[addr] = name
+                stats["alias_entries"] = stats.get("alias_entries", 0) + 1
                 continue
 
             code = self.translator.translate_function(addr, func_info)
@@ -1356,6 +1508,19 @@ class BatchTranslator:
         # translated chunks.
         defined = {name for _, name, _ in translations}
         defined |= set(manual_decls.values())   # hand-written, but defined
+        # A hand-written address that the raw database never detected needs its
+        # symbol counted as defined too. manual_decls only covers addresses that
+        # appear in func_list, and a reviewed entry recovered out of the middle
+        # of another function is precisely the case that does not: it was never
+        # a detector candidate, so it is absent from func_list, so no decl was
+        # recorded, so a stub was emitted for it anyway -- and the game failed
+        # to link with sub_00191390 already defined in recovered.obj. The
+        # project's own recovered entries are the ones this hits.
+        for _addr in manual:
+            defined.add(f"sub_{_addr:08X}")
+            _named = self.translator.func_db.get(_addr, {}).get("name")
+            if _named:
+                defined.add(_named)
         unresolved = {
             addr: name
             for addr, name in self.translator.lifter.referenced_calls.items()
@@ -1395,6 +1560,13 @@ class BatchTranslator:
             header_lines.append("")
             header_lines.append("/* Hand-written overrides (defined by the project) */")
             for addr in sorted(manual_decls):
+                # A tail_jump_alias has no body and no definition: its dispatch
+                # entry names the parent. Declaring it here would make every
+                # translation unit that includes this header reference a symbol
+                # nothing defines, which is 1666 unresolved externals. It is in
+                # manual_decls only so it is dispatched, not so it is declared.
+                if addr in _alias_dispatch:
+                    continue
                 header_lines.append(
                     f"void {manual_decls[addr]}(void);  /* 0x{addr:08X} */")
 
@@ -1570,7 +1742,8 @@ class BatchTranslator:
                                   for addr, name in manual_decls.items()],
             key=lambda e: e[0])
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")
-        self._write_dispatch_table(dispatch_entries, dispatch_path, header_name)
+        self._write_dispatch_table(dispatch_entries, dispatch_path, header_name,
+                                   alias_redirect=_alias_dispatch)
         generated_files.append(dispatch_path)
 
         stats["files"] = generated_files
@@ -1578,12 +1751,20 @@ class BatchTranslator:
         stats["chunk_size"] = chunk_size
         return stats
 
-    def _write_dispatch_table(self, translations, output_path, header_name):
+    def _write_dispatch_table(self, translations, output_path, header_name,
+                              alias_redirect=None):
         """
         Generate a dispatch table mapping Xbox VA -> function pointer.
 
         Uses a sorted array + binary search for O(log n) lookup.
+
+        alias_redirect maps a tail_jump_alias VA to the symbol of the parent
+        body that actually contains it. An alias is declared and dispatched but
+        never emitted, so its own name has no address; naming the parent is what
+        keeps the entry linkable. The VA is left alone, so an indirect branch to
+        the alias address still resolves.
         """
+        alias_redirect = alias_redirect or {}
         lines = [
             "/**",
             # getattr: the dispatch writer is exercised directly by tests
@@ -1612,7 +1793,11 @@ class BatchTranslator:
         ]
 
         for addr, name, _ in translations:
-            lines.append(f"    {{ 0x{addr:08X}u, (recomp_func_t){name} }},")
+            # A tail_jump_alias has no body of its own; its dispatch entry must
+            # name the parent that does. The VA stays the alias address so an
+            # indirect branch to the alias still lands on a real function.
+            dispatch_name = alias_redirect.get(addr, name)
+            lines.append(f"    {{ 0x{addr:08X}u, (recomp_func_t){dispatch_name} }},")
 
         addrs = [addr for addr, _, _ in translations]
         flat_base = min(addrs) if addrs else 0
