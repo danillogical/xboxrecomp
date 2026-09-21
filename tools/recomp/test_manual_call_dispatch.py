@@ -107,6 +107,9 @@ def test_split_translation_passes_manual_set_to_lifter():
             self.owned_function_starts = set()
             self.lifter = Lifter()
             self.seen_manual = None
+            # translate_batch_split asks the function database for a manual
+            # entry's name while range-checking it, so the stub needs one.
+            self.func_db = {}
 
         def translate_function(self, addr, func_info):
             self.seen_manual = self.lifter.manual_functions

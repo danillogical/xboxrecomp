@@ -103,8 +103,18 @@ def test_seeds_drops_unaligned_targets():
     with tempfile.TemporaryDirectory() as tmp:
         db = os.path.join(tmp, "targets.json")
         out = os.path.join(tmp, "seeds.json")
+        # An explicit empty function database, so this exercises the alignment
+        # filter rather than the interior check. Without it load_function_bodies
+        # falls back to the in-repo tools/disasm/output/functions.json, and the
+        # result then depends on whichever title was disassembled last: in the
+        # JSRF database 0x00130EC0 is interior to 0x00130DD0 and is dropped for
+        # that reason, not for alignment.
+        fns = os.path.join(tmp, "functions.json")
+        with open(fns, "w") as f:
+            json.dump([], f)
         save_db(db, {0x001B5540: 2, 0x001D99BA: 2, 0x0024B5FB: 2, 0x00130EC0: 2})
-        assert main(["--db", db, "seeds", "--out", out, "--align", "16"]) == 0
+        assert main(["--db", db, "--functions", fns,
+                     "seeds", "--out", out, "--align", "16"]) == 0
         kept = load_db(out)
     assert sorted(kept) == [0x00130EC0, 0x001B5540], [hex(v) for v in kept]
 
