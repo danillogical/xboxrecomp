@@ -1967,30 +1967,46 @@ class Lifter:
     def _is_external_target(self, addr):
         """Check if a jump target is outside the current function.
 
-        A target inside another function *in the same batch* is not an external
-        tail call. The enclosing body is translated into the same C file, its
-        `loc_<addr>:` label exists there, and a `goto` reaches it. Treating it
-        as external emitted `g_seh_ebp = ebp; sub_<addr>(); return;` -- which
-        both abandons the current frame (the guest expects to continue with it)
-        and names a symbol that is not a function and is never defined. On JSRF
-        that was 267 of the 541 unresolved targets, and it is why the generated
-        tree would not link.
+        Two kinds of target are *not* external, and they must be distinguished
+        from each other because they need different code:
 
-        The case that produces it: tail_jump_alias entries begin mid-body, so a
-        jump back into the parent's earlier blocks is outside the alias span but
-        well inside the parent.
+        * A target inside the current function: an ordinary intra-body branch.
+          `goto loc_X` reaches it.
 
-        The lift-time decision made here and the label validator in
-        translator.translate_function are independent guards. This one decides
-        whether to emit a `goto` at all; the validator then drops a `goto` whose
-        label it cannot find. A target owned by another function survives this
-        check and is still discarded there, which is correct -- C has no
-        cross-function goto.
+        * A target inside another entry's span but NOT a real entry point: a
+          fragment interior. `translate_batch_split` folds alias entries into
+          their owner and emits no separate body for them, so there is no
+          callable symbol to tail-call. `goto loc_X` reaches the label the
+          owner emits. Emitting `g_seh_ebp = ebp; sub_X(); return;` for one of
+          these abandons a frame the guest expects to keep and names a symbol
+          nothing defines -- 267 of JSRF's 541 unresolved targets.
+
+        A target that IS a real entry point is a genuine tail call and must
+        stay one, even though it also happens to fall inside a batch span. A
+        function start is inside its own span by construction, so a rule that
+        only asked "is it inside some span" classified every real tail call as
+        intra-body and emitted `goto loc_X` for it. C has no cross-function
+        goto, so the label validator then deleted the jump. On JSRF that was
+        the whole 456-forward-jump class: `0x00011C0E jmp 0x12890` targets
+        `sub_00012890`, a `call_target` function that is also reached by a
+        direct `RECOMP_ABI_CALL` at `0x00011C5A`. The jump was a tail call and
+        was rewritten to `(void)0`.
+
+        "Real entry point" deliberately excludes `tail_jump_alias`, whose whole
+        definition is that it is a fragment sharing its owner's bytes.
         """
         if self.func_start <= addr < self.func_end:
             return False
-        if self._enclosing_batch_span(addr) is not None:
+        info = self.func_db.get(addr)
+        if info is None:
+            # Not an entry at all. If it lands inside a body this batch emits,
+            # it is a fragment interior and a goto reaches its label.
+            return self._enclosing_batch_span(addr) is None
+        if info.get("detection_method") == "tail_jump_alias":
+            # A fragment: folded into its owner, no symbol of its own.
             return False
+        # A real entry point. External, so it stays a tail call even when its
+        # span is one of the batch spans.
         return True
 
     def _read_jump_table(self, table_va, max_entries=256):
