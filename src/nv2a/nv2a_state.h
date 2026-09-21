@@ -122,6 +122,15 @@ typedef struct NV2AState {
         uint32_t submit_diag_method;
         uint32_t submit_diag_param;
         uint32_t submit_successes;
+        /* Kick latch.  JSRF's kick primitive (0x00191270 / inlined at
+         * 0x001912C6) sets bit 16 of NV_PFIFO_CACHE1_DMA_PUT and then spins
+         * until the engine clears it.  The latch is owned by this model, so
+         * the pending submission must run and the bit must clear, otherwise
+         * the guest polls forever.  kick_requests counts accepted latches,
+         * kick_acks counts cleared ones; they must stay equal at rest. */
+        uint32_t kick_requests;
+        uint32_t kick_acks;
+        uint32_t kick_last_put;
         /* PFIFO object bindings.  Production SET_OBJECT walks RAMHT in the
          * claimed PRAMIN window.  fixture_* remains a test-only seam. */
         uint32_t binding_class[8];

@@ -1130,15 +1130,37 @@ static void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int siz
 {
     NV2AState *d = (NV2AState *)opaque;
     if (size != 4) return;
+    /* NV_USER_DMA_GET/PUT are aliases of the PFIFO DMA pointers, so both the
+     * read and write paths must use the PFIFO register slots.  Writing the
+     * USER-local slot instead would make a kick invisible to user_read and
+     * to nv2a_submit_pending, which read the PFIFO slots. */
     if (addr == NV_USER_DMA_GET) {
         qemu_mutex_lock(&d->pfifo.lock);
         d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = (uint32_t)val;
         qemu_mutex_unlock(&d->pfifo.lock);
     } else if (addr == NV_USER_DMA_PUT) {
+        /* JSRF kicks by setting bit 16 of the DMA PUT value and then polling
+         * until the engine clears it (0x00191270, inlined at
+         * 0x001912C6..0x001912EA).  The latch is owned here, so the sequence
+         * must be: store the offset, run the pending submission, clear the
+         * bit.  Clearing it is the acknowledgement the guest waits for;
+         * leaving it set spins 0x00191290 forever. */
+        uint32_t offset = (uint32_t)val & NV_PFIFO_CACHE1_DMA_PUT_OFFSET;
         qemu_mutex_lock(&d->pfifo.lock);
-        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = (uint32_t)val;
+        if (val & NV_PFIFO_CACHE1_DMA_PUT_KICK) {
+            d->pfifo.kick_requests++;
+            d->pfifo.kick_last_put = offset;
+        }
+        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = offset;
         qemu_mutex_unlock(&d->pfifo.lock);
         nv2a_submit_pending(d);
+        if (val & NV_PFIFO_CACHE1_DMA_PUT_KICK) {
+            qemu_mutex_lock(&d->pfifo.lock);
+            d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] &=
+                NV_PFIFO_CACHE1_DMA_PUT_OFFSET;
+            d->pfifo.kick_acks++;
+            qemu_mutex_unlock(&d->pfifo.lock);
+        }
     }
 }
 
@@ -1179,8 +1201,26 @@ void pfifo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         nv2a_update_irq(d);
         break;
     case NV_PFIFO_CACHE1_DMA_PUT:
-        d->pfifo.regs[addr] = (uint32_t)val;
-        nv2a_submit_pending(d);
+        /* Same latch contract as the NV_USER alias above.  `addr` here is
+         * already the block-local PFIFO offset, so it is the canonical slot. */
+        if (val & NV_PFIFO_CACHE1_DMA_PUT_KICK) {
+            uint32_t offset = (uint32_t)val & NV_PFIFO_CACHE1_DMA_PUT_OFFSET;
+            qemu_mutex_lock(&d->pfifo.lock);
+            d->pfifo.kick_requests++;
+            d->pfifo.kick_last_put = offset;
+            d->pfifo.regs[addr] = offset;
+            qemu_mutex_unlock(&d->pfifo.lock);
+            nv2a_submit_pending(d);
+            qemu_mutex_lock(&d->pfifo.lock);
+            d->pfifo.regs[addr] &= NV_PFIFO_CACHE1_DMA_PUT_OFFSET;
+            d->pfifo.kick_acks++;
+            qemu_mutex_unlock(&d->pfifo.lock);
+        } else {
+            qemu_mutex_lock(&d->pfifo.lock);
+            d->pfifo.regs[addr] = (uint32_t)val & NV_PFIFO_CACHE1_DMA_PUT_OFFSET;
+            qemu_mutex_unlock(&d->pfifo.lock);
+            nv2a_submit_pending(d);
+        }
         break;
     default:
         d->pfifo.regs[addr] = val;
