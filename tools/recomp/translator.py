@@ -1426,6 +1426,7 @@ class BatchTranslator:
             _candidate_parents.setdefault(_end, []).append(_addr)
         for _end in _candidate_parents:
             _candidate_parents[_end].sort()
+
         for _addr, _info in func_list:
             if _info.get("detection_method") != "tail_jump_alias":
                 continue
@@ -1438,6 +1439,52 @@ class BatchTranslator:
                         if p < _addr]
             if _earlier:
                 alias_parent[_addr] = max(_earlier)
+
+        # The other shape, and the common one: the alias ends exactly where the
+        # next real entry *starts*.
+        #
+        # "Same end, earlier start" above assumes the alias and its owner cover
+        # the same byte range and differ only in where they begin. That is one
+        # shape, but not the dominant one. When the detector records a landing
+        # site at the end of a body it takes the enclosing body's *end* -- and
+        # if the enclosing body is itself a fragment, the chain of fragments can
+        # end at an address that is the *start* of the next real function.
+        # JSRF: 2,902 of its 3,151 aliases end exactly on a real entry's start,
+        # and for those the same-end rule has no answer at all, because the only
+        # entries sharing that end are other aliases. `_resolve_owner` then
+        # follows the chain to another alias, finds no body, and the alias is
+        # emitted as its own `void sub_*(void)` -- a second definition of code
+        # the function below it already emits. 958 such duplicates were in the
+        # tree, and 56 of them held a `goto loc_X` whose label the real function
+        # emits, so the jump was a cross-function goto and the validator deleted
+        # it.
+        #
+        # The union of the bytes is what matters, not the equality of the ends:
+        # the alias's range abuts its owner's, so both bodies are fragments of
+        # one original routine and folding them together is correct. Anchoring
+        # on a **real** entry (never another alias) is what stops this from
+        # being a free-for-all; the alias-to-alias chain is still walked by
+        # _resolve_owner below. Only used when the same-end rule found nothing,
+        # so a genuine same-end owner always wins.
+        _real_by_start = {}
+        for _addr, _info in func_list:
+            if _info.get("detection_method") != "tail_jump_alias":
+                _real_by_start.setdefault(_addr, _info)
+        for _addr, _info in func_list:
+            if _info.get("detection_method") != "tail_jump_alias":
+                continue
+            if _addr in alias_parent:
+                continue                       # same-end rule already answered
+            _end = _batch_span((_addr, _info))[1]
+            _owner_info = _real_by_start.get(_end)
+            if _owner_info is None:
+                continue
+            # The owner must be the adjacent body, not an unrelated function
+            # that happens to start at this address in another section.
+            if _owner_info.get("section") and _info.get("section") \
+                    and _owner_info["section"] != _info["section"]:
+                continue
+            alias_parent[_addr] = _end
 
         # Resolve each parent to a symbol that actually has a body. An alias's
         # parent can itself be an alias -- several fragments of one original

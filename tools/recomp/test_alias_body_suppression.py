@@ -57,7 +57,8 @@ def _select(func_list, spans):
 
     Mirrors the loop in translate_batch_split, using the same input shape:
     (addr, info) pairs where an alias carries detection_method and an end that
-    matches its parent.
+    matches its parent, and a second rule for the abutting shape where the
+    alias's end is the owner's *start*.
     """
     alias_parent = {}
     candidate_parents = {}
@@ -73,6 +74,24 @@ def _select(func_list, spans):
         earlier = [p for p in candidate_parents.get(end, ()) if p < addr]
         if earlier:
             alias_parent[addr] = max(earlier)
+    # The abutting shape: the alias ends exactly where a real entry starts.
+    real_by_start = {}
+    for addr, info in func_list:
+        if info.get("detection_method") != "tail_jump_alias":
+            real_by_start.setdefault(addr, info)
+    for addr, info in func_list:
+        if info.get("detection_method") != "tail_jump_alias":
+            continue
+        if addr in alias_parent:
+            continue
+        end = spans[addr]
+        owner = real_by_start.get(end)
+        if owner is None:
+            continue
+        if owner.get("section") and info.get("section") \
+                and owner["section"] != info["section"]:
+            continue
+        alias_parent[addr] = end
     return alias_parent
 
 
@@ -150,6 +169,62 @@ class AliasBodySuppressionTest(unittest.TestCase):
         where translate_batch_split actually needs it.
         """
         self.assertTrue(hasattr(BatchTranslator, "translate_batch_split"))
+
+
+class AbuttingAliasParentTest(unittest.TestCase):
+    """The alias ends exactly where the next real entry *starts*.
+
+    This is the dominant shape in JSRF: 2,902 of its 3,151 aliases end on a real
+    entry's start, and for those the same-end rule has no answer, because the
+    only entries sharing that end are other aliases. Before the second rule
+    existed, 958 of them were emitted as their own `void sub_*(void)` -- a
+    second definition of code the function below already emits -- and 56 of
+    those duplicates held a `goto loc_X` whose label the real function emits, so
+    the jump was a cross-function goto and the validator deleted it.
+
+    The real case: sub_00011CE0 (alias, 0x11CE0..0x11D00) and sub_00011D00 (the
+    real `call_target` body starting exactly at the alias's end).
+    """
+
+    def test_the_abutting_owner_is_the_parent(self):
+        owner = (0x00011D00, {"name": "sub_00011D00", "section": ".text",
+                              "detection_method": "call_target"})
+        alias = (0x00011CE0, {"name": "sub_00011CE0", "section": ".text",
+                              "detection_method": "tail_jump_alias"})
+        spans = {0x00011D00: 0x00011D9D, 0x00011CE0: 0x00011D00}
+        self.assertEqual(_select([owner, alias], spans),
+                         {0x00011CE0: 0x00011D00})
+
+    def test_the_same_end_rule_still_wins_when_it_applies(self):
+        """A genuine same-end owner must not be displaced by the new rule."""
+        parent = (0x00110A0, {"name": "sub_000110A0", "end": 0x0011214,
+                              "detection_method": "prologue"})
+        alias = (0x0011105, {"name": "sub_00011105", "end": 0x0011214,
+                             "detection_method": "tail_jump_alias"})
+        spans = {0x00110A0: 0x0011214, 0x0011105: 0x0011214}
+        self.assertEqual(_select([parent, alias], spans), {0x0011105: 0x00110A0})
+
+    def test_another_alias_is_never_an_abutting_owner(self):
+        """Only a real entry may adopt an abutting alias.
+
+        Otherwise a chain of fragments could fold into each other and no real
+        body would end up owning the bytes.
+        """
+        other_alias = (0x00011D00, {"name": "sub_00011D00", "section": ".text",
+                                    "detection_method": "tail_jump_alias"})
+        alias = (0x00011CE0, {"name": "sub_00011CE0", "section": ".text",
+                              "detection_method": "tail_jump_alias"})
+        spans = {0x00011D00: 0x00011D9D, 0x00011CE0: 0x00011D00}
+        self.assertEqual(_select([other_alias, alias], spans), {})
+
+    def test_a_cross_section_abutting_entry_is_not_adopted(self):
+        """An address that also exists in another section is not the owner."""
+        owner = (0x00011D00, {"name": "sub_00011D00", "section": ".rdata",
+                              "detection_method": "imm_ref_target"})
+        alias = (0x00011CE0, {"name": "sub_00011CE0", "section": ".text",
+                              "detection_method": "tail_jump_alias"})
+        spans = {0x00011D00: 0x00011D9D, 0x00011CE0: 0x00011D00}
+        self.assertEqual(_select([owner, alias], spans), {})
 
 
 class AliasDispatchRedirectTest(unittest.TestCase):
