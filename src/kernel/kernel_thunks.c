@@ -188,6 +188,7 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal)
     case 139: return (ULONG_PTR)xbox_KeRestoreFloatingPointState;
     case 142: return (ULONG_PTR)xbox_KeSaveFloatingPointState;
     case 143: return (ULONG_PTR)xbox_KeSetBasePriorityThread;
+    case 138: return (ULONG_PTR)xbox_KeResetEvent;
     case 145: return (ULONG_PTR)xbox_KeSetEvent;
     case 149: return (ULONG_PTR)xbox_KeSetTimer;
     case 150: return (ULONG_PTR)xbox_KeSetTimerEx;

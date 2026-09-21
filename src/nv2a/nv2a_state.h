@@ -87,6 +87,7 @@ typedef struct NV2AState {
     uint8_t *vram_ptr;
     MemoryRegion ramin;
     uint8_t *ramin_ptr;
+    uint32_t ramin_guest_base;
 
     MemoryRegion mmio;
     MemoryRegion block_mmio[NV_NUM_BLOCKS];
@@ -121,8 +122,8 @@ typedef struct NV2AState {
         uint32_t submit_diag_method;
         uint32_t submit_diag_param;
         uint32_t submit_successes;
-        /* PFIFO object bindings.  RAMIN object lookup is intentionally not
-         * guessed yet; fixture_binding is an explicit test-only seam. */
+        /* PFIFO object bindings.  Production SET_OBJECT walks RAMHT in the
+         * claimed PRAMIN window.  fixture_* remains a test-only seam. */
         uint32_t binding_class[8];
         uint32_t binding_object[8];
         uint32_t fixture_class[8];
@@ -250,6 +251,21 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
 NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
                                  uint8_t *ramin_ptr, uint32_t ramin_size);
 
+/* Bind PRAMIN/RAMIN to the physical instance-memory claim.  The binding is
+ * deferred when the MMIO hook has not initialized yet, so the kernel bridge
+ * may publish the claim in either order.  The guest base is retained for
+ * diagnostics; accesses use the supplied host mapping exactly. */
+bool nv2a_bind_instance_memory(uint32_t guest_base, uint8_t *host_ptr,
+                               uint32_t size);
+/* Single-threaded focused-test seam for verifying both initialization orders.
+ * It intentionally abandons the old state and must never be used at runtime. */
+void nv2a_reset_standalone_for_test(void);
+/* Production claim transaction.  The hook implementation serializes the
+ * idempotence decision and binding commit with VEH/PTIMER MMIO ownership;
+ * standalone core tests use the binding entry point above directly. */
+bool nv2a_claim_instance_memory_threadsafe(uint32_t guest_base,
+                                           uint8_t *host_ptr, uint32_t size);
+
 /* Process an MMIO read/write from the VEH handler */
 uint64_t nv2a_mmio_read(NV2AState *d, hwaddr addr, unsigned int size);
 void nv2a_mmio_write(NV2AState *d, hwaddr addr, uint64_t val, unsigned int size);
@@ -259,7 +275,7 @@ void nv2a_mmio_write(NV2AState *d, hwaddr addr, uint64_t val, unsigned int size)
  * fallback mapping is performed. */
 bool nv2a_set_pushbuffer_window(NV2AState *d, uint8_t *base,
                                 uint32_t guest_base, uint32_t size);
-/* Test-only binding seam until the guest RAMIN/DMA object path is recovered. */
+/* Test-only binding seam.  Production SET_OBJECT uses RAMHT lookup. */
 bool nv2a_set_fixture_binding(NV2AState *d, uint32_t subchannel,
                               uint32_t object, uint32_t class_id);
 bool nv2a_set_fixture_execution(NV2AState *d, bool enabled);

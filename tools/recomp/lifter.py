@@ -1176,6 +1176,31 @@ class Lifter:
             if len(ops) >= 2:
                 return [f"/* bt {_fmt_operand_read(ops[0])}, {_fmt_operand_read(ops[1])} - bit test */"]
             return [f"/* bt {insn.op_str} */"]
+        if m == "out":
+            # Guest port I/O. JSRF GPU setup writes GPIO port 0x80C0.
+            if len(ops) >= 2:
+                port = _fmt_operand_read(ops[0])
+                value = _fmt_operand_read(ops[1])
+                width = _operand_width(ops[1]) or 1
+                if width == 1:
+                    return [f"xbox_outb((uint16_t)({port}), (uint8_t)({value}));"]
+                if width == 2:
+                    return [f"xbox_outw((uint16_t)({port}), (uint16_t)({value}));"]
+                return [f"xbox_outl((uint16_t)({port}), (uint32_t)({value}));"]
+            self.unimplemented.setdefault(m, []).append(insn.address)
+            return [f"/* TODO: {m} {insn.op_str} */"]
+        if m == "in":
+            if len(ops) >= 2:
+                dst = ops[0]
+                port = _fmt_operand_read(ops[1])
+                width = _operand_width(dst) or 1
+                if width == 1:
+                    return [_fmt_operand_write(dst, f"xbox_inb((uint16_t)({port}))") + ";"]
+                if width == 2:
+                    return [_fmt_operand_write(dst, f"xbox_inw((uint16_t)({port}))") + ";"]
+                return [_fmt_operand_write(dst, f"xbox_inl((uint16_t)({port}))") + ";"]
+            self.unimplemented.setdefault(m, []).append(insn.address)
+            return [f"/* TODO: {m} {insn.op_str} */"]
         if m == "emms":
             # A statement rather than a comment: emms genuinely has no
             # effect here (mm/x87 aliasing is not modelled), and a

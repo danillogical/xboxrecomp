@@ -15,6 +15,9 @@
  */
 
 #include "kernel.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 /* ============================================================================
  * Helper: Convert NT 100ns interval to Win32 milliseconds
@@ -113,6 +116,450 @@ NTSTATUS __stdcall xbox_NtSetEvent(HANDLE EventHandle, PLONG PreviousState)
  * The Object parameter is treated as a Win32 event HANDLE.
  * Returns the previous signal state.
  */
+static NTSTATUS xbox_wait_result_to_ntstatus(DWORD result, ULONG count);
+
+#define JSRF_INPLACE_KEVENT_CAP 128
+#define JSRF_INPLACE_HEADER_SIGNAL 4
+#define JSRF_INPLACE_MAX_WAITERS 32
+
+typedef struct {
+    LONG active;
+    LONG in_host_wait;
+    LONG paid;
+    HANDLE handle;
+} jsrf_event_waiter;
+
+typedef struct {
+    uint32_t guest_va;
+    ULONG type;
+    HANDLE handle;
+    jsrf_event_waiter waiters[JSRF_INPLACE_MAX_WAITERS];
+} jsrf_inplace_kevent;
+
+static INIT_ONCE g_inplace_kevent_once = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION g_inplace_kevent_cs;
+static jsrf_inplace_kevent g_inplace_kevents[JSRF_INPLACE_KEVENT_CAP];
+static unsigned g_inplace_kevent_cap = JSRF_INPLACE_KEVENT_CAP;
+static HANDLE g_event_gate_hit;
+static HANDLE g_event_gate_go;
+static volatile LONG g_event_gate_point;
+
+static void jsrf_event_test_hit_gate(unsigned point)
+{
+    if (InterlockedCompareExchange(&g_event_gate_point, 0, 0) != (LONG)point)
+        return;
+    if (g_event_gate_hit)
+        SetEvent(g_event_gate_hit);
+    /* RELOCK is taken while the event CS is held; do not wait on the
+     * tester or Set/Reset cannot run. */
+    if (point == JSRF_EVENT_TEST_GATE_RELOCK)
+        return;
+    if (g_event_gate_go)
+        WaitForSingleObject(g_event_gate_go, INFINITE);
+}
+
+static void jsrf_release_event_waiter(jsrf_event_waiter *me)
+{
+    if (me->handle) {
+        CloseHandle(me->handle);
+        me->handle = NULL;
+    }
+    me->paid = 0;
+    me->in_host_wait = 0;
+    me->active = 0;
+}
+
+static void jsrf_clear_event_waiters(jsrf_inplace_kevent *slot)
+{
+    unsigned i;
+    for (i = 0; i < JSRF_INPLACE_MAX_WAITERS; ++i) {
+        if (slot->waiters[i].handle)
+            CloseHandle(slot->waiters[i].handle);
+        memset(&slot->waiters[i], 0, sizeof(slot->waiters[i]));
+    }
+}
+
+static jsrf_event_waiter *jsrf_alloc_event_waiter(jsrf_inplace_kevent *slot)
+{
+    unsigned i;
+    for (i = 0; i < JSRF_INPLACE_MAX_WAITERS; ++i) {
+        if (slot->waiters[i].active)
+            continue;
+        slot->waiters[i].handle = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!slot->waiters[i].handle)
+            return NULL;
+        slot->waiters[i].active = 1;
+        slot->waiters[i].in_host_wait = 0;
+        slot->waiters[i].paid = 0;
+        return &slot->waiters[i];
+    }
+    return NULL;
+}
+
+static int jsrf_event_has_active_waiter(const jsrf_inplace_kevent *slot)
+{
+    unsigned i;
+    for (i = 0; i < JSRF_INPLACE_MAX_WAITERS; ++i)
+        if (slot->waiters[i].active)
+            return 1;
+    return 0;
+}
+
+static int jsrf_pay_host_waiter(jsrf_inplace_kevent *slot)
+{
+    unsigned i;
+    for (i = 0; i < JSRF_INPLACE_MAX_WAITERS; ++i) {
+        if (slot->waiters[i].active && slot->waiters[i].in_host_wait &&
+            !slot->waiters[i].paid && slot->waiters[i].handle) {
+            slot->waiters[i].paid = 1;
+            SetEvent(slot->waiters[i].handle);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static unsigned jsrf_pay_all_host_waiters(jsrf_inplace_kevent *slot)
+{
+    unsigned i, paid = 0;
+    for (i = 0; i < JSRF_INPLACE_MAX_WAITERS; ++i) {
+        if (slot->waiters[i].active && slot->waiters[i].in_host_wait &&
+            slot->waiters[i].handle) {
+            slot->waiters[i].paid = 1;
+            SetEvent(slot->waiters[i].handle);
+            paid++;
+        }
+    }
+    return paid;
+}
+
+static BOOL CALLBACK jsrf_inplace_kevent_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once;
+    (void)param;
+    (void)ctx;
+    InitializeCriticalSection(&g_inplace_kevent_cs);
+    return TRUE;
+}
+
+static void jsrf_inplace_lock(void)
+{
+    InitOnceExecuteOnce(&g_inplace_kevent_once, jsrf_inplace_kevent_init, NULL, NULL);
+    EnterCriticalSection(&g_inplace_kevent_cs);
+}
+
+static volatile LONG *jsrf_inplace_state(PVOID header)
+{
+    return (volatile LONG *)((uint8_t *)header + JSRF_INPLACE_HEADER_SIGNAL);
+}
+
+static jsrf_inplace_kevent *jsrf_inplace_acquire(uint32_t guest_va, PVOID header,
+                                                 ULONG type, LONG signaled)
+{
+    unsigned i;
+    jsrf_inplace_kevent *slot = NULL;
+    HANDLE created;
+
+    for (i = 0; i < g_inplace_kevent_cap; ++i) {
+        if (g_inplace_kevents[i].guest_va == guest_va) {
+            slot = &g_inplace_kevents[i];
+            if (slot->type != type) {
+                created = CreateEventW(NULL, type == XboxNotificationEvent ? TRUE : FALSE,
+                                       signaled > 0 ? TRUE : FALSE, NULL);
+                if (!created)
+                    return NULL;
+                CloseHandle(slot->handle);
+                slot->handle = created;
+                slot->type = type;
+                jsrf_clear_event_waiters(slot);
+            } else if (!jsrf_event_has_active_waiter(slot)) {
+                if (signaled > 0)
+                    SetEvent(slot->handle);
+                else
+                    ResetEvent(slot->handle);
+            }
+            return slot;
+        }
+    }
+    for (i = 0; i < g_inplace_kevent_cap; ++i) {
+        if (g_inplace_kevents[i].guest_va)
+            continue;
+        created = CreateEventW(NULL, type == XboxNotificationEvent ? TRUE : FALSE,
+                               signaled > 0 ? TRUE : FALSE, NULL);
+        if (!created)
+            return NULL;
+        g_inplace_kevents[i].guest_va = guest_va;
+        g_inplace_kevents[i].type = type;
+        g_inplace_kevents[i].handle = created;
+        jsrf_clear_event_waiters(&g_inplace_kevents[i]);
+        (void)header;
+        return &g_inplace_kevents[i];
+    }
+    return NULL;
+}
+
+static jsrf_inplace_kevent *jsrf_inplace_require(uint32_t guest_va, PVOID header, ULONG type)
+{
+    LONG signaled = InterlockedCompareExchange(jsrf_inplace_state(header), 0, 0);
+    jsrf_inplace_kevent *slot = jsrf_inplace_acquire(guest_va, header, type, signaled);
+    if (slot)
+        return slot;
+    fprintf(stderr,
+            "[KERNEL] in-place KEVENT registry exhausted cap=%u va=%08X\n",
+            g_inplace_kevent_cap, guest_va);
+    fflush(stderr);
+    LeaveCriticalSection(&g_inplace_kevent_cs);
+    abort();
+}
+
+LONG __stdcall xbox_KeSetInplaceEvent(uint32_t GuestVa, PVOID Header, ULONG Type,
+                                      LONG Increment, BOOLEAN Wait)
+{
+    volatile LONG *state = jsrf_inplace_state(Header);
+    jsrf_inplace_kevent *slot;
+    LONG previous;
+
+    (void)Increment;
+    (void)Wait;
+    jsrf_inplace_lock();
+    slot = jsrf_inplace_require(GuestVa, Header, Type);
+    previous = InterlockedCompareExchange(state, 0, 0);
+    if (Type == XboxSynchronizationEvent && jsrf_pay_host_waiter(slot)) {
+        /* Paid waiter is signaled on its private handle. */
+    } else {
+        InterlockedExchange(state, 1);
+        SetEvent(slot->handle);
+        if (Type == XboxNotificationEvent)
+            jsrf_pay_all_host_waiters(slot);
+    }
+    LeaveCriticalSection(&g_inplace_kevent_cs);
+    return previous;
+}
+
+LONG __stdcall xbox_KeResetInplaceEvent(uint32_t GuestVa, PVOID Header, ULONG Type)
+{
+    volatile LONG *state = jsrf_inplace_state(Header);
+    jsrf_inplace_kevent *slot;
+    LONG previous;
+
+    jsrf_inplace_lock();
+    slot = jsrf_inplace_require(GuestVa, Header, Type);
+    previous = InterlockedExchange(state, 0);
+    ResetEvent(slot->handle);
+    {
+        unsigned i;
+        for (i = 0; i < JSRF_INPLACE_MAX_WAITERS; ++i)
+            if (slot->waiters[i].active && !slot->waiters[i].paid &&
+                slot->waiters[i].handle)
+                ResetEvent(slot->waiters[i].handle);
+    }
+    LeaveCriticalSection(&g_inplace_kevent_cs);
+    return previous;
+}
+
+NTSTATUS __stdcall xbox_NtClearInplaceEvent(uint32_t GuestVa, PVOID Header, ULONG Type)
+{
+    xbox_KeResetInplaceEvent(GuestVa, Header, Type);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS __stdcall xbox_NtSetInplaceEvent(uint32_t GuestVa, PVOID Header, ULONG Type,
+                                          PLONG PreviousState)
+{
+    LONG previous = xbox_KeSetInplaceEvent(GuestVa, Header, Type, 1, FALSE);
+    if (PreviousState)
+        *PreviousState = previous;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS __stdcall xbox_NtPulseInplaceEvent(uint32_t GuestVa, PVOID Header, ULONG Type)
+{
+    volatile LONG *state = jsrf_inplace_state(Header);
+    jsrf_inplace_kevent *slot;
+
+    jsrf_inplace_lock();
+    slot = jsrf_inplace_require(GuestVa, Header, Type);
+    if (Type == XboxSynchronizationEvent)
+        jsrf_pay_host_waiter(slot);
+    else
+        jsrf_pay_all_host_waiters(slot);
+    InterlockedExchange(state, 0);
+    ResetEvent(slot->handle);
+    LeaveCriticalSection(&g_inplace_kevent_cs);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS __stdcall xbox_KeWaitInplaceEvent(uint32_t GuestVa, PVOID Header, ULONG Type,
+                                           BOOLEAN Alertable, PLARGE_INTEGER Timeout)
+{
+    volatile LONG *state = jsrf_inplace_state(Header);
+    jsrf_inplace_kevent *slot;
+    jsrf_event_waiter *me;
+    DWORD ms = xbox_nt_timeout_to_ms(Timeout);
+    ULONGLONG deadline = GetTickCount64() + (ms == INFINITE ? 0 : ms);
+    HANDLE handle;
+
+    jsrf_inplace_lock();
+    slot = jsrf_inplace_require(GuestVa, Header, Type);
+    handle = slot->handle;
+    for (;;) {
+        if (InterlockedCompareExchange(state, 0, 0) > 0) {
+            if (Type == XboxSynchronizationEvent) {
+                InterlockedExchange(state, 0);
+                ResetEvent(handle);
+            }
+            LeaveCriticalSection(&g_inplace_kevent_cs);
+            return STATUS_SUCCESS;
+        }
+        me = jsrf_alloc_event_waiter(slot);
+        if (!me) {
+            LeaveCriticalSection(&g_inplace_kevent_cs);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        LeaveCriticalSection(&g_inplace_kevent_cs);
+        jsrf_event_test_hit_gate(JSRF_EVENT_TEST_GATE_REGISTERED);
+        jsrf_inplace_lock();
+        me->in_host_wait = 1;
+        if (InterlockedCompareExchange(state, 0, 0) > 0) {
+            if (Type == XboxSynchronizationEvent) {
+                InterlockedExchange(state, 0);
+                ResetEvent(handle);
+            }
+            me->in_host_wait = 0;
+            jsrf_release_event_waiter(me);
+            LeaveCriticalSection(&g_inplace_kevent_cs);
+            return STATUS_SUCCESS;
+        }
+        LeaveCriticalSection(&g_inplace_kevent_cs);
+        jsrf_event_test_hit_gate(JSRF_EVENT_TEST_GATE_IN_HOST_WAIT);
+        {
+            DWORD remaining = ms;
+            DWORD result;
+            if (ms != INFINITE) {
+                ULONGLONG now = GetTickCount64();
+                if (now >= deadline)
+                    remaining = 0;
+                else
+                    remaining = (DWORD)(deadline - now);
+            }
+            result = WaitForSingleObjectEx(me->handle, remaining, Alertable);
+            jsrf_event_test_hit_gate(JSRF_EVENT_TEST_GATE_WAIT_RETURNED);
+            jsrf_inplace_lock();
+            jsrf_event_test_hit_gate(JSRF_EVENT_TEST_GATE_RELOCK);
+            me->in_host_wait = 0;
+            if (result == WAIT_TIMEOUT) {
+                if (me->paid) {
+                    InterlockedExchange(state, 1);
+                    SetEvent(handle);
+                }
+                jsrf_release_event_waiter(me);
+                LeaveCriticalSection(&g_inplace_kevent_cs);
+                return STATUS_TIMEOUT;
+            }
+            if (result != WAIT_OBJECT_0) {
+                jsrf_release_event_waiter(me);
+                LeaveCriticalSection(&g_inplace_kevent_cs);
+                return xbox_wait_result_to_ntstatus(result, 1);
+            }
+            if (me->paid) {
+                jsrf_release_event_waiter(me);
+                LeaveCriticalSection(&g_inplace_kevent_cs);
+                return STATUS_SUCCESS;
+            }
+            if (InterlockedCompareExchange(state, 0, 0) > 0) {
+                if (Type == XboxSynchronizationEvent) {
+                    InterlockedExchange(state, 0);
+                    ResetEvent(handle);
+                }
+                jsrf_release_event_waiter(me);
+                LeaveCriticalSection(&g_inplace_kevent_cs);
+                return STATUS_SUCCESS;
+            }
+            jsrf_release_event_waiter(me);
+            LeaveCriticalSection(&g_inplace_kevent_cs);
+            if (Type == XboxNotificationEvent)
+                return STATUS_SUCCESS;
+        }
+    }
+}
+
+void xbox_inplace_event_test_reset(void)
+{
+    unsigned i;
+    jsrf_inplace_lock();
+    for (i = 0; i < JSRF_INPLACE_KEVENT_CAP; ++i) {
+        if (g_inplace_kevents[i].handle)
+            CloseHandle(g_inplace_kevents[i].handle);
+        g_inplace_kevents[i].guest_va = 0;
+        g_inplace_kevents[i].type = 0;
+        g_inplace_kevents[i].handle = NULL;
+        jsrf_clear_event_waiters(&g_inplace_kevents[i]);
+    }
+    g_inplace_kevent_cap = JSRF_INPLACE_KEVENT_CAP;
+    LeaveCriticalSection(&g_inplace_kevent_cs);
+}
+
+unsigned xbox_inplace_event_test_used(void)
+{
+    unsigned i, used = 0;
+    jsrf_inplace_lock();
+    for (i = 0; i < g_inplace_kevent_cap; ++i)
+        if (g_inplace_kevents[i].guest_va)
+            ++used;
+    LeaveCriticalSection(&g_inplace_kevent_cs);
+    return used;
+}
+
+void xbox_inplace_event_test_set_cap(unsigned cap)
+{
+    jsrf_inplace_lock();
+    g_inplace_kevent_cap = cap && cap <= JSRF_INPLACE_KEVENT_CAP ? cap : JSRF_INPLACE_KEVENT_CAP;
+    LeaveCriticalSection(&g_inplace_kevent_cs);
+}
+
+int xbox_inplace_event_test_try_create(uint32_t GuestVa, PVOID Header, ULONG Type, LONG Signaled)
+{
+    jsrf_inplace_kevent *slot;
+    jsrf_inplace_lock();
+    slot = jsrf_inplace_acquire(GuestVa, Header, Type, Signaled);
+    LeaveCriticalSection(&g_inplace_kevent_cs);
+    return slot != NULL;
+}
+
+void xbox_inplace_event_test_arm_gate(unsigned point)
+{
+    if (!g_event_gate_hit)
+        g_event_gate_hit = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!g_event_gate_go)
+        g_event_gate_go = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ResetEvent(g_event_gate_hit);
+    ResetEvent(g_event_gate_go);
+    InterlockedExchange(&g_event_gate_point, (LONG)point);
+}
+
+int xbox_inplace_event_test_wait_hit(DWORD milliseconds)
+{
+    if (!g_event_gate_hit)
+        return 0;
+    return WaitForSingleObject(g_event_gate_hit, milliseconds) == WAIT_OBJECT_0;
+}
+
+void xbox_inplace_event_test_advance_gate(unsigned next_point)
+{
+    if (g_event_gate_hit)
+        ResetEvent(g_event_gate_hit);
+    InterlockedExchange(&g_event_gate_point, (LONG)next_point);
+    if (g_event_gate_go)
+        SetEvent(g_event_gate_go);
+}
+
+void xbox_inplace_event_test_release_gate(void)
+{
+    InterlockedExchange(&g_event_gate_point, JSRF_EVENT_TEST_GATE_OFF);
+    if (g_event_gate_go)
+        SetEvent(g_event_gate_go);
+}
+
 LONG __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait)
 {
     HANDLE hEvent = (HANDLE)Event;
@@ -120,8 +567,15 @@ LONG __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait)
     (void)Increment;
     (void)Wait;
 
-    /* We can't easily query previous state, so just set and return 0 */
+    /* HANDLE-typed callers remain on this path. In-place DISPATCHER_HEADER
+     * objects are routed by the kernel bridge before this function. */
     SetEvent(hEvent);
+    return 0;
+}
+
+LONG __stdcall xbox_KeResetEvent(PVOID Event)
+{
+    ResetEvent((HANDLE)Event);
     return 0;
 }
 

@@ -28,6 +28,7 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "nv2a_state.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
@@ -1308,6 +1309,34 @@ static void bridge_NtCreateEvent(void)
 }
 
 /* ── KeSetEvent (ordinal 145) ────────────────────────────── */
+#define XBOX_CANONICAL_LO 0x00010000u
+#define XBOX_CANONICAL_HI 0x04000000u
+#define XBOX_DISPATCHER_HEADER_SIZE 16u
+
+static int guest_range_in_canonical(uint32_t va, uint32_t bytes)
+{
+    uint64_t end = (uint64_t)va + bytes;
+    return va >= XBOX_CANONICAL_LO && end <= (uint64_t)XBOX_CANONICAL_HI;
+}
+
+static int guest_va_is_inplace_kevent(uint32_t va)
+{
+    uint8_t type, size;
+    uint32_t list, flink, blink;
+    if (!guest_range_in_canonical(va, XBOX_DISPATCHER_HEADER_SIZE))
+        return 0;
+    type = BRIDGE_MEM8(va);
+    size = BRIDGE_MEM8(va + 2u);
+    if (type > 1u || size != 4u)
+        return 0;
+    list = va + 8u;
+    flink = BRIDGE_MEM32(list);
+    blink = BRIDGE_MEM32(list + 4u);
+    if (flink == list && blink == list)
+        return 1;
+    return guest_range_in_canonical(flink, 4u) && guest_range_in_canonical(blink, 4u);
+}
+
 static void bridge_KeSetEvent(void)
 {
     uint32_t event_ptr = STACK_ARG(0);
@@ -1315,8 +1344,28 @@ static void bridge_KeSetEvent(void)
     uint32_t wait = STACK_ARG(2);
 
     recomp_diag_record(10, event_ptr, g_xbox_kernel_caller, 0);
-    g_eax = (uint32_t)xbox_KeSetEvent(XBOX_TO_NATIVE(event_ptr), increment, (BOOLEAN)wait);
+    if (guest_va_is_inplace_kevent(event_ptr)) {
+        g_eax = (uint32_t)xbox_KeSetInplaceEvent(
+            event_ptr, XBOX_TO_NATIVE(event_ptr), BRIDGE_MEM8(event_ptr),
+            increment, (BOOLEAN)wait);
+    } else {
+        g_eax = (uint32_t)xbox_KeSetEvent(
+            XBOX_TO_NATIVE(event_ptr), increment, (BOOLEAN)wait);
+    }
     recomp_diag_record(10, event_ptr, g_xbox_kernel_caller, g_eax);
+}
+
+static void bridge_KeResetEvent(void)
+{
+    uint32_t event_ptr = STACK_ARG(0);
+    recomp_diag_record(11, event_ptr, g_xbox_kernel_caller, 0);
+    if (guest_va_is_inplace_kevent(event_ptr)) {
+        g_eax = (uint32_t)xbox_KeResetInplaceEvent(
+            event_ptr, XBOX_TO_NATIVE(event_ptr), BRIDGE_MEM8(event_ptr));
+    } else {
+        g_eax = (uint32_t)xbox_KeResetEvent(XBOX_TO_NATIVE(event_ptr));
+    }
+    recomp_diag_record(11, event_ptr, g_xbox_kernel_caller, g_eax);
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
@@ -1330,9 +1379,15 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
 
-    g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-        XBOX_TO_NATIVE(object), wait_reason, wait_mode,
-        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    if (guest_va_is_inplace_kevent(object)) {
+        g_eax = (uint32_t)xbox_KeWaitInplaceEvent(
+            object, XBOX_TO_NATIVE(object), BRIDGE_MEM8(object),
+            (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    } else {
+        g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+            XBOX_TO_NATIVE(object), wait_reason, wait_mode,
+            (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    }
 
     recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
 }
@@ -1350,12 +1405,18 @@ static void bridge_NtWaitForSingleObject(void)
 {
     uint32_t diag_object = STACK_ARG(0);
     recomp_diag_record(8, diag_object, g_xbox_kernel_caller, 0);
-    HANDLE   handle      = bridge_resolve_handle(STACK_ARG(0));
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
 
-    g_eax = (uint32_t)xbox_NtWaitForSingleObject(
-        handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    if (guest_va_is_inplace_kevent(diag_object)) {
+        g_eax = (uint32_t)xbox_KeWaitInplaceEvent(
+            diag_object, XBOX_TO_NATIVE(diag_object), BRIDGE_MEM8(diag_object),
+            (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    } else {
+        HANDLE handle = bridge_resolve_handle(diag_object);
+        g_eax = (uint32_t)xbox_NtWaitForSingleObject(
+            handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+    }
 
     recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
 }
@@ -1367,8 +1428,13 @@ static void bridge_NtClearEvent(void)
 {
     uint32_t diag_object = STACK_ARG(0);
     recomp_diag_record(11, diag_object, g_xbox_kernel_caller, 0);
-    HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
-    g_eax = (uint32_t)xbox_NtClearEvent(handle);
+    if (guest_va_is_inplace_kevent(diag_object)) {
+        g_eax = (uint32_t)xbox_NtClearInplaceEvent(
+            diag_object, XBOX_TO_NATIVE(diag_object), BRIDGE_MEM8(diag_object));
+    } else {
+        HANDLE handle = bridge_resolve_handle(diag_object);
+        g_eax = (uint32_t)xbox_NtClearEvent(handle);
+    }
 
     recomp_diag_record(11, diag_object, g_xbox_kernel_caller, g_eax);
 }
@@ -1382,9 +1448,15 @@ static void bridge_NtSetEvent(void)
 {
     uint32_t diag_object = STACK_ARG(0);
     recomp_diag_record(10, diag_object, g_xbox_kernel_caller, 0);
-    HANDLE   handle = bridge_resolve_handle(STACK_ARG(0));
-    uint32_t prev   = STACK_ARG(1);
-    g_eax = (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev));
+    uint32_t prev = STACK_ARG(1);
+    if (guest_va_is_inplace_kevent(diag_object)) {
+        g_eax = (uint32_t)xbox_NtSetInplaceEvent(
+            diag_object, XBOX_TO_NATIVE(diag_object), BRIDGE_MEM8(diag_object),
+            XBOX_TO_NATIVE(prev));
+    } else {
+        HANDLE handle = bridge_resolve_handle(diag_object);
+        g_eax = (uint32_t)xbox_NtSetEvent(handle, XBOX_TO_NATIVE(prev));
+    }
 
     recomp_diag_record(10, diag_object, g_xbox_kernel_caller, g_eax);
 }
@@ -1396,9 +1468,15 @@ static void bridge_NtSetEvent(void)
  * faithfully -- a waiter not yet blocked misses it, exactly as on hardware. */
 static void bridge_NtPulseEvent(void)
 {
-    HANDLE handle = bridge_resolve_handle(STACK_ARG(0));
-    if (handle) PulseEvent(handle);
-    g_eax = 0;
+    uint32_t object = STACK_ARG(0);
+    if (guest_va_is_inplace_kevent(object)) {
+        g_eax = (uint32_t)xbox_NtPulseInplaceEvent(
+            object, XBOX_TO_NATIVE(object), BRIDGE_MEM8(object));
+    } else {
+        HANDLE handle = bridge_resolve_handle(object);
+        if (handle) PulseEvent(handle);
+        g_eax = 0;
+    }
 }
 
 /* ── NtWaitForSingleObjectEx (ordinal 234) ───────────────── */
@@ -2140,10 +2218,28 @@ static void bridge_MmClaimGpuInstanceMemory(void)
     if (bytes == 0xFFFFFFFFu) {
         bytes = XBOX_GPU_INSTANCE_DEFAULT;
     }
-    if (padding_va) {
-        BRIDGE_MEM32(padding_va) = 0;
+    /* The contiguous allocator permanently reserves only the top default
+     * instance window. Validate before subtraction or VA translation. */
+    if (bytes == 0 || bytes > XBOX_GPU_INSTANCE_DEFAULT ||
+        bytes > XBOX_CONTIG_SIZE) {
+        g_eax = 0;
+        fprintf(stderr, "[NV2A] rejected GPU instance claim size=0x%x\n", bytes);
+        return;
     }
-    g_eax = XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - bytes;
+    uint32_t base = XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - bytes;
+    /* The NV2A owner lock covers both the idempotence decision and binding
+     * commit.  The core is the sole claim authority, including pre-init
+     * publication; only publish the guest result after it accepts the claim. */
+    g_eax = 0;
+    if (!nv2a_claim_instance_memory_threadsafe(base,
+            (uint8_t *)XBOX_TO_NATIVE(base), bytes)) {
+        fprintf(stderr, "[NV2A] rejected GPU instance binding VA=0x%08x size=0x%x\n",
+                base, bytes);
+        return;
+    }
+    if (padding_va)
+        BRIDGE_MEM32(padding_va) = 0;
+    g_eax = base;
 }
 
 /* VOID HalRegisterShutdownNotification(PHAL_SHUTDOWN_REGISTRATION, BOOLEAN)
@@ -4583,6 +4679,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 142: return  4;  /* KeSaveFloatingPointState (1) */
     case 143: return  8;  /* KeSetBasePriorityThread (2) */
     case 144: return  8;  /* KeSetDisableBoostThread (2) */
+    case 138: return  4;  /* KeResetEvent (1) */
     case 145: return 12;  /* KeSetEvent (3) */
     case 149: return 16;  /* KeSetTimer (Timer+DueTime[8]+Dpc) */
     case 150: return 20;  /* KeSetTimerEx (Timer+DueTime[8]+Period+Dpc) */
@@ -4857,6 +4954,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
     /* Synchronization */
     case 189: return bridge_NtCreateEvent;
+    case 138: return bridge_KeResetEvent;
     case 145: return bridge_KeSetEvent;
     case 159: return bridge_KeWaitForSingleObject;
     case  99: return bridge_KeDelayExecutionThread;
@@ -5505,4 +5603,93 @@ void xbox_kernel_bridge_init(void)
     fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
             KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
 
+}
+
+#define JSRF_TEST_STACK_VA 0x0003F000u
+#define JSRF_TEST_TIMEOUT_VA 0x0003F200u
+
+static void jsrf_test_write_stack(uint32_t *args, unsigned count)
+{
+    unsigned i;
+    for (i = 0; i < count; ++i)
+        BRIDGE_MEM32(JSRF_TEST_STACK_VA + i * 4u) = args[i];
+    g_esp = JSRF_TEST_STACK_VA;
+}
+
+LONG xbox_test_bridge_KeSetEvent(uint32_t EventVa, LONG Increment, BOOLEAN Wait)
+{
+    uint32_t args[3] = { EventVa, (uint32_t)Increment, (uint32_t)Wait };
+    jsrf_test_write_stack(args, 3);
+    bridge_KeSetEvent();
+    return (LONG)g_eax;
+}
+
+LONG xbox_test_bridge_KeResetEvent(uint32_t EventVa)
+{
+    uint32_t args[1] = { EventVa };
+    jsrf_test_write_stack(args, 1);
+    bridge_KeResetEvent();
+    return (LONG)g_eax;
+}
+
+NTSTATUS xbox_test_bridge_KeWaitForSingleObject(uint32_t ObjectVa, BOOLEAN Alertable, int TimeoutMs)
+{
+    uint32_t timeout_ptr = 0;
+    uint32_t args[5];
+    if (TimeoutMs >= 0) {
+        int64_t relative = -(int64_t)TimeoutMs * 10000;
+        BRIDGE_MEM32(JSRF_TEST_TIMEOUT_VA) = (uint32_t)relative;
+        BRIDGE_MEM32(JSRF_TEST_TIMEOUT_VA + 4u) = (uint32_t)(relative >> 32);
+        timeout_ptr = JSRF_TEST_TIMEOUT_VA;
+    }
+    args[0] = ObjectVa;
+    args[1] = 0;
+    args[2] = 0;
+    args[3] = Alertable;
+    args[4] = timeout_ptr;
+    jsrf_test_write_stack(args, 5);
+    bridge_KeWaitForSingleObject();
+    return (NTSTATUS)g_eax;
+}
+
+NTSTATUS xbox_test_bridge_NtClearEvent(uint32_t EventVa)
+{
+    uint32_t args[1] = { EventVa };
+    jsrf_test_write_stack(args, 1);
+    bridge_NtClearEvent();
+    return (NTSTATUS)g_eax;
+}
+
+NTSTATUS xbox_test_bridge_NtSetEvent(uint32_t EventVa)
+{
+    uint32_t args[2] = { EventVa, 0 };
+    jsrf_test_write_stack(args, 2);
+    bridge_NtSetEvent();
+    return (NTSTATUS)g_eax;
+}
+
+NTSTATUS xbox_test_bridge_NtPulseEvent(uint32_t EventVa)
+{
+    uint32_t args[1] = { EventVa };
+    jsrf_test_write_stack(args, 1);
+    bridge_NtPulseEvent();
+    return (NTSTATUS)g_eax;
+}
+
+NTSTATUS xbox_test_bridge_NtWaitForSingleObject(uint32_t EventVa, BOOLEAN Alertable, int TimeoutMs)
+{
+    uint32_t timeout_ptr = 0;
+    uint32_t args[3];
+    if (TimeoutMs >= 0) {
+        int64_t relative = -(int64_t)TimeoutMs * 10000;
+        BRIDGE_MEM32(JSRF_TEST_TIMEOUT_VA) = (uint32_t)relative;
+        BRIDGE_MEM32(JSRF_TEST_TIMEOUT_VA + 4u) = (uint32_t)(relative >> 32);
+        timeout_ptr = JSRF_TEST_TIMEOUT_VA;
+    }
+    args[0] = EventVa;
+    args[1] = Alertable;
+    args[2] = timeout_ptr;
+    jsrf_test_write_stack(args, 3);
+    bridge_NtWaitForSingleObject();
+    return (NTSTATUS)g_eax;
 }

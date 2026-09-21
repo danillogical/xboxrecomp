@@ -438,9 +438,12 @@ void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
 
     uint8_t *ramin_ptr = g_nv2a_vram + NV2A_VRAM_SIZE;
 
-    /* Initialize NV2A state machine */
+    /* State publication and a concurrent instance claim are one owner-locked
+     * transaction.  The initializer itself does not acquire this lock. */
+    AcquireSRWLockExclusive(&g_mmio_owner_lock);
     NV2AState *nv2a = nv2a_init_standalone(g_nv2a_vram, NV2A_VRAM_SIZE,
                                             ramin_ptr, NV2A_RAMIN_SIZE);
+    ReleaseSRWLockExclusive(&g_mmio_owner_lock);
     if (!nv2a) return;
 
     /* USER DMA pointers are physical addresses in the separately mapped
@@ -494,6 +497,16 @@ static void owner_write(NV2AState *nv2a, uint32_t offset,
         ((offset >= 0x009000u && offset < 0x00a000u) ||
          offset == 0x680000u + NV_PRAMDAC_NVPLL_COEFF))
         SetEvent(g_ptimer_wake_event);
+}
+
+bool nv2a_claim_instance_memory_threadsafe(uint32_t guest_base,
+                                           uint8_t *host_ptr, uint32_t size)
+{
+    bool accepted;
+    AcquireSRWLockExclusive(&g_mmio_owner_lock);
+    accepted = nv2a_bind_instance_memory(guest_base, host_ptr, size);
+    ReleaseSRWLockExclusive(&g_mmio_owner_lock);
+    return accepted;
 }
 
 /* Publish every register consumed by the frozen GPU report from one locked
@@ -896,6 +909,10 @@ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
 }
 
 #else /* !_WIN32 -- SIGSEGV-based MMIO trapping deferred to main.c port */
+
+bool nv2a_claim_instance_memory_threadsafe(uint32_t guest_base,
+                                           uint8_t *host_ptr, uint32_t size)
+{ return nv2a_bind_instance_memory(guest_base, host_ptr, size); }
 
 void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
 { (void)xbox_mem_offset; }

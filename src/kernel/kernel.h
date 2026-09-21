@@ -731,6 +731,34 @@ NTSTATUS __stdcall xbox_NtCreateMutant(PHANDLE MutantHandle, PXBOX_OBJECT_ATTRIB
 NTSTATUS __stdcall xbox_NtReleaseMutant(HANDLE MutantHandle, PLONG PreviousCount);
 
 LONG     __stdcall xbox_KeSetEvent(PVOID Event, LONG Increment, BOOLEAN Wait);
+LONG     __stdcall xbox_KeResetEvent(PVOID Event);
+LONG     __stdcall xbox_KeSetInplaceEvent(uint32_t GuestVa, PVOID Header, ULONG Type, LONG Increment, BOOLEAN Wait);
+NTSTATUS __stdcall xbox_KeWaitInplaceEvent(uint32_t GuestVa, PVOID Header, ULONG Type, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
+NTSTATUS __stdcall xbox_NtClearInplaceEvent(uint32_t GuestVa, PVOID Header, ULONG Type);
+NTSTATUS __stdcall xbox_NtSetInplaceEvent(uint32_t GuestVa, PVOID Header, ULONG Type, PLONG PreviousState);
+NTSTATUS __stdcall xbox_NtPulseInplaceEvent(uint32_t GuestVa, PVOID Header, ULONG Type);
+LONG     __stdcall xbox_KeResetInplaceEvent(uint32_t GuestVa, PVOID Header, ULONG Type);
+#define JSRF_EVENT_TEST_GATE_OFF 0u
+#define JSRF_EVENT_TEST_GATE_REGISTERED 1u
+#define JSRF_EVENT_TEST_GATE_IN_HOST_WAIT 2u
+#define JSRF_EVENT_TEST_GATE_WAIT_RETURNED 3u
+#define JSRF_EVENT_TEST_GATE_RELOCK 4u
+
+void     xbox_inplace_event_test_reset(void);
+unsigned xbox_inplace_event_test_used(void);
+void     xbox_inplace_event_test_set_cap(unsigned cap);
+int      xbox_inplace_event_test_try_create(uint32_t GuestVa, PVOID Header, ULONG Type, LONG Signaled);
+void     xbox_inplace_event_test_arm_gate(unsigned point);
+int      xbox_inplace_event_test_wait_hit(DWORD milliseconds);
+void     xbox_inplace_event_test_advance_gate(unsigned next_point);
+void     xbox_inplace_event_test_release_gate(void);
+LONG     xbox_test_bridge_KeSetEvent(uint32_t EventVa, LONG Increment, BOOLEAN Wait);
+LONG     xbox_test_bridge_KeResetEvent(uint32_t EventVa);
+NTSTATUS xbox_test_bridge_KeWaitForSingleObject(uint32_t ObjectVa, BOOLEAN Alertable, int TimeoutMs);
+NTSTATUS xbox_test_bridge_NtClearEvent(uint32_t EventVa);
+NTSTATUS xbox_test_bridge_NtSetEvent(uint32_t EventVa);
+NTSTATUS xbox_test_bridge_NtPulseEvent(uint32_t EventVa);
+NTSTATUS xbox_test_bridge_NtWaitForSingleObject(uint32_t EventVa, BOOLEAN Alertable, int TimeoutMs);
 NTSTATUS __stdcall xbox_KeWaitForSingleObject(PVOID Object, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(ULONG Count, PVOID Objects[], ULONG WaitType, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
 
@@ -881,6 +909,12 @@ VOID    __stdcall xbox_XcUpdateCrypto(PVOID Param1, PVOID Param2);
 
 VOID    __stdcall xbox_WRITE_PORT_BUFFER_ULONG(PULONG Port, PULONG Buffer, ULONG Count);
 VOID    __stdcall xbox_WRITE_PORT_BUFFER_USHORT(PUSHORT Port, PUSHORT Buffer, ULONG Count);
+VOID    xbox_outb(uint16_t port, uint8_t value);
+VOID    xbox_outw(uint16_t port, uint16_t value);
+VOID    xbox_outl(uint16_t port, uint32_t value);
+uint8_t xbox_inb(uint16_t port);
+uint16_t xbox_inw(uint16_t port);
+uint32_t xbox_inl(uint16_t port);
 NTSTATUS __stdcall xbox_NtSetSystemTime(PLARGE_INTEGER SystemTime, PLARGE_INTEGER PreviousTime);
 
 /* Display / AV - handled by D3D layer but declared here for thunk table */

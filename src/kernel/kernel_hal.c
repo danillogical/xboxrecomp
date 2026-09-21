@@ -524,6 +524,48 @@ VOID __stdcall xbox_WRITE_PORT_BUFFER_USHORT(PUSHORT Port, PUSHORT Buffer, ULONG
     (void)Count;
 }
 
+static uint32_t g_last_io_port;
+static uint32_t g_last_io_value;
+
+VOID xbox_outb(uint16_t port, uint8_t value)
+{
+    g_last_io_port = port;
+    g_last_io_value = value;
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL, "outb port=0x%04X value=0x%02X", port, value);
+}
+
+VOID xbox_outw(uint16_t port, uint16_t value)
+{
+    g_last_io_port = port;
+    g_last_io_value = value;
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL, "outw port=0x%04X value=0x%04X", port, value);
+}
+
+VOID xbox_outl(uint16_t port, uint32_t value)
+{
+    g_last_io_port = port;
+    g_last_io_value = value;
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL, "outl port=0x%04X value=0x%08X", port, value);
+}
+
+uint8_t xbox_inb(uint16_t port)
+{
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL, "inb port=0x%04X -> 0", port);
+    return 0;
+}
+
+uint16_t xbox_inw(uint16_t port)
+{
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL, "inw port=0x%04X -> 0", port);
+    return 0;
+}
+
+uint32_t xbox_inl(uint16_t port)
+{
+    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL, "inl port=0x%04X -> 0", port);
+    return 0;
+}
+
 /* ============================================================================
  * System Time (Set)
  *

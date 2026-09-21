@@ -17,10 +17,58 @@
 
 static NV2AState *g_nv2a = NULL;
 static MemoryRegion g_vram_region;
-static MemoryRegion g_ramin_region;
+static uint32_t g_pending_instance_guest_base;
+static uint8_t *g_pending_instance_host_ptr;
+static uint32_t g_pending_instance_size;
+
+static bool instance_binding_valid(uint32_t guest_base, const uint8_t *host_ptr,
+                                   uint32_t size)
+{
+    return host_ptr != NULL && size != 0 &&
+           guest_base <= UINT32_MAX - size;
+}
+
+bool nv2a_bind_instance_memory(uint32_t guest_base, uint8_t *host_ptr,
+                               uint32_t size)
+{
+    if (!instance_binding_valid(guest_base, host_ptr, size)) {
+        NV2A_DPRINTF("rejecting invalid instance-memory binding base=0x%08x size=0x%x\n",
+                     guest_base, size);
+        return false;
+    }
+
+    /* Keep the request until the standalone state exists.  This is the
+     * explicit ordering seam between the kernel bridge and the MMIO hook. */
+    if (g_pending_instance_host_ptr) {
+        return g_pending_instance_guest_base == guest_base &&
+               g_pending_instance_host_ptr == host_ptr &&
+               g_pending_instance_size == size;
+    }
+    g_pending_instance_guest_base = guest_base;
+    g_pending_instance_host_ptr = host_ptr;
+    g_pending_instance_size = size;
+    if (g_nv2a) {
+        g_nv2a->ramin.size = size;
+        g_nv2a->ramin_ptr = host_ptr;
+        g_nv2a->ramin_guest_base = guest_base;
+    }
+    return true;
+}
 
 NV2AState *nv2a_get_state(void) {
     return g_nv2a;
+}
+
+void nv2a_reset_standalone_for_test(void)
+{
+    /* Focused single-threaded fixtures use this only to exercise both sides
+     * of the initialization-order contract in one process.  The abandoned
+     * state is intentionally not destroyed because its qemu locks may still
+     * contain platform-owned bookkeeping. */
+    g_nv2a = NULL;
+    g_pending_instance_guest_base = 0;
+    g_pending_instance_host_ptr = NULL;
+    g_pending_instance_size = 0;
 }
 
 static bool pci_config_access_valid(uint32_t offset, uint32_t length)
@@ -100,7 +148,12 @@ void nv2a_update_irq(NV2AState *d)
 
 DMAObject nv_dma_load(NV2AState *d, hwaddr dma_obj_address)
 {
-    assert(dma_obj_address < memory_region_size(&d->ramin));
+    if (!d || !d->ramin_ptr || memory_region_size(&d->ramin) < 12 ||
+        dma_obj_address > memory_region_size(&d->ramin) - 12) {
+        NV2A_DPRINTF("RAMIN DMA object outside bound: 0x%llx\n",
+                     (unsigned long long)dma_obj_address);
+        return (DMAObject){0};
+    }
 
     uint32_t *dma_obj = (uint32_t *)(d->ramin_ptr + dma_obj_address);
     uint32_t flags = ldl_le_p(dma_obj);
@@ -117,13 +170,20 @@ DMAObject nv_dma_load(NV2AState *d, hwaddr dma_obj_address)
 
 void *nv_dma_map(NV2AState *d, hwaddr dma_obj_address, hwaddr *len)
 {
+    if (!len)
+        return NULL;
+    *len = 0;
+    if (!d || !d->ramin_ptr || !d->vram || !d->vram_ptr ||
+        dma_obj_address > memory_region_size(&d->ramin) ||
+        memory_region_size(&d->ramin) - dma_obj_address < 12) {
+        return NULL;
+    }
     DMAObject dma = nv_dma_load(d, dma_obj_address);
     dma.address &= 0x07FFFFFF;
 
     if (dma.address >= memory_region_size(d->vram)) {
         fprintf(stderr, "[NV2A] DMA map address 0x%llx out of VRAM range\n",
                 (unsigned long long)dma.address);
-        *len = 0;
         return NULL;
     }
 
@@ -651,6 +711,12 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
     nv2a_reg_log_write(NV_PGRAPH, addr, size, val);
+    if (addr == NV_PGRAPH_INTR) {
+        d->pgraph.regs[addr] &= ~(uint32_t)val;
+        d->pgraph.pending_interrupts &= ~(uint32_t)val;
+        nv2a_update_irq(d);
+        return;
+    }
     d->pgraph.regs[addr] = val;
 }
 
@@ -762,12 +828,12 @@ enum {
     NV2A_SUBMIT_SINK_FULL = 9,
     NV2A_SUBMIT_BAD_POINTER = 10,
     NV2A_SUBMIT_UNSUPPORTED_METHOD = 11,
+    NV2A_SUBMIT_INVALID_HANDLE = 12,
 };
 
-/* NV01_SUBC_SET_OBJECT is the common PFIFO binding method.  The original
- * stream uses an object handle, whose class normally comes from RAMIN.  RAMIN
- * lookup is not wired into this standalone owner yet, so only an explicit
- * fixture binding may consume it. */
+/* NV01_SUBC_SET_OBJECT binds a RAMHT handle.  Production lookup uses the
+ * original 0x001945D6 hash into the claimed PRAMIN table; the fixture seam
+ * remains test-only. */
 #define M_SET_OBJECT 0x0000u
 #define NV097_CLASS  0x97u
 
@@ -786,6 +852,7 @@ const char *nv2a_submit_diagnostic(uint32_t code)
     case NV2A_SUBMIT_SINK_FULL: return "sink_capacity";
     case NV2A_SUBMIT_BAD_POINTER: return "invalid_get_put";
     case NV2A_SUBMIT_UNSUPPORTED_METHOD: return "unsupported_method";
+    case NV2A_SUBMIT_INVALID_HANDLE: return "invalid_handle";
     default: return "unknown";
     }
 }
@@ -852,6 +919,53 @@ static uint32_t submit_advance(NV2AState *d, uint32_t address)
     return address + 4 == end ? d->pfifo.pushbuffer_base : address + 4;
 }
 
+/* Original 0x001945D6: two 11-bit XOR-folds of the handle, then AND 0x7FF.
+ * That is the 4K RAMHT fold; other sizes use the same chunk XOR with
+ * bits = size_code + 11.  Channel id is 0 in the captured table and is
+ * not mixed in by 0x001945D6. */
+static uint32_t ramht_hash(uint32_t handle, unsigned bits)
+{
+    uint32_t mask, hash;
+    if (bits == 0 || bits >= 32) return 0;
+    mask = (1u << bits) - 1u;
+    hash = 0;
+    while (handle) {
+        hash ^= handle & mask;
+        handle >>= bits;
+    }
+    return hash;
+}
+
+static bool ramht_lookup_class(NV2AState *d, uint32_t handle, uint32_t *class_id)
+{
+    uint32_t ramht, size_code, ramht_size, ramht_base, bits, hash, slot;
+    uint32_t entry_handle, entry_context, instance;
+    uint32_t object[4];
+    if (!d || !class_id || !handle || !d->ramin_ptr || d->ramin.size < 16)
+        return false;
+    ramht = d->pfifo.regs[NV_PFIFO_RAMHT];
+    size_code = GET_MASK(ramht, NV_PFIFO_RAMHT_SIZE);
+    if (size_code > NV_PFIFO_RAMHT_SIZE_32K) return false;
+    ramht_size = 1u << (size_code + 12);
+    ramht_base = GET_MASK(ramht, NV_PFIFO_RAMHT_BASE_ADDRESS) << 12;
+    bits = size_code + 11;
+    if (ramht_size < 8 || ramht_size > d->ramin.size ||
+        ramht_base > d->ramin.size - ramht_size)
+        return false;
+    hash = ramht_hash(handle, bits);
+    slot = hash * 8u;
+    if (slot > ramht_size - 8) return false;
+    memcpy(&entry_handle, d->ramin_ptr + ramht_base + slot, 4);
+    memcpy(&entry_context, d->ramin_ptr + ramht_base + slot + 4, 4);
+    if (entry_handle != handle || !(entry_context & NV_RAMHT_STATUS))
+        return false;
+    instance = (entry_context & NV_RAMHT_INSTANCE) << 4;
+    if (instance > d->ramin.size - 16) return false;
+    memcpy(object, d->ramin_ptr + instance, 16);
+    *class_id = object[0] & 0xFFu;
+    return *class_id != 0;
+}
+
 bool nv2a_submit_pending(NV2AState *d)
 {
     uint32_t get, put, pc, ret = 0, words = 0, packets = 0;
@@ -905,21 +1019,35 @@ bool nv2a_submit_pending(NV2AState *d)
                 if (words >= 1024) { d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false; goto done; }
                 if (pc == put || !submit_read_word(d, pc, &param)) { d->pfifo.submit_diag = pc == put ? NV2A_SUBMIT_TRUNCATED : NV2A_SUBMIT_UNREADABLE; ok = false; goto done; }
                 pc = submit_advance(d, pc); ++words;
-                /* Object binding is accepted only through the explicit
-                 * fixture seam.  A real RAMIN/DMA lookup remains a hard
-                 * dependency for game acceptance. */
+                /* Production SET_OBJECT walks RAMHT in claimed PRAMIN.
+                 * The fixture seam stays opt-in for isolated 11b4b2 tests. */
                 if (method == M_SET_OBJECT) {
-                    if (!d->pfifo.fixture_execution || !param ||
-                        d->pfifo.fixture_object[subchannel] != param ||
-                        d->pfifo.fixture_class[subchannel] != NV097_CLASS) {
-                        d->pfifo.submit_diag = NV2A_SUBMIT_UNSUPPORTED_METHOD;
+                    uint32_t class_id = 0;
+                    bool bound = false;
+                    if (d->pfifo.fixture_execution) {
+                        if (param &&
+                            d->pfifo.fixture_object[subchannel] == param &&
+                            d->pfifo.fixture_class[subchannel] == NV097_CLASS) {
+                            class_id = NV097_CLASS;
+                            bound = true;
+                        }
+                        if (!bound) {
+                            d->pfifo.submit_diag = NV2A_SUBMIT_UNSUPPORTED_METHOD;
+                            d->pfifo.submit_diag_get = address;
+                            d->pfifo.submit_diag_subchannel = subchannel;
+                            d->pfifo.submit_diag_method = method;
+                            d->pfifo.submit_diag_param = param;
+                            ok = false; goto done;
+                        }
+                    } else if (!ramht_lookup_class(d, param, &class_id)) {
+                        d->pfifo.submit_diag = NV2A_SUBMIT_INVALID_HANDLE;
                         d->pfifo.submit_diag_get = address;
                         d->pfifo.submit_diag_subchannel = subchannel;
                         d->pfifo.submit_diag_method = method;
                         d->pfifo.submit_diag_param = param;
                         ok = false; goto done;
                     }
-                    staged_class[subchannel] = d->pfifo.fixture_class[subchannel];
+                    staged_class[subchannel] = class_id;
                     staged_object[subchannel] = param;
                 } else if (method != 0x0100u &&
                            !(staged_class[subchannel] == NV097_CLASS &&
@@ -1116,8 +1244,10 @@ const NV2ABlockInfo blocktable[NV_NUM_BLOCKS] = {
     STUB_ENTRY(PRMCIO,        0x601000, 0x001000),
     ENTRY(PRAMDAC,  pramdac,  0x680000, 0x001000),
     STUB_ENTRY(PRMDIO,        0x681000, 0x001000),
-    /* NV_PRAMIN = 19 */
-    { .name = NULL },
+    /* NV_PRAMIN = 19.  It is handled specially by nv2a_mmio_read/write so
+     * the block's backing can be rebound to the claimed instance window. */
+    { .name = "PRAMIN", .offset = 0x700000, .size = 0x100000,
+      .ops = { .read = nv2a_stub_read, .write = nv2a_stub_write } },
     /* NV_USER = 20 */
     ENTRY(USER,      user,      0x800000, 0x800000),
 };
@@ -1131,6 +1261,18 @@ const NV2ABlockInfo blocktable[NV_NUM_BLOCKS] = {
 
 uint64_t nv2a_mmio_read(NV2AState *d, hwaddr addr, unsigned int size)
 {
+    if (addr >= 0x700000 && addr < 0x800000) {
+        uint32_t offset = (uint32_t)(addr - 0x700000);
+        if (d && d->ramin_ptr && size >= 1 && size <= 4 &&
+            offset <= d->ramin.size && size <= d->ramin.size - offset) {
+            uint32_t value = 0;
+            memcpy(&value, d->ramin_ptr + offset, size);
+            return value;
+        }
+        NV2A_DPRINTF("PRAMIN read outside bound offset=0x%x size=%u\n",
+                     offset, size);
+        return 0;
+    }
     /* Find which block handles this address */
     for (int i = 0; i < NV_NUM_BLOCKS; i++) {
         if (!blocktable[i].name) continue;
@@ -1146,6 +1288,17 @@ uint64_t nv2a_mmio_read(NV2AState *d, hwaddr addr, unsigned int size)
 
 void nv2a_mmio_write(NV2AState *d, hwaddr addr, uint64_t val, unsigned int size)
 {
+    if (addr >= 0x700000 && addr < 0x800000) {
+        uint32_t offset = (uint32_t)(addr - 0x700000);
+        if (d && d->ramin_ptr && size >= 1 && size <= 4 &&
+            offset <= d->ramin.size && size <= d->ramin.size - offset) {
+            memcpy(d->ramin_ptr + offset, &val, size);
+            return;
+        }
+        NV2A_DPRINTF("PRAMIN write outside bound offset=0x%x size=%u\n",
+                     offset, size);
+        return;
+    }
     for (int i = 0; i < NV_NUM_BLOCKS; i++) {
         if (!blocktable[i].name) continue;
         if (addr >= blocktable[i].offset &&
@@ -1177,10 +1330,16 @@ NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
     d->vram_ptr = vram_ptr;
     d->vram_pci.size = vram_size;
 
-    /* Set up RAMIN */
-    g_ramin_region.size = ramin_size;
-    d->ramin.size = ramin_size;
-    d->ramin_ptr = ramin_ptr;
+    /* PRAMIN has no backing until MmClaimGpuInstanceMemory publishes the
+     * validated physical instance range.  The legacy detached allocation is
+     * retained in the constructor signature for source compatibility only. */
+    (void)ramin_ptr;
+    (void)ramin_size;
+    if (g_pending_instance_host_ptr) {
+        d->ramin.size = g_pending_instance_size;
+        d->ramin_ptr = g_pending_instance_host_ptr;
+        d->ramin_guest_base = g_pending_instance_guest_base;
+    }
 
     /* PCI config space: NV2A vendor/device */
     pci_set_long(d->parent_obj.config + PCI_VENDOR_ID, 0x02A010DE); /* NVIDIA NV2A */
@@ -1202,8 +1361,9 @@ NV2AState *nv2a_init_standalone(uint8_t *vram_ptr, uint32_t vram_size,
 
     g_nv2a = d;
 
-    fprintf(stderr, "[NV2A] Standalone GPU initialized: VRAM=%uMB RAMIN=%uKB\n",
-            vram_size / (1024*1024), ramin_size / 1024);
+    fprintf(stderr, "[NV2A] Standalone GPU initialized: VRAM=%uMB RAMIN=%s\n",
+            vram_size / (1024*1024),
+            d->ramin_ptr ? "instance-bound" : "unbound");
 
     return d;
 }
