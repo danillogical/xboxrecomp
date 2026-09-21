@@ -1176,6 +1176,30 @@ uint64_t pfifo_read(void *opaque, hwaddr addr, unsigned int size)
     case NV_PFIFO_INTR_EN_0:
         r = d->pfifo.enabled_interrupts;
         break;
+    case NV_PFIFO_CACHE1_STATUS:
+        /* The model consumes a submission synchronously inside
+         * nv2a_submit_pending, so cache1 is always drained and therefore always
+         * below the low watermark. Reporting the low mark is what "drained"
+         * means to a guest that polls it.
+         *
+         * JSRF spins on exactly this: 0x00194A72 loops at 0x194A78 and only
+         * leaves at 0x194ABF when CACHE1_STATUS bit 4 AND RUNOUT_STATUS bit 4
+         * are set and CACHE1_DMA_PUSH bit 4 is clear. With plain storage all
+         * three read 0, so the loop never terminates -- 3.2M MMIO accesses in
+         * 62s with no further kernel calls. */
+        r = NV_PFIFO_CACHE1_STATUS_LOW_MARK;
+        break;
+    case NV_PFIFO_RUNOUT_STATUS:
+        /* Same contract for the runout FIFO, which the same loop polls at
+         * guest offset 0x2400 (block-local 0x400). */
+        r = NV_PFIFO_RUNOUT_STATUS_LOW_MARK;
+        break;
+    case NV_PFIFO_CACHE1_DMA_PUSH:
+        /* Idle pusher: DMA_PUSH_STATE (bit 4) clear, so the guest's third
+         * condition holds. Explicit rather than incidental, because the same
+         * loop treats a set STATE bit as "still busy" and spins. */
+        r = d->pfifo.regs[addr] & ~NV_PFIFO_CACHE1_DMA_PUSH_STATE;
+        break;
     default:
         r = d->pfifo.regs[addr];
         break;

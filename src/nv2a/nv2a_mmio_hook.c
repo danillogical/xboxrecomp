@@ -815,46 +815,91 @@ bool nv2a_hook_run_decoder_tests(void)
 }
 
 /* ── MMIO access trace (RECOMP_MMIO_TRACE=1) ───────────────────────────────
- * A polled register is otherwise invisible: the hook handles the fault and
- * returns CONTINUE_EXECUTION, so neither the game log nor any other
- * diagnostic ever sees the address. That makes "which register is this guest
- * loop waiting on" unanswerable without recording it here. Off unless the
- * environment variable is set, so ordinary runs are unaffected. */
-#define MMIO_TRACE_SLOTS 96
-static struct { uint32_t offset; uint32_t count; uint64_t rip; } g_mmio_trace[MMIO_TRACE_SLOTS];
-static int g_mmio_trace_used = 0;
+ * A handled MMIO fault is invisible otherwise: the hook returns
+ * CONTINUE_EXECUTION, so the game log never sees the address, the collector's
+ * exception lines carry no address, and a deadline run writes no
+ * ExceptionStream to the minidump. That makes "which register is this guest
+ * loop waiting on, and how far does it sweep" unanswerable from any artifact a
+ * run produces.
+ *
+ * Hashed by faulting RIP, not linear-scanned and not keyed by offset. Both
+ * alternatives were tried and both mislead: an offset-keyed table cannot tell a
+ * poll from a sweep (it fills with the sweep's own addresses and reports a
+ * meaningless "hottest offset count=8"), and a 256-entry linear table fills
+ * immediately on this title -- 3.19M of 3.2M accesses landed in "untracked" and
+ * the hot site was invisible. Per RIP the trace keeps the count and the
+ * minimum/maximum offset seen, which is what separates a poll (min == max) from
+ * a bounded sweep from a runaway one. Off unless RECOMP_MMIO_TRACE is set. */
+#define MMIO_TRACE_SLOTS 4096            /* power of two */
+static struct {
+    uint64_t rip;
+    unsigned long count;
+    uint32_t min_off, max_off;
+    unsigned long writes;
+} g_mmio_sites[MMIO_TRACE_SLOTS];
+static unsigned long g_mmio_site_used = 0;
 static int g_mmio_trace_enabled = -1;
 static unsigned long g_mmio_trace_total = 0;
+static unsigned long g_mmio_trace_untracked = 0;
 
-static void mmio_trace_record(uint32_t offset, uint64_t rip)
+static void mmio_trace_dump(void)
 {
-    int i;
+    int picked[12];
+    int npicked = 0, pass, i, j, skip;
+    fprintf(stderr, "  [NV2A-TRACE] total=%lu sites=%lu untracked=%lu top:\n",
+            g_mmio_trace_total, g_mmio_site_used, g_mmio_trace_untracked);
+    for (pass = 0; pass < 12; pass++) {
+        unsigned long best = 0;
+        int bi = -1;
+        for (i = 0; i < MMIO_TRACE_SLOTS; i++) {
+            if (!g_mmio_sites[i].count) continue;
+            skip = 0;
+            for (j = 0; j < npicked; j++) if (picked[j] == i) { skip = 1; break; }
+            if (skip) continue;
+            if (g_mmio_sites[i].count > best) { best = g_mmio_sites[i].count; bi = i; }
+        }
+        if (bi < 0) break;
+        picked[npicked++] = bi;
+        fprintf(stderr, "    rip=0x%llX count=%lu off=0x%06X..0x%06X span=0x%X writes=%lu\n",
+                (unsigned long long)g_mmio_sites[bi].rip, g_mmio_sites[bi].count,
+                g_mmio_sites[bi].min_off, g_mmio_sites[bi].max_off,
+                g_mmio_sites[bi].max_off - g_mmio_sites[bi].min_off,
+                g_mmio_sites[bi].writes);
+    }
+    fflush(stderr);
+}
+
+static void mmio_trace_record(uint32_t offset, uint64_t rip, int is_write)
+{
+    uint32_t h, s, probe;
     if (g_mmio_trace_enabled < 0)
         g_mmio_trace_enabled = getenv("RECOMP_MMIO_TRACE") ? 1 : 0;
     if (!g_mmio_trace_enabled) return;
     g_mmio_trace_total++;
-    for (i = 0; i < g_mmio_trace_used; i++) {
-        if (g_mmio_trace[i].offset == offset) { g_mmio_trace[i].count++; break; }
+    h = (uint32_t)((rip * 2654435761ull) >> 19) & (MMIO_TRACE_SLOTS - 1);
+    for (probe = 0; probe < 64; probe++) {
+        s = (h + probe) & (MMIO_TRACE_SLOTS - 1);
+        if (g_mmio_sites[s].count == 0) {
+            g_mmio_sites[s].rip = rip;
+            g_mmio_sites[s].min_off = offset;
+            g_mmio_sites[s].max_off = offset;
+            g_mmio_sites[s].writes = 0;
+            g_mmio_site_used++;
+            break;
+        }
+        if (g_mmio_sites[s].rip == rip) break;
     }
-    if (i == g_mmio_trace_used && g_mmio_trace_used < MMIO_TRACE_SLOTS) {
-        g_mmio_trace[g_mmio_trace_used].offset = offset;
-        g_mmio_trace[g_mmio_trace_used].count = 1;
-        g_mmio_trace[g_mmio_trace_used].rip = rip;
-        g_mmio_trace_used++;
-        fprintf(stderr, "  [NV2A-TRACE] new offset=0x%06X first_rip=0x%llX (total=%lu)\n",
-                offset, (unsigned long long)rip, g_mmio_trace_total);
-        fflush(stderr);
+    if (probe == 64) {
+        /* Keep counting and keep dumping. Returning here is how the previous
+         * revision went silent once its table filled. */
+        g_mmio_trace_untracked++;
+    } else {
+        g_mmio_sites[s].count++;
+        if (offset < g_mmio_sites[s].min_off) g_mmio_sites[s].min_off = offset;
+        if (offset > g_mmio_sites[s].max_off) g_mmio_sites[s].max_off = offset;
+        if (is_write) g_mmio_sites[s].writes++;
     }
-    if (g_mmio_trace_total % 200000u == 0u) {
-        int best = -1;
-        for (i = 0; i < g_mmio_trace_used; i++)
-            if (best < 0 || g_mmio_trace[i].count > g_mmio_trace[best].count) best = i;
-        if (best >= 0)
-            fprintf(stderr, "  [NV2A-TRACE] total=%lu hottest offset=0x%06X count=%u rip=0x%llX\n",
-                    g_mmio_trace_total, g_mmio_trace[best].offset,
-                    g_mmio_trace[best].count, (unsigned long long)g_mmio_trace[best].rip);
-        fflush(stderr);
-    }
+    if (g_mmio_trace_total % 200000u == 0u) mmio_trace_dump();
 }
 
 bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
@@ -868,7 +913,7 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
         fault_addr >= (uintptr_t)g_mmio_aperture + NV2A_MMIO_SIZE)
         return false;
 
-    mmio_trace_record(mmio_offset, ctx->Rip);
+    mmio_trace_record(mmio_offset, ctx->Rip, is_write);
 
     AcquireSRWLockExclusive(&g_mmio_owner_lock);
     if (!InterlockedCompareExchange(&g_mmio_owner_active, 0, 0)) {
