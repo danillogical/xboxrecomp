@@ -149,11 +149,19 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
  * struct, so it is registered as the chain of indirections to follow:
  *
  *     device = MEM32(device_ptr_va)
- *     fence  = MEM32(device + get_ptr_off)
- *     MEM32(fence) = MEM32(device + put_off)
+ *     fence  = MEM32(device + ptr_off)
+ *     MEM32(fence) = MEM32(device + src_off)
  *
  * Every step is bounds-checked each poll, so registering a chain that is not
  * yet initialised (or never becomes valid) is harmless.
+ *
+ * src_off names the device field holding the fence VALUE the title compares
+ * against, and is not necessarily a push buffer position. JSRF waits on the
+ * word at `*(device + 0x34)` and compares it against the counter at
+ * `device + 0x30`; publishing the push buffer position there instead makes
+ * the wait's `limit - value` subtraction wrap and the comparison invert, so
+ * the wait never ends. What the wait needs is the counter, which is what the
+ * synchronous model has completed.
  *
  * Returns 0 on success, -1 if the table is full.
  */
@@ -186,7 +194,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 uint32_t xbox_ContiguousAllocatedBytes(void);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
-                         uint32_t put_off, uint32_t get_ptr_off);
+                         uint32_t src_off, uint32_t ptr_off);
 
 void xbox_MemoryLayoutShutdown(void);
 

@@ -987,6 +987,32 @@ static bool ramht_lookup_class(NV2AState *d, uint32_t handle, uint32_t *class_id
     return *class_id != 0;
 }
 
+/* ── PFIFO pointer trace ────────────────────────────────────────────────
+ * "Why did the ring not drain" is almost always "what were GET and PUT when
+ * the kick arrived", and the answer is a write history, not a value.  The
+ * submission diagnostic prints the state at the kick; this prints how it got
+ * there.  A title that never writes DMA GET leaves it at its reset value, and
+ * that is invisible in any single reading -- it only shows up as a walk that
+ * starts somewhere other than the ring.
+ *
+ * Gated by RECOMP_PFIFO_TRACE because it is per-write.  Bounded, because a
+ * title that spins on a register would otherwise fill the log. */
+static int pfifo_trace_enabled = -1;
+static unsigned pfifo_trace_lines;
+
+static void pfifo_trace(const char *site, uint32_t reg, uint32_t value)
+{
+    const char *name;
+    if (pfifo_trace_enabled < 0)
+        pfifo_trace_enabled = getenv("RECOMP_PFIFO_TRACE") != NULL;
+    if (!pfifo_trace_enabled || pfifo_trace_lines >= 256)
+        return;
+    name = reg == NV_PFIFO_CACHE1_DMA_GET ? "DMA_GET" : "DMA_PUT";
+    fprintf(stderr, "  [PFIFO] %-14s %s = %08X\n", site, name, value);
+    fflush(stderr);
+    pfifo_trace_lines++;
+}
+
 bool nv2a_submit_pending(NV2AState *d)
 {
     uint32_t get, put, pc, ret = 0, words = 0, packets = 0;
@@ -1146,6 +1172,7 @@ bool nv2a_submit_pending(NV2AState *d)
             d->pfifo.submit_last_param = staged[staged_count - 1].param;
         }
         d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = pc;
+        pfifo_trace("submit_commit", NV_PFIFO_CACHE1_DMA_GET, pc);
         ++d->pfifo.submit_successes;
         d->pfifo.submit_diag = NV2A_SUBMIT_OK;
     }
@@ -1175,6 +1202,7 @@ static void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int siz
      * USER-local slot instead would make a kick invisible to user_read and
      * to nv2a_submit_pending, which read the PFIFO slots. */
     if (addr == NV_USER_DMA_GET) {
+        pfifo_trace("user_write", NV_PFIFO_CACHE1_DMA_GET, (uint32_t)val);
         qemu_mutex_lock(&d->pfifo.lock);
         d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = (uint32_t)val;
         qemu_mutex_unlock(&d->pfifo.lock);
@@ -1186,6 +1214,7 @@ static void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int siz
          * bit.  Clearing it is the acknowledgement the guest waits for;
          * leaving it set spins 0x00191290 forever. */
         uint32_t offset = (uint32_t)val & NV_PFIFO_CACHE1_DMA_PUT_OFFSET;
+        pfifo_trace("user_write", NV_PFIFO_CACHE1_DMA_PUT, offset);
         qemu_mutex_lock(&d->pfifo.lock);
         if (val & NV_PFIFO_CACHE1_DMA_PUT_KICK) {
             d->pfifo.kick_requests++;
@@ -1271,6 +1300,9 @@ void pfifo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
     NV2AState *d = (NV2AState *)opaque;
 
     nv2a_reg_log_write(NV_PFIFO, addr, size, val);
+
+    if (addr == NV_PFIFO_CACHE1_DMA_GET || addr == NV_PFIFO_CACHE1_DMA_PUT)
+        pfifo_trace("pfifo_write", (uint32_t)addr, (uint32_t)val);
 
     switch (addr) {
     case NV_PFIFO_INTR_0:

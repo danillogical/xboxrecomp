@@ -271,23 +271,23 @@ static int g_apu_mmio_trapped = 0;
 
 static struct {
     uint32_t device_ptr_va;
-    uint32_t put_off;
-    uint32_t get_ptr_off;
+    uint32_t src_off;
+    uint32_t ptr_off;
 } g_fence_mirrors[XBOX_MAX_FENCE_MIRRORS];
 static int g_fence_mirror_count = 0;
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
-                         uint32_t put_off, uint32_t get_ptr_off)
+                         uint32_t src_off, uint32_t ptr_off)
 {
     if (g_fence_mirror_count >= XBOX_MAX_FENCE_MIRRORS)
         return -1;
     g_fence_mirrors[g_fence_mirror_count].device_ptr_va = device_ptr_va;
-    g_fence_mirrors[g_fence_mirror_count].put_off = put_off;
-    g_fence_mirrors[g_fence_mirror_count].get_ptr_off = get_ptr_off;
+    g_fence_mirrors[g_fence_mirror_count].src_off = src_off;
+    g_fence_mirrors[g_fence_mirror_count].ptr_off = ptr_off;
     g_fence_mirror_count++;
     fprintf(stderr, "  NV2A fence mirror: device at 0x%08X,"
-            " PUT +0x%X -> *(GET +0x%X)\n",
-            device_ptr_va, put_off, get_ptr_off);
+            " +0x%X -> *(+0x%X)\n",
+            device_ptr_va, src_off, ptr_off);
     return 0;
 }
 
@@ -457,21 +457,21 @@ static void fence_mirrors_tick(void)
             continue;
         dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
                                      + g_memory_offset);
-        if (!fence_readable(dev + g_fence_mirrors[i].get_ptr_off, 4)
-                || !fence_readable(dev + g_fence_mirrors[i].put_off, 4))
+        if (!fence_readable(dev + g_fence_mirrors[i].ptr_off, 4)
+                || !fence_readable(dev + g_fence_mirrors[i].src_off, 4))
             continue;
-        get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].get_ptr_off)
+        get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].ptr_off)
                                          + g_memory_offset);
         if (!fence_readable(get_ptr, 4))
             continue;
         {
             volatile uint32_t *fence =
                 (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
-            uint32_t put =
-                *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].put_off)
+            uint32_t value =
+                *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].src_off)
                                        + g_memory_offset);
-            if (*fence != put)
-                *fence = put;
+            if (*fence != value)
+                *fence = value;
         }
     }
 }
@@ -1605,17 +1605,35 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * loaded and then a fault, versus one asset and a stall in audio
              * init. Until the DSP handshake is answered, the honest default is
              * the failure that gets further, with the correct behaviour one
-             * variable away. */
+             * variable away.
+             *
+             * RECOMP_AC97_READY asks only for the codec bit. RECOMP_APU_TRAP
+             * additionally unmaps the APU, and only makes sense once a caller
+             * routes those faults somewhere. */
             if (getenv("RECOMP_AC97_READY")) {
-                /* The APU's registers have to fault so they can be routed to
-                 * the emulated APU, which is the half that answers the DSP
-                 * handshake. Backed as plain memory the guest's writes go
-                 * nowhere the APU can see, so it initialises and then waits
-                 * forever. Only the APU's own 512K is unmapped: AC'97 above it
-                 * stays plain memory, which is what the codec-ready bit needs.
-                 *
-                 * Enabled by the same variable, because neither half is any
-                 * use without the other. */
+                *(volatile uint32_t *)((char *)g_mcpx_memory
+                                       + MCPX_AC97_CODEC_STATUS)
+                    |= MCPX_AC97_CODEC_READY;
+                fprintf(stderr, "  AC97: codec reported ready at 0x%08X"
+                                " (DirectSound will initialise)\n",
+                        XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
+            }
+            /* The APU's own 512K can be unmapped so its register traffic can be
+             * routed to the emulated APU, which is the half that answers the
+             * DSP handshake. Only the APU's 512K is unmapped: AC'97 above it
+             * stays plain memory, which is what the codec-ready bit needs.
+             *
+             * Separate from RECOMP_AC97_READY, and that separation is the
+             * point. They used to be the same variable, so asking for the
+             * codec-ready bit also unmapped the APU -- and nothing in either
+             * repository ever called apu_hook_handle_mmio, so the first APU
+             * register access faulted and killed the process. JSRF reaches
+             * 0xFE811100 within two seconds under RECOMP_AC97_READY for exactly
+             * that reason (logs/runs/20260922-055053-100-p4-ac97). Two switches
+             * make the two behaviours independently reachable: the codec bit
+             * alone is a complete experiment, and the trap is only asked for
+             * when a handler is wired. */
+            if (getenv("RECOMP_APU_TRAP")) {
                 DWORD old_protect;
                 if (VirtualProtect((char *)g_mcpx_memory, 0x00080000u,
                                    PAGE_NOACCESS, &old_protect))
@@ -1623,12 +1641,10 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 if (g_apu_mmio_trapped)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO\n",
                             XBOX_MCPX_BASE, XBOX_MCPX_BASE + 0x00080000u);
-                *(volatile uint32_t *)((char *)g_mcpx_memory
-                                       + MCPX_AC97_CODEC_STATUS)
-                    |= MCPX_AC97_CODEC_READY;
-                fprintf(stderr, "  AC97: codec reported ready at 0x%08X"
-                                " (DirectSound will initialise)\n",
-                        XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
+                else
+                    fprintf(stderr, "  APU: trap requested but VirtualProtect"
+                                    " failed (error %lu); registers stay"
+                                    " plain memory\n", GetLastError());
             }
             fprintf(stderr, "  MCPX device aperture: %u MB at Xbox VA "
                     "0x%08X (APU/AC97/USB/NIC, zeroed)\n",
