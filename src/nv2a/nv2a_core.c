@@ -970,6 +970,7 @@ bool nv2a_submit_pending(NV2AState *d)
 {
     uint32_t get, put, pc, ret = 0, words = 0, packets = 0;
     uint32_t seen[1024]; unsigned seen_count = 0;
+    uint32_t trace[32] = { 0 };   /* ring of recent walk addresses, for the budget dump */
     struct { uint32_t subchannel, method, param; } staged[256];
     uint32_t staged_count = 0;
     uint32_t staged_class[8], staged_object[8];
@@ -994,7 +995,25 @@ bool nv2a_submit_pending(NV2AState *d)
     pc = get;
     while (pc != put) {
         uint32_t h, address = pc;
-        if (words >= 1024 || packets >= 256) { d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false; break; }
+        trace[words & 31u] = address;
+        if (words >= 1024 || packets >= 256) {
+            d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false;
+            /* A straight-line walk cannot consume more than PUT-GET words, so
+             * reaching the budget means a jump or call target moved pc and the
+             * walk kept going. Without the path this is indistinguishable from
+             * "the ring is simply large", which it is not. */
+            fprintf(stderr, "  [PFIFO] budget_exhausted get=%08X put=%08X"
+                    " begin=%08X end=%08X words=%u packets=%u pc=%08X\n",
+                    get, put, begin, end, words, packets, pc);
+            fprintf(stderr, "          last 32 visit addresses:");
+            for (unsigned i = 0; i < 32; ++i) {
+                if (i % 8u == 0u) fprintf(stderr, "\n            ");
+                fprintf(stderr, "%08X ", trace[(words - 32u + i) & 31u]);
+            }
+            fprintf(stderr, "\n");
+            fflush(stderr);
+            break;
+        }
         for (unsigned i = 0; i < seen_count; ++i) if (seen[i * 2] == pc && seen[i * 2 + 1] == ret) { d->pfifo.submit_diag = NV2A_SUBMIT_LOOP; ok = false; goto done; }
         if (seen_count < 512) { seen[seen_count * 2] = pc; seen[seen_count * 2 + 1] = ret; ++seen_count; }
         if (!submit_read_word(d, pc, &h)) { d->pfifo.submit_diag = NV2A_SUBMIT_UNREADABLE; ok = false; break; }
