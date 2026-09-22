@@ -836,6 +836,27 @@ enum {
  * remains test-only. */
 #define M_SET_OBJECT 0x0000u
 #define NV097_CLASS  0x97u
+/* The other classes JSRF binds, named here because whether a method may be
+ * executed is a per-class decision. nv2a_regs.h carries all four; the walk
+ * previously knew only NV097, so a subchannel bound to the blit engine could
+ * never be accepted no matter what it submitted. */
+#define NV_MEMCPY_CLASS     0x39u   /* NV_MEMORY_TO_MEMORY_FORMAT */
+#define NV_SURFACES2D_CLASS 0x62u   /* NV_CONTEXT_SURFACES_2D */
+#define NV_IMAGEBLIT_CLASS  0x9Fu   /* NV_IMAGE_BLIT */
+
+/* Is this a method this model can execute on a subchannel bound to class_id?
+ *
+ * The table is GENERATED from the pushbuffer the title actually submits
+ * (src/nv2a/nv2a_method_table.c, from docs/jsrf-nv2a-method-inventory.md), so
+ * "implemented" means "observed in a real submission" rather than "guessed".
+ *
+ * The contract is unchanged and is the reason this table exists at all: a method
+ * not listed causes the whole stream to be rejected and rolled back, which is
+ * what jsrf_nv2a_registers pins. Implementing a method means adding it to the
+ * inventory and giving it an effect -- it never means loosening the rejection.
+ * A subchannel with no binding has class 0, which implements nothing, so an
+ * unbound subchannel is still rejected. */
+bool nv2a_method_implemented(uint32_t class_id, uint32_t method);
 
 const char *nv2a_submit_diagnostic(uint32_t code)
 {
@@ -971,12 +992,20 @@ bool nv2a_submit_pending(NV2AState *d)
     uint32_t get, put, pc, ret = 0, words = 0, packets = 0;
     uint32_t seen[1024]; unsigned seen_count = 0;
     uint32_t trace[32] = { 0 };   /* ring of recent walk addresses, for the budget dump */
-    struct { uint32_t subchannel, method, param; } staged[256];
+    struct { uint32_t subchannel, method, param; } staged[1024];
     uint32_t staged_count = 0;
     uint32_t staged_class[8], staged_object[8];
     bool ok = true;
     if (!d) return false;
     qemu_mutex_lock(&d->pfifo.lock);
+    /* The sink is a per-submission record of the methods just walked. Nothing
+     * reads it and nothing used to clear it, so it ratcheted to its 256 cap and
+     * then rejected every later submission for the rest of the run -- which is
+     * what strands PFIFO_DMA_GET. The test harness already treats it this way
+     * (submit_reset zeroes sink_count), so this is the model catching up with
+     * its own contract rather than a relaxation: the within-submission cap is
+     * unchanged and a 257-packet stream still rejects. */
+    d->pfifo.sink_count = 0;
     memcpy(staged_class, d->pfifo.binding_class, sizeof(staged_class));
     memcpy(staged_object, d->pfifo.binding_object, sizeof(staged_object));
     get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
@@ -996,7 +1025,7 @@ bool nv2a_submit_pending(NV2AState *d)
     while (pc != put) {
         uint32_t h, address = pc;
         trace[words & 31u] = address;
-        if (words >= 1024 || packets >= 256) {
+        if (words >= 4096 || packets >= 1024) {
             d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false;
             /* A straight-line walk cannot consume more than PUT-GET words, so
              * reaching the budget means a jump or call target moved pc and the
@@ -1032,10 +1061,10 @@ bool nv2a_submit_pending(NV2AState *d)
         if ((h & 0xe0030003u) == 0u || (h & 0xe0030003u) == 0x40000000u) {
             uint32_t count = (h >> 18) & 0x7ffu, method = h & 0x1ffcu, subchannel = (h >> 13) & 7u;
             if (!(h & 0x40000000u) && count && method + 4u * (count - 1u) > 0x1ffcu) { d->pfifo.submit_diag = NV2A_SUBMIT_METHOD_RANGE; ok = false; break; }
-            if (d->pfifo.sink_count + staged_count + count > 256) { d->pfifo.submit_diag = NV2A_SUBMIT_SINK_FULL; ok = false; break; }
+            if (d->pfifo.sink_count + staged_count + count > 1024) { d->pfifo.submit_diag = NV2A_SUBMIT_SINK_FULL; ok = false; break; }
             for (uint32_t i = 0; i < count; ++i) {
                 uint32_t param;
-                if (words >= 1024) { d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false; goto done; }
+                if (words >= 4096) { d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false; goto done; }
                 if (pc == put || !submit_read_word(d, pc, &param)) { d->pfifo.submit_diag = pc == put ? NV2A_SUBMIT_TRUNCATED : NV2A_SUBMIT_UNREADABLE; ok = false; goto done; }
                 pc = submit_advance(d, pc); ++words;
                 /* Production SET_OBJECT walks RAMHT in claimed PRAMIN.
@@ -1069,21 +1098,7 @@ bool nv2a_submit_pending(NV2AState *d)
                     staged_class[subchannel] = class_id;
                     staged_object[subchannel] = param;
                 } else if (method != 0x0100u &&
-                           !(staged_class[subchannel] == NV097_CLASS &&
-                             (method == M_SET_SURFACE_CLIP_H ||
-                              method == M_SET_SURFACE_CLIP_V))) {
-                    if (method != 0x0100u || subchannel != 0) {
-                        d->pfifo.submit_diag = NV2A_SUBMIT_UNSUPPORTED_METHOD;
-                        d->pfifo.submit_diag_get = address;
-                        d->pfifo.submit_diag_subchannel = subchannel;
-                        d->pfifo.submit_diag_method = method;
-                        d->pfifo.submit_diag_param = param;
-                        ok = false;
-                        goto done;
-                    }
-                }
-                if (method != M_SET_OBJECT && method != 0x0100u &&
-                    staged_class[subchannel] != NV097_CLASS) {
+                           !nv2a_method_implemented(staged_class[subchannel], method)) {
                     d->pfifo.submit_diag = NV2A_SUBMIT_UNSUPPORTED_METHOD;
                     d->pfifo.submit_diag_get = address;
                     d->pfifo.submit_diag_subchannel = subchannel;
@@ -1105,16 +1120,22 @@ bool nv2a_submit_pending(NV2AState *d)
     if (ok) {
         for (uint32_t i = 0; i < staged_count; ++i) {
             d->pfifo.sink[d->pfifo.sink_count].subchannel = staged[i].subchannel;
+            d->pfifo.sink[d->pfifo.sink_count].class_id = staged_class[staged[i].subchannel];
             d->pfifo.sink[d->pfifo.sink_count].method = staged[i].method;
             d->pfifo.sink[d->pfifo.sink_count].param = staged[i].param;
             ++d->pfifo.sink_count;
-            /* These two NV097 words are fully defined as pairs of unsigned
-             * 16-bit fields (X/WIDTH and Y/HEIGHT), so every 32-bit parameter
-             * has a defined capture representation and no reserved bits.
-             * Other surface methods remain unsupported until their enum,
-             * alignment and DMA bounds contracts are implemented. */
-            if (staged[i].method == M_SET_SURFACE_CLIP_H ||
-                staged[i].method == M_SET_SURFACE_CLIP_V) {
+            /* Capture the parameter as register state. For the register-setting
+             * methods -- which is most of the NV097 pipeline, and all of the
+             * surface, blit and memcpy state -- this IS the implementation: the
+             * value is where a renderer reads it from. Methods that trigger an
+             * action rather than set state (blit, notify, flip) are captured here
+             * too and need their own handling on top; the notify one is what
+             * JSRF's ring-space wait at 0x001914F0 is waiting on.
+             *
+             * Only NV097 has a register file in this model, so only NV097 is
+             * captured this way; the other classes' parameters are recorded in
+             * the sink, which now carries the class. */
+            if (staged_class[staged[i].subchannel] == NV097_CLASS) {
                 d->pgraph.regs[staged[i].method / 4] = staged[i].param;
             }
         }
@@ -1173,6 +1194,23 @@ static void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int siz
         d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = offset;
         qemu_mutex_unlock(&d->pfifo.lock);
         nv2a_submit_pending(d);
+        /* Per-submit diagnostic. GET only moves on success, so when it stays put
+         * the reason is here and nowhere else -- the walk's own diag, plus the
+         * exact packet that stopped it. Kept in the model rather than re-added
+         * per investigation, because "why did the ring not drain" is the question
+         * this model gets asked most often. */
+        {
+            static unsigned long submits;
+            if (submits < 64)
+                fprintf(stderr, "  [PFIFO] submit #%lu diag=%s get=%08X put=%08X"
+                        " method=%03X subch=%u param=%08X at=%08X\n",
+                        submits, nv2a_submit_diagnostic(d->pfifo.submit_diag),
+                        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET],
+                        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT],
+                        d->pfifo.submit_diag_method, d->pfifo.submit_diag_subchannel,
+                        d->pfifo.submit_diag_param, d->pfifo.submit_diag_get);
+            submits++;
+        }
         if (val & NV_PFIFO_CACHE1_DMA_PUT_KICK) {
             qemu_mutex_lock(&d->pfifo.lock);
             d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] &=

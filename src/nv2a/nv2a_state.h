@@ -139,7 +139,10 @@ typedef struct NV2AState {
         uint32_t fixture_object[8];
         bool fixture_execution;
         uint32_t sink_count;
-        struct { uint32_t subchannel, method, param; } sink[256];
+        /* class_id is recorded because the same method number means different
+         * things in different classes -- 0x2FC is NV09F_SET_OPERATION and an
+         * NV097 surface method, and both appear in JSRF's stream. */
+        struct { uint32_t subchannel, class_id, method, param; } sink[1024];
     } pfifo;
 
     struct {
