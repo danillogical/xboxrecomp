@@ -40,6 +40,15 @@ void nv2a_hook_shutdown(void);
 /* Focused decoder/flags/bounds regression used by the integration probe. */
 bool nv2a_hook_run_decoder_tests(void);
 
+/* Route the card's interrupt line to its host owner.
+ *
+ * The standalone build compiles `pci_irq_assert` to a no-op, so the model
+ * otherwise aggregates its pending and enabled masks and tells nobody. The
+ * sink is called only when the line changes level. Call after
+ * `nv2a_hook_init`; returns false if no device is up yet. */
+bool nv2a_hook_set_irq_sink(void (*sink)(void *opaque, int asserted),
+                            void *opaque);
+
 /* Deterministic clock injection and wakeup for runtime integration tests. */
 bool nv2a_hook_set_ptimer_clock(uint64_t (*clock_ns)(void *), void *opaque);
 void nv2a_hook_notify_ptimer_clock_changed(void);

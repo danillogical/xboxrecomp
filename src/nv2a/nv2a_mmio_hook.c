@@ -520,7 +520,7 @@ static void publish_diagnostic_state(NV2AState *nv2a, bool extra_valid,
         0x001800, 0x001804, 0x001808,
         0x002100, 0x003240, 0x003244,
         0x009100, 0x009140, 0x009200, 0x009210, 0x009400, 0x009410,
-        0x10020C, 0x100410, 0x400100, 0x600100, 0x600800,
+        0x10020C, 0x100410, 0x400100, 0x600100, 0x600140, 0x600800,
         0x800040, 0x800044
     };
     enum { DIAG_COUNT = sizeof(offsets) / sizeof(offsets[0]) };
@@ -555,8 +555,10 @@ static DWORD WINAPI ptimer_service_thread(void *opaque)
 {
     NV2AState *nv2a = (NV2AState *)opaque;
     HANDLE wake = g_ptimer_wake_event;
+    uint64_t next_vblank_ns = 0;
+    uint64_t frame_ns = 0;
     for (;;) {
-        uint64_t delay_ns;
+        uint64_t delay_ns, now_ns;
         uint32_t pending_before, pmc_before;
         AcquireSRWLockExclusive(&g_mmio_owner_lock);
         if (InterlockedCompareExchange(&g_ptimer_stopping, 0, 0)) {
@@ -565,8 +567,35 @@ static DWORD WINAPI ptimer_service_thread(void *opaque)
         }
         pending_before = nv2a->ptimer.pending_interrupts;
         pmc_before = nv2a->pmc.pending_interrupts;
+
+        /* The display clock. Every other interrupt source in this model is
+         * driven by a guest register write; a vertical blank is the one that
+         * has to come from the card, so it lives on this service loop. */
+        now_ns = nv2a->ptimer.clock_ns ?
+            nv2a->ptimer.clock_ns(nv2a->ptimer.clock_opaque) :
+            (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        frame_ns = nv2a_display_frame_ns(nv2a);
+        if (next_vblank_ns == 0 || now_ns >= next_vblank_ns + frame_ns * 4) {
+            /* First frame, or the loop was away for several frames: re-arm
+             * from now rather than emitting a catch-up burst, which would
+             * present as a storm of interrupts the guest never saw. */
+            next_vblank_ns = now_ns + frame_ns;
+        } else if (now_ns >= next_vblank_ns) {
+            nv2a_vblank_pulse(nv2a);
+            next_vblank_ns += frame_ns;
+            if (next_vblank_ns <= now_ns) next_vblank_ns = now_ns + frame_ns;
+        }
+
         nv2a_ptimer_service(nv2a);
         delay_ns = nv2a_ptimer_next_alarm_ns(nv2a);
+        {
+            uint64_t until_vblank = next_vblank_ns > now_ns
+                                  ? next_vblank_ns - now_ns : 0;
+            if (until_vblank < delay_ns) delay_ns = until_vblank;
+        }
+        /* Never a zero-length wait: `ptimer_wait_ms(0)` returns immediately and
+         * this loop would spin instead of idling between frames. */
+        if (delay_ns < 1000000ull) delay_ns = 1000000ull;
         if (InterlockedCompareExchange(&g_mmio_owner_active, 0, 0) &&
             (pending_before != nv2a->ptimer.pending_interrupts ||
              pmc_before != nv2a->pmc.pending_interrupts)) {
@@ -934,6 +963,17 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     return handled;
 }
 
+bool nv2a_hook_set_irq_sink(void (*sink)(void *opaque, int asserted),
+                            void *opaque)
+{
+    NV2AState *nv2a = nv2a_get_state();
+    if (!nv2a) return false;
+    AcquireSRWLockExclusive(&g_mmio_owner_lock);
+    nv2a_set_irq_sink(nv2a, sink, opaque);
+    ReleaseSRWLockExclusive(&g_mmio_owner_lock);
+    return true;
+}
+
 bool nv2a_hook_pci_config_read(uint32_t offset, void *buffer, uint32_t length)
 {
     NV2AState *nv2a = nv2a_get_state();
@@ -1012,6 +1052,8 @@ bool nv2a_hook_install_aperture(void *aperture, size_t size)
 void nv2a_hook_disable_aperture(void) {}
 void nv2a_hook_shutdown(void) {}
 bool nv2a_hook_run_decoder_tests(void) { return false; }
+bool nv2a_hook_set_irq_sink(void (*sink)(void *opaque, int asserted), void *opaque)
+{ (void)sink; (void)opaque; return false; }
 bool nv2a_hook_set_ptimer_clock(uint64_t (*clock_ns)(void *), void *opaque)
 { (void)clock_ns; (void)opaque; return false; }
 void nv2a_hook_notify_ptimer_clock_changed(void) {}

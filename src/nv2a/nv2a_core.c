@@ -105,6 +105,24 @@ bool nv2a_pci_config_write(NV2AState *d, uint32_t offset,
  * IRQ aggregation (from xemu nv2a.c)
  * ============================================================ */
 
+int nv2a_irq_line_asserted(NV2AState *d)
+{
+    /* NV_PMC_INTR_EN_0 is a two-bit master enable (hardware/software), not a
+     * per-source mask: the per-source masks are the block registers, and
+     * `nv2a_update_irq` has already folded them into the PMC summary. So the
+     * line is "something is pending and interrupts are enabled at all". */
+    return d && d->pmc.pending_interrupts != 0 && d->pmc.enabled_interrupts != 0;
+}
+
+void nv2a_set_irq_sink(NV2AState *d,
+                       void (*sink)(void *opaque, int asserted), void *opaque)
+{
+    if (!d) return;
+    d->irq_sink = sink;
+    d->irq_sink_opaque = opaque;
+    d->irq_line_asserted = nv2a_irq_line_asserted(d);
+}
+
 void nv2a_update_irq(NV2AState *d)
 {
     /* PFIFO */
@@ -135,11 +153,85 @@ void nv2a_update_irq(NV2AState *d)
         d->pmc.pending_interrupts &= ~NV_PMC_INTR_0_PTIMER;
     }
 
-    if (d->pmc.pending_interrupts && d->pmc.enabled_interrupts) {
+    int asserted = nv2a_irq_line_asserted(d);
+    if (asserted) {
         pci_irq_assert(PCI_DEVICE(d));
     } else {
         pci_irq_deassert(PCI_DEVICE(d));
     }
+    /* Edge-report the level. `nv2a_update_irq` runs on every register write
+     * that touches a block's interrupt state, so reporting unconditionally
+     * would re-enter the guest's ISR for a line the guest has not cleared
+     * yet -- which is a livelock, not a level-triggered interrupt. */
+    if (d->irq_sink && asserted != d->irq_line_asserted) {
+        d->irq_line_asserted = asserted;
+        d->irq_sink(d->irq_sink_opaque, asserted);
+    }
+}
+
+/* ============================================================
+ * Display clock
+ *
+ * The card has a CRT controller that produces a vertical blank once per
+ * frame. The model previously had no source for it at all: the kernel's
+ * synthetic vblank poke OR-ed into NV_PMC_INTR_0 and NV_PCRTC_INTR_0, and
+ * both of those registers are write-1-to-clear, so the poke cleared pending
+ * bits instead of setting them. Nothing else asserted a pending bit, so
+ * `nv2a_update_irq` had nothing to aggregate and the guest's ISR never saw a
+ * PCRTC interrupt.
+ * ============================================================ */
+
+void nv2a_vblank_pulse(NV2AState *d)
+{
+    if (!d) return;
+    /* The pending bit is set by the display, unconditionally: the enable
+     * masks gate delivery, never the source. */
+    d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
+    nv2a_update_irq(d);
+}
+
+/* The pixel clock is the video PLL, decoded exactly as the core PLL is. */
+static uint64_t pramdac_video_clock_freq(NV2AState *d)
+{
+    uint32_t val = d->pramdac.video_clock_coeff;
+    uint32_t m = val & NV_PRAMDAC_VPLL_COEFF_MDIV;
+    uint32_t n = (val & NV_PRAMDAC_VPLL_COEFF_NDIV) >> 8;
+    uint32_t p = (val & NV_PRAMDAC_VPLL_COEFF_PDIV) >> 16;
+    if (m == 0 || n == 0) return 0;
+    return (uint64_t)((NV2A_CRYSTAL_FREQ * n) / (1u << p) / m);
+}
+
+static const char *g_display_frame_source = "60hz-fallback";
+
+const char *nv2a_display_frame_source(void)
+{
+    return g_display_frame_source;
+}
+
+uint64_t nv2a_display_frame_ns(NV2AState *d)
+{
+    uint64_t pixel_hz, htotal, vtotal, frame_ns;
+
+    g_display_frame_source = "60hz-fallback";
+    if (d) {
+        pixel_hz = pramdac_video_clock_freq(d);
+        htotal = d->pramdac.fp_hcrtc;
+        vtotal = d->pramdac.fp_vcrtc;
+        if (pixel_hz && htotal && vtotal) {
+            frame_ns = (uint64_t)((long double)htotal * (long double)vtotal
+                                  * (long double)NANOSECONDS_PER_SECOND
+                                  / (long double)pixel_hz);
+            /* 40..240 Hz. Outside that the timing registers are not a mode
+             * this model can honestly read, and a wrong period is worse than
+             * a documented nominal one. */
+            if (frame_ns >= 1000000000ull / 240ull &&
+                frame_ns <= 1000000000ull / 40ull) {
+                g_display_frame_source = "video-timing";
+                return frame_ns;
+            }
+        }
+    }
+    return 1000000000ull / 60ull;
 }
 
 /* ============================================================

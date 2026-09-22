@@ -78,6 +78,18 @@ typedef struct NV2AState {
     qemu_irq irq;
     bool exiting;
 
+    /* The card's interrupt line, delivered to whatever owns the host side.
+     *
+     * `pci_irq_assert`/`pci_irq_deassert` are compiled-in no-ops in the
+     * standalone build, so without this the model computes its pending and
+     * enabled masks and then tells nobody. The kernel bridge registers a sink
+     * that raises the guest's vector; the sink is called only on a line
+     * transition, never once per update, so a level that stays asserted does
+     * not re-enter the guest ISR. */
+    void (*irq_sink)(void *opaque, int asserted);
+    void *irq_sink_opaque;
+    int irq_line_asserted;
+
     VGACommonState vga;
     GraphicHwOps hw_ops;
     QEMUTimer *vblank_timer;
@@ -213,6 +225,32 @@ extern const NV2ABlockInfo blocktable[NV_NUM_BLOCKS];
  * ============================================================ */
 
 void nv2a_update_irq(NV2AState *d);
+
+/* Register the host owner of the card's interrupt line. */
+void nv2a_set_irq_sink(NV2AState *d,
+                       void (*sink)(void *opaque, int asserted), void *opaque);
+
+/* Whether the line is currently asserted: something is pending and the master
+ * enable is on. NV_PMC_INTR_EN_0 is a two-bit hardware/software master enable,
+ * not a per-source mask -- the per-source masks are the block registers, which
+ * `nv2a_update_irq` has already folded into the PMC summary. */
+int nv2a_irq_line_asserted(NV2AState *d);
+
+/* One vertical blank from the display clock.
+ *
+ * The model has no display clock of its own, which is why the card's PCRTC
+ * pending bit was never set by anything. Asserting the pending bit is the
+ * hardware's job; clearing it is the guest's, through its write-1-to-clear to
+ * NV_PCRTC_INTR_0. Nothing here touches the guest's enables. */
+void nv2a_vblank_pulse(NV2AState *d);
+
+/* Frame period in nanoseconds, from the guest-programmed video timing.
+ *
+ * Falls back to 60 Hz when the guest has not programmed a video PLL and
+ * timing that produce a plausible refresh. The fallback is reported through
+ * `nv2a_display_frame_source` so a run can say which one it used. */
+uint64_t nv2a_display_frame_ns(NV2AState *d);
+const char *nv2a_display_frame_source(void);
 
 /* Register block log helpers (no-op stubs since trace is disabled) */
 static inline

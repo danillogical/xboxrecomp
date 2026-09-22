@@ -29,6 +29,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "nv2a_state.h"
+#include "nv2a_mmio_hook.h"
 #include "recomp_icall_feedback.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
@@ -2021,56 +2022,71 @@ static int kernel_raise_interrupt(uint32_t vector)
 /* The GPU's vertical blank, delivered rather than merely enabled.
  *
  * The D3D8 library linked into a title installs an ISR for this and then waits
- * on it. Nothing ever raised it, so a title whose frame loop waits for vblank
- * rather than polling stops after its first clear -- which is exactly where
- * Half-Life 2's loader stops, with its videos open, its 23 MB of UI textures
- * loaded, and no second frame.
+ * on it. The ISR reads the NV2A's own interrupt status to decide whether the
+ * interrupt is its business, so the model's pending and enable registers have
+ * to be real before the routine is called.
  *
- * The ISR reads the NV2A's own interrupt status to decide whether the
- * interrupt is its business, so the registers have to say vblank before the
- * routine is called: PCRTC_INTR_0 bit 0 for the vblank itself, and PMC_INTR_0
- * bit 24 to say the PCRTC block is the source. Without those the handler looks,
- * finds nothing, and correctly declines.
+ * This used to poke those registers from here:
  *
- * ponytail: a fixed 60 Hz off the timer tick rather than anything tied to the
- * display mode, and no field or interlace handling. A title that measures
- * refresh rate from this will read 60; a title that needs the real one wants
- * the mode AvSetDisplayMode was given, which is recorded a few files away.
+ *     MEM32(0xFD060100) |= 1;          // PCRTC_INTR_0
+ *     MEM32(0xFD000100) |= (1 << 24);  // PMC_INTR_0
+ *
+ * Both are write-1-to-clear in the model -- as they are on the card -- so an
+ * OR against the read-back value CLEARS every bit that is already pending and
+ * sets nothing. Measured consequence, in a run with this path enabled: the ISR
+ * ran and queued a DPC 968 times, `NV_PMC_INTR_0` read 0 and `NV_PCRTC_INTR_0`
+ * read 0 at the deadline, and the DPC routine's `test esi, 0x01000000` never
+ * took its branch, so the producer that signals the title's frame event was
+ * never reached. (`logs/runs/20260922-155540-785-a2-vblank-probe/`.)
+ *
+ * The source now lives where it belongs: `nv2a_vblank_pulse` on the model's
+ * display clock asserts the PCRTC pending bit, the guest's own write-1-to-clear
+ * acknowledges it, and `NV_PMC_INTR_EN_0` (which the guest programs) gates
+ * delivery. What is left here is the line's host owner.
+ *
+ * The ISR and the DPC it queues both run guest code, which needs a guest stack
+ * and a TIB. They therefore run on the timer thread, which has both, and the
+ * deferred routine is drained in the same iteration so the guest's
+ * acknowledgment lands before the line is sampled again.
  */
-#define XBOX_NV2A_REG_BASE     0xFD000000u
-#define NV2A_PMC_INTR_0        0x00000100u
-#define NV2A_PMC_INTR_PCRTC    (1u << 24)
-#define NV2A_PCRTC_INTR_0      0x00600100u
-#define NV2A_PCRTC_INTR_VBLANK (1u << 0)
-#define NV2A_VECTOR            3u
+#define NV2A_VECTOR 3u
 
-static void kernel_vblank_tick(void)
+/* The card's interrupt line, as reported by the model. Written from the NV2A
+ * service thread, read here. */
+static volatile LONG g_nv2a_irq_line;
+
+static void kernel_nv2a_irq_sink(void *opaque, int asserted)
 {
-    static int enabled = -1;
-    static long long next_ms;
-    long long now;
+    (void)opaque;
+    InterlockedExchange(&g_nv2a_irq_line, asserted ? 1 : 0);
+}
 
-    if (enabled < 0)
-        enabled = getenv("RECOMP_VBLANK") != NULL;
-    if (!enabled)
+/* Called once the NV2A model exists. Returns 0 on success. */
+int xbox_Nv2aAttachIrqLine(void)
+{
+    if (!nv2a_hook_set_irq_sink(kernel_nv2a_irq_sink, NULL))
+        return -1;
+    fprintf(stderr, "  [NV2A] interrupt line attached to vector %u\n",
+            NV2A_VECTOR);
+    fflush(stderr);
+    return 0;
+}
+
+/* Deliver the line to the guest. Level-triggered: while the line is asserted
+ * the ISR runs, once per timer tick, until the guest acknowledges by clearing
+ * the source. An ISR that declines leaves the line up, which is what an
+ * unhandled interrupt looks like. */
+static void kernel_deliver_nv2a_irq(void)
+{
+    if (!InterlockedCompareExchange(&g_nv2a_irq_line, 0, 0))
         return;
-
-    now = (long long)GetTickCount64();
-    if (now < next_ms)
-        return;
-    next_ms = now + 16;                       /* ~60 Hz */
-
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
-
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
-    BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
-
     {
         static unsigned n;
         int claimed = kernel_raise_interrupt(NV2A_VECTOR);
         if (n++ < 3)
-            fprintf(stderr, "  [NV2A] vblank -> ISR %s\n",
+            fprintf(stderr, "  [NV2A] irq line -> ISR %s\n",
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
         fflush(stderr);
@@ -2332,8 +2348,8 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         int i;
 
         Sleep(10);
-        kernel_vblank_tick();  /* the GPU's frame clock */
-        kernel_drain_dpcs();   /* deferred work, before due timers */
+        kernel_deliver_nv2a_irq();   /* the GPU's interrupt line */
+        kernel_drain_dpcs();         /* deferred work, before due timers */
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {

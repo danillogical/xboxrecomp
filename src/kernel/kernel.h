@@ -494,6 +494,14 @@ ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
 void xbox_kernel_bridge_init(void);
 
+/* Route the NV2A model's interrupt line to the guest's vector 3.
+ *
+ * Call after the NV2A model exists (nv2a_hook_init). The model asserts the
+ * line from its own display clock and the guest acknowledges it through its
+ * own write-1-to-clear; this only connects the two. Returns 0 on success,
+ * -1 if no device is up yet. */
+int xbox_Nv2aAttachIrqLine(void);
+
 /**
  * Per-title kernel ordinal remap.
  *
