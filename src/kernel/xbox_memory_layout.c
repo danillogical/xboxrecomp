@@ -566,8 +566,6 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 *get = *put;
             }
         }
-        fence_mirrors_tick();
-        counter_mirrors_tick();
         frame_counters_tick();
         framebuffer_probe_tick();
 
@@ -667,6 +665,14 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * millisecond unit, so the rate matches. */
         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
                                + g_memory_offset) = GetTickCount();
+
+        /* Publish model state into guest memory. Outside the register gate on
+         * purpose: these write GUEST MEMORY, not MMIO, so who owns the
+         * registers is irrelevant to them. Leaving them inside meant claiming
+         * the register owner silently stopped every mirror -- which is why
+         * nothing ever wrote the notify word a title waits on. */
+        fence_mirrors_tick();
+        counter_mirrors_tick();
 
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
