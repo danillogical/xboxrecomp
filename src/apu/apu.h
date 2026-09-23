@@ -21,8 +21,13 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 /* Shut down and free the APU state. */
 void mcpx_apu_shutdown(MCPXAPUState *d);
 
-/* MMIO read from APU register space (addr is offset from 0xFE800000). */
+/* MMIO read from APU register space (addr is offset from 0xFE800000).
+ *
+ * This is the accessor the VEH calls, so it is the one that reports a read of
+ * a block the model does not implement. Use the quiet form when the value is
+ * wanted for a diagnostic of its own rather than consumed as device state. */
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
+uint64_t mcpx_apu_mmio_read_quiet(MCPXAPUState *d, uint64_t addr, unsigned int size);
 
 /* MMIO write to APU register space (addr is offset from 0xFE800000). */
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size);

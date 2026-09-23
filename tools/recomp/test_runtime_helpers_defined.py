@@ -62,6 +62,24 @@ class RuntimeHelpersDefinedTest(unittest.TestCase):
             encoding="utf-8")
         self.assertIn("RecompXmm g_xmm0", main_c)
 
+    def test_mmio_window_guard_is_defined(self):
+        """The `rep movs`/`rep stosb` rules emit recomp_range_is_mmio.
+
+        Same failure mode as the XMM helpers: the lifter names it as a string,
+        so a rule can start emitting it while the runtime never defines it, and
+        the only symptom is a compile error in the generated C of whichever
+        title first copies over a device window.
+        """
+        lifter = _LIFTER.read_text(encoding="utf-8")
+        runtime = _RUNTIME.read_text(encoding="utf-8")
+
+        self.assertIn("recomp_range_is_mmio(", lifter)
+        self.assertIn("recomp_range_is_mmio(uint32_t va, uint32_t len)", runtime)
+        # The windows themselves must be named in the runtime, not inlined in
+        # the rule, so there is one place to keep in step with the VEH.
+        self.assertIn("RECOMP_MMIO_NV2A_BASE", runtime)
+        self.assertIn("RECOMP_MMIO_APU_BASE", runtime)
+
 
 if __name__ == "__main__":
     unittest.main()

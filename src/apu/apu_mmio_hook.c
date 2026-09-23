@@ -271,7 +271,7 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
              * the command-block address means recognising the address when it
              * goes past, and an offset alone never shows it. */
             uint64_t v = g_apu_state
-                       ? mcpx_apu_mmio_read(g_apu_state, mmio_offset, 4) : 0;
+                       ? mcpx_apu_mmio_read_quiet(g_apu_state, mmio_offset, 4) : 0;
             fprintf(stderr, "  [APUMMIO] %s 0x%05X = %08X%s\n",
                     is_write ? "write" : "read ", mmio_offset,
                     (uint32_t)v, ok ? "" : "  (decode failed)");

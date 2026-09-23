@@ -2193,10 +2193,30 @@ class Lifter:
         #
         # memcpy is still used when the ranges provably do not overlap, which
         # is the overwhelming majority of calls.
+        #
+        # Neither memcpy nor memset is valid when either range is a device
+        # window. MMIO is trapped by a VEH that decodes the faulting
+        # instruction and emulates the register access, so it can only work on
+        # the guest's own instruction. A host library routine raises the fault
+        # instead, at a RIP inside that library, and the decoder then sees
+        # whatever encoding the library chose -- an AVX form, which it cannot
+        # read, so the fault escapes and the process dies. JSRF's first one is
+        # guest 0x001A1B41 `rep movsd` with ESI = 0xFE830200 (the APU's GP
+        # window) and EDI = a RAM buffer: the ranges do not overlap, the copy
+        # is 280 bytes, and it faulted inside the CRT's memcpy at
+        # logs/runs/20260922-162546-668-a2c-175300. Taking the element-wise
+        # path instead makes every access a guest instruction the hook can
+        # read, which is the whole point of routing it.
+        #
+        # A window boundary is deliberately tested on the guest VA, not on the
+        # translated host pointer: recomp_range_is_mmio is about what the VEH
+        # is prepared to answer for.
         if "movsb" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  if ((_d + _n <= _s || _s + _n <= _d)"
+                    " && !recomp_range_is_mmio(edi, _n)"
+                    " && !recomp_range_is_mmio(esi, _n)) memcpy(_d, _s, _n);",
                     "  else { uint32_t _i; for (_i = 0; _i < _n; _i++) _d[_i] = _s[_i]; }",
                     "  esi += ecx; edi += ecx; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
@@ -2205,7 +2225,9 @@ class Lifter:
         if "movsd" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 4;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  if ((_d + _n <= _s || _s + _n <= _d)"
+                    " && !recomp_range_is_mmio(edi, _n)"
+                    " && !recomp_range_is_mmio(esi, _n)) memcpy(_d, _s, _n);",
                     "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM32(edi + _i*4) = MEM32(esi + _i*4); }",
                     "  esi += ecx * 4; edi += ecx * 4; }",
@@ -2215,7 +2237,9 @@ class Lifter:
         if "movsw" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx * 2;",
-                    "  if (_d + _n <= _s || _s + _n <= _d) memcpy(_d, _s, _n);",
+                    "  if ((_d + _n <= _s || _s + _n <= _d)"
+                    " && !recomp_range_is_mmio(edi, _n)"
+                    " && !recomp_range_is_mmio(esi, _n)) memcpy(_d, _s, _n);",
                     "  else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM16(edi + _i*2) = MEM16(esi + _i*2); }",
                     "  esi += ecx * 2; edi += ecx * 2; }",
@@ -2223,7 +2247,10 @@ class Lifter:
                     " MEM16(edi - _i*2) = MEM16(esi - _i*2); esi -= ecx * 2; edi -= ecx * 2; }",
                     "ecx = 0; /* rep movsw */"]
         if "stosb" in m:
-            return ["if (!g_df) { memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx); edi += ecx; }",
+            return ["if (!g_df && !recomp_range_is_mmio(edi, ecx))"
+                    " { memset((void*)XBOX_PTR(edi), (uint8_t)eax, ecx); edi += ecx; }",
+                    "else if (!g_df) { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
+                    " MEM8(edi + _i) = LO8(eax); edi += ecx; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM8(edi - _i) = LO8(eax); edi -= ecx; }",
                     "ecx = 0; /* rep stosb */"]

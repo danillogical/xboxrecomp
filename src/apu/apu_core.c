@@ -623,7 +623,7 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
  * addr is offset from APU base (0xFE800000)
  * ============================================================ */
 
-uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
+uint64_t mcpx_apu_mmio_read_quiet(MCPXAPUState *d, uint64_t addr, unsigned int size)
 {
     if (!d) return 0;
     if (addr >= 0x20000 && addr < 0x30000) {
@@ -632,6 +632,36 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
         return mcpx_apu_read(d, (hwaddr)addr, size);
     }
     return 0;
+}
+
+/* The GP (0x30000) and EP (0x50000) DSP blocks have no model, so a read there
+ * returns 0. For a single unimplemented register that is the honest answer.
+ * For a bulk read it is not: JSRF copies 280 bytes out of the GP window into a
+ * RAM structure (guest 0x001A1B41, src 0xFE830200), and a silent zero there is
+ * indistinguishable in the log from device state that genuinely read zero --
+ * the same failure the run-profile rule calls out when it refuses to map the
+ * aperture readable. Name the block once, so the gap is a fact in the run log
+ * rather than an inference from an empty buffer. */
+static void apu_note_unimplemented_block_read(uint64_t addr, unsigned int size)
+{
+    static unsigned char reported[8];
+    unsigned block = (unsigned)(addr >> 16);
+
+    if (block >= 8u || reported[block])
+        return;
+    reported[block] = 1;
+    fprintf(stderr, "[APU] read of unimplemented %s DSP block at offset "
+                    "0x%05llX (size %u) -> 0; no model for this block\n",
+            addr < 0x40000 ? "GP" : (addr < 0x60000 ? "EP" : "unknown"),
+            (unsigned long long)addr, size);
+    fflush(stderr);
+}
+
+uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
+{
+    if (addr >= 0x30000)
+        apu_note_unimplemented_block_read(addr, size);
+    return mcpx_apu_mmio_read_quiet(d, addr, size);
 }
 
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size)

@@ -77,6 +77,36 @@ class DirectionFlagLifterTest(unittest.TestCase):
                 generated = _lift(Instruction(0, 1, mnemonic, "", "a4"))
                 self.assertIn(f"RECOMP_DF_STEP({size})", generated)
 
+    def test_rep_movs_avoids_the_block_copy_over_a_device_window(self):
+        """A copy over MMIO has to be walked element by element.
+
+        MMIO is emulated by decoding the faulting *guest* instruction, so a
+        copy that reaches a host memcpy raises the fault inside that library
+        instead, at a RIP where the decoder sees the library's own encoding --
+        an AVX form, which it cannot read, so the fault escapes and the
+        process dies. JSRF's first one is `rep movsd` with ESI = 0xFE830200
+        (the APU's GP window) and EDI a RAM buffer: the ranges provably do not
+        overlap, so the block copy was taken and the title died at a RIP in
+        the CRT (logs/runs/20260922-162546-668-a2c-175300).
+        """
+        for mnemonic, element in (("rep movsb", "MEM8"), ("rep movsw", "MEM16"),
+                                  ("rep movsd", "MEM32")):
+            with self.subTest(mnemonic=mnemonic):
+                generated = _lift(Instruction(0, 2, mnemonic, "", "f3a5"))
+
+                # Both ends are checked: a device window on either side of the
+                # copy is unemulatable through memcpy.
+                self.assertIn("recomp_range_is_mmio(edi, _n)", generated)
+                self.assertIn("recomp_range_is_mmio(esi, _n)", generated)
+                # ...and the element-wise fallback it lands on is still there.
+                self.assertIn(f"{element}(", generated)
+
+    def test_rep_stosb_avoids_memset_over_a_device_window(self):
+        generated = _lift(Instruction(0, 2, "rep stosb", "", "f3aa"))
+
+        self.assertIn("recomp_range_is_mmio(edi, ecx)", generated)
+        self.assertIn("MEM8(edi + _i) = LO8(eax)", generated)
+
 
 if __name__ == "__main__":
     unittest.main()
