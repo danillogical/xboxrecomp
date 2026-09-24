@@ -134,6 +134,10 @@ static size_t xbox_TiledApertureSize(void)
 
 static HANDLE g_nv2a_ack_thread = NULL;
 static volatile LONG g_nv2a_ack_stop = 0;
+/* One-shot flag for the AC'97 reach witness: printed once, on the first tick
+ * that observes GC bit 1 set. Keeps the witness bounded and makes it a reach
+ * witness rather than a per-tick trace. */
+static volatile LONG g_ac97_witness_done = 0;
 /* Read at worker start; diagnostic fixtures may disable GPU mutations while
  * retaining the same worker's kernel/APU clock updates. Frozen collectors
  * read this exported value to identify the active model. */
@@ -253,6 +257,14 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
 static const uint32_t MCPX_COUNTERS[] = {
     0x020010,   /* APU GP sample counter, DirectSound SetupVoiceProcessor */
 };
+
+/* AC'97 register offsets and bits, used by the always-on codec model in
+ * nv2a_ack_thread below. File scope because the worker is defined far above
+ * the layout code that documents them. */
+#define MCPX_AC97_GLOB_CNT     0x0040012Cu   /* 0xFEC0012C: GC, guest-written */
+#define MCPX_AC97_CODEC_STATUS 0x00400130u   /* 0xFEC00130: GS, guest-polled */
+#define MCPX_AC97_COLD_RESET   0x00000002u   /* GC bit 1, active-low Cold Reset# */
+#define MCPX_AC97_CODEC_READY  0x00000100u   /* GS bit 8, primary codec ready */
 
 static void *g_mcpx_regs = NULL;
 /* Set when the APU's registers are unmapped so they can be routed to the
@@ -654,6 +666,55 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 volatile uint32_t *c =
                     (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_COUNTERS[i]);
                 *c += 1;
+            }
+        }
+
+        /* AC'97 codec presence. GS(0xFEC00130).bit8 := GC(0xFEC0012C).bit1.
+         *
+         * Level-triggered every tick: the guest's own reset write drives the
+         * ready bit, so this models device state rather than asserting a
+         * constant. See the derivation and its citations at the definition of
+         * MCPX_AC97_CODEC_STATUS above.
+         *
+         * OUTSIDE the g_apu_mmio_trapped gate on purpose, like the mirrors
+         * below: this writes GUEST MEMORY in the AC'97 aperture, which is above
+         * the APU's 512K window, so who owns the APU registers is irrelevant.
+         * Gating it would let RECOMP_APU_TRAP silently stop the model.
+         *
+         * Atomic read-modify-write: sub_001A71B3 performs full-dword writes to
+         * this register, so a plain |= from this thread could lose a guest
+         * update. No other bit of GLOB_STA is touched, and GC is never written
+         * from the host -- it is read only, so the guest's own value is what
+         * drives the model. */
+        if (g_mcpx_regs) {
+            volatile uint32_t *gc =
+                (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_AC97_GLOB_CNT);
+            volatile uint32_t *gs =
+                (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_AC97_CODEC_STATUS);
+            uint32_t gc_now = *gc;
+
+            if (gc_now & MCPX_AC97_COLD_RESET)
+                InterlockedOr((volatile LONG *)gs, (LONG)MCPX_AC97_CODEC_READY);
+            else
+                InterlockedAnd((volatile LONG *)gs, (LONG)~MCPX_AC97_CODEC_READY);
+
+            /* Reach witness: print once, on the first tick that observes GC bit
+             * 1 set, and read BOTH registers back through the guest mapping --
+             * not from locals -- so a wrong-address model is visible rather
+             * than silent. Printed AFTER the atomic set on this same tick: the
+             * reverse order would report GS bit 8 clear while GC bit 1 is set,
+             * and the packet's AC4 would then FAIL a correct model.
+             *
+             * Emitted with a bare fprintf + fflush, NOT through the
+             * KERNEL_LOG_ON budget gate, so it survives log truncation -- the
+             * same property that makes the KeConnectInterrupt line usable as
+             * AC4-POLL. */
+            if (!g_ac97_witness_done && (gc_now & MCPX_AC97_COLD_RESET)) {
+                g_ac97_witness_done = 1;
+                fprintf(stderr,
+                        "[A3A] ac97 witness: gc=0x%08X gs=0x%08X\n",
+                        (unsigned)*gc, (unsigned)*gs);
+                fflush(stderr);
             }
         }
 
@@ -1575,9 +1636,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         );
         g_mcpx_regs = g_mcpx_memory;
         if (g_mcpx_memory) {
-            /* AC'97 codec ready.
+            /* AC'97 codec ready -- modelled, always on.
              *
-             * DirectSound resets the codec by setting a bit in 0xFEC0012C and
+             * DirectSound resets the codec by setting bit 1 of 0xFEC0012C and
              * then polls 0xFEC00130 for bit 8 a thousand times waiting for the
              * codec to come up. On zeroed registers that bit never appears, so
              * the wait times out and DirectSoundCreate returns DSERR_NODRIVER
@@ -1591,48 +1652,79 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * which crashes. Reporting the codec as present is what lets the
              * engine initialise at all.
              *
-             * The aperture is plain memory, so setting the bit once is enough:
-             * nothing clears it, and the poll reads it on the first pass. */
-            #define MCPX_AC97_CODEC_STATUS 0x00400130u   /* 0xFEC00130 */
-            #define MCPX_AC97_CODEC_READY  0x00000100u
-            /* Opt-in, and not because it is wrong.
+             * THE RULE, and it is a MODEL rather than an assertion:
              *
-             * Reporting the codec is the correct answer -- DSERR_NODRIVER is
-             * not what hardware returns -- but it is only correct as far as it
-             * goes. DirectSound then hands the audio DSP a command block in
-             * RAM and spins until the DSP clears it, and there is no DSP here,
-             * so the title trades a late crash for an early hang: 44 assets
-             * loaded and then a fault, versus one asset and a stall in audio
-             * init. Until the DSP handshake is answered, the honest default is
-             * the failure that gets further, with the correct behaviour one
-             * variable away.
+             *     GS(0xFEC00130).bit8 := GC(0xFEC0012C).bit1
              *
-             * RECOMP_AC97_READY asks only for the codec bit. RECOMP_APU_TRAP
-             * additionally unmaps the APU, and only makes sense once a caller
-             * routes those faults somewhere. */
-            if (getenv("RECOMP_AC97_READY")) {
-                *(volatile uint32_t *)((char *)g_mcpx_memory
-                                       + MCPX_AC97_CODEC_STATUS)
-                    |= MCPX_AC97_CODEC_READY;
-                fprintf(stderr, "  AC97: codec reported ready at 0x%08X"
-                                " (DirectSound will initialise)\n",
-                        XBOX_MCPX_BASE + MCPX_AC97_CODEC_STATUS);
-            }
+             * Bit 1 of GC is ICH_AC97COLD, the ACTIVE-LOW Cold Reset# line:
+             * writing 1 RELEASES the codec from reset, and 0 holds it in reset.
+             * So bit 8 of GS -- "primary (AC_SDIN0) codec ready" -- is set
+             * exactly when bit 1 of GC is set, and cleared when it is clear.
+             * Evaluated level-triggered on every tick of this worker, so it
+             * tracks the guest's own reset writes rather than latching once.
+             *
+             * Polarity, cited (Linux v6.6, sound/pci/intel8x0.c, SHA-256
+             * F5F1AE46661C848CCD29C2B1368DB38A159EC8650209E54FB2974996F50B5FFC).
+             * The identifiers below are quoted WITHOUT their hash sign so this
+             * comment cannot be mistaken for preprocessor directives:
+             *   L140  "define ICH_AC97COLD 0x00000002"  -- AC'97 cold reset
+             *   L163  "define ICH_PCR 0x00000100"       -- primary (AC_SDIN0) codec ready
+             *   L2360-2361 in snd_intel8x0_ich_chip_reset is decisive:
+             *         finish cold or do warm reset
+             *         cnt |= (cnt and ICH_AC97COLD) == 0 ? ICH_AC97COLD : ICH_AC97WARM;
+             *     -- when bit 1 reads 0 the driver SETS it to finish the reset,
+             *     so 0 = reset in progress and 1 = released/running.
+             *   L2295-2298 (error path) clears the bit "for the next chance",
+             *     i.e. clearing RE-ARMS the reset.
+             *
+             * Corroborated by xemu, the reference Xbox emulator: hw/audio/ac97.c
+             * (commit 2799183ecc5119269be01c340d0c9465dbb04d02) defines
+             * GS_S0CR (1 << 8) as read-only and returns `glob_sta | GS_S0CR`
+             * unconditionally (L785); hw/xbox/mcpx/aci.c (commit
+             * 704ece9ac661f325aa51bb0b28d326063633227b) maps NAM at +0x0 and
+             * NABM at +0x100, which puts GLOB_STA at 0xFEC00130, and
+             * hw/xbox/xbox.c:334 instantiates that device.
+             *
+             * ADMITTED under docs/jsrf-run-profiles.md section
+             * "Unconditional modeled hardware causes" (commit
+             * 73eee970a2d3e22a4301879e00d0125d27ee0498), class 1: device state
+             * from modeled prior state. The evidence is the secondary-source
+             * path -- xemu plus Linux intel8x0, two independent sources of
+             * different provenance, at least one Xbox/MCPX-specific -- and no
+             * public MCPX/ACI datasheet exists. That limitation is recorded
+             * rather than papered over: deriving GS.bit8 from GC.bit1 is a
+             * STATED MODELLING ASSUMPTION WITH A NAMED FALSIFIER (write GC bit 1
+             * clear and read GS bit 8), not a documented device behaviour, and
+             * the falsifier cannot occur in this title.
+             *
+             * WHAT IS NOT MODELLED, deliberately: W1C on this register. The
+             * second consumer, sub_001A71B3, does a full-dword read-modify-write
+             * of 0xFEC00130 and would clear bit 8 if it ran -- but it is only
+             * reachable from the vector-6 ISR, which this runtime never raises,
+             * so its write-back path is unreachable while only bit 8 is set.
+             *
+             * The register sits ABOVE the APU's 512K window
+             * (src/apu/README.md:73 scopes the VEH-hooked window to
+             * 0xFE800000-0xFE87FFFF), so this is plain memory here.
+             *
+             * This replaces an environment-gated override: the answer is now a
+             * modelled cause rather than a shortcut, and it is unconditional.
+             * The register constants live at file scope, beside MCPX_COUNTERS,
+             * because the worker that uses them is defined above. */
             /* The APU's own 512K can be unmapped so its register traffic can be
              * routed to the emulated APU, which is the half that answers the
              * DSP handshake. Only the APU's 512K is unmapped: AC'97 above it
              * stays plain memory, which is what the codec-ready bit needs.
              *
-             * Separate from RECOMP_AC97_READY, and that separation is the
-             * point. They used to be the same variable, so asking for the
-             * codec-ready bit also unmapped the APU -- and nothing in either
-             * repository ever called apu_hook_handle_mmio, so the first APU
-             * register access faulted and killed the process. JSRF reaches
-             * 0xFE811100 within two seconds under RECOMP_AC97_READY for exactly
-             * that reason (logs/runs/20260922-055053-100-p4-ac97). Two switches
-             * make the two behaviours independently reachable: the codec bit
-             * alone is a complete experiment, and the trap is only asked for
-             * when a handler is wired. */
+             * RECOMP_APU_TRAP is now independent of the codec model. They used
+             * to share a variable, so asking for the codec-ready bit also
+             * unmapped the APU -- and nothing in either repository ever called
+             * apu_hook_handle_mmio, so the first APU register access faulted and
+             * killed the process. JSRF reaches 0xFE811100 within two seconds
+             * under that combined switch for exactly that reason
+             * (logs/runs/20260922-055053-100-p4-ac97). The codec bit is now
+             * modelled unconditionally and does NOT unmap anything, so this
+             * trap is only asked for when a handler is wired. */
             if (getenv("RECOMP_APU_TRAP")) {
                 DWORD old_protect;
                 if (VirtualProtect((char *)g_mcpx_memory, 0x00080000u,
