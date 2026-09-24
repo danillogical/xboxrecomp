@@ -1153,6 +1153,11 @@ class FunctionTranslator:
 
         backward = scan(-1, 1)
         forward = scan(1, 0)
+        if not forward:
+            # Some MSVC tables use the alignment remainder directly as the
+            # index. Slot zero is unreachable on this path and overlaps the
+            # preceding instruction, while slots one onward are real targets.
+            forward = scan(1, 1)
         if len(backward) + len(forward) < 2:
             return []
         backward.reverse()
