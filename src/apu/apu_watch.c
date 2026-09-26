@@ -556,6 +556,14 @@ void apu_watch_boot_scratch_read(uint32_t guest_va, uint32_t first_dword,
     InterlockedIncrement(&s.counts[APU_WATCH_C_BOOT_SCRATCH_READ]);
     if (latch_fire(&s.latch[APU_WATCH_BOOT_SCRATCH_READ], seq, guest_va,
                    first_dword, (uint32_t)len, 0, s.gp_insns, dsp_addr)) {
+        /* Mirror the class latch into the `gpin` slot. The `[GPIN] summary`
+         * line prints `g->boot_scratch_read.latched` (emit_gpin_block), and the
+         * snapshot carries that slot, so firing only the class latch would
+         * leave the printed presence witness permanently 0 -- and AC-FIX (vi)
+         * reads it. Written under the same write-once guard, so it freezes
+         * exactly when the class latch does and the at_clear copy (which is a
+         * memcpy of this whole struct) stays consistent with it. */
+        s.gpin.boot_scratch_read = s.latch[APU_WATCH_BOOT_SCRATCH_READ];
         after_latch_fired(APU_WATCH_BOOT_SCRATCH_READ);
     }
 }
@@ -627,6 +635,10 @@ void apu_gpin_mixbuf_read(uint32_t offset, uint32_t value)
         if (latch_fire(&s.latch[APU_WATCH_MIXBUF_STUB_READ], seq,
                        GP_DSP_MIXBUF_BASE + offset, s.mixbuf_vp_active_voices,
                        value, 0, s.gp_insns, 0)) {
+            /* Mirror into the `gpin` slot, for the same reason as
+             * apu_watch_boot_scratch_read(): `[GPIN] summary` prints the slot,
+             * and the snapshot carries it. */
+            s.gpin.mixbuf_stub_read = s.latch[APU_WATCH_MIXBUF_STUB_READ];
             after_latch_fired(APU_WATCH_MIXBUF_STUB_READ);
         }
     }
