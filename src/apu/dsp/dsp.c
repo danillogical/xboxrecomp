@@ -136,6 +136,10 @@ DSPState *dsp_init(void *rw_opaque, dsp_scratch_rw_func scratch_rw,
     dsp->dma.rw_opaque = rw_opaque;
     dsp->dma.scratch_rw = scratch_rw;
     dsp->dma.fifo_rw = fifo_rw;
+    /* A4b1 LOCAL MODIFICATION (new, in dsp_init): the DMA's copy of the side
+     * flag. dsp_dma.c is shared by the GP and the EP, and the FIFO_READ input
+     * hook must fire for the GP only -- see the field's comment in dsp_dma.h. */
+    dsp->dma.is_gp = is_gp;
 
     /* A4b1 LOCAL MODIFICATION (dsp.c:122-126 upstream).
      *

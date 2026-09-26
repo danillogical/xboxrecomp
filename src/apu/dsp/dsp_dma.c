@@ -25,6 +25,12 @@
 #include "dsp_dma_regs.h"
 #include "interp/dsp_cpu_regs.h"
 
+/* A4b1 LOCAL MODIFICATION (new include after dsp_dma.c:26 upstream): the
+ * toolkit's GP input accounting and the FIFO universe it indexes. Used by the
+ * FIFO_READ input hook in the read arm; see the marked block there. */
+#include "apu_watch.h"
+#include "apu_regs.h"
+
 #ifdef DEBUG
 
 const char *buffer_names[] = {
@@ -287,6 +293,48 @@ static void dsp_dma_run(DSPDMAState *s)
             } else {
                 fprintf(stderr, "Unhandled DSP DMA buffer: 0x%x\n", buf_id);
                 assert(!"Unhandled dsp dma buffer");
+                /* A4b1 LOCAL MODIFICATION (new, in the read arm's else branch
+                 * after dsp_dma.c:287 upstream): the FIFO_READ input hook for
+                 * the path that actually exists.
+                 *
+                 * The pinned read arm implements only buf_id 0xE/0xF; for any
+                 * other id it prints and then FALLS THROUGH, because the
+                 * `assert` above is elided -- the APU library is built with
+                 * NDEBUG (build/xboxrecomp/src/apu/xbox_apu.vcxproj, every
+                 * Release PreprocessorDefinitions). The loop below then
+                 * mem_writes `scratch_buf` into DSP memory, and scratch_buf is
+                 * the file-static intermediate buffer, so the DSP consumes
+                 * STALE BYTES as its input. That is a real GP input and DS6
+                 * requires every GP input path to be recorded, so it is
+                 * recorded here.
+                 *
+                 * GATED ON is_gp: this file is shared by the GP and the EP
+                 * (both run frames -- gp_ep.c:599 and :649), and rw_opaque does
+                 * not identify the side. An ungated hook would record an EP
+                 * fall-through as a GP input and could wrongly fail AC-INPUTS.
+                 *
+                 * `buf_id` is the input-FIFO index, mirroring the write arm's
+                 * buf_id 0..3 -> output FIFO. That mapping is an INFERENCE: no
+                 * pinned source states it. The decision does not depend on it,
+                 * because the consumed data is the stale buffer whatever the id
+                 * means, and both input slots are classified stub/unknown, so
+                 * any count > 0 is AC-INPUTS FAIL.
+                 *
+                 * The gp_fifo_rw hook (gp_ep.c:251) covers the fifo_rw route if
+                 * a later pin wires input FIFOs through it. The two can never
+                 * both fire for one transfer, because this arm never calls
+                 * fifo_rw.
+                 *
+                 * Any other buf_id names no buffer the pin knows at all: it
+                 * fails closed to the out-of-universe detector, which makes the
+                 * run UNKNOWN rather than silently unaccounted. */
+                if (s->is_gp) {
+                    if (buf_id < GP_INPUT_FIFO_COUNT) {
+                        apu_gpin_fifo_read(buf_id, transfer_size);
+                    } else {
+                        apu_gpin_record_out_of_universe(APU_WATCH_GPIN_FIFO, buf_id);
+                    }
+                }
             }
 
             for (int i = 0; i < count; i++) {

@@ -48,7 +48,35 @@
  * covering DSP_PERIPH_BASE (0xFFFF80) .. 0xFFFFFF. */
 #define APU_WATCH_DSP_PERIPH_SIZE DSP_PERIPH_SIZE
 
-/* FIFO: GP_OUTPUT_FIFO_COUNT (4) + GP_INPUT_FIFO_COUNT (2) = 6, apu_regs.h. */
+/* FIFO: GP_OUTPUT_FIFO_COUNT (4) + GP_INPUT_FIFO_COUNT (2) = 6, apu_regs.h.
+ *
+ * STATIC PER-FIFO SOURCE CLASSIFICATION (Device semantics 6; AC-PORT step 4).
+ * The meaning of all six indices, decided once from the pinned source:
+ *
+ *   slots 0..GP_INPUT_FIFO_COUNT-1 (0..1) -- the GP INPUT FIFOs. Their data
+ *     source is "none modelled at the pin": the pinned read arm does not
+ *     implement buf_id 0..3, so a read-direction transfer naming one of them
+ *     falls through (its `assert` is NDEBUG-elided) and the DSP consumes the
+ *     stale intermediate buffer instead. Classified STUB/UNKNOWN, so any count
+ *     > 0 is AC-INPUTS FAIL, which is R2-EXPL-INPUT in A4b2. Written by the
+ *     read-arm hook in dsp_dma.c (gated on the DMA's is_gp) and by the
+ *     gp_fifo_rw hook under !dir (gp_ep.c:251).
+ *
+ *   slots GP_INPUT_FIFO_COUNT..APU_WATCH_FIFO_COUNT-1 (2..5) -- the output
+ *     FIFOs' reserved places in the declared 6-element universe. They are
+ *     GP-PRODUCED, not inputs, so they are NEVER WRITTEN. The fixture asserts
+ *     they are 0, as a guard against a future hook recording outputs here.
+ *
+ * The two index spaces are per-direction and COLLIDE: in gp_fifo_rw an output
+ * fifo 0 and an input fifo 0 both arrive as index 0 (gp_ep.c:219-233). That is
+ * why the read arm uses buf_id directly for the input slots while the output
+ * slots stay empty, rather than one flat index.
+ *
+ * INFERENCE, stated: that a read-arm buf_id of 0..1 denotes input FIFO 0..1
+ * mirrors the write arm's buf_id 0..3 -> output FIFO, and no pinned source
+ * states it. The classification does not depend on it: the consumed data is the
+ * stale buffer whatever the id means, and both input slots are stub/unknown, so
+ * any count > 0 fails AC-INPUTS either way. */
 #define APU_WATCH_FIFO_COUNT (GP_OUTPUT_FIFO_COUNT + GP_INPUT_FIFO_COUNT)
 
 /* DMA region classes: LOW_RAM, CONTIG, DEVICE, OTHER_MAPPED. */

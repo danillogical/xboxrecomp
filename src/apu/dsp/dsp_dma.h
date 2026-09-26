@@ -54,6 +54,20 @@ typedef struct DSPDMAState {
     dsp_scratch_rw_func scratch_rw;
     dsp_fifo_rw_func fifo_rw;
 
+    /* A4b1 LOCAL MODIFICATION (new field in DSPDMAState).
+     *
+     * Which DSP this DMA belongs to. DSPDMAState is embedded in DSPState as
+     * `dma` (dsp.h:100), and dsp_dma.c is SHARED by the GP and the EP -- both
+     * run frames (gp_ep.c:599 and :649) -- while mem_opaque/rw_opaque do not
+     * identify the side. The A4b1 FIFO_READ input hook in the read arm must
+     * fire for the GP only, or an EP fall-through would be recorded as a GP
+     * input and could wrongly fail AC-INPUTS.
+     *
+     * Copied from DSPState.is_gp in dsp_init (dsp.c:133), where it is set once
+     * and never mutated. Not serialized: nothing memcpys DSPState or
+     * DSPDMAState (checked), so adding the field cannot disturb state sync. */
+    bool is_gp;
+
     uint32_t configuration;
     uint32_t control;
     uint32_t start_block;
