@@ -5,6 +5,75 @@ xboxrecomp is MIT licensed (see LICENSE). The components listed below are
 not, and are included here under their original licences with their original
 copyright intact. They are other people's work and are credited as such.
 
+**The MIT licence covers this project's own code. It does not cover the whole
+binary.** Since A4b1 the build links the DSP56300 core extracted from xemu,
+which is GPL-2.0-or-later, so a binary linking `xbox_apu` is a
+**GPL-2.0-or-later combined work** and must be distributed under the GPL, not
+under MIT. See the "GPL-2.0-or-later" section below. The LGPL section's
+relinking permission does not extend to it.
+
+
+GPL-2.0-or-later — the DSP56300 core, extracted from xemu
+---------------------------------------------------------
+
+  https://github.com/xemu-project/xemu
+  Pinned commit: 67cc79e663038d1f55448c0f566b37dde016adf6
+  ("apu: Add new DSP56300 emulator with JIT execution engine", Matt Borgerson)
+  Upstream path: hw/xbox/mcpx/apu/dsp/
+  Per-file SHA-256 and the local-modification list: docs/reviews/a4b-xemu-pin.md
+
+  Files, with the copyright each one's own header carries:
+
+    src/apu/dsp/dsp.c              (c) 2015 espes; 2020-2025 Matt Borgerson;
+                                   (C) 2001-2008 ARAnyM developer team;
+                                   adaption to Hatari (C) 2008 Thomas Huth
+    src/apu/dsp/dsp.h              (c) 2015 espes; (C) 2001-2008 ARAnyM
+                                   developer team; adaption to Hatari (C) 2008
+                                   Thomas Huth
+    src/apu/dsp/dsp_c.c            (c) 2015 espes; 2020-2025 Matt Borgerson;
+                                   (C) 2001-2008 ARAnyM developer team;
+                                   adaption to Hatari (C) 2008 Thomas Huth
+    src/apu/dsp/dsp_internal.h     (c) 2015 espes; 2020-2025 Matt Borgerson
+    src/apu/dsp/debug.h            (c) 2025 Matt Borgerson
+    src/apu/dsp/interp/dsp_cpu.c   (c) 2015 espes; 2020-2025 Matt Borgerson;
+                                   (C) 2003-2008 ARAnyM developer team;
+                                   adaption to Hatari (C) 2008 Thomas Huth
+    src/apu/dsp/interp/dsp_cpu.h   (c) 2015 espes; (C) 2003-2008 ARAnyM
+                                   developer team; adaption to Hatari (C) 2008
+                                   Thomas Huth
+    src/apu/dsp/interp/dsp_cpu_regs.h
+                                   (c) 2015 espes; (C) 2003-2008 ARAnyM
+                                   developer team; adaption to Hatari (C) 2008
+                                   Thomas Huth
+    src/apu/dsp/interp/dsp_emu.c.inc
+                                   (c) 2015 espes; (C) 2003-2008 ARAnyM
+                                   developer team; adaption to Hatari (C) 2008
+                                   Thomas Huth
+    src/apu/dsp/interp/dsp_dis.c.inc
+                                   (c) 2015 espes; (C) 2003-2008 ARAnyM
+                                   developer team; adaption to Hatari (C) 2008
+                                   Thomas Huth
+    src/apu/dsp/interp/debug.c     (c) 2015 espes; 2020-2025 Matt Borgerson;
+                                   (C) 2001-2008 ARAnyM developer team;
+                                   adaption to Hatari (C) 2008 Thomas Huth
+
+  The DSP56300 interpreter descends from Hatari's DSP M56001 emulation by the
+  ARAnyM developer team, which is why those copyright lines travel with it.
+
+  src/apu/dsp/trace.h carries no licence header upstream. It is a bare shim
+  (46 bytes, no code), so it is listed here for completeness and adds no term.
+
+  Licensed under the GNU General Public License, version 2 or (at your
+  option) any later version. The full text is in LICENSES/GPL-2.0.txt; the
+  canonical copy is https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+
+  This is a **stronger** obligation than the LGPL below. The GPL's relinking
+  permission does not apply: a binary that links these files must be
+  distributed under the GPL-2.0-or-later as a whole. The files are marked
+  `-text` in `src/apu/dsp/.gitattributes` so they are stored byte-exact, and
+  every local modification is listed in the pin record.
+
+
 
 LGPL-2.1-or-later — extracted from xemu
 ---------------------------------------
@@ -16,7 +85,11 @@ LGPL-2.1-or-later — extracted from xemu
     src/apu/apu_core.c    MCPX APU core
                           (c) 2012 espes; 2018-2019 Jannik Vogel;
                           2019-2025 Matt Borgerson
-    src/apu/apu_dsp.c     MCPX APU DSP (GP/EP)
+    src/apu/apu_mixdown.c MCPX APU DSP (GP/EP) — the EP monitor mixdown.
+                          A4b1 removed apu_dsp.c (Device semantics 2 and 4
+                          left it an empty translation unit); this file is its
+                          surviving part, so the same copyright and licence
+                          travel with it.
                           (c) 2012 espes; 2019-2025 Matt Borgerson
     src/apu/apu_vp.c      MCPX APU voice processor
                           (c) 2012 espes; 2018-2019 Jannik Vogel;
@@ -32,6 +105,14 @@ LGPL-2.1-or-later — extracted from xemu
 
   src/apu/apu_shim.h is this project's own file but is released under the
   same licence, because it exists only to host the extracted APU code.
+
+  `src/apu/apu_watch.c`, `src/apu/apu_watch.h` and `src/apu/dsp/shim/` are
+  this project's **own new work** (A4b1: the GP DMA translation function, the
+  single write choke point, the watched-word ledger, and the QEMU include
+  shims). They are not extracted from xemu and carry no third-party
+  copyright. They are listed here only so the file set is unambiguous; being
+  compiled into `xbox_apu` they are nonetheless part of the GPL-2.0-or-later
+  combined work described above.
 
   Licensed under the GNU Lesser General Public License, version 2.1 or (at
   your option) any later version. The full text is in LICENSES/LGPL-2.1.txt;
