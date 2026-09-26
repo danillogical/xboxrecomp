@@ -25,118 +25,47 @@
 #include "apu_regs.h"
 #include "apu_debug.h"
 
-/* ============================================================
- * DSP CPU registers
- * ============================================================ */
-
-#define DSP_REG_MAX     0x40
-#define DSP_XRAM_SIZE   4096
-#define DSP_YRAM_SIZE   2048
-#define DSP_PRAM_SIZE   4096
-#define DSP_MIXBUFFER_SIZE 1024
-#define DSP_PERIPH_SIZE 128
+/* The watched-word ledger's exported surface: the GP DMA choke point, the one
+ * translation function and the GP input hooks. Included here so the pinned
+ * files, which see apu_state.h through the apu_int.h shim, get one declaration
+ * site for each rather than a second copy of it. */
+#include "apu_watch.h"
 
 /* ============================================================
- * DSP Core State (from dsp_cpu.h)
- * ============================================================ */
+ * The DSP56300 core's layout (A4b1 step 2: "One layout")
+ *
+ * This header used to carry its own copy of the DSP state -- a stale
+ * `dsp_core_s`/`dsp_core_t` and a stale `DSPDMAState`/`DSPState` pair, with a
+ * comment claiming they came "from dsp_cpu.h" when no such file existed here.
+ * Two layouts that both claim to be the DSP's is exactly how a device model and
+ * its state drift apart.
+ *
+ * The pinned headers now REPLACE them, so there is one definition of every DSP
+ * type in this toolkit and it is the pinned one:
+ *
+ *   dsp/dsp.h                    DSPState, DspCoreState, DSPOps, the DSP API
+ *   dsp/dsp_dma.h                DSPDMAState, the DMA callbacks and registers
+ *   dsp/interp/dsp_cpu.h         dsp_core_t, the interpreter's own core state
+ *   dsp/interp/dsp_cpu_regs.h    DSP_REG_*, DSP_SPACE_*, DSP_*RAM_SIZE,
+ *                                DSP_MIXBUFFER_*, DSP_PERIPH_SIZE
+ *
+ * The three constants the rest of the APU reads (DSP_XRAM_SIZE, DSP_YRAM_SIZE,
+ * DSP_PRAM_SIZE, DSP_MIXBUFFER_SIZE, DSP_PERIPH_SIZE, DSP_REG_MAX) all come from
+ * dsp_cpu_regs.h now, so the definitions that used to sit here are gone rather
+ * than duplicated.
+ *
+ * Copyright (c) 2012 espes
+ * Copyright (c) 2018-2019 Jannik Vogel
+ * Copyright (c) 2019-2025 Matt Borgerson
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ */
 
-typedef struct dsp_core_s {
-    bool is_gp;
-    bool is_idle;
-    uint32_t cycle_count;
-
-    uint16_t instr_cycle;
-
-    uint32_t pc;
-    uint32_t registers[DSP_REG_MAX];
-
-    /* stack[0=ssh], stack[1=ssl] */
-    uint32_t stack[2][16];
-
-    uint32_t xram[DSP_XRAM_SIZE];
-    uint32_t yram[DSP_YRAM_SIZE];
-    uint32_t pram[DSP_PRAM_SIZE];
-    const void *pram_opcache[DSP_PRAM_SIZE];
-
-    uint32_t mixbuffer[DSP_MIXBUFFER_SIZE];
-
-    /* peripheral space */
-    uint32_t periph[DSP_PERIPH_SIZE];
-
-    uint32_t loop_rep;
-    uint32_t pc_on_rep;
-
-    /* Interruptions */
-    uint16_t interrupt_state;
-    uint16_t interrupt_instr_fetch;
-    uint16_t interrupt_save_pc;
-    uint16_t interrupt_counter;
-    uint16_t interrupt_ipl_to_raise;
-    uint16_t interrupt_pipeline_count;
-    int16_t interrupt_ipl[12];
-    uint16_t interrupt_is_pending[12];
-
-    /* callbacks */
-    uint32_t (*read_peripheral)(struct dsp_core_s *core, uint32_t address);
-    void (*write_peripheral)(struct dsp_core_s *core, uint32_t address, uint32_t value);
-
-    uint32_t num_inst;
-    uint32_t cur_inst_len;
-    uint32_t cur_inst;
-
-    char str_disasm_memory[2][50];
-    uint32_t disasm_memory_ptr;
-    bool exception_debugging;
-
-    uint32_t disasm_prev_inst_pc;
-    bool disasm_is_looping;
-
-    uint32_t disasm_cur_inst;
-    uint16_t disasm_cur_inst_len;
-
-    char disasm_str_instr[256];
-    char disasm_str_instr2[523];
-    char disasm_parallelmove_name[64];
-
-    uint32_t disasm_registers_save[64];
-} dsp_core_t;
-
-/* ============================================================
- * DSP DMA State (from dsp_dma.h)
- * ============================================================ */
-
-typedef void (*dsp_scratch_rw_func)(
-    void *opaque, uint8_t *ptr, uint32_t addr, size_t len, bool dir);
-typedef void (*dsp_fifo_rw_func)(
-    void *opaque, uint8_t *ptr, unsigned int index, size_t len, bool dir);
-
-typedef struct DSPDMAState {
-    dsp_core_t *core;
-
-    void *rw_opaque;
-    dsp_scratch_rw_func scratch_rw;
-    dsp_fifo_rw_func fifo_rw;
-
-    uint32_t configuration;
-    uint32_t control;
-    uint32_t start_block;
-    uint32_t next_block;
-
-    bool error;
-    bool eol;
-} DSPDMAState;
-
-/* ============================================================
- * DSP State (from dsp_state.h)
- * ============================================================ */
-
-typedef struct DSPState {
-    dsp_core_t core;
-    DSPDMAState dma;
-    int save_cycles;
-    uint32_t interrupts;
-    bool is_gp;
-} DSPState;
+#include "dsp/dsp.h"
+#include "dsp/dsp_internal.h"
 
 /* ============================================================
  * SVF (State Variable Filter) - from vp/svf.h
@@ -426,25 +355,27 @@ typedef struct MCPXAPUVPState {
 
     uint32_t inbuf_sge_handle;
     uint32_t outbuf_sge_handle;
+
+    /* Voices the most recent mcpx_apu_vp_frame() processed. The GP mix-buffer
+     * provenance flag reads it (Device semantics 6); the VP writes it. */
+    int vp_active_voices;
 } MCPXAPUVPState;
 
 /* ============================================================
  * GP/EP State (from dsp/gp_ep.h)
+ *
+ * The pinned gp_ep.h DEFINES MCPXAPUGPState and MCPXAPUEPState, so this header
+ * no longer defines its own copies -- two structs with the same name and the
+ * same shape is the same defect as two DSP layouts, one level up. The pinned
+ * header is included instead, which is step 2's "one layout" applied to the GP
+ * and EP state as well.
+ *
+ * It also brings the pinned declarations of mcpx_apu_dsp_init,
+ * mcpx_apu_update_dsp_preference, mcpx_apu_dsp_frame, gp_ops and ep_ops, so
+ * there is one declaration site for each of those too.
  * ============================================================ */
 
-typedef struct MCPXAPUGPState {
-    bool realtime;
-    MemoryRegion mmio;
-    DSPState *dsp;
-    uint32_t regs[0x10000];
-} MCPXAPUGPState;
-
-typedef struct MCPXAPUEPState {
-    bool realtime;
-    MemoryRegion mmio;
-    DSPState *dsp;
-    uint32_t regs[0x10000];
-} MCPXAPUEPState;
+#include "dsp/gp_ep.h"
 
 /* ============================================================
  * Main APU State (from apu_int.h)
@@ -513,10 +444,35 @@ void mcpx_apu_vp_finalize(MCPXAPUState *d);
 void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_vp_reset(MCPXAPUState *d);
 
-/* DSP functions (stubbed) */
-void mcpx_apu_dsp_init(MCPXAPUState *d);
-void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
-void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+/* How many voices the VP actually processed in the frame it just ran. This is
+ * the VP's own active-voice count, which Device semantics 6's MIXBUF provenance
+ * flag needs: `mixbuf_stub = (vp_active_voices > 0) || (any sample written is
+ * non-zero)`. The VP counts it; it is not re-derived here. */
+int mcpx_apu_vp_active_voices(MCPXAPUState *d);
+
+/* Is the test tone currently producing output? The [GPRUN] line carries it. */
+int mcpx_apu_test_tone_active(void);
+
+/* The EP's existing mixbin passthrough to the monitor (src/apu/apu_mixdown.c).
+ * Device semantics 2 keeps it; the pinned gp_ep.c frame function calls it. */
+int mcpx_apu_mixdown_all(void);
+void mcpx_apu_monitor_mixdown(MCPXAPUState *d,
+                              float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+
+/* The ledger's own declarations -- the GP input hooks, the DMA choke point, the
+ * translation function, the run counters and the trace lines -- are in
+ * src/apu/apu_watch.h and nowhere else, included at the top of this file. */
+
+/* DSP entry points. mcpx_apu_dsp_init, mcpx_apu_update_dsp_preference and
+ * mcpx_apu_dsp_frame are all DEFINED in the pinned gp_ep.c (gp_ep.c:496, :26 and
+ * :572 upstream) and declared by the pinned dsp/gp_ep.h, which is included
+ * above. They are deliberately not repeated here: one declaration, in the pinned
+ * header, as step 2's "one layout" requires.
+ *
+ * The old src/apu/apu_dsp.c held this toolkit's own definitions of all three
+ * plus the synthetic ack. Device semantics 2 and 4 replaced them with the pinned
+ * ones and deleted the ack, so that file is gone; its one remaining piece, the
+ * EP monitor mixdown, is src/apu/apu_mixdown.c and is declared above. */
 
 /* Debug globals */
 extern MCPXAPUState *g_state;

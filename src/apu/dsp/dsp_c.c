@@ -28,6 +28,10 @@
 #include "interp/dsp_cpu.h"
 #include "debug.h"
 
+/* A4b1 LOCAL MODIFICATION (dsp_c.c:30 upstream): the toolkit's ledger, for the
+ * bootstrap window and the instruction counter. See the marked hunks below. */
+#include "apu_watch.h"
+
 static dsp_core_t *c_core(DSPState *dsp)
 {
     return (dsp_core_t *)dsp->backend;
@@ -55,10 +59,17 @@ static void c_write_peripheral(dsp_core_t *core, uint32_t address,
     write_peripheral((DSPState *)core->opaque, address, value);
 }
 
+/* A4b1 LOCAL MODIFICATION (new, before dsp_c.c:58 upstream): the previous value
+ * of the core's cycle counter, so the gp_insns delta below is this run's
+ * retired instructions and not the frame's running total. The frame path resets
+ * the counter through dsp_set_cycle_count(dsp, 0), which resets this with it. */
+static uint32_t s_last_cycle_count;
+
 static void dsp_c_reset(DSPState *dsp)
 {
     dsp56k_reset_cpu(c_core(dsp));
     dsp->save_cycles = 0;
+    s_last_cycle_count = 0;      /* A4b1 LOCAL MODIFICATION */
 }
 
 static void dsp_c_step(DSPState *dsp)
@@ -83,6 +94,22 @@ static void dsp_c_run(DSPState *dsp, int cycles)
         if (core->is_idle) {
             break;
         }
+    }
+
+    /* A4b1 LOCAL MODIFICATION (new, after dsp_c.c:87 upstream): the run
+     * counter gp_insns -- "instructions the core retired since the latest
+     * bootstrap" (Device semantics 6). The pinned dsp56k_execute_instruction
+     * accumulates core->cycle_count by instr_cycle per retired instruction, so
+     * that IS the retired-instruction count in cycles; the delta across this
+     * call is what this run retired.
+     *
+     * The ledger's own copy is kept because gp_insns is reset at each
+     * bootstrap (apu_watch_gp_bootstrap) while core->cycle_count is reset per
+     * frame by the frame path, so neither is the other. */
+    {
+        uint32_t now = dsp_get_cycle_count(dsp);
+        apu_watch_gp_insns_add(dsp->is_gp, now - s_last_cycle_count);
+        s_last_cycle_count = now;
     }
 }
 
@@ -165,6 +192,7 @@ static uint32_t dsp_c_get_cycle_count(DSPState *dsp)
 static void dsp_c_set_cycle_count(DSPState *dsp, uint32_t count)
 {
     c_core(dsp)->cycle_count = count;
+    s_last_cycle_count = count;  /* A4b1 LOCAL MODIFICATION: see s_last_cycle_count */
 }
 
 static void dsp_c_invalidate_opcache(DSPState *dsp)

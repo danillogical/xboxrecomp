@@ -28,6 +28,14 @@
 #include "trace.h"
 #include "ui/xemu-settings.h"
 
+/* A4b1 LOCAL MODIFICATION (dsp.c:31 upstream): the toolkit's GP input
+ * accounting, Device semantics 6. This is the PERIPH hook's call site -- the
+ * one place the DSP core reads its peripheral file -- so AC-PORT step 4 can
+ * name it and AC-FIX (viii) exercises it through the production path. The hook
+ * is a no-op unless the trace or a fixture is watching, and it changes no value,
+ * store or control flow. */
+#include "apu_watch.h"
+
 /* Defines */
 #define BITMASK(x) ((1 << (x)) - 1)
 
@@ -67,6 +75,16 @@ uint32_t read_peripheral(DSPState *dsp, uint32_t address)
         v = dsp_dma_read(&dsp->dma, DMA_CONFIGURATION);
         break;
     }
+
+    /* A4b1 LOCAL MODIFICATION (dsp.c:71 upstream, immediately before the trace
+     * call): the PERIPH input hook. Device semantics 6 keys this array by
+     * peripheral offset over the finite universe DSP_PERIPH_SIZE = 128, and the
+     * offset is address - DSP_PERIPH_BASE so index 0 is 0xFFFF80. The value is
+     * passed because the array records each offset's FIRST value, which is what
+     * the Session's static modelled/stub classification is read against.
+     *
+     * Observation only: the hook returns void and v is untouched. */
+    apu_gpin_periph_read(address - DSP_PERIPH_BASE, v);
 
     trace_dsp_read_peripheral(address, v);
     return v;
@@ -119,11 +137,21 @@ DSPState *dsp_init(void *rw_opaque, dsp_scratch_rw_func scratch_rw,
     dsp->dma.scratch_rw = scratch_rw;
     dsp->dma.fifo_rw = fifo_rw;
 
-    if (g_config.audio.use_dsp_jit) {
-        dsp_jit_init(dsp);
-    } else {
-        dsp_c_init(dsp);
-    }
+    /* A4b1 LOCAL MODIFICATION (dsp.c:122-126 upstream).
+     *
+     * Upstream:
+     *     if (g_config.audio.use_dsp_jit) { dsp_jit_init(dsp); }
+     *     else { dsp_c_init(dsp); }
+     * The JIT is an A4b1 non-goal and dsp_jit.* is absent from the vendored set,
+     * so the branch is removed and dsp_c_init is called unconditionally -- which
+     * is exactly what Device semantics 2 requires ("dsp_c_init is called
+     * unconditionally", "No new environment variable is added").
+     *
+     * apu_shim.h pins g_config.audio.use_dsp_jit to false, so upstream's else
+     * arm is the one this port would take anyway; the modification removes the
+     * reference to a backend that is not in the tree rather than changing which
+     * backend runs. */
+    dsp_c_init(dsp);
 
     dsp_reset(dsp);
 
@@ -212,19 +240,30 @@ void dsp_sync_from_vm(DSPState *dsp)
 
 void dsp_set_engine(DSPState *dsp, bool use_jit)
 {
-    bool currently_jit = (dsp->ops == &jit_dsp_ops);
-    if (use_jit == currently_jit) {
-        return;
-    }
-
-    dsp_sync_to_vm(dsp);
-    dsp->ops->finalize(dsp);
+    /* A4b1 LOCAL MODIFICATION (dsp.c:213-230 upstream).
+     *
+     * Upstream this switches between the C interpreter and the JIT. There is no
+     * JIT in this port (a packet non-goal), and dsp_internal.h's local
+     * modification removes jit_dsp_ops/dsp_jit_init with it, so the switch has
+     * nothing to switch to. It is reduced to its meaning here: the interpreter
+     * is the only engine, so selecting it is a no-op and selecting the JIT is
+     * refused rather than silently ignored.
+     *
+     * This is NOT a behaviour change for A4b1. apu_shim.h pins
+     * g_config.audio.use_dsp_jit to false, so the only caller
+     * (mcpx_apu_update_dsp_preference, gp_ep.c:44-48) passes false: the
+     * `currently_jit` test below is false and the function returns at once,
+     * exactly as upstream's `if (use_jit == currently_jit) return;` does. */
+    bool currently_jit = false;
 
     if (use_jit) {
-        dsp_jit_init(dsp);
-    } else {
-        dsp_c_init(dsp);
+        fprintf(stderr, "[APU] DSP JIT requested but not ported (A4b1 non-goal);"
+                        " staying on the C interpreter\n");
+        return;
     }
-
-    dsp_sync_from_vm(dsp);
+    if (currently_jit) {
+        return;
+    }
+    /* The interpreter is already the engine: nothing to sync, nothing to
+     * re-initialise. */
 }

@@ -1169,10 +1169,24 @@ static void voice_process(MCPXAPUState *d,
  * Simplified single-threaded version (no worker threads initially)
  * ============================================================ */
 
+/* How many voices the VP actually processed in the frame it just ran.
+ *
+ * Device semantics 6's MIXBUF provenance flag is
+ * `mixbuf_stub = (vp_active_voices > 0) || (any sample written is non-zero)`,
+ * and the first clause is this: the VP's own count of the voices it processed,
+ * not a re-derivation. It is the count from the most recent
+ * mcpx_apu_vp_frame(), which the frame path calls immediately before the GP
+ * mix-buffer write, so the two are the same frame's. */
+int mcpx_apu_vp_active_voices(MCPXAPUState *d)
+{
+    return d ? d->vp.vp_active_voices : 0;
+}
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+    d->vp.vp_active_voices = 0;
 
     for (int list = 0; list < 3; list++) {
         hwaddr top, current, next;
@@ -1198,6 +1212,7 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                d->vp.vp_active_voices++;
             }
             d->regs[current] = d->regs[next];
         }

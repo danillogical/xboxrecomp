@@ -23,6 +23,74 @@
 #include <math.h>
 
 /* ============================================================
+ * The pinned xemu DSP56300 sources (A4b1 step 2)
+ *
+ * src/apu/dsp/ is vendored byte-for-byte from xemu at
+ * 67cc79e663038d1f55448c0f566b37dde016adf6 and needs a handful of symbols the
+ * NV2A shim does not carry. They are added here, in the toolkit's own shim
+ * header, rather than by editing a vendored file.
+ *
+ * The surface was inventoried, not guessed: see
+ * docs/reviews/a4b1-execution-evidence.md, "Step 2 prerequisite". Everything
+ * below is a NO-OP or a PASS-THROUGH. Nothing here invents device behaviour.
+ * ============================================================ */
+
+/* ssize_t is not part of the MSVC CRT vocabulary. dsp_dma.c declares
+ * `static ssize_t scratch_buf_size` for its intermediate DMA buffer, so the
+ * name has to exist. intptr_t is the same width the type has on the POSIX
+ * hosts this toolkit also builds for. */
+#if defined(_MSC_VER) && !defined(_SSIZE_T_DEFINED)
+#define _SSIZE_T_DEFINED
+typedef intptr_t ssize_t;
+#endif
+
+/* QEMU's dirty-tracking entry point, called by the pinned gp_ep.c after it
+ * writes a scatter-gather page (gp_ep.c:77).
+ *
+ * A NO-OP, and honestly so: this toolkit has no migration and no dirty bitmap
+ * -- guest RAM is a plain host mapping that the guest and the model share, so
+ * there is nothing to mark. Adding a bitmap nothing reads would be the
+ * dishonest version of this shim. */
+#ifndef memory_region_set_dirty
+#define memory_region_set_dirty(mr, addr, size) ((void)0)
+#endif
+
+/* xemu's audio settings, which the pinned dsp.c and gp_ep.c read.
+ *
+ * The two fields they use are set to the values Device semantics 2 requires,
+ * with NO environment variable:
+ *
+ *   use_dsp     = true   the GP is enabled unconditionally
+ *                        (gp_ep.c:31-41 sets d->gp.realtime/d->ep.realtime)
+ *   use_dsp_jit = false  the C interpreter is chosen, never the JIT. The JIT is
+ *                        a packet non-goal, and dsp_jit.* is deliberately
+ *                        absent from the vendored set.
+ *
+ * So `if (g_config.audio.use_dsp_jit) dsp_jit_init(dsp); else dsp_c_init(dsp);`
+ * at dsp.c:122-126 takes the dsp_c_init arm unconditionally, which is what
+ * Device semantics 2 says, and dsp_set_engine() at gp_ep.c:44-48 is a no-op
+ * because its preference never changes. */
+static struct {
+    struct {
+        float volume_limit;
+        bool hrtf;
+        struct {
+            int num_workers;
+        } vp;
+        bool use_dsp;
+        bool use_dsp_jit;
+    } audio;
+} g_config = {
+    .audio = {
+        .volume_limit = 1.0f,
+        .hrtf = false,
+        .vp = { .num_workers = 1 },
+        .use_dsp = true,
+        .use_dsp_jit = false,
+    },
+};
+
+/* ============================================================
  * Additional atomic ops needed by APU code
  * ============================================================ */
 
@@ -349,23 +417,9 @@ static inline void warn_reportf_err(Error *err, const char *fmt, ...) {
 
 /* ============================================================
  * g_config stub (xemu settings used by APU)
+ *
+ * Defined above, together with the two fields the pinned DSP56300 sources read.
  * ============================================================ */
-
-static struct {
-    struct {
-        float volume_limit;
-        bool hrtf;
-        struct {
-            int num_workers;
-        } vp;
-    } audio;
-} g_config = {
-    .audio = {
-        .volume_limit = 1.0f,
-        .hrtf = false,
-        .vp = { .num_workers = 1 },
-    },
-};
 
 /* ============================================================
  * RCU stubs (used by worker threads)
@@ -382,10 +436,14 @@ static inline void rcu_unregister_thread(void) {}
 #define g_malloc0_n(n, size) calloc((n), (size))
 #endif
 
-/* ============================================================
- * HWADDR_PRIx format specifier
- * ============================================================ */
-
+/* HWADDR_PRIx format specifier.
+ *
+ * The pinned gp_ep.c uses `"0x%" HWADDR_PRIx` with a hwaddr (uint64_t) argument
+ * in its DPRINTF calls, so this has to expand to a 64-bit length modifier. The
+ * NV2A shim does not define PRIx64, so it is defined here rather than assumed. */
+#ifndef PRIx64
+#define PRIx64 "llx"
+#endif
 #ifndef HWADDR_PRIx
 #define HWADDR_PRIx PRIx64
 #endif

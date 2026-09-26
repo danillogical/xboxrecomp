@@ -22,7 +22,15 @@
 #include "apu_state.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
+#include "apu_watch.h"
 #include "fpconv.h"
+
+/* A4b1 step 2/3: the pinned GP/EP header. It is where
+ * mcpx_apu_dsp_init, mcpx_apu_update_dsp_preference, mcpx_apu_dsp_frame and
+ * gp_ops/ep_ops are declared -- the pinned definitions are the only ones -- so
+ * this is the one declaration site rather than a second copy in apu_state.h.
+ * Every include it needs resolves through dsp/shim/. */
+#include "dsp/gp_ep.h"
 
 /* ============================================================
  * Globals
@@ -399,6 +407,12 @@ static void throttle(MCPXAPUState *d)
 
 static void se_frame(MCPXAPUState *d)
 {
+    /* The ledger's global se_frame count and its every-256th-frame emission
+     * (Device semantics 6/7). One tick per APU frame, before anything else this
+     * frame does, so the count is the frame number the rest of the frame's
+     * lines report. */
+    apu_watch_frame_tick();
+
     mcpx_apu_update_dsp_preference(d);
     mcpx_debug_begin_frame();
     g_dbg.gp_realtime = d->gp.realtime;
@@ -500,13 +514,22 @@ static void mcpx_apu_reset_locked(MCPXAPUState *d)
     memset(d->regs, 0, sizeof(d->regs));
     mcpx_apu_vp_reset(d);
 
+    /* A4b1 step 2: "The pram_opcache reset moves to the pinned API."
+     *
+     * The opcache is the C interpreter's per-address opcode cache and it lives
+     * in the interpreter's own core, not in the toolkit's state. The pinned API
+     * for clearing it is dsp_invalidate_opcache(), which is what
+     * dsp_c_invalidate_opcache() implements (dsp_c.c:170-173). Reaching into
+     * `dsp->core.pram_opcache` -- as this used to -- was reaching into the
+     * VM-snapshot mirror of the core, which is a different object with a
+     * different size (DspCoreState.pram_opcache is 4096 entries, dsp_core_t's
+     * is too, but they are not the same array) and which the pinned interpreter
+     * never reads. */
     if (d->gp.dsp) {
-        memset((void *)d->gp.dsp->core.pram_opcache, 0,
-               sizeof(d->gp.dsp->core.pram_opcache));
+        dsp_invalidate_opcache(d->gp.dsp);
     }
     if (d->ep.dsp) {
-        memset((void *)d->ep.dsp->core.pram_opcache, 0,
-               sizeof(d->ep.dsp->core.pram_opcache));
+        dsp_invalidate_opcache(d->ep.dsp);
     }
     d->set_irq = false;
 }
@@ -609,13 +632,22 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
             mcpx_apu_vp_write(d, vp_addr, val, size);
         }
         /* VP reads handled by caller if needed */
+    } else if (addr >= 0x30000 && addr < 0x40000) {
+        /* A4b1 step 3: the GP block (0x30000..0x3FFFF) is routed to the pinned
+         * gp_ops. The pinned gp_write takes its own lock, so this does not hold
+         * d->lock here. GP reads go through mcpx_apu_mmio_read_quiet below. */
+        if (is_write) {
+            gp_ops.write(d, addr - 0x30000, val, size);
+        }
     } else if (addr < 0x20000) {
         /* Main APU registers */
         if (is_write) {
             mcpx_apu_write(d, addr, val, size);
         }
     }
-    /* GP (0x30000) and EP (0x50000) regions ignored for now */
+    /* EP (0x50000) stays unrouted: an EP write is still dropped, and an EP read
+     * still returns 0 with the once-per-block note. That is A4b1's explicit
+     * non-goal, not an omission. */
 }
 
 /* ============================================================
@@ -628,20 +660,41 @@ uint64_t mcpx_apu_mmio_read_quiet(MCPXAPUState *d, uint64_t addr, unsigned int s
     if (!d) return 0;
     if (addr >= 0x20000 && addr < 0x30000) {
         return mcpx_apu_vp_read(d, addr - 0x20000, size);
+    } else if (addr >= 0x30000 && addr < 0x40000) {
+        /* A4b1 step 3: GP reads are routed to the pinned gp_read from BOTH
+         * entry points -- here and mcpx_apu_dispatch_mmio above -- so a trapped
+         * GP read and a quiet diagnostic read see the same device. */
+        return gp_ops.read(d, addr - 0x30000, size);
     } else if (addr < 0x20000) {
         return mcpx_apu_read(d, (hwaddr)addr, size);
     }
     return 0;
 }
 
-/* The GP (0x30000) and EP (0x50000) DSP blocks have no model, so a read there
- * returns 0. For a single unimplemented register that is the honest answer.
- * For a bulk read it is not: JSRF copies 280 bytes out of the GP window into a
- * RAM structure (guest 0x001A1B41, src 0xFE830200), and a silent zero there is
- * indistinguishable in the log from device state that genuinely read zero --
- * the same failure the run-profile rule calls out when it refuses to map the
- * aperture readable. Name the block once, so the gap is a fact in the run log
- * rather than an inference from an empty buffer. */
+/* The GP (0x30000) DSP block is now modelled (A4b1 step 3); the EP (0x50000)
+ * still has no model.
+ *
+ * The note fires where a read really does return a silent 0 with nothing behind
+ * it: the EP block and the unassigned blocks past it. A4b1 step 3 says the note
+ * "keeps firing for EP and for unmodelled GP offsets", and after the port there
+ * are no unmodelled GP offsets left to name -- every offset in 0x30000..0x3FFFF
+ * is answered by the pinned gp_read, either by one of its four explicit memory
+ * ranges (XMEM, MIXBUF, YMEM, PMEM) or by its register file, which is the
+ * hardware's own model for the GP control registers (GPSADDR, GPSMAXSGE,
+ * GPFADDR, GPRST, and the GPOF/GPIF FIFO registers).
+ *
+ * Keeping the note on GP would make it lie. Its whole point, per this comment
+ * upstream, is that "a silent zero there is indistinguishable in the log from
+ * device state that genuinely read zero"; now that a GP read returns the
+ * register the guest wrote, the note would claim "-> 0; no model for this
+ * block" about a read that returned a real value from a real model. A note that
+ * is false is worse than a note that is absent.
+ *
+ * For a single unimplemented register a 0 is the honest answer. For a bulk read
+ * it is not: JSRF copies 280 bytes out of the GP window into a RAM structure
+ * (guest 0x001A1B41, src 0xFE830200), and that is why the note exists at all.
+ * Name the block once, so the gap is a fact in the run log rather than an
+ * inference from an empty buffer. */
 static void apu_note_unimplemented_block_read(uint64_t addr, unsigned int size)
 {
     static unsigned char reported[8];
@@ -652,14 +705,14 @@ static void apu_note_unimplemented_block_read(uint64_t addr, unsigned int size)
     reported[block] = 1;
     fprintf(stderr, "[APU] read of unimplemented %s DSP block at offset "
                     "0x%05llX (size %u) -> 0; no model for this block\n",
-            addr < 0x40000 ? "GP" : (addr < 0x60000 ? "EP" : "unknown"),
+            addr < 0x60000 ? "EP" : "unknown",
             (unsigned long long)addr, size);
     fflush(stderr);
 }
 
 uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size)
 {
-    if (addr >= 0x30000)
+    if (addr >= 0x40000)
         apu_note_unimplemented_block_read(addr, size);
     return mcpx_apu_mmio_read_quiet(d, addr, size);
 }
@@ -668,6 +721,17 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
 {
     if (!d) return;
     mcpx_apu_dispatch_mmio(d, (hwaddr)addr, val, size, true);
+}
+
+/* Is the test tone currently producing output?
+ *
+ * The [GPRUN] line carries it (Device semantics 7: `tone=%d`). It is the
+ * toolkit's own tone generator, not a device register, so the pinned frame path
+ * cannot read it; this accessor is how it reaches the line. Observation only:
+ * nothing branches on it, and it changes no value, store or control flow. */
+int mcpx_apu_test_tone_active(void)
+{
+    return g_test_tone.active ? 1 : 0;
 }
 
 /* ============================================================

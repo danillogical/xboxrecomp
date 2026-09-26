@@ -29,6 +29,10 @@
 #include "debug.h"
 #include "trace.h"
 
+/* A4b1 LOCAL MODIFICATION (new include after dsp_cpu.c:30): the toolkit's GP
+ * input accounting, for the MIXBUF read hook below. */
+#include "apu_watch.h"
+
 #define BITMASK(x)  ((1<<(x))-1)
 
 #define TRACE_DSP_DISASM 0
@@ -903,8 +907,19 @@ uint32_t dsp56k_read_memory(dsp_core_t* dsp, int space, uint32_t address)
             assert(dsp->read_peripheral);
             return dsp->read_peripheral(dsp, address);
         } else if (address >= DSP_MIXBUFFER_BASE && address < DSP_MIXBUFFER_BASE+DSP_MIXBUFFER_SIZE) {
+            /* A4b1 LOCAL MODIFICATION (dsp_cpu.c:906 upstream): the MIXBUF input
+             * hook. Device semantics 6 keys this array by bin over the finite
+             * universe NUM_MIXBINS = 32, with bin = (addr - 0x1400) / 32, and
+             * counts reads_while_stub against the per-frame provenance flag the
+             * pinned frame path sets. Observation only: the returned word is
+             * the mixbuffer's, untouched. */
+            apu_gpin_mixbuf_read(address - DSP_MIXBUFFER_BASE,
+                                 dsp->mixbuffer[address-DSP_MIXBUFFER_BASE]);
             return dsp->mixbuffer[address-DSP_MIXBUFFER_BASE];
         } else if (address >= 0xc00 && address < 0xc00+DSP_MIXBUFFER_SIZE) {
+            /* The 0xc00 alias of the same buffer. Recorded too: it is the same
+             * 1024 words, and a read here is a mix-buffer read. */
+            apu_gpin_mixbuf_read(address - 0xc00, dsp->mixbuffer[address-0xc00]);
             return dsp->mixbuffer[address-0xc00];
         } else {
             if (address < DSP_XRAM_SIZE) {
