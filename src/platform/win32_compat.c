@@ -12,6 +12,8 @@
 
 /* Enable memfd_create, MAP_FIXED_NOREPLACE, timegm. Must precede all #includes. */
 #define _GNU_SOURCE
+/* Darwin: exposes memset_s, its explicit_bzero equivalent. */
+#define __STDC_WANT_LIB_EXT1__ 1
 
 #include "win32_compat.h"
 
@@ -21,6 +23,7 @@
 #include <strings.h>
 #include <stdio.h>
 #include <time.h>
+#include <signal.h>
 #include <errno.h>
 #include <unistd.h>
 #include <sched.h>
@@ -30,6 +33,7 @@
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <mach/mach.h>
+#include <mach/mach_vm.h>
 #else
 #include <sys/sysinfo.h>
 #endif
@@ -53,6 +57,12 @@ LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(
 LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
 
 LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
+{
+    __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return cmp;
+}
+
+LONGLONG InterlockedCompareExchange64(volatile LONGLONG *p, LONGLONG xchg, LONGLONG cmp)
 {
     __atomic_compare_exchange_n(p, &cmp, xchg, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
     return cmp;
@@ -120,6 +130,71 @@ VOID DeleteCriticalSection(LPCRITICAL_SECTION cs)
 }
 
 /* ===================================================================== */
+/* Slim reader/writer locks                                              */
+/* ===================================================================== */
+
+/* An SRWLOCK is usable straight from SRWLOCK_INIT, so the pthread_rwlock_t
+ * behind it has to appear on first use. Unlike the condition variables below
+ * -- whose lazy init is covered by the caller holding the paired CRITICAL
+ * SECTION -- an SRWLOCK is by definition taken from several threads at once
+ * with nothing else held, so first use genuinely races. Serialise just that:
+ * once Ptr is published, every acquire is a plain atomic load. */
+static pthread_rwlock_t *srw_lazy_init(PSRWLOCK lock)
+{
+    pthread_rwlock_t *rw = __atomic_load_n((pthread_rwlock_t **)&lock->Ptr,
+                                           __ATOMIC_ACQUIRE);
+    if (!rw) {
+        static pthread_mutex_t init_lock = PTHREAD_MUTEX_INITIALIZER;
+        pthread_mutex_lock(&init_lock);
+        rw = (pthread_rwlock_t *)lock->Ptr;
+        if (!rw) {
+            rw = (pthread_rwlock_t *)malloc(sizeof(*rw));
+            pthread_rwlock_init(rw, NULL);
+            __atomic_store_n((pthread_rwlock_t **)&lock->Ptr, rw, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&init_lock);
+    }
+    return rw;
+}
+
+VOID InitializeSRWLock(PSRWLOCK lock)
+{
+    lock->Ptr = NULL;
+    srw_lazy_init(lock);
+}
+
+VOID AcquireSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_rdlock(srw_lazy_init(lock)); }
+VOID ReleaseSRWLockShared(PSRWLOCK lock)     { pthread_rwlock_unlock(srw_lazy_init(lock)); }
+VOID AcquireSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_wrlock(srw_lazy_init(lock)); }
+VOID ReleaseSRWLockExclusive(PSRWLOCK lock)  { pthread_rwlock_unlock(srw_lazy_init(lock)); }
+
+/* ===================================================================== */
+/* One-time initialisation                                               */
+/* ===================================================================== */
+
+/* Win32 semantics: the callback runs at most once for a given INIT_ONCE, and
+ * a callback returning FALSE leaves it un-run so a later call retries. Ptr
+ * doubles as the "done" flag. One global mutex covers every INIT_ONCE --
+ * initialisation is rare, and the fast path never touches it. */
+BOOL InitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN fn, PVOID param, PVOID *context)
+{
+    static pthread_mutex_t once_lock = PTHREAD_MUTEX_INITIALIZER;
+
+    if (__atomic_load_n(&once->Ptr, __ATOMIC_ACQUIRE))
+        return TRUE;
+
+    pthread_mutex_lock(&once_lock);
+    BOOL ok = TRUE;
+    if (!once->Ptr) {
+        ok = fn(once, param, context);
+        if (ok)
+            __atomic_store_n(&once->Ptr, (PVOID)1, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&once_lock);
+    return ok;
+}
+
+/* ===================================================================== */
 /* Condition variables (paired with a CRITICAL_SECTION)                  */
 /* ===================================================================== */
 
@@ -176,7 +251,7 @@ VOID WakeAllConditionVariable(PCONDITION_VARIABLE cv)
 /* ===================================================================== */
 
 typedef enum { K_EVENT, K_SEM, K_MUTEX, K_THREAD, K_TIMER, K_HEAP,
-               K_FILEMAP, K_FILE } w32_kind;
+               K_FILEMAP, K_FILE, K_WAITABLE_TIMER } w32_kind;
 
 #define W32_MAX_APC 16
 
@@ -219,6 +294,12 @@ typedef struct w32_object {
     DWORD           timer_period;
     WAITORTIMERCALLBACK timer_cb;
     PVOID           timer_param;
+
+    /* waitable timer */
+    int             waitable_manual_reset;
+    struct timespec waitable_due_time;
+    int             waitable_triggered;
+    int             waitable_armed;
 
     /* file mapping / fd-backed file handle */
     int             fd;
@@ -266,6 +347,8 @@ static void obj_release(w32_object *o)
         free(o->file_path);
     } else if (o->kind == K_FILEMAP) {
         if (o->fd >= 0) close(o->fd);
+    } else if (o->kind == K_WAITABLE_TIMER) {
+        /* Waitable timers: no special cleanup needed */
     }
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
@@ -350,6 +433,24 @@ static int drain_apcs(void)
     return run;
 }
 
+static int timespec_before(const struct timespec *a, const struct timespec *b)
+{
+    return a->tv_sec != b->tv_sec ? a->tv_sec < b->tv_sec : a->tv_nsec < b->tv_nsec;
+}
+
+/* Signalled once the due time passes; latched, so a manual-reset timer stays
+ * signalled until it is set or cancelled again. Caller holds o->lock. */
+static int waitable_due(w32_object *o)
+{
+    struct timespec now;
+    if (o->waitable_triggered) return 1;
+    if (!o->waitable_armed) return 0;
+    clock_gettime(CLOCK_REALTIME, &now);
+    if (timespec_before(&now, &o->waitable_due_time)) return 0;
+    o->waitable_triggered = 1;
+    return 1;
+}
+
 /*
  * Wait on a single object. The object lock must NOT be held.
  * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT.
@@ -372,18 +473,34 @@ static DWORD wait_single(w32_object *o, DWORD ms)
         case K_MUTEX:
             ready = (o->mtx_owner == 0 || o->mtx_owner == GetCurrentThreadId());
             break;
+        case K_WAITABLE_TIMER: ready = waitable_due(o); break;
         default:       ready = 1; break;
         }
         if (ready) break;
 
-        int rc = timed ? pthread_cond_timedwait(&o->cond, &o->lock, &ts)
-                       : pthread_cond_wait(&o->cond, &o->lock);
-        if (rc == ETIMEDOUT) { result = WAIT_TIMEOUT; break; }
+        /* An armed timer has its own deadline. Waiting on the caller's alone
+         * would sleep straight past the due time, so take whichever comes
+         * first and re-test. */
+        struct timespec until = ts;
+        int bounded = timed;
+        if (o->kind == K_WAITABLE_TIMER && o->waitable_armed &&
+            (!timed || timespec_before(&o->waitable_due_time, &ts))) {
+            until = o->waitable_due_time;
+            bounded = 1;
+        }
+        int rc = bounded ? pthread_cond_timedwait(&o->cond, &o->lock, &until)
+                         : pthread_cond_wait(&o->cond, &o->lock);
+        if (rc == ETIMEDOUT && timed && !timespec_before(&until, &ts)) {
+            result = WAIT_TIMEOUT; break;
+        }
     }
 
     if (result == WAIT_OBJECT_0) {
         switch (o->kind) {
         case K_EVENT: if (!o->manual_reset) o->signaled = 0; break;
+        case K_WAITABLE_TIMER:
+            if (!o->waitable_manual_reset) { o->waitable_triggered = 0; o->waitable_armed = 0; }
+            break;
         case K_SEM:   o->sem_count--; break;
         case K_MUTEX: o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion++; break;
         default: break;
@@ -848,6 +965,63 @@ BOOL TrySubmitThreadpoolCallback(PTP_SIMPLE_CALLBACK callback,
 }
 
 /* ===================================================================== */
+/* Waitable timers                                                       */
+/* ===================================================================== */
+
+HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR name)
+{
+    (void)sa;
+    (void)name;
+    w32_object *o = obj_alloc(K_WAITABLE_TIMER);
+    o->waitable_manual_reset = manualReset;
+    return (HANDLE)o;
+}
+
+BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
+                      PTIMERAPCROUTINE completion, PVOID arg, BOOL resume)
+{
+    w32_object *o = (w32_object *)h;
+    (void)completion; (void)arg; (void)resume;
+    if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
+    pthread_mutex_lock(&o->lock);
+    /* Win32 100ns units: negative is relative to now, positive is an absolute
+     * FILETIME. ponytail: period is ignored -- one-shot only, revisit if a
+     * title actually arms a repeating timer. */
+    if (dueTime->QuadPart <= 0) {
+        clock_gettime(CLOCK_REALTIME, &o->waitable_due_time);
+        LONGLONG ns = -dueTime->QuadPart * 100LL;
+        o->waitable_due_time.tv_sec  += (time_t)(ns / 1000000000LL);
+        o->waitable_due_time.tv_nsec += (long)(ns % 1000000000LL);
+        if (o->waitable_due_time.tv_nsec >= 1000000000L) {
+            o->waitable_due_time.tv_sec++;
+            o->waitable_due_time.tv_nsec -= 1000000000L;
+        }
+    } else {
+        /* FILETIME epoch is 1601-01-01; Unix is 1970-01-01. */
+        LONGLONG unix100ns = dueTime->QuadPart - 116444736000000000LL;
+        o->waitable_due_time.tv_sec  = (time_t)(unix100ns / 10000000LL);
+        o->waitable_due_time.tv_nsec = (long)((unix100ns % 10000000LL) * 100LL);
+    }
+    (void)period;
+    o->waitable_armed = 1;
+    o->waitable_triggered = 0;
+    pthread_mutex_unlock(&o->lock);
+    pthread_cond_broadcast(&o->cond);
+    return TRUE;
+}
+
+BOOL CancelWaitableTimer(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
+    pthread_mutex_lock(&o->lock);
+    o->waitable_triggered = 0;
+    o->waitable_armed = 0;
+    pthread_mutex_unlock(&o->lock);
+    return TRUE;
+}
+
+/* ===================================================================== */
 /* Heap (thin wrapper over malloc; the single process heap)              */
 /* ===================================================================== */
 
@@ -897,6 +1071,59 @@ static int prot_from_page(DWORD protect)
     }
 }
 
+#if defined(__APPLE__)
+/* Darwin has no MAP_FIXED_NOREPLACE, and the two mmap options are both wrong
+ * for VirtualAlloc: MAP_FIXED silently unmaps whatever already occupies the
+ * range, and a bare address hint can be relocated by the kernel for reasons
+ * other than the range being taken -- so "we got a different address" is only
+ * an approximation of "it was occupied", and a racy one.
+ *
+ * mach_vm_map with VM_FLAGS_FIXED is the exact primitive: it maps at the
+ * address given, and returns KERN_NO_SPACE rather than displacing an existing
+ * mapping. That is what Win32 promises, and this layer exists to keep the Xbox
+ * HLE above it honest -- a VirtualAlloc that quietly replaced a live mapping
+ * would corrupt whatever held it, far from the call that did it.
+ *
+ * Memory from mach_vm_map is released by munmap like any other, because the
+ * BSD and Mach halves of Darwin share one VM map, so VirtualFree is unchanged.
+ */
+/* Length registry, defined with the view helpers below. Win32 frees by address
+ * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
+ * documented to take size 0 -- so the length has to be recoverable here or
+ * munmap cannot be called at all. */
+void view_register(void *addr, size_t len);
+size_t view_take(const void *addr);
+
+static void *mach_map_fixed(void *address, size_t size, int prot)
+{
+    mach_vm_address_t addr = (mach_vm_address_t)(uintptr_t)address;
+    mach_vm_size_t len = (size + vm_page_size - 1) & ~((mach_vm_size_t)vm_page_size - 1);
+    vm_prot_t vmprot = VM_PROT_NONE;
+
+    if (prot & PROT_READ)  vmprot |= VM_PROT_READ;
+    if (prot & PROT_WRITE) vmprot |= VM_PROT_WRITE;
+    if (prot & PROT_EXEC)  vmprot |= VM_PROT_EXECUTE;
+
+    kern_return_t kr = mach_vm_map(
+        mach_task_self(),
+        &addr,
+        len,
+        0,
+        VM_FLAGS_FIXED,
+        MEMORY_OBJECT_NULL,
+        0,
+        FALSE,
+        vmprot,
+        VM_PROT_ALL,
+        VM_INHERIT_DEFAULT
+    );
+    if (kr != KERN_SUCCESS) {
+        return MAP_FAILED;
+    }
+    return (void *)(uintptr_t)addr;
+}
+#endif
+
 LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protect)
 {
     int prot  = prot_from_page(protect);
@@ -912,17 +1139,32 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 
 #if defined(MAP_FIXED_NOREPLACE)
     if (address) flags |= MAP_FIXED_NOREPLACE;
-#elif defined(__APPLE__)
-    /* TODO: mach_vm_map with VM_FLAGS_FIXED (which does fail rather than replace),
-     * or a mach_vm_region probe before an MAP_FIXED call. */
 #endif
-    void *p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE,
-                   flags, -1, 0);
-    if (p == MAP_FAILED) { SetLastError(8); return NULL; }
-#if !defined(MAP_FIXED_NOREPLACE)
-    /* TODO: Without MAP_FIXED_NOREPLACE (macOS or older kernels) plain
-     * MAP_FIXED would silently unmap whatever already lives there. Getting a
-     * different address means the range was taken: fail as Linux does. */
+
+    void *p;
+#if defined(__APPLE__)
+    if (address) {
+        p = mach_map_fixed(address, size, prot ? prot : PROT_READ | PROT_WRITE);
+    } else
+#endif
+    p = mmap(address, size, prot ? prot : PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (p == MAP_FAILED) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
+    /* Remember the length: VirtualFree(MEM_RELEASE) is passed size 0 by every
+     * Win32 caller, and munmap cannot be called without one. */
+    view_register(p, size);
+#if !defined(MAP_FIXED_NOREPLACE) && !defined(__APPLE__)
+    /* Older kernels without MAP_FIXED_NOREPLACE: plain MAP_FIXED would silently
+     * unmap whatever already lives there, so we pass the address as a hint and
+     * treat a different result as "taken". Apple goes through mach_map_fixed
+     * above, which reports that properly instead of inferring it. */
+    if (address && p != address) {
+        munmap(p, size);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
 #endif
     return p;
 }
@@ -930,9 +1172,14 @@ LPVOID VirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD pro
 BOOL VirtualFree(LPVOID address, SIZE_T size, DWORD freeType)
 {
     if (freeType & MEM_RELEASE) {
-        /* Win32 MEM_RELEASE passes size 0; we can't know the length, so this
-         * path is only safe when callers pass the real size. */
-        if (size == 0) return TRUE;
+        /* Win32 MEM_RELEASE passes size 0 and frees the whole allocation, so
+         * the length comes from the registry VirtualAlloc filled in. Returning
+         * TRUE without unmapping -- as this used to -- made every release a
+         * silent no-op: the caller believed the address was free, the next
+         * allocation there failed, and nothing connected the two. */
+        size_t len = view_take(address);
+        if (size == 0) size = len;
+        if (size == 0) return FALSE;
         return munmap(address, size) == 0;
     }
     if (freeType & MEM_DECOMMIT)
@@ -1029,22 +1276,41 @@ VOID ExitProcess(UINT exitCode) { exit((int)exitCode); }
 BOOL IsDebuggerPresent(void)
 {
 #if defined(__APPLE__)
-    /* TODO: Darwin: KERN_PROC_PID reports P_TRACED when a debugger is attached. */
-    return FALSE;
+    /* Darwin: KERN_PROC_PID reports P_TRACED when a debugger is attached. */
+    struct kinfo_proc info;
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+    size_t size = sizeof(info);
+    memset(&info, 0, size);
+    if (sysctl(mib, sizeof(mib), &info, &size, NULL, 0) != 0) return FALSE;
+    return (info.kp_proc.p_flag & P_TRACED) != 0;
 #else
-    /* TODO: On Linux a non-zero TracerPid in /proc/self/status means ptrace is attached. */
-    return FALSE;
+    /* Linux: a non-zero TracerPid in /proc/self/status means ptrace is attached. */
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return FALSE;
+    char line[256];
+    BOOL traced = FALSE;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "TracerPid:", 10) == 0) {
+            traced = strtol(line + 10, NULL, 10) != 0;
+            break;
+        }
+    }
+    fclose(f);
+    return traced;
 #endif
 }
 
 VOID DebugBreak(void) {
-    // TODO: Use __debugbreak()?
+    /* Not __debugbreak(): that is an MSVC intrinsic, and this file is the
+     * half that MSVC never compiles. SIGTRAP is the POSIX equivalent --
+     * continuable under a debugger, fatal without one, as on Windows. */
+    raise(SIGTRAP);
 }
 
 VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
 #if defined(__APPLE__)
-    // TODO: Darwin explicit_bzero equivalent is memset_s.
+    memset_s(ptr, cnt, 0, cnt);
 #else
     explicit_bzero(ptr, cnt);
 #endif
@@ -1137,6 +1403,16 @@ DWORD GetFileSize(HANDLE h, LPDWORD high)
     if (fstat(fd, &st) != 0) return INVALID_FILE_SIZE;
     if (high) *high = (DWORD)(((uint64_t)st.st_size >> 32) & 0xFFFFFFFFu);
     return (DWORD)(st.st_size & 0xFFFFFFFFu);
+}
+
+BOOL GetFileSizeEx(HANDLE h, PLARGE_INTEGER size)
+{
+    int fd = w32_handle_fd(h);
+    if (fd < 0 || !size) { SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    struct stat st;
+    if (fstat(fd, &st) != 0) { SetLastError(ERROR_GEN_FAILURE); return FALSE; }
+    size->QuadPart = (LONGLONG)st.st_size;
+    return TRUE;
 }
 
 BOOL FlushFileBuffers(HANDLE h)
@@ -1273,7 +1549,7 @@ typedef struct { void *addr; size_t len; } w32_view;
 static w32_view        s_views[512];
 static pthread_mutex_t s_views_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static void view_register(void *addr, size_t len)
+void view_register(void *addr, size_t len)
 {
     pthread_mutex_lock(&s_views_lock);
     for (int i = 0; i < 512; i++)
@@ -1281,7 +1557,31 @@ static void view_register(void *addr, size_t len)
     pthread_mutex_unlock(&s_views_lock);
 }
 
-static size_t view_take(const void *addr)
+/* Non-destructive counterpart to view_take, and interior-aware: VirtualQuery
+ * is asked about addresses *within* a region at least as often as about its
+ * base -- a translated guest VA lands in the middle of the 64 MB window.
+ * Picks the containing region and reports where it starts. */
+int view_lookup(const void *addr, void **base_out, size_t *len_out)
+{
+    int found = 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        if (!s_views[i].addr)
+            continue;
+        uintptr_t lo = (uintptr_t)s_views[i].addr;
+        uintptr_t hi = lo + s_views[i].len;
+        if ((uintptr_t)addr >= lo && (uintptr_t)addr < hi) {
+            if (base_out) *base_out = s_views[i].addr;
+            if (len_out)  *len_out  = s_views[i].len;
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    return found;
+}
+
+size_t view_take(const void *addr)
 {
     size_t len = 0;
     pthread_mutex_lock(&s_views_lock);
@@ -1296,8 +1596,14 @@ static size_t view_take(const void *addr)
 static int anon_map_fd(const char *name)
 {
 #if defined(__APPLE__)
-    // TODO: use shm_open on macOS 10.12+ or mkstemp + unlink for older versions
-    return 0;
+    static volatile LONG map_counter = 0;
+    char shm_name[32];
+    LONG seq = InterlockedIncrement(&map_counter);
+    const char *base = name ? name : "xbox_map";
+    snprintf(shm_name, sizeof(shm_name), "/%s_%ld", base, seq);
+    int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
+    if (fd >= 0) shm_unlink(shm_name);
+    return fd;
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif
@@ -1340,10 +1646,40 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
     off_t  off = ((off_t)offHigh << 32) | offLow;
     SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
     int prot   = PROT_READ | ((access != FILE_MAP_READ) ? PROT_WRITE : 0);
-    int flags  = MAP_SHARED | (baseAddr ? MAP_FIXED : 0);
+    int flags  = MAP_SHARED;
+
+    /* Win32 MapViewOfFileEx *fails* when the requested address is unavailable.
+     * Plain MAP_FIXED does the opposite: it silently unmaps whatever is there
+     * and succeeds. The Xbox memory model asks for 28 mirror views at computed
+     * addresses, so with a base the OS chose rather than one we picked, that
+     * difference is the process quietly destroying its own libraries and heap
+     * and dying somewhere unrelated a moment later. */
+    if (baseAddr) {
+#if defined(MAP_FIXED_NOREPLACE)
+        flags |= MAP_FIXED_NOREPLACE;
+#elif defined(__APPLE__)
+        /* Darwin has no MAP_FIXED_NOREPLACE. Claim the range first with
+         * mach_vm_map(VM_FLAGS_FIXED), which refuses rather than displaces;
+         * MAP_FIXED below can then only replace the placeholder we now own. */
+        if (mach_map_fixed(baseAddr, len, PROT_READ | PROT_WRITE) == MAP_FAILED) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return NULL;
+        }
+        flags |= MAP_FIXED;
+#else
+        flags |= MAP_FIXED;
+#endif
+    }
 
     void *p = mmap(baseAddr, len, prot, flags, o->fd, off);
     if (p == MAP_FAILED) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    if (baseAddr && p != baseAddr) {
+        /* MAP_FIXED_NOREPLACE hands back a different address instead of
+         * failing on some kernels; treat that as the refusal it means. */
+        munmap(p, len);
+        SetLastError(ERROR_INVALID_ADDRESS);
+        return NULL;
+    }
     view_register(p, len);
     return p;
 }
@@ -1364,27 +1700,89 @@ BOOL UnmapViewOfFile(LPCVOID baseAddr)
 /* VirtualQuery                                                           */
 /* ===================================================================== */
 
+/*
+ * Answers from the view registry rather than from a constant.
+ *
+ * This used to report RegionSize 0x1000, MEM_COMMIT, PAGE_READWRITE and
+ * AllocationBase NULL for every address it was handed, mapped or not. Four
+ * kernel entry points are built on it, and one of them chooses a deallocator
+ * with it: MmFreeContiguousMemory frees via VirtualFree only when
+ * AllocationBase equals the pointer, so a hardcoded NULL sent every
+ * contiguous buffer -- all of which come from VirtualAlloc, i.e. mmap -- to
+ * _aligned_free, which is free(). The allocator aborts on the foreign
+ * pointer. MmQueryAllocationSize answered 0x1000 for everything and
+ * NtQueryVirtualMemory called unmapped addresses committed and readable.
+ *
+ * Everything the shim maps -- VirtualAlloc and MapViewOfFileEx alike -- is in
+ * the registry, so it can answer for exactly the memory it owns and say
+ * MEM_FREE for the rest. Saying MEM_FREE for an address it did not map is the
+ * honest answer: a host heap pointer is not a Win32 reservation, and the
+ * callers that branch on this want to know which allocator owns the pointer.
+ */
 SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T length)
 {
     if (!buffer || length < sizeof(*buffer)) return 0;
     memset(buffer, 0, sizeof(*buffer));
-    buffer->BaseAddress    = (PVOID)address;
-    buffer->AllocationBase = NULL;       /* != address -> freed via _aligned_free */
-    buffer->RegionSize     = 0x1000;
-    buffer->State          = MEM_COMMIT;
-    buffer->Protect        = PAGE_READWRITE;
-    buffer->Type           = 0x20000;    /* MEM_PRIVATE */
+
+    void  *base = NULL;
+    size_t len  = 0;
+
+    if (!view_lookup(address, &base, &len)) {
+        /* Not ours. Report it free rather than inventing a committed page. */
+        buffer->BaseAddress    = (PVOID)address;
+        buffer->AllocationBase = NULL;
+        buffer->RegionSize     = 0;
+        buffer->State          = MEM_FREE;
+        buffer->Protect        = PAGE_NOACCESS;
+        buffer->Type           = 0;
+        return sizeof(*buffer);
+    }
+
+    buffer->BaseAddress      = (PVOID)address;
+    buffer->AllocationBase   = base;
+    buffer->AllocationProtect = PAGE_READWRITE;
+    /* From the queried address to the end of the region, which is what Win32
+     * reports and what callers sizing a copy out of it depend on. */
+    buffer->RegionSize       = len - (size_t)((uintptr_t)address - (uintptr_t)base);
+    buffer->State            = MEM_COMMIT;
+    buffer->Protect          = PAGE_READWRITE;
+    buffer->Type             = MEM_PRIVATE;
     return sizeof(*buffer);
 }
 
 BOOL GlobalMemoryStatusEx(LPMEMORYSTATUSEX b)
 {
+    if (!b) return FALSE;
 #if defined(__APPLE__)
-    /* TODO: Darwin has no sysinfo(2): physical memory comes from sysctl, the free
-     * page count from the Mach VM statistics, swap from vm.swapusage. */
+    /* Darwin has no sysinfo(2): physical memory comes from sysctl hw.memsize,
+     * swap from vm.swapusage, the free page count from the Mach VM statistics. */
+    uint64_t memsize = 0;
+    size_t   len     = sizeof(memsize);
+    int oid_memsize[] = { CTL_HW, HW_MEMSIZE };
+    if (sysctl(oid_memsize, 2, &memsize, &len, NULL, 0) != 0) return FALSE;
+
+    vm_size_t page = 0;
+    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS) page = 4096;
+
+    vm_statistics64_data_t vm;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    ULONGLONG avail = 0;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          (host_info64_t)&vm, &count) == KERN_SUCCESS)
+        avail = ((ULONGLONG)vm.free_count + vm.inactive_count) * (ULONGLONG)page;
+
+    struct xsw_usage swap;
+    len = sizeof(swap);
+    int oid_swapusage[] = { CTL_VM, VM_SWAPUSAGE };
+    if (sysctl(oid_swapusage, 2, &swap, &len, NULL, 0) != 0)
+        memset(&swap, 0, sizeof(swap));
+
+    b->ullTotalPhys     = (ULONGLONG)memsize;
+    b->ullAvailPhys     = avail;
+    b->ullTotalPageFile = b->ullTotalPhys + (ULONGLONG)swap.xsu_total;
+    b->ullAvailPageFile = b->ullAvailPhys + (ULONGLONG)swap.xsu_avail;
 #else
     struct sysinfo si;
-    if (!b) return FALSE;
     if (sysinfo(&si) != 0) return FALSE;
 
     ULONGLONG unit = si.mem_unit ? si.mem_unit : 1;

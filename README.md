@@ -22,7 +22,7 @@ on, or find out what people are stuck on before you duplicate the effort.
 
 ### Recent Changes
 
-**Current version: v0.8.0 — _"Snapshot"_ (September 2026).**
+**Current version: v0.11.0 — _"Nothing Said So"_ (September 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
 ---
@@ -164,11 +164,14 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 ### Prerequisites
 
 - **Windows 11/10** (D3D11 backend) — or **Linux** (OpenGL backend; `tools/linux/install_deps.sh`)
-- **macOS**: install the native libraries required by the OpenGL backend with `brew install sdl2 libepoxy`
+- **macOS**: homebrew, docker `tools/macos/setup.sh`
 - **Python 3.10+** with `capstone` (`pip install capstone`)
 - **Visual Studio 2022** (MSVC compiler)
 - **CMake 3.20+**
 - An original Xbox game disc image (you must own the game)
+
+`py -3` below is the Windows Python Launcher — on Linux and macOS use
+`python3`, and on a Microsoft Store install that has no `py`, use `python`.
 
 ### Step-by-Step
 
@@ -269,7 +272,8 @@ xboxrecomp/
 │   ├── abi_analysis/            # Calling convention / param recovery
 │   ├── recomp/                  # x86 -> C static recompiler
 │   ├── debug_symbols/           # Debug-build symbol recovery
-│   ├── symbols/ ghidra_naming/  # Optional symbol-name recovery
+│   ├── symbols/ ghidra_naming/  # Optional symbol-name recovery (Ghidra)
+│   ├── ida_naming/              # ... or the same thing through IDA
 │   ├── xiso/ xmv/               # Disc image and video container tools
 │   └── fusion/                  # MS Ficl/Fission study tooling
 ├── src/                         # Runtime libraries (C, link-time)
@@ -333,6 +337,7 @@ xboxrecomp/
 - [Gap Analysis vs xemu](docs/technical/gap-analysis.md) — What's implemented, what's missing, prioritized roadmap
 - [Microsoft's Own Recompiler](docs/technical/ms-fusion-recompiler.md) — White-room analysis of Ficl/Fission: pipeline, address map, HLE boundary
 - [Ficl/Fission Codegen Teardown](docs/technical/ms-fusion-codegen-teardown.md) — IDA/Hex-Rays teardown of both their translators, and how it reframes our roadmap
+- [SVOD Extraction](docs/technical/svod-extraction.md) — reading the BC package container to get the donor title's guest XBE out, and the validation gate that catches a plausible-looking bad extraction
 - [Burnout 3 Reunification](docs/technical/burnout3-reunification.md) — bringing the origin title back onto the extracted toolkit: what's done, and the threading gate that makes the runtime a merge not a swap
 
 ### Xbox Formats
@@ -404,7 +409,7 @@ capstone        # x86 disassembly  (pip install capstone)
 pytest          # test suite only  (pip install pytest)
 ```
 
-That's it for the core pipeline — no IDA, no Ghidra, no proprietary tools. Just the standard library + Capstone. (An *optional* `tools/ghidra_naming` helper can use headless Ghidra purely to recover symbol names; it is never required to produce a working build.)
+That's it for the core pipeline — no IDA, no Ghidra, no proprietary tools. Just the standard library + Capstone. (Optional `tools/ghidra_naming` and `tools/ida_naming` helpers use headless Ghidra or IDA purely to recover symbol names; neither is ever required to produce a working build.)
 
 ### Running the tests
 
@@ -413,18 +418,53 @@ py -3 -m pytest tools/       # unit tests
 py -3 -m tools.conformance   # differential: lifted C vs the real CPU
 ```
 
-Run unit tests on MacOS
+Several unit tests compile the lifter's own output and sweep it against x86's
+definitions — they are the real proof for the shift, flag and x87 work, and
+each is paired with a negative control that feeds the harness the pre-fix
+expression and requires it to fail. They need a C compiler on `PATH`, and
+**skip rather than fail without one**, so check the skip count: a clean run is
+386 passed / 0 skipped. If clang is installed but not on `PATH`:
+
 ```bash
-bash tools/macos/run_tests.sh
+export PATH="/c/Program Files/LLVM/bin:$PATH"   # Git Bash
 ```
 
 The unit tests are fast and need no game files. The conformance suite goes
-further: it assembles each snippet with MSVC, lifts the resulting bytes, then
-runs the lifted C *and the original instructions* over the same inputs and
-requires them to agree. Because we target x86 and run on x86, the host CPU is
-the oracle — no model to be wrong. See
-[Conformance Testing](docs/technical/conformance-testing.md). It needs a 32-bit
-MSVC, and is skipped rather than failed where there isn't one.
+further: it assembles each snippet, lifts the resulting bytes, then runs the
+lifted C *and the original instructions* over the same inputs and requires them
+to agree. The CPU executing those instructions is the oracle — no model to be
+wrong. See [Conformance Testing](docs/technical/conformance-testing.md).
+
+### Running the tests (MacOS)
+
+That oracle has to be 32-bit x86. On Windows a 32-bit MSVC supplies one.
+Everywhere else Docker containers stand in for the toolchain while the lifting stays on
+the host. Run the setup once:
+
+```bash
+bash tools/macos/setup.sh --test        # adds the images (~2.2 GB, ~10 min)
+```
+
+After that **the suite runs exactly as it does on Windows** — the commands below
+are the commands, no platform-specific runner:
+
+```bash
+py -3 -m tools.conformance                  # snippets + corpus
+py -3 -m tools.conformance --only snippets
+py -3 -m tools.conformance --xbe tools/conformance/test.xbe
+```
+
+| image | phase | cost |
+|---|---|---|
+| `xboxrecomp-gcc-i386` | snippets | ~280 MB, under a minute |
+| `xboxrecomp-msvc-amd64` | corpus, XBE — compiles and links | ~975 MB, ~5 min |
+| `xboxrecomp-msvc-wine` | corpus, XBE — runs the 32-bit harnesses | ~985 MB, ~4 min |
+
+The snippet image is GCC and builds in seconds. The other two carry MSVC under
+Wine and each download ~1.5 GB from Microsoft, so setup says what it is about to
+do before building them. See
+[tools/conformance/msvc-wine/](tools/conformance/msvc-wine/) for why corpus and
+XBE need the real MSVC where snippets do not, and why it takes two images.
 
 If you fix a lift, add the case.
 
@@ -496,6 +536,502 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### v0.11.0 — *"Nothing Said So"* (September 2026)
+
+*Twenty-seven contributed PRs, and almost every one of them is a defect that had
+no voice. A pushbuffer executor reporting* `draws 0` *for a title submitting
+geometry every frame. Thirty of thirty-two audio mixbins computed correctly and
+thrown away, with no counter anywhere to say so. A 2,500-line APU that nothing
+in the tree could call. A watchdog that could not read the register a title was
+hanging on. An* `__SEH_prolog` *detector whose "not found" was indistinguishable
+from a CRT that has none. The previous release was named for the negative
+control, the test that fails on purpose so a passing one means something. This
+one is named for what happens when nothing is watching at all.*
+
+**Seven lifter defects, found by differential fuzzing against an independent
+x86 core** — each paired with a negative control that feeds the harness the
+pre-fix expression and requires it to fail —
+*[@andeecollard](https://github.com/andeecollard)* (#69–#72, #75–#77)
+
+- **Rotates ran at 32 bits whatever the operand was.** Every narrow read in the
+  lifter arrives zero-extended, so a byte rotate happened inside a 32-bit word:
+  the bits that should wrap at bit 7 landed in bits 31..8, and the store threw
+  them away. `ror al, 2` on 0x01 gave 0x00 where x86 gives 0x40. The count is
+  masked to five bits and only *then* reduced modulo the width, so `rol al, 16`
+  is the identity and came back zero. Same defect class as the `sar` width bug
+  fixed two releases ago — that one was found and the rotates beside it were
+  not — *[@andeecollard](https://github.com/andeecollard)* (#69)
+- **`bts`/`btr`/`btc` reported the bit they left, not the bit they found.** All
+  four bit-test instructions copy the tested bit into CF, but only `bt` leaves
+  it alone. The carry condition was rebuilt at the consumer by reading the bit
+  a second time — which for the other three reads back what the instruction
+  had just written. `jb` after `bts` was always taken, after `btr` never, after
+  `btc` exactly backwards. That is the test-and-set idiom, *"did I claim this
+  or was it already taken?"*, reading its own answer, with no input for which
+  guest code could observe the truth. MSVC emits it for lock acquisition and
+  for the character-map loops behind `strpbrk`/`strspn`/`strcspn` —
+  *[@andeecollard](https://github.com/andeecollard)* (#70)
+- **The sign flag after a compare was computed with signed overflow.** `js`
+  came out as `(int32_t)(_fas - _fbs) < 0`, and that subtraction overflows for
+  exactly the inputs the sign flag is being asked about. `cmp 0x80000000, 1`
+  leaves 0x7FFFFFFF on the hardware so SF is 0; in C it is `INT_MIN - 1`, and
+  from `-O1` the compiler is entitled to fold `a - b < 0` into `a < b` and
+  answer 1. Both gcc and clang do, so the emitted program's meaning changed
+  with the optimisation level. Subtracting unsigned at the operand's own width
+  and taking the top bit is SF exactly, at every width, with no undefined case
+  — *[@andeecollard](https://github.com/andeecollard)* (#71)
+- **`popfd` was listed as an instruction that preserves EFLAGS**, next to
+  `pushfd`, which genuinely does. `popfd` replaces every flag, so `cmp eax,
+  ebx; popfd; je` resolved the branch from the comparison the restore existed
+  to discard. The file already knew: the `neg`/`sbb` peephole four hundred
+  lines away carries an explicit `!= "popfd"` guard that the main tracking loop
+  never got — two statements about the same instruction, disagreeing —
+  *[@andeecollard](https://github.com/andeecollard)* (#72)
+- **`shld`/`shrd` ignored x86's count rules, and a zero count wrote.** The
+  count is masked to five bits, and a masked count of zero must leave the
+  destination alone. The emitted expression built `src >> (32 - cnt)`, so a
+  count of zero shifted by the operand's full width — undefined in C, and on a
+  host that reduces the shift amount modulo the width it returns `src` whole,
+  landing `dst | src` for an instruction that must not write at all.
+  `_lift_shift` states the rule for `shl`/`shr`/`sar` next door; the
+  double-precision pair never got it. Not latent: the title it was found on
+  runs `shrd eax, edx, cl` twice with a runtime count —
+  *[@andeecollard](https://github.com/andeecollard)* (#75)
+- **`movsd` is two instructions and the dispatcher picked by name.** The string
+  `MOVSD` copies a dword from `[esi]` to `es:[edi]`; the SSE2 `MOVSD` moves a
+  scalar double in or out of an xmm register. They share a mnemonic and nothing
+  else, and the string branch runs first, so `movsd xmm0, qword ptr [eax]`
+  walked `esi` and `edi` and touched neither operand the instruction names. The
+  load never happened and the register kept its old value, silently —
+  *[@andeecollard](https://github.com/andeecollard)* (#76)
+- **The result-setter family rebuilt its condition at the consumer.**
+  `and`/`or`/`xor`, `add`/`sub`, `adc`/`sbb`, `neg` and the shifts all write
+  their destination, and the jcc reading their flags can be several blocks
+  later, so `and eax, 0x0F; mov eax, 0x99; jne` asked about 0x99. `inc`/`dec`
+  already published their result into `_fa` at the write for exactly this
+  reason, with a comment saying why — two instructions out of fourteen. This
+  extends that rule to the rest —
+  *[@andeecollard](https://github.com/andeecollard)* (#77)
+
+**Ten fixes from bringing up a real title**, each one a place where the runtime
+stopped a step short of something the title needed and said nothing about it —
+*[@fearkov](https://github.com/fearkov)* (#73, #74, #80–#87)
+
+- **A loop head lost its only exit test.** Blocks are lifted in address order,
+  so the predecessor on a back edge sits *after* the block it reaches and has
+  no out-state on a single pass. The join correctly refuses to guess, the `jcc`
+  at the top falls back to `_flags` — a variable nothing ever assigns — and the
+  branch compiles as never taken. Mid-function that costs a little accuracy; at
+  the top of a counted loop it removes the exit. In the XMV decoder's row
+  padding the loop stored eight bytes and advanced `edi` by sixteen forever,
+  walked off the framebuffer and took the process with it. The state is settled
+  to a fixed point before emitting now, and `sub eax, ecx` and `dec eax` are
+  allowed to merge on the one thing a `jz` is actually asking —
+  *[@fearkov](https://github.com/fearkov)* (#86)
+- **`__SEH_prolog` detection required the four-push form.** The second byte
+  marker is `lea ebp, [esp+0x10]`, and that offset is not a constant — it
+  counts the slots the helper pushed before it. The three-push form lands on
+  `0x0C` and was undetectable. Silent, because "not found" is indistinguishable
+  from a CRT that has no `__SEH_prolog`, which is a normal result: every SEH
+  function then kept its caller's stale `ebp`, so the first frame-relative
+  store landed in the *caller's* frame and the epilogue cut the stack back to
+  it. A title can also link both forms, and returning the first match meant the
+  winner was decided by nothing but the lower address —
+  *[@fearkov](https://github.com/fearkov)* (#87)
+- **`NV097_DRAW_ARRAYS` was not handled by the pushbuffer executor.**
+  `BEGIN_END` arrives, `END` arrives, and in between comes a run description —
+  first vertex and count — rather than the index list the draw path wants, so
+  every batch was dropped with `idx_count == 0` and the report said `draws 0`.
+  A title submitting geometry every frame looked exactly like one submitting
+  none. Decoding the run into indices turns the same seconds of the same title
+  into 30,541 draws, checked against the pixel count rather than asserted —
+  *[@fearkov](https://github.com/fearkov)* (#81)
+- **The emulated APU was unreachable.** `src/apu/` is a working ~2,500-line
+  extraction of xemu's MCPX APU, and three independent gaps — each sufficient
+  alone — meant nothing in the tree could call any of it.
+  `apu_hook_handle_mmio` sits under a comment reading *"called from VEH in
+  main.c"* and no `main.c` called it; `g_apu_state` was never assigned; and
+  `xbox_apu` never linked `xaudio2_8`, which stayed invisible for as long as
+  nothing referenced the archive — *[@fearkov](https://github.com/fearkov)*
+  (#84)
+- **The AC'97 channel reset had to complete on the write.** MSVC hoisted the
+  load out of the wait loop, so the title reads the control register exactly
+  once, a few instructions after writing it, and spins forever on that single
+  value. A thread clearing the bit afterwards is racing a window a few
+  instructions wide and gets one attempt; measured, it loses. Trapping the
+  write — read-only page, single-step, mask RR out, re-protect — is the only
+  version that is there in time — *[@fearkov](https://github.com/fearkov)*
+  (#82)
+- **USB enumeration stopped one step short**, six ways. A driver starting a
+  fresh reset writes `SetPortReset` and `ClearPortResetStatusChange` in the
+  same word, and the write-1-to-clear line ran *after* the handler set PRSC and
+  wiped the bit that same write had just raised — so the port reset forever
+  while looking connected, enabled and powered the whole time. Plus:
+  descriptors live in the contiguous window the bounds check rejected, no frame
+  clock, a control data stage that restarted every descriptor, only the control
+  list walked, and a done queue never retired —
+  *[@fearkov](https://github.com/fearkov)* (#85)
+- **`RtlNtStatusToDosError` answered 317 for every status it did not know.**
+  317 is `ERROR_MR_MID_NOT_FOUND`, *"there is no message text for this
+  number"* — an honest default for an unmapped failure and the wrong answer
+  entirely for a status that is not one. A resource loader that starts an
+  asynchronous read and marks the object as loading only on `ERROR_IO_PENDING`
+  never marked it, so the poll that finishes the load reported "not started" on
+  every frame and the title sat in its first boot state forever with input,
+  audio and rendering all working — *[@fearkov](https://github.com/fearkov)*
+  (#80)
+- **The watchdog could not read the registers a title hangs on.** The peek
+  accepted only addresses below 64 MB, which reads as "RAM" but is not the
+  question: every aperture the runtime maps is mapped at the same offset and is
+  just as dereferenceable. Peeking `0xFD800044` printed nothing at all — not a
+  value and not an error — so the design note promising *"run the title and the
+  watchdog sample will name the register"* was not true for the case it was
+  written for. Also samples on an early exit, since a title whose `main()`
+  returns during init never reaches the watchdog at all —
+  *[@fearkov](https://github.com/fearkov)* (#83)
+- **The DVD device open and the media check behind it.** A title checking its
+  media opens `\Device\CdRom0` itself — the bare device — and the path table
+  carried only the form with a trailing separator, which is the prefix for
+  reading a *file* off the disc. The open failed, the title read that as "no
+  disc", and it exited through `HalReturnToFirmware` before drawing a frame —
+  *[@fearkov](https://github.com/fearkov)* (#74)
+- **The runtime cross-compiles with MinGW-w64.** Two macro collisions, 51
+  errors before anything links. `KernelMode` and `UserMode` are ordinary words
+  that the Windows SDK uses as struct member names, so object-like macros
+  rewrote those declarations to `WINBOOL 0;`; enum constants live in a
+  different namespace and coexist. And the `__debugbreak` guard tested
+  `_MSC_VER` where it needed `_WIN32` — MinGW is neither, and declares a real
+  one. MSVC on Windows stays the reference environment; this adds a host —
+  *[@fearkov](https://github.com/fearkov)* (#73)
+
+**The APU was mixing thirty-two submix bins down to two.** `mcpx_apu_dsp_frame`
+read `mixbins[0]` and `mixbins[1]` and discarded the other thirty. On hardware
+the GP and EP do that mixdown; here they are stubs, so thirty bins were computed
+correctly and thrown away every frame with no counter anywhere to say so. Titles
+route their 3D positional voices — their sound effects — to bins above 1.
+Measured over one 200-second gameplay run with a positive control beside it:
+557,466 music voice-frames heard and none lost, 377,768 effect voice-frames
+produced correctly and discarded. Music is on 2D voices and lands in bins 0 and
+1, which is why the music was always audible and no effect ever was, and why
+several investigations looked everywhere but this line. Even bins left, odd bins
+right, behind `RECOMP_APU_MIXDOWN_ALL` (default on) because it changes audible
+output for every title — *[@andeecollard](https://github.com/andeecollard)*
+(#67)
+
+**The Xbox memory model runs on a POSIX host**, and building it found five bugs
+that were not about POSIX at all. The sentinel bug: `for (i = 0; try_bases[i] !=
+0 || i == 0; i++)` stopped *at* the terminating zero rather than using it, so
+the "let the OS choose" fallback never ran — invisible on Windows, where a low
+base succeeds, and fatal on arm64 macOS, where every fixed base sits inside
+`__PAGEZERO`. `MapViewOfFileEx` used bare `MAP_FIXED`, which silently unmaps
+whatever occupies the range while Win32's contract is to fail, so with an
+OS-chosen base the 28 RAM mirrors landed straight through the process's own
+libraries and heap: the original SIGSEGV was not a failed mapping but a
+successful one on top of something live. `VirtualFree(ptr, 0, MEM_RELEASE)`
+returned TRUE without unmapping anything. Shutdown released none of five
+regions. And `MmGetPhysicalAddress` had two implementations that disagreed —
+the bridge translated, the kernel returned its argument unchanged — so the
+answer a title got depended on which dispatch path it took, and the corruption
+surfaces as wrong geometry with nothing naming the function —
+*[@dplewis](https://github.com/dplewis)* (#60)
+
+**The conformance suite runs in Docker, and on macOS from a setup script.** Two
+MSVC images, because no single one does both halves on Apple Silicon: `link.exe`
+is I/O-bound over memory-mapped files and never finishes under 32-bit emulation,
+while Rosetta cannot execute 32-bit x86 at all. Build on amd64, execute on i386
+— *[@dplewis](https://github.com/dplewis)* (#59)
+
+**Tooling.** Deterministic differential fuzzing through the existing
+native-versus-lifted runner, with seeded sequences and boundary-heavy inputs
+reproducible by seed and case index (#62). `tools/doctor.py`, a read-only
+bring-up report joining function recovery, identification and ABI artifacts,
+translation statistics and runtime warnings into one ranked list of what to look
+at next (#64). A Media Foundation WMA-to-PCM backend, with a synthetic CC0
+fixture and an injected read-error case so the failure path is tested rather
+than assumed (#65). An inventory of flat basic-block dispatch, which measures
+what a byte-indexed x64 dispatch table would cost before anyone writes one (#63)
+— *[@NoRain211](https://github.com/NoRain211)*. And an SVOD container reader, so
+`coverage_oracle.py` can finally be given its second argument: the container is
+plain XDVDFS with SHA-1 hash blocks interleaved at a fixed stride, and the gate
+checks kernel imports resolving to real names rather than a header magic,
+because a flat `dd` of the data files still parses correctly and is wrong every
+0x1000 bytes — *[@andeecollard](https://github.com/andeecollard)* (#78)
+
+**Two tests were reading state they had not set up.** `test_icall_feedback`
+never passed `--functions`, so it fell back to
+`tools/disasm/output/functions.json` — a build artifact of whatever title the
+developer last disassembled. Absent on a clean checkout, so both tests passed;
+disassemble a title first and they fail, correctly, because that title has real
+functions covering the addresses the test seeds —
+*[@fearkov](https://github.com/fearkov)* (#79). And
+`test_unmangled_names_are_rejected` asserted a fact about Windows: `onexit` is a
+Microsoft CRT name and free everywhere else, so the negative control demanded a
+compile failure that could not happen off MSVC —
+*[@dplewis](https://github.com/dplewis)* (#61)
+
+**Also.** Three things were fixed on integration. PR #75's standalone
+double-shift harness compiles the lifted statement on its own, so #77's new
+`_fa`/`_fas` snapshot had no declaration there — the two are correct separately
+and only collide when merged. #60 reached for `sysconf(_SC_PAGESIZE)` in
+`xbox_memory_layout.c`, which builds on Windows too; `GetSystemInfo` supplies it
+there. And — fittingly for this release — the compiled arm of #71's own test,
+the load-bearing half that proves the sign-flag fix at `-O2`, searched `CC`,
+`cc` and `gcc` and never `clang`, so it skipped on the platform the project
+targets. A clean run is now **386 passed / 0 skipped**, up from 272, and
+`tools.conformance` reports 5,261 vectors and 211 function vectors with zero
+mismatches.
+
+### v0.10.0 — *"Negative Control"* (September 2026)
+
+*Twenty contributed PRs, and the thread running through them is the gap between
+a thing being declared and a thing being true. A function declared with nine
+arguments that takes ten. An argument declared on the stack that arrives in a
+register. A shift declared arithmetic that was logical. A test suite declared
+passing that was skipping. Several of these arrived with a* negative control —
+*a second test that feeds the harness the pre-fix code and requires it to fail,
+on the grounds that a sweep passing against both spellings is testing nothing.
+That is the right instinct, and it names the release.*
+
+**Fourteen fixes from one contributor, found by driving a real title through
+the pipeline** and chasing each wrong answer back to its cause — the largest
+single batch the project has taken. Each arrived with a regression that fails
+without it — *[@GTTeancum](https://github.com/GTTeancum)* (#41–#45, #47–#51,
+#53–#56)
+
+**Four kernel calls had the wrong ABI.**
+
+- **`NtQueryDirectoryFile` was declared with nine arguments and has ten.** The
+  missing `FileInformationClass` meant every argument after it was read one slot
+  early — the search mask and restart flag came from the wrong places — and the
+  bridge popped 36 bytes where the guest pushed 40. A four-byte stack leak per
+  call, which is the kind that runs for a while and then does not. The
+  enumeration also returned the host's `.` and `..`, which FATX does not have —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#51)
+- **`KfRaiseIrql` and `KfLowerIrql` are `__fastcall`**, so their argument
+  arrives in `CL` and the bridge was reading it off the stack. The cleanup table
+  already said zero bytes, so the value read was whatever sat at that address —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#54)
+- **Counted object names were read as NUL-terminated.** The XDK passes a
+  directory name with a trailing wildcard and `Length` shortened to exclude it,
+  without writing a NUL at the new end, so the path picked up the wildcard and
+  whatever followed it in guest memory. The same fix made
+  `ObjectAttributes->RootDirectory` real rather than always `NULL`, which is what
+  lets a title open a save file relative to the directory handle it just
+  enumerated — *[@GTTeancum](https://github.com/GTTeancum)* (#53)
+- **`MmGetPhysicalAddress` returned the virtual address unchanged.** For the
+  contiguous arena — the virtual *window* onto physical RAM — that hands a DMA
+  consumer an address with the high bit still set —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#55)
+
+**Three pieces of kernel state that were the wrong shape.**
+
+- **The pending kernel-dispatch slot was a single process-wide global.** Two
+  threads resolving an import at the same time raced, and the loser invoked the
+  *other* thread's service, popping that one's argument count off its own stack.
+  Thread-local now: a one-word change, and worth finding —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#43)
+- **`IdexChannelObject` was exported as an opaque self-pointer.** It is a
+  structure, and guest file-close code walks `DeviceQueue.DeviceListHead` at
+  +0x28, where it found nulls. Host-backed synchronous I/O never enqueues guest
+  IRPs, so the honest answer is a correctly formed *empty* circular list —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#45)
+- **The EEPROM advertised mono audio with AC3.** `XC_AUDIO` was set to
+  `0x00010001`, and in that field 1 means *mono*. A title asked the console what
+  it was plugged into and was told one channel plus an encoded output path that
+  does not exist — *[@GTTeancum](https://github.com/GTTeancum)* (#56)
+
+**Six x86 semantics the lifter had subtly wrong.**
+
+- **`SAR` shifted at 32 bits regardless of operand width.** Every narrow read
+  arrives zero-extended, so `(int32_t)` on an 8- or 16-bit operand never saw a
+  sign bit and the shift was a logical one wearing an arithmetic cast. `sar al,
+  1` on `0x80` gave `0x40` where x86 gives `0xC0` — a negative number halved into
+  a positive one, which is how a fixed-point divide or a signed average goes
+  wrong without ever faulting. The count is masked to five bits as x86 does, and
+  CF comes from the sign-extended value so a count at or past the operand width
+  still reports the sign bit. Found independently by two people —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#50) and
+  *[@andeecollard](https://github.com/andeecollard)* (#57)
+- **`INC`/`DEC` destroyed the carry flag they are defined to preserve.** The
+  whole point of `inc` over `add reg, 1` is that CF survives it. Their own flags
+  were no better: `js`, `jl` and friends re-read the destination at the branch,
+  so a `mov` in between changed the answer, and OF and PF were not modelled at
+  all — *[@GTTeancum](https://github.com/GTTeancum)* (#44)
+- **`jbe` and `ja` after `and`/`or`/`xor` were folded to constants.** Those
+  instructions do clear CF, so `jb` and `jae` after one really are 0 and 1 — but
+  `jbe` is CF|ZF and `ja` is !CF && !ZF, and ZF is whatever the result was.
+  Collapsing all four meant `and eax, eax; jbe` never branched and `ja` always
+  did: wrong exactly when the result is zero and right the rest of the time, so
+  it survives ordinary traffic and then takes the wrong arm on the empty list,
+  the null handle, the zero count —
+  *[@andeecollard](https://github.com/andeecollard)* (#57)
+- **`FIST`/`FISTP` ignored the guest's rounding mode**, lifting to `llrint`,
+  which rounds by the *host's*. The era's CRT `_ftol` sets round-toward-zero and
+  then converts, so the truncation it asks for silently became round-to-nearest:
+  the 255.5 a colour-packing path expects to floor to 255 became 256, and every
+  channel of white wrapped to 0 — *[@GTTeancum](https://github.com/GTTeancum)*
+  (#47)
+- **`FXAM` was not implemented, and the status word was rebuilt from scratch at
+  every read.** `fnstsw` derived C0/C2/C3 from the comparison result alone, so a
+  classification instruction contributed nothing and a title asking "is this a
+  NaN, a zero, an infinity?" got the last *compare* back. The condition bits are
+  shared x87 state now, so they survive a call the way the hardware's do —
+  *[@GTTeancum](https://github.com/GTTeancum)* (#49)
+- **A classic `push ebp; mov ebp, esp` prologue pushed an uninitialised C
+  local.** The generated `ebp` was only seeded from the caller's frame for
+  *frameless* functions, and a function with a real prologue reads it on its very
+  first statement, so the guest's saved-frame chain got an indeterminate word
+  that the epilogue pops back. Reached from both directions and merged together:
+  one seeds it from the caller's frame, the other initialises the declaration,
+  and the fix wants both — *[@GTTeancum](https://github.com/GTTeancum)* (#48) and
+  *[@andeecollard](https://github.com/andeecollard)* (#57)
+
+**Two recovery passes that were guessing.** Comparison snapshots were discarded
+at any control-flow join whose predecessors compared different registers — the
+operands differ but the runtime slots they save into do not, so a shared consumer
+can use whichever path actually ran (#41). And a bare immediate could split an
+instruction the sweep had already decoded: an integer constant landing in an
+unclaimed code gap is weak evidence, and treating it as a function entry carved
+the real instruction stream in half (#42) —
+*[@GTTeancum](https://github.com/GTTeancum)*
+
+**Display gamma ramps.** `SetGammaRamp` and `GetGammaRamp` were empty stubs that
+took their arguments and dropped them, so a title that dims the screen for a fade
+simply did not — invisible until you know the fade is missing rather than
+instant. Implemented as a presentation-time transform, which is the part worth
+having: the ramp is applied on the way to the swap chain and the guest's own
+pixels are snapshotted first and copied back after, so a title that reads its
+backbuffer back still sees what it drew, and a failed `Present` does not leave
+gamma baked into guest memory. Runs on a deferred context so the game's bound
+pipeline survives, and an identity ramp costs no GPU work at all —
+*[@NoRain211](https://github.com/NoRain211)* (#46)
+
+**The conformance suite no longer needs Windows to prove anything.** It proves
+the lifter correct by running each snippet as real x86 and comparing, which meant
+a 32-bit MSVC — everywhere else it skipped, and a skip proves nothing. A
+`linux/386` container now supplies the toolchain and the CPU while the lifting
+stays on the host. Two details make it trustworthy rather than merely green:
+what is substituted is the toolchain and never the comparison, and the corpus and
+XBE phases, which genuinely need PE linking, report as *skipped* rather than
+passed. The sharpest find is in the harness — the native side deliberately runs
+the x87 at 53-bit precision, and musl's i386 `libm` needs extended precision for
+its argument reduction, so leaving that in force made `cos(100.0)` come back as
+-1.27e16 — *[@dplewis](https://github.com/dplewis)* (#52)
+
+**The Darwin `TODO`s became implementations.** `IsDebuggerPresent` reads
+`P_TRACED` on macOS and `TracerPid` on Linux instead of answering "no"
+everywhere; `SecureZeroMemory` uses `memset_s`; `GlobalMemoryStatusEx` assembles
+its answer from `hw.memsize`, the Mach VM statistics and `vm.swapusage`. The best
+of them is `anon_map_fd`, which on macOS had been returning a literal `0` — a
+valid file descriptor, and specifically *stdin*, so every file mapping on that
+path was quietly backed by the wrong thing. Plus
+`InterlockedCompareExchange64` and waitable-timer handles —
+*[@dplewis](https://github.com/dplewis)* (#38, #39, #40)
+
+**Also.** Four defects were fixed on integration, all on paths the Windows build
+cannot reach — so none were wrong at review time, they were unbuilt. One PR
+called `__debugbreak()`, an MSVC intrinsic, from inside the half of
+`win32_compat.c` guarded by `!defined(_WIN32)`, where clang rejects it outright;
+`win32_compat.c` is now compile-checked under Linux rather than assumed. The
+waitable timers shipped `Create` and `Cancel` with no `SetWaitableTimer` and no
+`wait_single` case, so a wait on one returned immediately; both are wired up.
+And the test suite was itself half-skipping: nine of the compile-and-sweep tests
+need a C compiler on `PATH`, and without one they skip rather than fail — 272
+tests pass where 237 did, and the difference is entirely tests that had been
+sitting out.
+
+### v0.9.0 — *"Quietly Wrong"* (September 2026)
+
+*A release of contributed fixes, and nearly all of them share a shape: the code
+ran, returned, and was wrong, with no error anywhere. A stub that answers 0. A
+flag that was dropped instead of preserved. A value rounded the wrong way. A
+blend state that failed to create and left the previous one bound. None of them
+look like a bug from where you find them.*
+
+**Every kernel ordinal is routed.** All 371 Xbox kernel exports — 347 function
+ordinals plus 24 data exports — now have either a real bridge, a documented
+stub, or a data entry. The ~136 that were unrouted fell through to a silent
+return-0, which is worse than a crash: the title carries on with a plausible
+answer it never asked for. The structural piece is a guest-VA to host-HANDLE
+shadow table — a `KEVENT`/`KSEMAPHORE`/`KMUTANT` created through
+`KeInitializeEvent` lives in *guest memory* and is not a handle, and
+`KeSetEvent` and the `KeWaitFor*` pair had been treating the VA as one. The
+audit that was supposed to catch all this was itself broken and passing: its
+regexes anchored on a function's *name*, the file gained a comment mentioning
+that name, the comment matched first, and the check was skipped entirely —
+*[@DarthSidious666](https://github.com/DarthSidious666)* (#32)
+
+**Two generator bugs that stop the build.** `cmovcc` reads CF exactly as a
+`jcc` does, but the carry-declaration scan looked only at `jcc` and `setcc`, so
+a `cmovb` after an `add` emitted `if (_cf)` with `_cf` never declared. And a
+guest function whose recovered name is a reserved C identifier or a Win32
+export collides at compile or link time — Black has a function literally named
+`onexit` (C2373 against UCRT's), Nightfire re-exports shims named exactly like
+the APIs they wrap (LNK2005 against `kernel32.lib`). Both take the `_<addr>`
+suffix `func_id` already gives duplicate names —
+*[@DarthSidious666](https://github.com/DarthSidious666)* (#28)
+
+**MMX was losing comparisons and rounding by hand.**
+
+- **Fifteen implemented MMX forms were missing from the EFLAGS-preserve set**,
+  so the lifter dropped the live comparison before them and recomputed. `cmp
+  eax, 0; pavgb mm0, mm1; sete al` returns 1 on the CPU and returned 0 lifted —
+  *[@NoRain211](https://github.com/NoRain211)* (#34)
+- **`PADDUSW`/`PSUBUSW` became TODO comments** while the `MOVQ` loads and
+  stores around them still ran, so a store published the unchanged value —
+  *[@NoRain211](https://github.com/NoRain211)* (#33)
+- **Float-to-MMX conversion added 0.5 and cast**, rounding halfway away from
+  zero regardless of MXCSR, and range-checked against a *float* `INT32_MAX`
+  that rounds up to 2147483648 and admits an out-of-range cast. Uses the SSE
+  scalar conversions on x86 now — *[@NoRain211](https://github.com/NoRain211)*
+  (#35)
+
+**Two D3D8 states that were wrong in the invisible direction.**
+
+- **Colour blend factors were copied into the alpha fields**, which D3D11
+  rejects, so a guest `SRCCOLOR` or `DESTCOLOR` failed `CreateBlendState` with
+  `E_INVALIDARG` and left the *previous* state bound — a wrong blend rather
+  than a missing one — *[@NoRain211](https://github.com/NoRain211)* (#36)
+- **`D3DFVF_XYZRHW` threw RHW away** and emitted clip W = 1, so pretransformed
+  geometry landed in the right place with its texture coordinates interpolated
+  affinely across it — *[@NoRain211](https://github.com/NoRain211)* (#37)
+
+**The POSIX build works again.** Missing includes that C99 turned from warnings
+into errors, `strtok_s` where POSIX wants `strtok_r`, and no implementation at
+all for `GetFileSizeEx` or the Slim reader/writer locks. An `SRWLOCK` is usable
+straight from `SRWLOCK_INIT` and is by definition taken from several threads
+with nothing else held, so unlike the condition variables its first use
+genuinely races, and it is serialised accordingly. Also caught the FATX
+geometry constants being defined inside the `_WIN32` half and referenced from
+the POSIX half — *[@dplewis](https://github.com/dplewis)* (#27)
+
+**A real flip drives the frame counter.** `FLIP_STALL` now advances every
+registered swap counter, and while those arrive the 62 Hz fallback timer stands
+down. That timer exists for a title nothing presents for; once the pushbuffer
+executor is actually running flips it is the wrong clock and an actively
+harmful one. Half-Life 2's loader paces its intro video on this count, so a
+62 Hz timer against an executor managing a fraction of a frame per second ran
+the video forward in virtual time far faster than it could be drawn — which
+looks exactly like a stalling, blocky video rather than a clock running away.
+The rasteriser's per-pixel surface check moved to once per batch alongside it:
+`dma_resolve` walked the arena high-water mark twice per pixel to guard a
+rasterisation cheaper than the guard, and neither answer can change mid-batch.
+
+**An IDA path for name recovery**, alongside the Ghidra one. Not a port of
+pcrecomp's four IDA scripts — one exporter that writes the same
+`functions.json`/`symbols.json` `merge_names.py` already reads, so the merge,
+the placeholder filter, the sanitising and `--apply` stay where they are.
+IDA's FLIRT and Ghidra's FidDb are the same idea with different coverage and
+neither is a superset, so running both and taking the union names more than
+either alone. `merge_names` learned IDA's autonames while it was there — `loc_`
+is IDA's `LAB_`, and `jpt_`/`algn_`/`asc_`/`stru_` have no Ghidra equivalent,
+so without them an IDA export merges thousands of addresses-in-disguise into
+the recompiler.
+
+**Also.** `write_if_changed` in the translator — a regen rewrites all 54 chunks
+of generated C, and an mtime bump on identical bytes costs a full `/O2` rebuild
+of 365 MB for nothing.
 
 ### v0.8.0 — *"Snapshot"* (September 2026)
 

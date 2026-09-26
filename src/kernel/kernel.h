@@ -36,9 +36,21 @@ typedef UCHAR KIRQL, *PKIRQL;
 typedef CCHAR KPROCESSOR_MODE;
 typedef LONG KPRIORITY;
 
-/* Processor modes */
-#define KernelMode  0
-#define UserMode    1
+/* Processor modes.
+ *
+ * Enum constants, not #defines. "KernelMode" and "UserMode" are ordinary
+ * words, and the Windows SDK uses both as struct member names: WINBOOL
+ * KernelMode in <rpcasync.h>, and the KernelMode/UserMode bitfields of
+ * SYSTEM_SUPPORTED_PROCESSOR_ARCHITECTURES_INFORMATION in <winnt.h>. An
+ * object-like macro rewrites those declarations to "WINBOOL 0;" in any
+ * translation unit that reaches an SDK header after this one -- which is
+ * every kernel .c file under MinGW. Enum constants sit in the ordinary
+ * identifier namespace; struct members have their own, so the names coexist.
+ * The values are what they were. */
+enum {
+    KernelMode = 0,
+    UserMode   = 1
+};
 
 /* IRQL levels (Xbox uses same NT IRQL model) */
 #define PASSIVE_LEVEL   0
@@ -78,6 +90,9 @@ typedef LONG KPRIORITY;
 #endif
 #ifndef STATUS_INVALID_HANDLE
 #define STATUS_INVALID_HANDLE           ((NTSTATUS)0xC0000008L)
+#endif
+#ifndef STATUS_INVALID_INFO_CLASS
+#define STATUS_INVALID_INFO_CLASS       ((NTSTATUS)0xC0000003L)
 #endif
 #ifndef STATUS_INVALID_PARAMETER
 #define STATUS_INVALID_PARAMETER        ((NTSTATUS)0xC000000DL)
@@ -679,6 +694,7 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID FileInformation, ULONG Length,
+    XBOX_FILE_INFORMATION_CLASS FileInformationClass,
     PXBOX_ANSI_STRING FileName, BOOLEAN RestartScan);
 
 NTSTATUS __stdcall xbox_NtFsControlFile(

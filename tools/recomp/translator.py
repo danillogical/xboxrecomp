@@ -23,7 +23,97 @@ from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
-                     detect_setjmp_helpers)
+                     _RESULT_SNAPSHOT_SETTERS,
+                     detect_setjmp_helpers, _func_ident, _operand_width)
+
+
+def _merge_flag_states(states):
+    """Merge comparable snapshots without requiring identical source operands.
+
+    CMP/TEST save their operands into function-local _fa/_fb/_fas/_fbs at
+    runtime. A shared consumer can use whichever predecessor executed. Keep
+    operation and width equal because sign/parity handling depends on them;
+    arithmetic states still reconstruct operands and cannot use this merge.
+    """
+    if not states or any(not state or not state[0] for state in states):
+        return None
+    first = states[0]
+    if all(state == first for state in states[1:]):
+        return first
+    if first[0] in ("cmp", "test") and len(first[1]) == 2:
+        width = _operand_width(first[1][0]) or _operand_width(first[1][1])
+        for kind, ops in states[1:]:
+            if kind != first[0] or len(ops) != 2:
+                return None
+            if (_operand_width(ops[0]) or _operand_width(ops[1])) != width:
+                return None
+        return first
+    return _merge_zero_flag(states)
+
+
+def _merge_zero_flag(states):
+    """Predecessors that disagree on the operation but not on the zero flag.
+
+    `sub eax, ecx` reaching a loop head by fall-through and `dec eax` reaching
+    it by the back edge are different setters, so the state cannot be
+    inherited as itself -- yet both leave ZF as (eax == 0), which is the whole
+    of what a je or jne there is asking.
+
+    Unlike the CMP/TEST merge above, these reconstruct their operands rather
+    than reading a snapshot, so the merge only survives when every predecessor
+    names the same destination register. The name carries the width, so
+    `dec al` and `sub eax, ecx` do not merge.
+
+    The marker is deliberately narrow: only ZF is answerable from it, and
+    _make_condition refuses everything else.
+    """
+    from .lifter import ZF_FROM_DEST
+    dests = set()
+    for setter, ops in states:
+        if setter not in ZF_FROM_DEST or not ops:
+            return None
+        op = ops[0]
+        # disasm.Operand, not a capstone operand: .type is the string "reg".
+        if getattr(op, "type", None) != "reg" or not op.reg:
+            return None
+        dests.add(op.reg)
+    if len(dests) != 1:
+        return None
+    return ("__zf_from_dest", [states[0][1][0]])
+
+
+def _incoming_flag_state(sources, known, is_entry):
+    """The flag state a block inherits, or None when it cannot be known.
+
+    A predecessor with no computed state yet makes the result unknown rather
+    than guessed: that costs a fallback condition and never a wrong one.
+    """
+    if is_entry or not sources:
+        return None
+    if not all(p in known for p in sources):
+        return None
+    return _merge_flag_states([known[p] for p in sources])
+
+
+def write_if_changed(path, text):
+    """Write text to path only when it differs from what is already there.
+
+    Every regen rewrites all 54 chunks of generated C. If the bytes are
+    identical the mtime bump still forces the compiler to redo the whole
+    365 MB at /O2, which is minutes of a saturated box for a one-function
+    change. Comparing first makes an unchanged chunk free.
+
+    Returns True if the file was written.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return True
 
 
 def _fixup_icall_esp_save(lines):
@@ -175,6 +265,20 @@ def xbe_title(xbe_data, xbe_path):
         pass
     return os.path.splitext(os.path.basename(xbe_path))[0]
 
+
+
+def _seh_prologs_of(lifter):
+    """Every __SEH_prolog address a lifter knows about, as a set.
+
+    Reads SEH_PROLOGS when present and falls back to the scalar SEH_PROLOG,
+    so a lifter stub that only sets the old attribute still works -- the test
+    suite builds exactly such a stub, and so may callers outside this repo.
+    """
+    prologs = getattr(lifter, "SEH_PROLOGS", None)
+    if prologs:
+        return set(prologs)
+    one = getattr(lifter, "SEH_PROLOG", None)
+    return {one} if one is not None else set()
 
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
@@ -531,7 +635,7 @@ class FunctionTranslator:
     @staticmethod
     def _function_needs_cf(instructions):
         """True when something in the function reads CF."""
-        from .lifter import (FLAG_SETTERS, CF_TRACKED,
+        from .lifter import (FLAG_SETTERS, CF_TRACKED, BT_MODIFY,
                              _EFLAGS_SETTERS, _FLAGS_UNDEFINED)
 
         last_setter = None
@@ -544,8 +648,12 @@ class FunctionTranslator:
                 cc = m[1:]
             elif m.startswith("set"):
                 cc = m[3:]
+            elif m.startswith("cmov") and len(m) > 4:
+                cc = m[4:]
             if (cc in FunctionTranslator._CARRY_CC
-                    and last_setter in CF_TRACKED):
+                    and (last_setter in CF_TRACKED
+                         or last_setter in ("inc", "dec")
+                         or last_setter in BT_MODIFY)):
                 return True
             if m in FLAG_SETTERS or m in _EFLAGS_SETTERS:
                 last_setter = m
@@ -581,32 +689,24 @@ class FunctionTranslator:
         """
         if self._func_has_prologue(instructions):
             return True
-        seh_prolog = getattr(self.lifter, "SEH_PROLOG", None)
-        if seh_prolog is None:
+        seh_prologs = _seh_prologs_of(self.lifter)
+        if not seh_prologs:
             return False
-        return any(getattr(insn, "call_target", None) == seh_prolog
+        return any(getattr(insn, "call_target", None) in seh_prologs
                    for insn in instructions)
 
-    def translate_function(self, func_addr, func_info):
-        """
-        Translate a single function to C code.
-        Returns a string of C source code, or None on failure.
-        """
-        start = func_addr
+    def decode_function(self, start, end):
+        """Recover instructions and blocks, including indirect-entry leaders."""
         recovered = self._recovered_cfg.get(start)
-        end = recovered["end"] if recovered else func_info.get("end")
-        if not end:
-            end = start + func_info.get("size", 0)
+        if recovered:
+            end = recovered["end"]
         if end <= start:
-            return None
-
-        name = func_info.get("name", f"sub_{start:08X}")
-        size = end - start
+            return [], []
 
         # Read bytes from XBE
         raw_bytes = self._read_func_bytes(start, end)
         if not raw_bytes:
-            return None
+            return [], []
 
         # Set function bounds for the lifter
         self.lifter.func_start = start
@@ -618,10 +718,32 @@ class FunctionTranslator:
         instructions = (recovered["instructions"] if recovered else
                         self.disasm.disassemble_function(raw_bytes, start, end))
         if not instructions:
-            return None
+            return [], []
+
+        # Addresses this function loads as immediates into a register and
+        # then jumps to. `mov ebx, 0x3A0DC; ... ; jmp ebx` is a continuation
+        # chain inside one function, and its targets need labels for the
+        # goto the lifter emits -- see _lift_jmp. Restricted to functions
+        # that actually contain a register-operand indirect jmp, so a plain
+        # `mov reg, <address of a function>` for a callback does not start
+        # splitting blocks everywhere.
+        imm_refs = set()
+        if any(insn.mnemonic == "jmp" and not insn.jump_target and insn.operands
+               and insn.operands[0].type == "reg" for insn in instructions):
+            for insn in instructions:
+                if insn.mnemonic != "mov" or len(insn.operands) < 2:
+                    continue
+                if insn.operands[0].type != "reg":
+                    continue
+                if insn.operands[1].type != "imm":
+                    continue
+                value = insn.operands[1].imm
+                if start <= value < end:
+                    imm_refs.add(value)
+        self.lifter.imm_code_refs = imm_refs
 
         # Collect switch table targets as extra block leaders
-        switch_leaders = set()
+        switch_leaders = set(imm_refs)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
                 targets = self.lifter._analyze_switch_table(insn.operands)
@@ -646,6 +768,24 @@ class FunctionTranslator:
         blocks = self.disasm.build_basic_blocks(
             instructions, start, end,
             extra_leaders=switch_leaders if switch_leaders else None)
+        return instructions, blocks
+
+    def translate_function(self, func_addr, func_info):
+        """
+        Translate a single function to C code.
+        Returns a string of C source code, or None on failure.
+        """
+        start = func_addr
+        recovered = self._recovered_cfg.get(start)
+        end = recovered["end"] if recovered else func_info.get("end")
+        if not end:
+            end = start + func_info.get("size", 0)
+        if end <= start:
+            return None
+
+        name = _func_ident(start, func_info.get("name", f"sub_{start:08X}"))
+        size = end - start
+        instructions, blocks = self.decode_function(start, end)
         if not blocks:
             return None
 
@@ -730,8 +870,10 @@ class FunctionTranslator:
         # hardcoded to one game's CRT here, so for every other title the forcing
         # silently never fired and the generated C failed to compile with
         # "'ebp': undeclared identifier".
-        seh_funcs = {a for a in (self.lifter.SEH_PROLOG, self.lifter.SEH_EPILOG)
-                     if a is not None}
+        seh_funcs = _seh_prologs_of(self.lifter)
+        epilog = getattr(self.lifter, "SEH_EPILOG", None)
+        if epilog is not None:
+            seh_funcs = seh_funcs | {epilog}
         if seh_funcs and any(insn.call_target in seh_funcs
                              for insn in instructions):
             used_regs.add("ebp")
@@ -790,7 +932,15 @@ class FunctionTranslator:
         if "ebp" in used_regs:
             reg_decls.append("ebp")
         if reg_decls:
-            lines.append(f"    uint32_t {', '.join(reg_decls)};")
+            # Initialised, not just declared. A function with a real
+            # "push ebp; mov ebp, esp" prologue pushes ebp before it ever
+            # assigns one, so its first statement reads this local while the
+            # value is still indeterminate. At -O0 that is whatever the host
+            # stack happened to hold; from -O1 up it is poison the compiler is
+            # free to propagate, and the pushed word is a frame pointer the
+            # epilogue pops back and callers may walk.
+            decls = ", ".join(f"{r} = 0" for r in reg_decls)
+            lines.append(f"    uint32_t {decls};")
 
         # A function with no `push ebp; mov ebp, esp` prologue that still reads
         # ebp is addressing its *caller's* frame. MSVC emits these for shared
@@ -808,7 +958,12 @@ class FunctionTranslator:
         # would still hold. Deliberately not the same as making ebp global:
         # that also changes save/restore, and a callee that fails to restore
         # then corrupts its caller (tried; esp underflowed inside XapiStartup).
-        if "ebp" in used_regs and not self._func_has_prologue(instructions):
+        if "ebp" in used_regs and self._func_has_prologue(instructions):
+            # The prologue's first PUSH saves the incoming register before
+            # MOV establishes this function's frame. It must not push an
+            # uninitialized C local into the guest's saved-frame chain.
+            lines.append("    ebp = g_ebp;  /* prologue saves caller's frame */")
+        elif "ebp" in used_regs:
             lines.append("    ebp = g_ebp;  /* frameless: caller's frame */")
 
         # Add _flags variable if function has conditional instructions
@@ -829,7 +984,8 @@ class FunctionTranslator:
         # cmpxchg belongs here too: it snapshots the compare it performed,
         # because eax may be replaced before the branch reads the result.
         if any(insn.mnemonic in ("cmp", "test", "bsf", "bsr", "cmpxchg",
-                                 "lock cmpxchg", "xadd", "lock xadd")
+                                 "lock cmpxchg", "xadd", "lock xadd", "inc", "dec")
+               or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
@@ -859,10 +1015,11 @@ class FunctionTranslator:
         #
         # adc/sbb read CF directly, and so does a jb/jae whose flags came from
         # arithmetic rather than a cmp -- the bit-stream decoders in the Xbox
-        # XCompress code are nothing but "add reg,reg" followed by jae. Which
-        # setter a branch reads is the lifter's tracking rule, mirrored here so
-        # only the functions that consume CF declare it: computing it beside
-        # every add in the image would be a line per add in 48,000 functions.
+        # XCompress code are nothing but "add reg,reg" followed by jae, and a
+        # cmovb/cmovae after an add reads the same carry. Which setter a branch
+        # reads is the lifter's tracking rule, mirrored here so only the
+        # functions that consume CF declare it: computing it beside every add
+        # in the image would be a line per add in 48,000 functions.
         has_carry = self._function_needs_cf(instructions)
         if has_carry:
             lines.append(f"    int _cf = 0; /* carry flag */")
@@ -912,6 +1069,7 @@ class FunctionTranslator:
         for insn in instructions:
             if insn.jump_target and start <= insn.jump_target < end:
                 label_addrs.add(insn.jump_target)
+        label_addrs |= self.lifter.imm_code_refs
         # Add switch table targets (indirect jmp with intra-function table)
         for insn in instructions:
             if insn.mnemonic == "jmp" and not insn.jump_target and insn.operands:
@@ -938,7 +1096,56 @@ class FunctionTranslator:
             if not leaves and i + 1 < len(blocks):
                 preds[blocks[i + 1].start].add(bb.start)
 
+        # Settle the flag state before emitting anything.
+        #
+        # Blocks are walked in address order, so the predecessor on a back
+        # edge sits *after* the block it reaches and has no out-state on a
+        # first pass. The join then sees an unknown predecessor and gives up,
+        # which is safe but costly: the jcc at the top of a counted loop is
+        # exactly that shape, and it lifts to the `_flags` fallback -- a
+        # variable nothing assigns, so the branch compiles as never taken and
+        # the loop has no exit.
+        #
+        # Iterating to a fixed point fixes it. A block's out-state depends on
+        # its own instructions unless it has no flag setter at all, in which
+        # case it passes its incoming state through, so the pass converges;
+        # three rounds is more than any real loop nest needs. The lines are
+        # discarded here, only the out-states are kept.
+        #
+        # lift_basic_block accumulates two things on the Lifter across calls.
+        # referenced_calls is a dict keyed by address, so re-lifting a block
+        # rewrites the same entries. unimplemented appends, and its counts are
+        # a report about the title rather than about how many times the lifter
+        # ran, so they are saved and restored around the probe.
+        # Without a back edge, address order already visits every predecessor
+        # before the block it reaches, so the emit pass settles the state as
+        # it goes and the probe would only repeat its work. Aliasing
+        # settled_state onto the dict that pass fills is what makes the two
+        # cases one loop: it then reads exactly the states it has computed
+        # itself, which is what this function did before the probe existed.
         out_state = {}
+        settled_state = out_state
+        if any(p >= bb.start for bb in blocks for p in preds[bb.start]):
+            saved_unimplemented = {
+                k: list(v) for k, v in self.lifter.unimplemented.items()
+            }
+            for _ in range(3):
+                changed = False
+                for bb in blocks:
+                    incoming = _incoming_flag_state(
+                        preds[bb.start], out_state, bb.start == start)
+                    _, new_out = lift_basic_block(
+                        self.lifter, bb, flag_state=incoming)
+                    if out_state.get(bb.start) != new_out:
+                        out_state[bb.start] = new_out
+                        changed = True
+                if not changed:
+                    break
+            self.lifter.unimplemented.clear()
+            self.lifter.unimplemented.update(saved_unimplemented)
+            settled_state = out_state
+            out_state = {}
+
         for bb in blocks:
             # Emit label if this block is a branch target
             if bb.start in label_addrs or bb.start == start:
@@ -949,22 +1156,13 @@ class FunctionTranslator:
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
 
-            # Inherit the flag state only when every predecessor agrees on it.
-            # Blocks are walked in address order, so a back edge's predecessor
-            # may not be computed yet -- treat that as unknown rather than
-            # guessing, which costs a fallback condition and never a wrong one.
-            sources = preds[bb.start]
-            if bb.start == start or not sources:
-                incoming = None
-            elif all(p in out_state for p in sources):
-                states = [out_state[p] for p in sources]
-                incoming = states[0]
-                for other in states[1:]:
-                    if other != incoming:
-                        incoming = None
-                        break
-            else:
-                incoming = None
+            # Inherit agreed state, including compatible CMP/TEST snapshots
+            # whose source operands differ between predecessor paths. The
+            # states come from the pre-pass above, so a back edge's
+            # predecessor is known here even though it sits later in address
+            # order.
+            incoming = _incoming_flag_state(preds[bb.start], settled_state,
+                                            bb.start == start)
 
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming)
@@ -1138,9 +1336,9 @@ class BatchTranslator:
         # Detect the SEH helpers once here rather than per-Lifter, so the
         # result can be reported and overridden from the command line.
         if seh_prolog is None or seh_epilog is None:
-            found_prolog, found_epilog = detect_seh_helpers(
+            found_prologs, found_epilog = detect_seh_helpers(
                 self.func_db, self.xbe_data, verbose=True)
-            seh_prolog = seh_prolog if seh_prolog is not None else found_prolog
+            seh_prolog = seh_prolog if seh_prolog is not None else found_prologs
             seh_epilog = seh_epilog if seh_epilog is not None else found_epilog
         self.seh_prolog = seh_prolog
         self.seh_epilog = seh_epilog
@@ -1235,7 +1433,7 @@ class BatchTranslator:
 
         # Forward declarations
         for addr, func_info in func_list:
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             decl = self._make_declaration(addr, name)
             c_chunks.append(f"{decl};")
         c_chunks.append("")
@@ -1244,7 +1442,7 @@ class BatchTranslator:
 
         # Translate each function
         for i, (addr, func_info) in enumerate(func_list):
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             if verbose and (i % 100 == 0 or i == len(func_list) - 1):
                 print(f"  [{i+1}/{len(func_list)}] Translating {name} at 0x{addr:08X}...")
 
@@ -1505,7 +1703,7 @@ class BatchTranslator:
             return cur
 
         for i, (addr, func_info) in enumerate(func_list):
-            name = func_info.get("name", f"sub_{addr:08X}")
+            name = _func_ident(addr, func_info.get("name", f"sub_{addr:08X}"))
             if verbose and (i % 500 == 0 or i == len(func_list) - 1):
                 print(f"  [{i+1}/{len(func_list)}] Translating {name}...",
                       file=sys.stderr)
@@ -1625,8 +1823,7 @@ class BatchTranslator:
 
         header_lines.extend(["", "#endif /* RECOMP_FUNCS_H */", ""])
 
-        with open(header_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(header_lines))
+        write_if_changed(header_path, "\n".join(header_lines))
 
         # recomp_types.h goes with it.
         #
@@ -1716,8 +1913,7 @@ class BatchTranslator:
             for addr, name, code in chunk:
                 c_lines.append(code)
 
-            with open(c_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(c_lines))
+            write_if_changed(c_path, "\n".join(c_lines))
             generated_files.append(c_path)
 
             if verbose:
@@ -1765,8 +1961,7 @@ class BatchTranslator:
                 )
             stub_lines.append("")
 
-            with open(stub_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(stub_lines))
+            write_if_changed(stub_path, "\n".join(stub_lines))
             generated_files.append(stub_path)
 
             if verbose:
@@ -1945,5 +2140,4 @@ class BatchTranslator:
             "",
         ])
 
-        with open(output_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines))
+        write_if_changed(output_path, "\n".join(lines))

@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
+#include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
@@ -164,7 +165,27 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_FLIP_INCREMENT_WRITE        0x012C
 #define NV097_FLIP_STALL                  0x0130
 #define NV097_ARRAY_ELEMENT16             0x1800
+/* Draw a run of vertices straight out of the arrays, with no index list:
+ * bits 0..23 are the first vertex, bits 24..31 the count minus one. It may
+ * appear several times inside one BEGIN_END to draw a longer run. */
+#define NV097_DRAW_ARRAYS                 0x1810
 #define NV097_INLINE_ARRAY                0x1818
+/* Immediate-mode vertices. SET_VERTEX3F/4F carry the position, and writing
+ * its last component completes a vertex using whatever the SET_VERTEX_DATA*
+ * registers currently hold for the other attributes. This is how Half-Life
+ * 2's Xbox loader and the game's own 2D drawing submit every quad -- neither
+ * uses INLINE_ARRAY -- so without these the executor saw SET_BEGIN_END pairs
+ * with nothing attached and reported `draws 0` while a million and a half
+ * textured quads a minute went past it. */
+#define NV097_SET_VERTEX3F                0x1500   /* +0..0x08, 3 floats */
+#define NV097_SET_VERTEX4F                0x1518   /* +0..0x0C, 4 floats */
+#define NV097_SET_VERTEX_DATA2F_M         0x1880   /* + attr*8,  2 floats */
+#define NV097_SET_VERTEX_DATA4F_M         0x1A00   /* + attr*16, 4 floats */
+#define NV097_SET_VERTEX_DATA4UB          0x1940   /* + attr*4,  D3DCOLOR */
+
+/* One immediate vertex, as this file packs it for the shared draw path:
+ * position float4, diffuse D3DCOLOR, texcoord0 float2. */
+#define IMM_VERTEX_DWORDS 7
 
 #define NV097_CLEAR_COLOR_MASK            0xF0   /* R,G,B,A bits */
 
@@ -206,10 +227,24 @@ static struct {
      * different place to read them from. */
     uint32_t   inline_buf[NV_MAX_INLINE];
     uint32_t   inline_count;
+    /* Current values of the immediate-mode attributes, and how many complete
+     * vertices they have produced in this batch. */
+    float      imm_pos[4];
+    uint32_t   imm_diffuse;
+    float      imm_tex[2];
+    uint32_t   imm_count;
     int        inline_active;
     uint32_t   draws, verts, nonzero_draws;
     float      min_x, max_x, min_y, max_y;
     uint32_t color_offset, color_base, pitch, format;
+    /* The surface the last batch actually drew into. A double-buffered title
+     * has already pointed color_offset at the next buffer and cleared it by
+     * the time the flip arrives, so dumping the current one dumps the frame
+     * that has not been drawn yet -- which is how a correctly rendered
+     * sequence came out as 12 black BMPs. */
+    uint32_t drawn_offset;
+    uint64_t pixels;
+    uint32_t pixel_max;   /* brightest value any pixel write carried */
     uint32_t clip_x, clip_w, clip_y, clip_h;
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
@@ -226,7 +261,7 @@ static struct {
  * skipped but which things dominate, because that is the order to implement
  * them in. */
 #define PB_EXEC_MAX_UNHANDLED 2048
-typedef struct { uint32_t method, count; } PbUnhandled;
+typedef struct { uint32_t method, count, last_param; } PbUnhandled;
 static PbUnhandled s_unhandled[PB_EXEC_MAX_UNHANDLED];
 static int s_unhandled_count;
 
@@ -301,7 +336,7 @@ static void note_texture_use(void)
     }
 }
 
-static void note_unhandled(uint32_t method)
+static void note_unhandled(uint32_t method, uint32_t param)
 {
     int i;
 
@@ -309,12 +344,14 @@ static void note_unhandled(uint32_t method)
     for (i = 0; i < s_unhandled_count; i++) {
         if (s_unhandled[i].method == method) {
             s_unhandled[i].count++;
+            s_unhandled[i].last_param = param;
             return;
         }
     }
     if (s_unhandled_count < PB_EXEC_MAX_UNHANDLED) {
         s_unhandled[s_unhandled_count].method = method;
         s_unhandled[s_unhandled_count].count = 1;
+        s_unhandled[s_unhandled_count].last_param = param;
         s_unhandled_count++;
     }
 }
@@ -428,7 +465,9 @@ static void dump_surface_bmp(void)
 
     /* BMP rows run bottom-up. */
     for (y = h; y-- > 0; ) {
-        const uint8_t *row = mem + dma_resolve(s_gpu.color_offset)
+        const uint8_t *row = mem + dma_resolve(s_gpu.drawn_offset
+                                                ? s_gpu.drawn_offset
+                                                : s_gpu.color_offset)
                            + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
         for (x = 0; x < w; x++) {
             uint8_t bgr[3];
@@ -829,21 +868,42 @@ static void dump_texture_bmp(uint32_t seq)
     fflush(stderr);
 }
 
+/* The surface, resolved once per batch.
+ *
+ * dma_resolve consults the contiguous arena's high-water mark and
+ * surface_hits_image walks the image range; both were being done per pixel
+ * -- dma_resolve twice -- which cost more than the rasterisation they
+ * guarded. Neither answer can change inside a batch, because the colour
+ * offset arrives as a method and a method cannot arrive mid-triangle.
+ *
+ * This is not a micro-optimisation for its own sake: the loader's video
+ * paces on frames actually presented, so the rasteriser's throughput is the
+ * playback rate. */
+static uint8_t *s_surface;          /* host address of surface row 0 */
+
+static int surface_begin_batch(const uint8_t *mem)
+{
+    uint32_t base = dma_resolve(s_gpu.color_offset);
+
+    if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
+        return 0;
+    s_surface = (uint8_t *)mem + base;
+    return 1;
+}
+
 static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
 {
     uint8_t *row;
 
+    (void)mem;
     if (x < (int)s_gpu.clip_x || x >= (int)(s_gpu.clip_x + s_gpu.clip_w))
         return;
     if (y < (int)s_gpu.clip_y || y >= (int)(s_gpu.clip_y + s_gpu.clip_h))
         return;
-    /* Same reason the clear checks: a rasterised triangle writes guest memory
-     * too, and a surface address that lands on the image is no safer one pixel
-     * at a time than 4.9 MB at once. */
-    if (surface_hits_image(dma_resolve(s_gpu.color_offset),
-                           (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
-        return;
-    row = mem + dma_resolve(s_gpu.color_offset) + (size_t)y * s_gpu.pitch;
+    s_gpu.pixels++;
+    if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
+        s_gpu.pixel_max = argb;
+    row = s_surface + (size_t)y * s_gpu.pitch;
     if (bpp == 4) {
         ((uint32_t *)row)[x] = argb;
     } else if (bpp == 2) {
@@ -872,6 +932,12 @@ static void raster_triangle(const float a[2], const float b[2],
     area = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
     if (area == 0.0f)
         return;                            /* degenerate */
+
+    /* Where this batch writes. The same check the per-pixel path made, made
+     * once: a surface address landing on the title's own image is no safer
+     * one pixel at a time than 4.9 MB at once. */
+    if (!surface_begin_batch(mem))
+        return;
 
     minx = (int)floorf(fminf(a[0], fminf(b[0], c[0])));
     maxx = (int)ceilf (fmaxf(a[0], fmaxf(b[0], c[0])));
@@ -918,6 +984,7 @@ static void raster_triangle(const float a[2], const float b[2],
         }
     }
     s_gpu.tris_drawn++;
+    s_gpu.drawn_offset = s_gpu.color_offset;
 }
 
 /* Attribute 3 is diffuse colour in every NV2A layout that sets one. Absent it,
@@ -1352,6 +1419,124 @@ out:
     s_gpu.idx_count = 0;
 }
 
+/* Draw the vertices SET_VERTEX3F/4F completed.
+ *
+ * Same trick as draw_inline_array: rather than a second copy of the topology
+ * and rasterisation code, describe what was accumulated as an ordinary vertex
+ * array and hand it to the existing path. The layout is ours and fixed, so
+ * the attribute table is written out here rather than derived from the
+ * title's format registers.
+ *
+ * The title's own table is saved and put back -- it has not stopped using it.
+ *
+ * ponytail: position, diffuse and texcoord0 only. That is what a 2D quad
+ * carries and what this rasteriser samples; a second texcoord set or a normal
+ * would need the D3D11 translator, not more slots here.
+ */
+static void draw_immediate(void)
+{
+    VertexAttr saved[NV_VERTEX_ATTRS];
+    uint32_t i;
+
+    if (s_gpu.imm_count < 3)
+        return;
+
+    memcpy(saved, s_gpu.attr, sizeof saved);
+    memset(s_gpu.attr, 0, sizeof s_gpu.attr);
+    /* Offsets are byte offsets into inline_buf here, not guest addresses --
+     * fetch_attr reads them that way while inline_active is set, which is
+     * also why 0 is a legal offset for position. */
+    s_gpu.attr[0].type = 2; s_gpu.attr[0].size = 4;   /* position float4  */
+    s_gpu.attr[0].offset = 0;
+    s_gpu.attr[3].type = 0; s_gpu.attr[3].size = 4;   /* diffuse D3DCOLOR */
+    s_gpu.attr[3].offset = 16;
+    s_gpu.attr[9].type = 2; s_gpu.attr[9].size = 2;   /* texcoord0 float2 */
+    s_gpu.attr[9].offset = 20;
+    s_gpu.attr[0].stride = s_gpu.attr[3].stride = s_gpu.attr[9].stride =
+        IMM_VERTEX_DWORDS * 4;
+
+    for (i = 0; i < s_gpu.imm_count && i < NV_MAX_INDICES; i++)
+        s_gpu.idx[i] = (uint16_t)i;
+    s_gpu.idx_count = i;
+
+    /* fetch_attr bounds-checks against inline_count dwords. */
+    s_gpu.inline_count = s_gpu.imm_count * IMM_VERTEX_DWORDS;
+    s_gpu.inline_active = 1;
+    draw_primitive();
+    s_gpu.inline_active = 0;
+
+    memcpy(s_gpu.attr, saved, sizeof saved);
+    s_gpu.idx_count = 0;
+    s_gpu.inline_count = 0;
+}
+
+/* A vertex is complete: append it in the layout draw_immediate describes. */
+static void imm_emit_vertex(void)
+{
+    uint32_t at = s_gpu.imm_count * IMM_VERTEX_DWORDS;
+
+    if (!s_gpu.prim || at + IMM_VERTEX_DWORDS > NV_MAX_INLINE)
+        return;
+    memcpy(&s_gpu.inline_buf[at],     s_gpu.imm_pos, 4 * sizeof(float));
+    memcpy(&s_gpu.inline_buf[at + 4], &s_gpu.imm_diffuse, sizeof(uint32_t));
+    memcpy(&s_gpu.inline_buf[at + 5], s_gpu.imm_tex, 2 * sizeof(float));
+    s_gpu.imm_count++;
+}
+
+/* The immediate-mode writes. Returns 1 if `method` was one of them.
+ *
+ * Split out because it is a range test against five separate bases, and that
+ * reads better than five more cases in an already long switch.
+ */
+static int imm_vertex_method(uint32_t method, uint32_t param)
+{
+    union { uint32_t u; float f; } v;
+    v.u = param;
+
+    if (method >= NV097_SET_VERTEX4F && method < NV097_SET_VERTEX4F + 16) {
+        uint32_t c = (method - NV097_SET_VERTEX4F) / 4;
+        s_gpu.imm_pos[c] = v.f;
+        if (c == 3)                      /* w completes the vertex */
+            imm_emit_vertex();
+        return 1;
+    }
+    if (method >= NV097_SET_VERTEX3F && method < NV097_SET_VERTEX3F + 12) {
+        uint32_t c = (method - NV097_SET_VERTEX3F) / 4;
+        s_gpu.imm_pos[c] = v.f;
+        if (c == 2) {                    /* z completes it, w is implicitly 1 */
+            s_gpu.imm_pos[3] = 1.0f;
+            imm_emit_vertex();
+        }
+        return 1;
+    }
+    if (method >= NV097_SET_VERTEX_DATA2F_M
+            && method < NV097_SET_VERTEX_DATA2F_M + NV_VERTEX_ATTRS * 8) {
+        uint32_t off = method - NV097_SET_VERTEX_DATA2F_M;
+        if (off / 8 == 9)                /* attribute 9 is texture coord 0 */
+            s_gpu.imm_tex[(off % 8) / 4] = v.f;
+        return 1;
+    }
+    if (method >= NV097_SET_VERTEX_DATA4F_M
+            && method < NV097_SET_VERTEX_DATA4F_M + NV_VERTEX_ATTRS * 16) {
+        uint32_t off = method - NV097_SET_VERTEX_DATA4F_M;
+        uint32_t attr = off / 16, c = (off % 16) / 4;
+        if (attr == 0) {
+            s_gpu.imm_pos[c] = v.f;
+            if (c == 3)
+                imm_emit_vertex();
+        } else if (attr == 9 && c < 2) {
+            s_gpu.imm_tex[c] = v.f;
+        }
+        return 1;
+    }
+    if (method >= NV097_SET_VERTEX_DATA4UB
+            && method < NV097_SET_VERTEX_DATA4UB + NV_VERTEX_ATTRS * 4) {
+        if ((method - NV097_SET_VERTEX_DATA4UB) / 4 == 3)   /* diffuse */
+            s_gpu.imm_diffuse = param;
+        return 1;
+    }
+    return 0;
+}
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -1382,7 +1567,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     }
 
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
-        note_unhandled(method);
+        note_unhandled(method, param);
         return;
     }
     switch (method) {
@@ -1415,13 +1600,20 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.prim = param;
             s_gpu.idx_count = 0;
             s_gpu.inline_count = 0;
+            s_gpu.imm_count = 0;
         } else {
-            if (s_gpu.inline_count)
+            /* Three ways a batch can have arrived, and only one is in use at
+             * a time: vertices completed by SET_VERTEX4F, a payload written
+             * with INLINE_ARRAY, or indices into the title's own arrays. */
+            if (s_gpu.imm_count)
+                draw_immediate();
+            else if (s_gpu.inline_count)
                 draw_inline_array();
             else
                 draw_primitive();
             s_gpu.prim = 0;
             s_gpu.inline_count = 0;
+            s_gpu.imm_count = 0;
         }
         break;
 
@@ -1431,6 +1623,26 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (s_gpu.prim && s_gpu.inline_count < NV_MAX_INLINE)
             s_gpu.inline_buf[s_gpu.inline_count++] = param;
         break;
+
+    case NV097_DRAW_ARRAYS: {
+        /* The method this title actually draws with, and the reason the
+         * executor reported zero draws while geometry was being submitted the
+         * whole time: BEGIN_END arrived, END arrived, and in between came a
+         * run description rather than the index list the draw path wanted, so
+         * every batch ended with idx_count == 0 and was dropped in silence.
+         *
+         * Expanded into indices because that is what the rasteriser consumes,
+         * and an implicit run is just the indices start..start+count-1. */
+        uint32_t start = param & 0x00FFFFFFu;
+        uint32_t count = ((param >> 24) & 0xFFu) + 1u;
+        uint32_t i;
+
+        if (!s_gpu.prim)
+            break;
+        for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
+            s_gpu.idx[s_gpu.idx_count++] = (uint16_t)(start + i);
+        break;
+    }
 
     case NV097_ARRAY_ELEMENT16:
         /* Two 16-bit indices per parameter word. */
@@ -1470,6 +1682,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now. */
         s_gpu.flip_read = s_gpu.flip_write;
+        /* And this is a completed swap, which is what a title's own swap
+         * counter counts -- see xbox_Nv2aFrameCounterFlip. */
+        xbox_Nv2aFrameCounterFlip();
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
             if (n++ < 8) {
@@ -1535,8 +1750,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             a->type   =  param        & 0x0F;
             a->size   = (param >> 4)  & 0x0F;
             a->stride = (param >> 8)  & 0xFF;
-        } else {
-            note_unhandled(method);
+        } else if (!imm_vertex_method(method, param)) {
+            note_unhandled(method, param);
         }
         break;
     }
@@ -1726,6 +1941,12 @@ void nv2a_pb_exec_report(void)
     /* Drawn and skipped separately: "nothing appeared" and "every batch needed
      * a vertex program we do not run" look identical on screen, and only one
      * of them means the rasteriser is broken. */
+    fprintf(stderr, "[GPU] brightest pixel written 0x%08X\n", s_gpu.pixel_max);
+    fprintf(stderr, "[GPU] %llu pixels written; draw surface 0x%08X"
+                    " -> 0x%08X, clear surface 0x%08X -> 0x%08X\n",
+            (unsigned long long)s_gpu.pixels, s_gpu.drawn_offset,
+            dma_resolve(s_gpu.drawn_offset), s_gpu.color_offset,
+            dma_resolve(s_gpu.color_offset));
     fprintf(stderr, "[GPU] rasterised %u triangles; %u batches skipped as not"
                     " screen-space, %u triangles fully off-surface\n",
             s_gpu.tris_drawn, s_gpu.batches_untransformed,
@@ -1774,8 +1995,18 @@ void nv2a_pb_exec_report(void)
             s_unhandled[i] = s_unhandled[best];
             s_unhandled[best] = t;
         }
-        fprintf(stderr, "  [GPU]   0x%04X x%u\n",
-                s_unhandled[i].method, s_unhandled[i].count);
+        {
+            /* The value as well as the count. A method nobody decoded is
+             * a guess until you see what it carried: screen coordinates,
+             * a 0..1 texcoord and a packed colour are told apart at a
+             * glance, and that is what says which vertex encoding a title
+             * is using. */
+            union { uint32_t u; float f; } v;
+            v.u = s_unhandled[i].last_param;
+            fprintf(stderr, "  [GPU]   0x%04X x%-8u last=0x%08X (%.4f)\n",
+                    s_unhandled[i].method, s_unhandled[i].count,
+                    v.u, v.f);
+        }
     }
     }    fflush(stderr);
 }

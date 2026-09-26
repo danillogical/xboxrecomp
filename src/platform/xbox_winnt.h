@@ -40,8 +40,18 @@ static inline void xbox_path_normalize(char *p)
 #endif
 }
 
-/* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent on POSIX. */
-#if !defined(_MSC_VER)
+/* MSVC's __debugbreak() intrinsic -> gcc/clang equivalent on POSIX.
+ *
+ * The guard has to exclude every _WIN32 host, not just _MSC_VER. MinGW is
+ * neither: it defines _WIN32 but not _MSC_VER, and <_mingw.h> -- reached
+ * through the <windows.h> below -- declares a real __debugbreak(), an inline
+ * that emits int3. Defining a function-like macro of that name first turns
+ * that declaration into an expansion, and the (void) parameter list is read
+ * as an argument: "macro '__debugbreak' passed 1 arguments, but takes just 0".
+ *
+ * Where a Windows SDK exists its own __debugbreak is the better one anyway --
+ * it traps to a debugger, where __builtin_trap() raises SIGILL. */
+#if !defined(_MSC_VER) && !defined(_WIN32)
 #define __debugbreak() __builtin_trap()
 #endif
 
@@ -209,6 +219,15 @@ typedef struct _RTL_CRITICAL_SECTION {
  * pthread_cond_t* on POSIX). */
 typedef struct { PVOID Ptr; } CONDITION_VARIABLE, *PCONDITION_VARIABLE;
 #define CONDITION_VARIABLE_INIT { NULL }
+
+/* SRWLOCK / INIT_ONCE: same single-pointer layout as Win32, and like it both
+ * are usable from a static initialiser with no explicit Initialize* call.
+ * Ptr is a pthread_rwlock_t* on POSIX. */
+typedef struct { PVOID Ptr; } SRWLOCK, *PSRWLOCK;
+#define SRWLOCK_INIT { NULL }
+
+typedef struct { PVOID Ptr; } INIT_ONCE, *PINIT_ONCE, *LPINIT_ONCE;
+#define INIT_ONCE_STATIC_INIT { NULL }
 
 /* ---- Common small structs ---------------------------------------------- */
 typedef struct _FILETIME   { DWORD dwLowDateTime; DWORD dwHighDateTime; }

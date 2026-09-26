@@ -182,6 +182,10 @@ int xbox_Nv2aMirrorCounter(uint32_t device_ptr_va,
                            uint32_t src_off, uint32_t dst_off);
 
 int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
+/* Advance those counters now, because a swap really completed. Called by the
+ * pushbuffer executor on FLIP_STALL; while these arrive the 60 Hz fallback
+ * stands down, so the count follows what was actually drawn. */
+void xbox_Nv2aFrameCounterFlip(void);
 
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
@@ -225,6 +229,10 @@ void xbox_ProtectMirrorsForDebug(void);
  * does nothing unless that variable is set. */
 void xbox_WatchdogStart(void);
 
+/* Print the globals named by RECOMP_PEEK, tagged with `label`. No-op when
+ * RECOMP_PEEK is unset. Called at a hang and at an early exit. */
+void xbox_PeekSample(const char *label);
+
 /* ================================================================
  * Xbox stack for recompiled code
  * ================================================================ */
@@ -257,7 +265,7 @@ void xbox_WatchdogStart(void);
 #define KDATA_FILE_OBJ_TYPE     0x0C0  /* IoFileObjectType (4 bytes) */
 #define KDATA_TIME_INCREMENT    0x0D0  /* KeTimeIncrement (4 bytes) */
 #define KDATA_BOOT_SMC_VIDEO    0x0E0  /* HalBootSMCVideoMode (4 bytes) */
-#define KDATA_IDEX_CHANNEL      0x0F0  /* IdexChannelObject (opaque) */
+#define KDATA_IDEX_CHANNEL      0x500  /* IDE_CHANNEL_OBJECT (512-byte reserved region) */
 #define KDATA_HD_KEY            0x100  /* XboxHDKey (16 bytes) */
 #define KDATA_SIGNATURE_KEY     0x110  /* XboxSignatureKey (16 bytes) */
 #define KDATA_LAN_KEY           0x120  /* XboxLANKey (16 bytes) */
@@ -336,6 +344,15 @@ typedef union RecompXmm {
  *
  * Sits below every XBE's image base (0x00010000), so it displaces nothing.
  *
+ * 0x4000 rather than 0x1000 because protection is applied at *host* page
+ * granularity. Apple Silicon pages are 16 KB, so RECOMP_TRAP_NULL asking to
+ * protect guest page zero actually covers guest 0..0x3FFF -- which reached a
+ * TIB at 0x1000 and killed the run, so the guard disabled itself on every
+ * such host and the diagnostic quietly did nothing. At 0x4000 the largest
+ * page any supported host uses fits below the TIB and the guard installs.
+ * Nothing else lives in the low 64 KB, and no guest code names the address:
+ * fs: resolves through g_fs_base.
+ *
  * Per-thread, because a TIB is. It used to be one constant address for the
  * whole process, which meant every guest thread shared one SEH chain head
  * and -- through fs:[4] -- one CRT per-thread data block. Half-Life 2
@@ -346,7 +363,7 @@ typedef union RecompXmm {
  * XBOX_TIB_MAIN is where the first thread's TIB is built; every spawned
  * thread gets its own from xbox_AllocThreadTib() and points g_fs_base at
  * it. */
-#define XBOX_TIB_MAIN       0x00001000
+#define XBOX_TIB_MAIN       0x00004000
 extern RECOMP_TLS uint32_t g_fs_base;
 #define XBOX_FS_BASE        g_fs_base
 
