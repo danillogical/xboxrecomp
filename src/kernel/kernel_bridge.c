@@ -2199,7 +2199,13 @@ static void kernel_deliver_nv2a_irq(void)
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
 {
-    while (g_dpc_head != g_dpc_tail) {
+    /* Drain one snapshot.  A DPC is allowed to queue itself (or another DPC),
+     * but that work belongs to the next scheduler pass.  Following the live
+     * tail here turns a self-requeueing graphics DPC into an infinite loop and
+     * prevents the timer thread from ever delivering another vblank. */
+    LONG stop = g_dpc_tail;
+
+    while (g_dpc_head != stop) {
         LONG head = g_dpc_head;
         PendingDpc d = g_dpc_queue[head];
         g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
