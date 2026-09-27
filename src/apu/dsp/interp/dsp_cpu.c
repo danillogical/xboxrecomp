@@ -493,6 +493,7 @@ void dsp56k_b9_epoch_begin(void);
  * outside this translation unit, and gp_ep.c -- the packet's in-scope call
  * site -- cannot name it. */
 static int gp_decode_pending = 0;
+static int gp_decode2_pending = 0;
 
 /* ============================================================
  * A4b2-NR-followup: the P 00B9 effective-address trace
@@ -591,6 +592,36 @@ static int b9_core_is_gp(dsp_core_t *dsp)
     return (dsp && dsp->opaque) ? (((DSPState *)dsp->opaque)->is_gp ? 1 : 0) : 0;
 }
 
+/* A4b2-NR-next-edge: log the per-core identity ONCE per distinct opaque pointer,
+ * so the trace's GP/EP attribution can be checked rather than trusted. A histogram
+ * that classified every execution as GP while the EP also runs would silently mix
+ * two programs; this makes that visible. */
+static void b9_note_core_identity(dsp_core_t *dsp)
+{
+    static void *seen_ptr[8];
+    static int seen_gp[8];
+    static int n = 0;
+    int i;
+
+    if (!dsp) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        if (seen_ptr[i] == dsp->opaque) {
+            return;
+        }
+    }
+    if (n < 8) {
+        seen_ptr[n] = dsp->opaque;
+        seen_gp[n] = b9_core_is_gp(dsp);
+        fprintf(stderr,
+                "[GPB9] core #%d: opaque=%p is_gp=%d (opaque resolves to a "
+                "DSPState)\n", n, dsp->opaque, seen_gp[n]);
+        fflush(stderr);
+        n++;
+    }
+}
+
 static int gp_b9_enabled(void)
 {
     if (!b9.inited) {
@@ -632,6 +663,7 @@ void dsp56k_b9_note_exec(dsp_core_t *dsp)
                 b9_core_is_gp(dsp), dsp->pc);
         fflush(stderr);
     }
+    b9_note_core_identity(dsp);
     b9.exec_total++;
     if (dsp->pc < DSP_PRAM_SIZE) {
         b9.pc_hist[dsp->pc]++;
@@ -798,6 +830,14 @@ void dsp56k_request_decode(void)
 {
     if (gp_decode_enabled()) {
         gp_decode_pending = 1;
+    }
+}
+
+/* A4b2-NR-next-edge: request the second, at-exchange decode. Same gate. */
+void dsp56k_request_decode2(void)
+{
+    if (gp_decode_enabled()) {
+        gp_decode2_pending = 1;
     }
 }
 
@@ -1020,6 +1060,19 @@ void dsp56k_execute_instruction(dsp_core_t* dsp)
          * most of the program -- exactly the kind of partial enumeration
          * AGENTS.md warns about. DSP_PRAM_SIZE is the true bound. */
         dsp56k_decode_p_range(dsp, 0, DSP_PRAM_SIZE - 1);
+    }
+
+    /* A4b2-NR-next-edge: a SECOND decode at the first exchange, tagged so the two
+     * can be compared. The bootstrap-time decode is only a snapshot: if the GP
+     * loads or patches P-memory afterwards, the snapshot does not describe what
+     * the GP actually executed. Comparing the two is how that is established
+     * rather than assumed. */
+    if (gp_decode2_pending) {
+        gp_decode2_pending = 0;
+        fprintf(stderr, "[GPDECODE] second-decode-at-exchange begin\n");
+        dsp56k_decode_p_range(dsp, 0, DSP_PRAM_SIZE - 1);
+        fprintf(stderr, "[GPDECODE] second-decode-at-exchange end\n");
+        fflush(stderr);
     }
 
     uint32_t disasm_return = 0;

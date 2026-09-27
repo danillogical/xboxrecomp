@@ -76,6 +76,16 @@ typedef struct DspCoreState {
     uint32_t cycle_count;
     uint16_t instr_cycle;
     bool halt_requested;
+    /* A4b2-NR-next-edge (Advisor Q4 guardrail): CLOBBERED IN TRACED RUNS -- DO NOT
+     * READ.
+     *
+     * This is DspCoreState.is_gp, a *different* field from DSPState.is_gp below.
+     * dsp_init() sets it correctly (dsp.c:144), but dsp_c_sync_to_vm() overwrites
+     * it from the interpreter core's never-populated is_gp (dsp_c.c:215) on every
+     * traced GP frame, so in traced runs it reads 0. It currently has no readers,
+     * which is the only reason this is harmless.
+     *
+     * Classification by this field is FORBIDDEN. */
     bool is_gp;
 
     uint32_t loop_rep;

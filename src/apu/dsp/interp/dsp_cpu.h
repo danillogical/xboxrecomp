@@ -46,6 +46,17 @@ typedef struct dsp_interrupt_s {
 typedef struct dsp_core_s dsp_core_t;
 
 struct dsp_core_s {
+    /* A4b2-NR-next-edge (Advisor Q4 guardrail): NEVER POPULATED -- DO NOT READ.
+     *
+     * The only writer is dsp_c_sync_from_vm() (dsp_c.c:252), and that function is
+     * registered in the ops table but has ZERO CALLERS, so this field is always 0.
+     * Classifying work by it silently reports "not the GP": a diagnostic that
+     * gated on it measured gp_exec_total=0 while its own histogram showed 288
+     * GP-image PCs executing.
+     *
+     * Canonical GP test instead: DSPState.is_gp, reachable from this core via its
+     * `opaque` back-pointer (dsp_c_init points opaque at the DSPState); in DMA
+     * paths use DSPDMAState.is_gp. Classification by this field is FORBIDDEN. */
     bool is_gp;
     bool is_idle;
     uint32_t cycle_count;

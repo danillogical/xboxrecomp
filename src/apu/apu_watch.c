@@ -1016,6 +1016,13 @@ void apu_watch_freeze_at_clear(uint32_t seq)
         extern void dsp56k_b9_terminal(const char *why);
         dsp56k_b9_terminal("first-exchange");
     }
+    /* A4b2-NR-next-edge: request a second full decode AT the exchange, so the
+     * bootstrap-time snapshot can be compared against the image actually in
+     * P-memory when the doorbell fires. Declared locally for the same reason. */
+    {
+        extern void dsp56k_request_decode2(void);
+        dsp56k_request_decode2();
+    }
 }
 
 /* ============================================================
