@@ -76,6 +76,16 @@ uint32_t read_peripheral(DSPState *dsp, uint32_t address)
         break;
     }
 
+    /* A4b2-NR LOCAL MODIFICATION: the diagnostic substitution for the one
+     * placeholder peripheral this discovery targets. It runs AFTER the switch
+     * has produced v and BEFORE the accounting hook, so the accounting records
+     * the value the GP actually observed. Strict no-op unless
+     * RECOMP_APU_GP_INPUT_PERTURB is set; every other peripheral is untouched
+     * (the selector itself checks the address). */
+    if (address == 0xFFFFB3) {
+        v = apu_watch_perturb_periph_ffffb3(v);
+    }
+
     /* A4b1 LOCAL MODIFICATION (dsp.c:71 upstream, immediately before the trace
      * call): the PERIPH input hook. Device semantics 6 keys this array by
      * peripheral offset over the finite universe DSP_PERIPH_SIZE = 128, and the

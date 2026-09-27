@@ -1959,6 +1959,99 @@ static void case_xi(void)
     check_counts_lines(&s, "(xi)");
 }
 
+/* ---- A4b2-NR (xii): the diagnostic GP input perturbation selectors ---------
+ *
+ * The A4b2-NR packet's Leg 2 depends on this hook actually substituting the
+ * values the GP observes, and on it being inert when the gate is absent. A hook
+ * that cannot be shown to fire proves nothing, so each selector is exercised
+ * here rather than assumed.
+ *
+ * Process isolation: apu_watch_perturb_mode() caches the environment on first
+ * call (read-once, like apu_watch_trace_enabled), so ONE process can only ever
+ * exercise ONE mode. The mode is therefore chosen by the CTest registration that
+ * launches this binary (see CMakeLists.txt), and this case asserts against
+ * whatever mode the process was started with. Every mode is registered, so every
+ * selector is covered across the suite.
+ *
+ * What this case asserts:
+ *   - absent gate  -> selector is the identity and no counter moves (inertness);
+ *   - zero/max     -> the returned value is the mode's constant, and it differs
+ *                     from the original whenever the original was not already
+ *                     that constant;
+ *   - prng         -> deterministic for a given seed and different across calls;
+ *   - bad-output   -> inputs are NOT substituted (its effect is on the doorbell
+ *                     classification, asserted in the live-run leg instead).
+ */
+static void case_xii(void)
+{
+    const char *e = getenv("RECOMP_APU_GP_INPUT_PERTURB");
+    int mode = apu_watch_perturb_mode();
+    uint32_t got;
+
+    check(mode == apu_watch_perturb_mode(), "(xii) mode is cached (read once)");
+
+    if (!e || !*e) {
+        check(mode == APU_PERTURB_OFF, "(xii) absent gate -> OFF");
+        got = apu_watch_perturb_mixbuf(0x123456u);
+        check(got == 0x123456u, "(xii) absent gate -> mixbuf identity");
+        got = apu_watch_perturb_periph_ffffb3(0x654321u);
+        check(got == 0x654321u, "(xii) absent gate -> periph identity");
+        return;
+    }
+
+    switch (mode) {
+    case APU_PERTURB_ZERO:
+        check(apu_watch_perturb_mixbuf(0x123456u) == 0u, "(xii) zero -> mixbuf 0");
+        check(apu_watch_perturb_periph_ffffb3(0x654321u) == 0u,
+              "(xii) zero -> periph 0");
+        break;
+    case APU_PERTURB_MAX:
+        check(apu_watch_perturb_mixbuf(0x123456u) == 0xFFFFFFu,
+              "(xii) max -> mixbuf 0xFFFFFF");
+        check(apu_watch_perturb_periph_ffffb3(0x654321u) == 0xFFFFFFu,
+              "(xii) max -> periph 0xFFFFFF");
+        break;
+    case APU_PERTURB_PRNG: {
+        uint32_t a = apu_watch_perturb_mixbuf(0x123456u);
+        uint32_t b = apu_watch_perturb_mixbuf(0x123456u);
+        check(a <= 0xFFFFFFu, "(xii) prng stays 24-bit");
+        check(a != b, "(xii) prng advances per call (same input, different value)");
+        break;
+    }
+    case APU_PERTURB_BAD_OUTPUT:
+        /* bad-output must NOT touch the two stub inputs; its whole point is to
+         * be the control that leaves them alone. */
+        check(apu_watch_perturb_mixbuf(0x123456u) == 0x123456u,
+              "(xii) bad-output leaves mixbuf untouched");
+        check(apu_watch_perturb_periph_ffffb3(0x654321u) == 0x654321u,
+              "(xii) bad-output leaves periph untouched");
+        /* And it must be able to FAIL: with the control active, a zero-payload
+         * transfer covering W_va must NOT take the 3->0 exchange, so GP_CLEAR
+         * must not latch. This is the can-fail property the live-run comparator
+         * depends on; asserting it here means the control is proven to bite. */
+        {
+            struct apu_watch_snapshot s;
+            apu_watch_reset();
+            gp_state_reset();
+            *ram32(WATCH_BASE_VA) = W_SEED;
+            *ram32(W_VA) = 3;
+            cap_begin();
+            gp_zero_write_covering_w();
+            emit_now();
+            apu_watch_snapshot(&s);
+            cap_end();
+            check(s.latch[APU_WATCH_GP_CLEAR].seq == 0,
+                  "(xii) bad-output suppresses GP_CLEAR (control bites)");
+            check(s.latch[APU_WATCH_GP_NONZERO_OVER].seq != 0,
+                  "(xii) bad-output routes the write to GP_NONZERO_OVER");
+        }
+        break;
+    default:
+        check(0, "(xii) unrecognised mode must not select a substitution");
+        break;
+    }
+}
+
 /* Trace-off registration: (a)-(e), (i)-(vi), (viii), (ix'), (x), (xi) hold as
  * snapshot, PRAM and memory checks; (c)'s unmapped line is present; and the
  * case output contains zero matching lines other than `unmapped`. */
@@ -2077,6 +2170,23 @@ int main(void)
            trace_on ? "1" : "0", (unsigned)W_VA,
            (unsigned)xbox_ContiguousAllocatedBytes());
 
+    /* A4b2-NR: `bad-output` is the known-bad control for the doorbell
+     * classification, so by construction it SUPPRESSES GP_CLEAR. Running it
+     * through the cases below would fail ~21 assertions that correctly require
+     * GP_CLEAR to latch -- a property of the control, not a defect. It is
+     * therefore exercised alone: its own arm asserts the selector behaviour, and
+     * its doorbell effect is asserted in the live-run leg where a comparator
+     * exists to observe it. */
+    if (apu_watch_perturb_mode() == APU_PERTURB_BAD_OUTPUT) {
+        case_xii();
+        xbox_MemoryLayoutShutdown();
+        free(d);
+        printf("%s: %u checks, %u failed (RECOMP_APU_TRACE=%s, bad-output "
+               "control-only arm)\n",
+               failures ? "FAIL" : "PASS", checks, failures, trace_on ? "1" : "0");
+        return failures ? 1 : 0;
+    }
+
     case_a();
     case_b();
     case_c();
@@ -2093,6 +2203,7 @@ int main(void)
     case_ix();
     case_x();
     case_xi();
+    case_xii();
 
     if (!trace_on) {
         check_trace_off_emission();

@@ -397,6 +397,18 @@ static void proc_rst_write(DSPState *dsp, uint32_t oldval, uint32_t val)
                 }
                 apu_watch_trace_gpboot(val, oldval, sge0, sge0_va, pram, 0x200);
             }
+
+            /* A4b2-NR Leg 1 (diagnostic, discovery instrumentation): request a
+             * decode of the loaded program image so the static mechanism leg has
+             * the real instruction stream. The request is serviced by the next
+             * executed instruction, because dsp_core_t is opaque here. Read-only
+             * with respect to the DSP and a strict no-op unless
+             * RECOMP_APU_GP_DECODE is set. Declared locally because dsp_cpu.h is
+             * outside this packet's write scope. */
+            {
+                extern void dsp56k_request_decode(void);
+                dsp56k_request_decode();
+            }
         }
     }
 }

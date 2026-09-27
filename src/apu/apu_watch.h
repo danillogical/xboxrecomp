@@ -367,6 +367,30 @@ void apu_gpin_fifo_read(uint32_t fifo, size_t bytes);
 /* The out-of-universe detector, reachable directly by the fixture case (x). */
 void apu_gpin_record_out_of_universe(uint32_t kind, uint32_t index);
 
+/* ---- A4b2-NR diagnostic GP input perturbation (discovery instrumentation) ----
+ *
+ * Reads RECOMP_APU_GP_INPUT_PERTURB=<mode>:<seed> once and caches it. Absent,
+ * empty or unrecognised mode => strict NO-OP: the selectors return their input
+ * unchanged and no counter moves. Modes: zero, max (0xFFFFFF), prng (fixed
+ * documented 24-bit xorshift32 stream, seed recorded), bad-output (control
+ * only; inputs are NOT substituted). This is discovery instrumentation for the
+ * A4b2-NR packet and changes no production value when the variable is absent. */
+enum {
+    APU_PERTURB_OFF = 0,
+    APU_PERTURB_ZERO,
+    APU_PERTURB_MAX,
+    APU_PERTURB_PRNG,
+    APU_PERTURB_BAD_OUTPUT
+};
+int apu_watch_perturb_mode(void);
+const char *apu_watch_perturb_mode_name(void);
+/* The two GP read sites. Each returns the value the GP should observe. */
+uint32_t apu_watch_perturb_mixbuf(uint32_t value);
+uint32_t apu_watch_perturb_periph_ffffb3(uint32_t value);
+/* Complete uncapped summary of what was substituted. Called at the at_clear
+ * freeze and at run end. */
+void apu_watch_perturb_report(void);
+
 /* ---- Run counters ---- */
 void apu_watch_gp_bootstrap(int is_gp);
 void apu_watch_gp_bootstrap_done(int is_gp);

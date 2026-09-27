@@ -16,6 +16,7 @@
 #include "apu_state.h"
 
 #include <stdio.h>
+#include <stdlib.h>   /* A4b2-NR: getenv/strtoul/strchr for the diagnostic gate */
 #include <string.h>
 
 /* Device semantics 3 names xbox_ContiguousAllocatedBytes()
@@ -90,6 +91,163 @@ static struct {
     uint32_t unmapped_n;
     uint32_t unmapped_set[APU_WATCH_UNMAPPED_SET];
 } s;
+
+/* ============================================================
+ * A4b2-NR diagnostic GP input perturbation (discovery instrumentation)
+ * ============================================================
+ *
+ * Reads RECOMP_APU_GP_INPUT_PERTURB=<mode>:<seed> ONCE and caches it, exactly
+ * like apu_watch_trace_enabled() above. When the variable is absent, empty, or
+ * carries an unrecognised mode, this is a strict NO-OP: every selector returns
+ * its input unchanged and no counter moves, so a run without the variable is
+ * byte-for-byte the production behaviour.
+ *
+ * This exists only to answer the A4b2-NR discovery question: do the two stub
+ * inputs (VP-produced MIXBUF samples and the 0xFFFFB3 placeholder) influence the
+ * B+0x810 doorbell exchange? It substitutes the value RETURNED to the GP; it
+ * never mutates storage, VP mixing, DMA output, CPU memory or EP reads.
+ *
+ * Every call records the ORIGINAL and the SUBSTITUTED value so the evidence can
+ * show that substitution actually happened (a hook that cannot be shown to have
+ * fired proves nothing).
+ */
+static struct {
+    int inited;
+    int mode;                 /* APU_PERTURB_* */
+    uint32_t seed;
+    /* Counters, per class. Uncapped by construction: fixed key universe. */
+    uint64_t mixbuf_reads, mixbuf_changed;
+    uint64_t periph_reads, periph_changed;
+    uint32_t mixbuf_first_orig, mixbuf_first_sub, mixbuf_first_seen;
+    uint32_t periph_first_orig, periph_first_sub, periph_first_seen;
+    uint32_t prng_state;
+} p;
+
+int apu_watch_perturb_mode(void)
+{
+    if (!p.inited) {
+        const char *e = getenv("RECOMP_APU_GP_INPUT_PERTURB");
+        p.inited = 1;
+        p.mode = APU_PERTURB_OFF;
+        if (e && *e) {
+            const char *colon = strchr(e, ':');
+            size_t n = colon ? (size_t)(colon - e) : strlen(e);
+            unsigned long seed = 0;
+            if (colon && colon[1]) {
+                seed = strtoul(colon + 1, NULL, 0);
+            }
+            if (n == 4 && !strncmp(e, "zero", 4)) {
+                p.mode = APU_PERTURB_ZERO;
+            } else if (n == 3 && !strncmp(e, "max", 3)) {
+                p.mode = APU_PERTURB_MAX;
+            } else if (n == 4 && !strncmp(e, "prng", 4)) {
+                p.mode = APU_PERTURB_PRNG;
+            } else if (n == 10 && !strncmp(e, "bad-output", 10)) {
+                p.mode = APU_PERTURB_BAD_OUTPUT;
+            } else {
+                /* Unrecognised mode: refuse loudly rather than silently running
+                 * a control. The variable stays set, so the run is diagnostic
+                 * either way; the value is simply not substituted. */
+                fprintf(stderr,
+                        "[GPPERTURB] ERROR unrecognised mode in "
+                        "RECOMP_APU_GP_INPUT_PERTURB=%s; no substitution "
+                        "performed\n", e);
+                fflush(stderr);
+            }
+            if (p.mode != APU_PERTURB_OFF) {
+                p.seed = (uint32_t)seed;
+                p.prng_state = (uint32_t)seed ? (uint32_t)seed : 0x2545F491u;
+                fprintf(stderr,
+                        "[GPPERTURB] enabled mode=%s seed=%u (diagnostic "
+                        "discovery instrumentation; inputs substituted)\n",
+                        apu_watch_perturb_mode_name(), p.seed);
+                fflush(stderr);
+            }
+        }
+    }
+    return p.mode;
+}
+
+const char *apu_watch_perturb_mode_name(void)
+{
+    switch (p.mode) {
+    case APU_PERTURB_ZERO:       return "zero";
+    case APU_PERTURB_MAX:        return "max";
+    case APU_PERTURB_PRNG:       return "prng";
+    case APU_PERTURB_BAD_OUTPUT: return "bad-output";
+    default:                     return "off";
+    }
+}
+
+/* Deterministic 24-bit stream (xorshift32). Documented so a reader can
+ * reproduce it: state must never be 0, and each call advances it once. */
+static uint32_t perturb_next(void)
+{
+    uint32_t x = p.prng_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    p.prng_state = x;
+    return x & 0xFFFFFFu;
+}
+
+/* The substitution itself. `class` selects which counter pair moves. */
+static uint32_t perturb_value(int is_mixbuf, uint32_t orig)
+{
+    uint32_t sub = orig;
+    switch (p.mode) {
+    case APU_PERTURB_ZERO: sub = 0; break;
+    case APU_PERTURB_MAX:  sub = 0xFFFFFFu; break;
+    case APU_PERTURB_PRNG: sub = perturb_next(); break;
+    default:               return orig;   /* off / bad-output: inputs untouched */
+    }
+    if (is_mixbuf) {
+        if (!p.mixbuf_reads) {
+            p.mixbuf_first_orig = orig; p.mixbuf_first_sub = sub;
+        }
+        p.mixbuf_reads++;
+        if (sub != orig) p.mixbuf_changed++;
+    } else {
+        if (!p.periph_reads) {
+            p.periph_first_orig = orig; p.periph_first_sub = sub;
+        }
+        p.periph_reads++;
+        if (sub != orig) p.periph_changed++;
+    }
+    return sub;
+}
+
+/* Called by the two GP read sites. Returns the value the GP should observe. */
+uint32_t apu_watch_perturb_mixbuf(uint32_t value)
+{
+    if (apu_watch_perturb_mode() == APU_PERTURB_OFF) return value;
+    return perturb_value(1, value);
+}
+
+uint32_t apu_watch_perturb_periph_ffffb3(uint32_t value)
+{
+    if (apu_watch_perturb_mode() == APU_PERTURB_OFF) return value;
+    return perturb_value(0, value);
+}
+
+void apu_watch_perturb_report(void)
+{
+    if (!p.inited || p.mode == APU_PERTURB_OFF) return;
+    fprintf(stderr,
+            "[GPPERTURB] report mode=%s seed=%u "
+            "mixbuf_reads=%llu mixbuf_changed=%llu "
+            "mixbuf_first_orig=%06X mixbuf_first_sub=%06X "
+            "periph_reads=%llu periph_changed=%llu "
+            "periph_first_orig=%06X periph_first_sub=%06X\n",
+            apu_watch_perturb_mode_name(), p.seed,
+            (unsigned long long)p.mixbuf_reads,
+            (unsigned long long)p.mixbuf_changed,
+            p.mixbuf_first_orig, p.mixbuf_first_sub,
+            (unsigned long long)p.periph_reads,
+            (unsigned long long)p.periph_changed,
+            p.periph_first_orig, p.periph_first_sub);
+    fflush(stderr);
+}
 
 /* ============================================================
  * Trace gate (Device semantics 7: read once and cached)
@@ -406,6 +564,37 @@ void apu_gp_dma_write(uint8_t *dst, const uint8_t *src, uint32_t guest_va,
 
     if (overlaps && full_cover) {
         payload = ldl_le_p(src + (size_t)(w_va - guest_va));
+
+        /* A4b2-NR diagnostic known-bad control (`bad-output` mode).
+         *
+         * The control must show the comparator CAN observe a changed doorbell
+         * outcome; a hook that cannot fail proves nothing. It leaves the two
+         * stub inputs entirely untouched and overrides ONLY the payload this
+         * choke point classifies, so a zero-payload doorbell is classified as
+         * nonzero and GP_CLEAR must not latch.
+         *
+         * Deliberately classification-only. The data movement is unchanged:
+         * `src` is not rewritten, so `memcpy(dst, src, len)` below lands exactly
+         * the bytes production would land. Both paths therefore end with the
+         * same value at W_va (production via the 3->0 exchange, the control via
+         * the ordinary store), and the ONLY difference the comparator can see is
+         * the latch -- which is precisely the variable under test. Rewriting the
+         * buffer instead would perturb guest memory and confound the comparison.
+         *
+         * Strict no-op in every other mode, including when the variable is
+         * absent. The false payload is logged so the record is never mistaken
+         * for a real observation. */
+        if (apu_watch_perturb_mode() == APU_PERTURB_BAD_OUTPUT && payload == 0) {
+            uint32_t bad = 0xDEADBEEFu;
+            fprintf(stderr,
+                    "[GPPERTURB] bad-output control: guest_va=%08X "
+                    "dsp_addr=%06X offset=%zu payload %08X -> %08X "
+                    "(classification only; transfer bytes and stub inputs "
+                    "unchanged)\n",
+                    guest_va, dsp_addr, (size_t)(w_va - guest_va), payload, bad);
+            fflush(stderr);
+            payload = bad;
+        }
 
         if (payload != 0) {
             /* GP_NONZERO_OVER: observed is the dword at W_va immediately before
@@ -812,6 +1001,10 @@ void apu_watch_freeze_at_clear(uint32_t seq)
     s.at_clear.seq = seq;
     s.at_clear.frame = s.se_frame;
     memcpy(&s.at_clear.gpin, &s.gpin, sizeof(s.gpin));
+    /* A4b2-NR: emit the complete uncapped substitution summary at the same
+     * write-once moment the input accounting is frozen, so the discovery
+     * evidence shows what the GP actually consumed before the exchange. */
+    apu_watch_perturb_report();
 }
 
 /* ============================================================
@@ -823,6 +1016,9 @@ static void emit_counts(void)
     if (!apu_watch_trace_enabled()) {
         return;
     }
+    /* A4b2-NR: the substitution summary rides every counts emission, so the
+     * discovery record has an uncapped series rather than one sample. */
+    apu_watch_perturb_report();
     fprintf(stderr,
             "[GPWATCH] counts seq=%u boots=%u gp_frames=%u gp_insns=%llu "
             "GP_CLEAR=%u GP_ZERO_OVER_ZERO=%u GP_ZERO_OVER_OTHER=%u "

@@ -443,6 +443,108 @@ static const OpcodeEntry *lookup_opcode(uint32_t op) {
     return opcache[tag].entry;
 }
 
+/* ============================================================
+ * A4b2-NR diagnostic P-memory decode (discovery instrumentation)
+ * ============================================================
+ *
+ * The pinned DSP56300 decoder below (disasm_instruction) already exists, but its
+ * only output path is DPRINTF, gated by DEBUG_DSP == 0 (debug.h:25), so nothing
+ * reaches a log. A4b2-NR Leg 1 needs the loaded program image as text, so this
+ * exposes it behind a read-once environment gate.
+ *
+ * It is read-only with respect to the DSP: it saves and restores pc and the
+ * decoder scratch state, and it changes no memory, register or control flow.
+ * Strict no-op unless RECOMP_APU_GP_DECODE is set, so a production run is
+ * unaffected.
+ *
+ * Undecodable words are printed as explicit gaps, never as NOPs: a decoder that
+ * silently substituted NOPs would fabricate instructions in the very image the
+ * static leg reasons about.
+ */
+static int gp_decode_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_APU_GP_DECODE");
+        on = (e && *e) ? 1 : 0;
+    }
+    return on;
+}
+
+/* Defined below; the diagnostic decoder needs it. */
+static uint16_t disasm_instruction(dsp_core_t* dsp, dsp_trace_disasm_t mode);
+
+/* A4b2-NR: set by dsp56k_request_decode() and serviced on the next executed
+ * instruction. The request takes no argument because dsp_core_t is opaque
+ * outside this translation unit, and gp_ep.c -- the packet's in-scope call
+ * site -- cannot name it. */
+static int gp_decode_pending = 0;
+
+/* A4b2-NR: request a one-shot decode of the loaded program image. Called from
+ * the in-scope gp_ep.c immediately after the bootstrap that loaded it. Takes no
+ * argument because dsp_core_t is opaque outside this file; the pending flag is
+ * serviced by the next executed instruction, which has the core in hand. */
+void dsp56k_request_decode(void)
+{
+    if (gp_decode_enabled()) {
+        gp_decode_pending = 1;
+    }
+}
+
+void dsp56k_decode_p_range(dsp_core_t *dsp, uint32_t pc_lo, uint32_t pc_hi)
+{
+    uint32_t pc;
+    uint32_t saved_pc;
+
+    if (!dsp || !gp_decode_enabled() || pc_lo > pc_hi) {
+        return;
+    }
+    saved_pc = dsp->pc;
+    fprintf(stderr, "[GPDECODE] begin P[%04X..%04X]\n", pc_lo, pc_hi);
+    for (pc = pc_lo; pc <= pc_hi; ) {
+        uint32_t inst = dsp56k_read_memory(dsp, DSP_SPACE_P, pc);
+        uint16_t len;
+
+        dsp->pc = pc;
+        dsp->disasm_prev_inst_pc = 0xFFFFFFFFu;  /* defeat the loop suppression */
+        dsp->disasm_is_looping = false;
+        dsp->disasm_str_instr[0] = 0;
+        dsp->disasm_parallelmove_name[0] = 0;
+        /* Guard the decode. lookup_opcode_slow() ends in
+         * `assert(!"Invalid op code in dsp_cpu"); return NULL;` -- and in a
+         * Release build assert() is a no-op, so an unrecognised word makes
+         * lookup_opcode() return NULL. disasm_instruction() then dereferences
+         * it and the run dies with an access violation.
+         *
+         * So test the pointer, not a field of it. The packet requires
+         * undecodable words to be reported as gaps, and a decoder that faults on
+         * the very image under study would destroy the evidence it exists to
+         * produce. */
+        if (inst < 0x100000u && lookup_opcode(inst) == NULL) {
+            fprintf(stderr, "[GPDECODE] P %04X %06X  <UNDECODED>\n", pc,
+                    inst & 0xFFFFFFu);
+            pc += 1;
+            continue;
+        }
+        len = disasm_instruction(dsp, DSP_DISASM_MODE);
+        if (len == 0) {
+            len = 1;
+        }
+        if (dsp->disasm_str_instr[0]) {
+            fprintf(stderr, "[GPDECODE] P %04X %06X  %s\n", pc, inst & 0xFFFFFFu,
+                    dsp->disasm_str_instr);
+        } else {
+            /* A gap, stated as a gap. Never a fabricated NOP. */
+            fprintf(stderr, "[GPDECODE] P %04X %06X  <UNDECODED>\n", pc,
+                    inst & 0xFFFFFFu);
+        }
+        pc += len;
+    }
+    fprintf(stderr, "[GPDECODE] end\n");
+    fflush(stderr);
+    dsp->pc = saved_pc;
+}
+
 static uint16_t disasm_instruction(dsp_core_t* dsp, dsp_trace_disasm_t mode)
 {
     dsp->disasm_mode = mode;
@@ -595,6 +697,15 @@ static const char* disasm_get_instruction_text(dsp_core_t* dsp)
 void dsp56k_execute_instruction(dsp_core_t* dsp)
 {
     trace_dsp56k_execute_instruction(dsp->is_gp, dsp->pc);
+
+    /* A4b2-NR: service a pending diagnostic decode request. Placed here because
+     * this is the first point after the in-scope caller that has the core. It
+     * runs before execution, so it decodes exactly the image the bootstrap
+     * loaded. Cleared unconditionally so a failed decode cannot retry forever. */
+    if (gp_decode_pending) {
+        gp_decode_pending = 0;
+        dsp56k_decode_p_range(dsp, 0, 0x1FF);
+    }
 
     uint32_t disasm_return = 0;
     dsp->disasm_memory_ptr = 0;
@@ -912,15 +1023,27 @@ uint32_t dsp56k_read_memory(dsp_core_t* dsp, int space, uint32_t address)
              * universe NUM_MIXBINS = 32, with bin = (addr - 0x1400) / 32, and
              * counts reads_while_stub against the per-frame provenance flag the
              * pinned frame path sets. Observation only: the returned word is
-             * the mixbuffer's, untouched. */
-            apu_gpin_mixbuf_read(address - DSP_MIXBUFFER_BASE,
-                                 dsp->mixbuffer[address-DSP_MIXBUFFER_BASE]);
-            return dsp->mixbuffer[address-DSP_MIXBUFFER_BASE];
+             * the mixbuffer's, untouched.
+             *
+             * A4b2-NR LOCAL MODIFICATION: the A4b2-NR diagnostic substitution
+             * runs AFTER the memory lookup and BEFORE the accounting hook, so
+             * the accounting records the value the GP actually observed. It is
+             * a strict no-op unless RECOMP_APU_GP_INPUT_PERTURB is set. */
+            uint32_t v = apu_watch_perturb_mixbuf(
+                dsp->mixbuffer[address-DSP_MIXBUFFER_BASE]);
+            apu_gpin_mixbuf_read(address - DSP_MIXBUFFER_BASE, v);
+            return v;
         } else if (address >= 0xc00 && address < 0xc00+DSP_MIXBUFFER_SIZE) {
             /* The 0xc00 alias of the same buffer. Recorded too: it is the same
-             * 1024 words, and a read here is a mix-buffer read. */
-            apu_gpin_mixbuf_read(address - 0xc00, dsp->mixbuffer[address-0xc00]);
-            return dsp->mixbuffer[address-0xc00];
+             * 1024 words, and a read here is a mix-buffer read.
+             *
+             * A4b2-NR LOCAL MODIFICATION: same diagnostic substitution as the
+             * 0x1400 range above. Both alias and primary are covered because a
+             * perturbation that missed one would leave a live stub path. */
+            uint32_t v = apu_watch_perturb_mixbuf(
+                dsp->mixbuffer[address-0xc00]);
+            apu_gpin_mixbuf_read(address - 0xc00, v);
+            return v;
         } else {
             if (address < DSP_XRAM_SIZE) {
                 return dsp->xram[address];
