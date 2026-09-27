@@ -153,6 +153,22 @@ static void dsp_dma_run(DSPDMAState *s)
         uint32_t scratch_base = s->mem_read(s->mem_opaque, block_space, block_addr+5);
         uint32_t scratch_size = s->mem_read(s->mem_opaque, block_space, block_addr+6)+1;
 
+        /* A4b2-NR-epoch-slice-followup: record the descriptor's OWN scratch fields.
+         * The exchange block (24) does not write slot +5, so scratch_base is
+         * whatever memory holds; assuming zero would be an unverified premise of
+         * exactly the kind that has produced six errors in this analysis. This
+         * makes the dsp_addr arithmetic measured rather than assumed. */
+        {
+            extern void dsp_dma_scratch_fields(DSPDMAState *s, uint32_t block_addr,
+                                               uint32_t scratch_base,
+                                               uint32_t scratch_offset,
+                                               uint32_t scratch_size,
+                                               uint32_t dsp_offset,
+                                               uint32_t count);
+            dsp_dma_scratch_fields(s, block_addr, scratch_base, scratch_offset,
+                                   scratch_size, dsp_offset, count);
+        }
+
         s->next_block = next_block;
         if (s->next_block & NODE_POINTER_EOL) {
             s->eol = true;

@@ -1023,6 +1023,23 @@ static struct {
  * the DMA write hook at the GP_CLEAR latch. Declared near the top of the file,
  * ahead of apu_gp_dma_write(), because that function reads it. */
 
+/* Record each block's OWN scratch fields, so the dsp_addr arithmetic is measured
+ * rather than assumed. Emitted to the artifact when the descriptor gate is set. */
+void dsp_dma_scratch_fields(DSPDMAState *s, uint32_t block_addr,
+                            uint32_t scratch_base, uint32_t scratch_offset,
+                            uint32_t scratch_size, uint32_t dsp_offset,
+                            uint32_t count)
+{
+    if (!dmad.on || !dmad.fp || !s || !s->is_gp) {
+        return;
+    }
+    fprintf(dmad.fp, "#FIELDS block=%u base=0x%X offset=0x%X size=0x%X "
+                     "dsp_off=0x%X count=%u scratch_addr=0x%X\n",
+            block_addr, scratch_base, scratch_offset, scratch_size, dsp_offset,
+            count, scratch_base + scratch_offset);
+    fflush(dmad.fp);
+}
+
 void dsp_dma_descriptor_trace(DSPDMAState *s, uint32_t next_block)
 {
     uint32_t addr;
