@@ -1023,6 +1023,13 @@ void apu_watch_freeze_at_clear(uint32_t seq)
         extern void dsp56k_request_decode2(void);
         dsp56k_request_decode2();
     }
+    /* A4b2-NR-next-edge-followup: emit the P-write watch terminal at the same
+     * write-once moment, so the image-I stability record covers exactly the
+     * window from bootstrap to the first exchange. Strict no-op unless set. */
+    {
+        extern void dsp56k_pwrite_terminal(const char *why);
+        dsp56k_pwrite_terminal("first-exchange");
+    }
 }
 
 /* ============================================================

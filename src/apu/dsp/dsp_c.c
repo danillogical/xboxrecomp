@@ -117,6 +117,15 @@ static void dsp_c_bootstrap(DSPState *dsp)
 {
     dsp_core_t *core = c_core(dsp);
 
+    /* A4b2-NR-next-edge-followup: this bulk load writes core->pram directly and
+     * therefore BYPASSES the write watch at write_memory_raw(). Recorded so the
+     * coverage gap is visible in the watch artifact rather than an unstated
+     * assumption. Declared locally to keep the change to these two files. */
+    {
+        extern void dsp56k_pwrite_note_bootstrap_bulk(size_t words);
+        dsp56k_pwrite_note_bootstrap_bulk(0x800);
+    }
+
     // scratch memory is dma'd in to pram by the bootrom
     dsp->dma.scratch_rw(dsp->dma.rw_opaque, (uint8_t *)core->pram, 0, 0x800 * 4,
                         false);
@@ -259,6 +268,14 @@ static void dsp_c_sync_from_vm(DSPState *dsp)
     memcpy(core->stack, vm->stack, sizeof(vm->stack));
     memcpy(core->xram, vm->xram, sizeof(vm->xram));
     memcpy(core->yram, vm->yram, sizeof(vm->yram));
+    /* A4b2-NR-next-edge-followup: this memcpy writes core->pram directly and
+     * bypasses the write watch. This function currently has ZERO CALLERS, so it
+     * never runs; recorded anyway so that if it ever gains a caller the watch
+     * artifact shows the bypass instead of silently under-reporting. */
+    {
+        extern void dsp56k_pwrite_note_sync_bulk(size_t words);
+        dsp56k_pwrite_note_sync_bulk(DSP_PRAM_SIZE);
+    }
     memcpy(core->pram, vm->pram, sizeof(vm->pram));
     memcpy(core->mixbuffer, vm->mixbuffer, sizeof(vm->mixbuffer));
     memcpy(core->periph, vm->periph, sizeof(vm->periph));

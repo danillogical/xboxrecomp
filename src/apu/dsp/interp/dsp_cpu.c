@@ -488,12 +488,216 @@ void dsp56k_b9_note_read(dsp_core_t *dsp, uint32_t address, uint32_t value);
 void dsp56k_b9_terminal(const char *why);
 void dsp56k_b9_epoch_begin(void);
 
+/* A4b2-NR-next-edge-followup: the P-memory write watch, defined below and used
+ * by write_memory_raw(). */
+void dsp56k_pwrite_watch(dsp_core_t *dsp, uint32_t address, uint32_t value);
+void dsp56k_pwrite_terminal(const char *why);
+
 /* A4b2-NR: set by dsp56k_request_decode() and serviced on the next executed
  * instruction. The request takes no argument because dsp_core_t is opaque
  * outside this translation unit, and gp_ep.c -- the packet's in-scope call
  * site -- cannot name it. */
 static int gp_decode_pending = 0;
 static int gp_decode2_pending = 0;
+
+/* ============================================================
+ * A4b2-NR-next-edge-followup: the P-memory write watch
+ * ============================================================
+ *
+ * The Advisor mandated this before any slice may be built: the previous packet
+ * found the GP loads a SECOND program into P-memory after the bootstrap, so a
+ * slice is only valid over bytes PROVEN STABLE across its claimed window.
+ *
+ * This records every write to P-memory -- address, value, and the PC that made
+ * it -- so quiescence over a range can be established, or every modification
+ * mapped. It sits at write_memory_raw(), which is the single choke point for all
+ * P writes regardless of which instruction or DMA path performed them.
+ *
+ * It is also the instrument that closes the doorbell-path transient-modification
+ * gap: a watch over 0x000-0x172 showing no writes from bootstrap to exchange is
+ * what upgrades "the doorbell instructions are byte-identical in two samples" to
+ * "the doorbell instructions were not modified in between".
+ *
+ * Read-only with respect to the DSP (it observes, then the caller stores), and a
+ * strict no-op unless RECOMP_APU_PWRITE_WATCH is set.
+ *
+ * Completeness: one event per write, streamed synchronously, uncapped, with a
+ * monotonic ordinal and a terminal record carrying the count and per-range
+ * tallies, so a truncated watch is detectable rather than silently read as
+ * "no writes happened".
+ */
+#define PWRITE_IMAGE_I_LO   0x0000u
+#define PWRITE_IMAGE_I_HI   0x0172u
+
+static struct {
+    int inited;
+    int on;
+    FILE *fp;
+    int invalid;
+    uint64_t events;
+    uint64_t ord;
+    uint64_t in_image_i;         /* writes landing in the boot image */
+    uint64_t above_image_i;
+    uint32_t first_in_image_i;   /* first such address, or ~1 */
+    uint64_t first_in_image_ord;
+    uint32_t first_in_image_pc;
+    uint64_t ngp_skipped;        /* non-GP writes seen and excluded (EP) */
+    /* Coverage audit: PRAM has mutation paths that do NOT go through
+     * write_memory_raw (dsp_c.c). Each is reported so the residual is visible
+     * in the record instead of being an unstated assumption. */
+    uint64_t bootstrap_bulk;     /* dsp_c_bootstrap scratch_rw into core->pram */
+    uint64_t sync_from_vm_bulk;  /* dsp_c_sync_from_vm memcpy core->pram */
+} pw;
+
+/* Called from dsp_c_bootstrap's bulk scratch_rw, so a bootstrap-time PRAM load is
+ * RECORDED rather than silently bypassing the watch. */
+void dsp56k_pwrite_note_bootstrap_bulk(size_t words)
+{
+    if (!pwrite_watch_enabled()) {
+        return;
+    }
+    pw.bootstrap_bulk++;
+    if (pw.fp) {
+        fprintf(pw.fp, "# BOOTSTRAP_BULK_LOAD words=%zu (bypasses write_memory_raw)\n",
+                words);
+        fflush(pw.fp);
+    }
+}
+
+/* Called from dsp_c_sync_from_vm's memcpy, which currently has zero callers.
+ * If that ever changes, the record shows it. */
+void dsp56k_pwrite_note_sync_bulk(size_t words)
+{
+    if (!pwrite_watch_enabled()) {
+        return;
+    }
+    pw.sync_from_vm_bulk++;
+    if (pw.fp) {
+        fprintf(pw.fp, "# SYNC_FROM_VM_BULK words=%zu (bypasses write_memory_raw)\n",
+                words);
+        fflush(pw.fp);
+    }
+}
+
+static void pw_fail(const char *why)
+{
+    if (!pw.invalid) {
+        pw.invalid = 1;
+        fprintf(stderr, "[GPWRITE] TRACE INVALID: %s (events=%llu)\n", why,
+                (unsigned long long)pw.events);
+        fflush(stderr);
+    }
+}
+
+static int pwrite_watch_enabled(void)
+{
+    if (!pw.inited) {
+        const char *e = getenv("RECOMP_APU_PWRITE_WATCH");
+        pw.inited = 1;
+        pw.on = (e && *e) ? 1 : 0;
+        pw.first_in_image_i = 0xFFFFFFFFu;
+        if (pw.on) {
+            const char *p = getenv("RECOMP_APU_PWRITE_WATCH_FILE");
+            pw.fp = fopen((p && *p) ? p : "gpwrite_watch.txt", "wb");
+            if (!pw.fp) {
+                pw_fail("cannot open watch artifact");
+            } else {
+                fprintf(pw.fp, "# A4b2-NR-next-edge-followup P-memory write watch\n");
+                fprintf(pw.fp, "# fields: ord pc addr oldvalue newvalue in_image_i is_gp\n");
+                fflush(pw.fp);
+                fprintf(stderr, "[GPWRITE] watch enabled -> %s\n",
+                        (p && *p) ? p : "gpwrite_watch.txt");
+                fflush(stderr);
+            }
+        }
+    }
+    return pw.on;
+}
+
+void dsp56k_pwrite_watch(dsp_core_t *dsp, uint32_t address, uint32_t value)
+{
+    uint32_t old;
+    int in_i;
+    int is_gp;
+
+    if (!pwrite_watch_enabled() || !dsp) {
+        return;
+    }
+    /* GP-only. The GP and EP are separate cores over separate P-memories, so an
+     * EP write is not an event in the GP program's epoch structure at all; mixing
+     * the two would corrupt the quiescence argument. The flag is read through the
+     * opaque back-pointer (DSPState.is_gp), NOT core->is_gp, which is never
+     * populated -- see the guardrail comment on that field. Measured on the first
+     * watch run: 3512 events, all is_gp=1, zero non-GP. The filter is here so that
+     * the instrument is correct by construction rather than by the EP happening
+     * not to run.
+     *
+     * Non-GP writes are COUNTED, not silently dropped: a nonzero count is
+     * reported in the terminal so "the EP was quiet" is visible rather than
+     * assumed. */
+    is_gp = b9_core_is_gp(dsp);
+    if (!is_gp) {
+        pw.ngp_skipped++;
+        return;
+    }
+    old = dsp->pram[address] & 0xFFFFFFu;
+    in_i = (address >= PWRITE_IMAGE_I_LO && address <= PWRITE_IMAGE_I_HI);
+
+    if (in_i) {
+        pw.in_image_i++;
+        if (pw.first_in_image_i == 0xFFFFFFFFu) {
+            pw.first_in_image_i = address;
+            pw.first_in_image_ord = pw.ord;
+            pw.first_in_image_pc = dsp->pc;
+        }
+    } else {
+        pw.above_image_i++;
+    }
+
+    if (!pw.fp || pw.invalid) {
+        return;
+    }
+    if (fprintf(pw.fp, "%llu %04X %04X %06X %06X %d\n",
+                (unsigned long long)pw.ord, dsp->pc, address, old,
+                value & 0xFFFFFFu, in_i) < 0) {
+        pw_fail("write failed");
+        return;
+    }
+    pw.ord++;
+    pw.events++;
+}
+
+void dsp56k_pwrite_terminal(const char *why)
+{
+    if (!pwrite_watch_enabled() || !pw.fp) {
+        return;
+    }
+    if (fflush(pw.fp) != 0) {
+        pw_fail("flush failed at terminal");
+    }
+    fprintf(stderr,
+            "[GPWRITE] terminal reason=%s events=%llu in_image_i=%llu "
+            "above_image_i=%llu ngp_skipped=%llu first_in_image=%s invalid=%d\n",
+            why, (unsigned long long)pw.events,
+            (unsigned long long)pw.in_image_i,
+            (unsigned long long)pw.above_image_i,
+            (unsigned long long)pw.ngp_skipped,
+            (pw.first_in_image_i == 0xFFFFFFFFu) ? "none" : "PRESENT",
+            pw.invalid);
+    fflush(stderr);
+    fprintf(pw.fp, "# terminal reason=%s events=%llu in_image_i=%llu "
+                   "above_image_i=%llu ngp_skipped=%llu invalid=%d\n",
+            why, (unsigned long long)pw.events,
+            (unsigned long long)pw.in_image_i,
+            (unsigned long long)pw.above_image_i,
+            (unsigned long long)pw.ngp_skipped, pw.invalid);
+    if (pw.first_in_image_i != 0xFFFFFFFFu) {
+        fprintf(pw.fp, "# FIRST_IMAGE_I_WRITE addr=%04X ord=%llu pc=%04X\n",
+                pw.first_in_image_i, (unsigned long long)pw.first_in_image_ord,
+                pw.first_in_image_pc);
+    }
+    fflush(pw.fp);
+}
 
 /* ============================================================
  * A4b2-NR-followup: the P 00B9 effective-address trace
@@ -1459,6 +1663,7 @@ static void write_memory_raw(dsp_core_t* dsp, int space, uint32_t address, uint3
         dsp->yram[address] = value;
     } else if (space == DSP_SPACE_P) {
         assert(address < DSP_PRAM_SIZE);
+        dsp56k_pwrite_watch(dsp, address, value);
         stl_le_p(&dsp->pram[address], value);
         dsp->pram_opcache[address] = NULL;
     } else {
