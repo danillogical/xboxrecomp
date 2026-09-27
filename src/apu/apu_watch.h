@@ -372,15 +372,16 @@ void apu_gpin_record_out_of_universe(uint32_t kind, uint32_t index);
  * Reads RECOMP_APU_GP_INPUT_PERTURB=<mode>:<seed> once and caches it. Absent,
  * empty or unrecognised mode => strict NO-OP: the selectors return their input
  * unchanged and no counter moves. Modes: zero, max (0xFFFFFF), prng (fixed
- * documented 24-bit xorshift32 stream, seed recorded), bad-output (control
- * only; inputs are NOT substituted). This is discovery instrumentation for the
- * A4b2-NR packet and changes no production value when the variable is absent. */
+ * documented 24-bit xorshift32 stream, seed recorded). This is discovery
+ * instrumentation for the A4b2-NR packet and changes no production value when the
+ * variable is absent. The `bad-output` known-bad control was removed at
+ * A4b2-NR-next-edge-followup closure; its bite is preserved in the archived run
+ * 20260927-130142-334-a4b2-nr-badoutput. */
 enum {
     APU_PERTURB_OFF = 0,
     APU_PERTURB_ZERO,
     APU_PERTURB_MAX,
-    APU_PERTURB_PRNG,
-    APU_PERTURB_BAD_OUTPUT
+    APU_PERTURB_PRNG
 };
 int apu_watch_perturb_mode(void);
 const char *apu_watch_perturb_mode_name(void);

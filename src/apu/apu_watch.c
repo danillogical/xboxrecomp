@@ -142,8 +142,6 @@ int apu_watch_perturb_mode(void)
                 p.mode = APU_PERTURB_MAX;
             } else if (n == 4 && !strncmp(e, "prng", 4)) {
                 p.mode = APU_PERTURB_PRNG;
-            } else if (n == 10 && !strncmp(e, "bad-output", 10)) {
-                p.mode = APU_PERTURB_BAD_OUTPUT;
             } else {
                 /* Unrecognised mode: refuse loudly rather than silently running
                  * a control. The variable stays set, so the run is diagnostic
@@ -174,7 +172,6 @@ const char *apu_watch_perturb_mode_name(void)
     case APU_PERTURB_ZERO:       return "zero";
     case APU_PERTURB_MAX:        return "max";
     case APU_PERTURB_PRNG:       return "prng";
-    case APU_PERTURB_BAD_OUTPUT: return "bad-output";
     default:                     return "off";
     }
 }
@@ -199,7 +196,7 @@ static uint32_t perturb_value(int is_mixbuf, uint32_t orig)
     case APU_PERTURB_ZERO: sub = 0; break;
     case APU_PERTURB_MAX:  sub = 0xFFFFFFu; break;
     case APU_PERTURB_PRNG: sub = perturb_next(); break;
-    default:               return orig;   /* off / bad-output: inputs untouched */
+    default:               return orig;   /* off: inputs untouched */
     }
     if (is_mixbuf) {
         if (!p.mixbuf_reads) {
@@ -565,36 +562,15 @@ void apu_gp_dma_write(uint8_t *dst, const uint8_t *src, uint32_t guest_va,
     if (overlaps && full_cover) {
         payload = ldl_le_p(src + (size_t)(w_va - guest_va));
 
-        /* A4b2-NR diagnostic known-bad control (`bad-output` mode).
-         *
-         * The control must show the comparator CAN observe a changed doorbell
-         * outcome; a hook that cannot fail proves nothing. It leaves the two
-         * stub inputs entirely untouched and overrides ONLY the payload this
-         * choke point classifies, so a zero-payload doorbell is classified as
-         * nonzero and GP_CLEAR must not latch.
-         *
-         * Deliberately classification-only. The data movement is unchanged:
-         * `src` is not rewritten, so `memcpy(dst, src, len)` below lands exactly
-         * the bytes production would land. Both paths therefore end with the
-         * same value at W_va (production via the 3->0 exchange, the control via
-         * the ordinary store), and the ONLY difference the comparator can see is
-         * the latch -- which is precisely the variable under test. Rewriting the
-         * buffer instead would perturb guest memory and confound the comparison.
-         *
-         * Strict no-op in every other mode, including when the variable is
-         * absent. The false payload is logged so the record is never mistaken
-         * for a real observation. */
-        if (apu_watch_perturb_mode() == APU_PERTURB_BAD_OUTPUT && payload == 0) {
-            uint32_t bad = 0xDEADBEEFu;
-            fprintf(stderr,
-                    "[GPPERTURB] bad-output control: guest_va=%08X "
-                    "dsp_addr=%06X offset=%zu payload %08X -> %08X "
-                    "(classification only; transfer bytes and stub inputs "
-                    "unchanged)\n",
-                    guest_va, dsp_addr, (size_t)(w_va - guest_va), payload, bad);
-            fflush(stderr);
-            payload = bad;
-        }
+        /* A4b2-NR-next-edge-followup closure: the `bad-output` known-bad control
+         * that used to override `payload` here has been REMOVED, as the packet
+         * requires. Its purpose was to show the comparator CAN observe a changed
+         * doorbell outcome, and that is preserved in the archived run
+         * 20260927-130142-334-a4b2-nr-badoutput (GP_CLEAR latches = 0,
+         * GP_NONZERO_OVER latches = 1, two control log lines) together with the
+         * fixture assertions that exercised it. Removing the arm leaves the
+         * remaining perturbation modes (zero/max/prng) intact: they substitute the
+         * two stub inputs and never touch this classification. */
 
         if (payload != 0) {
             /* GP_NONZERO_OVER: observed is the dword at W_va immediately before

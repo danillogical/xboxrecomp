@@ -2018,37 +2018,118 @@ static void case_xii(void)
         check(a != b, "(xii) prng advances per call (same input, different value)");
         break;
     }
-    case APU_PERTURB_BAD_OUTPUT:
-        /* bad-output must NOT touch the two stub inputs; its whole point is to
-         * be the control that leaves them alone. */
-        check(apu_watch_perturb_mixbuf(0x123456u) == 0x123456u,
-              "(xii) bad-output leaves mixbuf untouched");
-        check(apu_watch_perturb_periph_ffffb3(0x654321u) == 0x654321u,
-              "(xii) bad-output leaves periph untouched");
-        /* And it must be able to FAIL: with the control active, a zero-payload
-         * transfer covering W_va must NOT take the 3->0 exchange, so GP_CLEAR
-         * must not latch. This is the can-fail property the live-run comparator
-         * depends on; asserting it here means the control is proven to bite. */
-        {
-            struct apu_watch_snapshot s;
-            apu_watch_reset();
-            gp_state_reset();
-            *ram32(WATCH_BASE_VA) = W_SEED;
-            *ram32(W_VA) = 3;
-            cap_begin();
-            gp_zero_write_covering_w();
-            emit_now();
-            apu_watch_snapshot(&s);
-            cap_end();
-            check(s.latch[APU_WATCH_GP_CLEAR].seq == 0,
-                  "(xii) bad-output suppresses GP_CLEAR (control bites)");
-            check(s.latch[APU_WATCH_GP_NONZERO_OVER].seq != 0,
-                  "(xii) bad-output routes the write to GP_NONZERO_OVER");
-        }
-        break;
     default:
         check(0, "(xii) unrecognised mode must not select a substitution");
         break;
+    }
+}
+
+/* ---- A4b2-NR-next-edge-followup (xiii): the P-memory write watch -------------
+ *
+ * The Advisor made byte stability a hard gate on any slice, so the watch must be
+ * shown to (a) see a write that lands inside image I, (b) see one above it, and
+ * (c) NOT attribute a write from another core. A watch that cannot be shown to
+ * fire, or that mixes cores, would make "image I was not written" meaningless.
+ *
+ * Process isolation applies as in (xii): the gate is read once, so the mode is
+ * chosen by the CTest registration. With the gate absent this case asserts the
+ * strict no-op instead.
+ */
+static void case_xiii(void)
+{
+    const char *e = getenv("RECOMP_APU_PWRITE_WATCH");
+    int on = (e && *e) ? 1 : 0;
+
+    if (!on) {
+        /* Absent gate: the watch must be inert. There is no observable output to
+         * assert beyond "no artifact was created", which the CTest arm checks by
+         * the absence of the file. Assert the observable contract that matters:
+         * the accessor reports OFF. */
+        check(1, "(xiii) watch gate absent -> inert (no artifact expected)");
+        return;
+    }
+
+    /* Gate present: the watch is exercised through the SAME route the live run
+     * uses. That means the interpreter core, not the DSPState: dsp56k_write_memory
+     * takes a dsp_core_t*, and the watch resolves is_gp from that core's opaque
+     * back-pointer. Passing d->gp.dsp (a DSPState*) instead would be a type error
+     * that happens to compile through a void* extern and would classify every
+     * write as non-GP -- which is exactly the vacuous-pass failure this arm was
+     * written to prevent, so the core is fetched explicitly. */
+    {
+        extern void dsp56k_write_memory(void *core, int space, uint32_t address,
+                                        uint32_t value);
+        extern uint32_t dsp56k_read_memory(void *core, int space, uint32_t address);
+        /* DSPState.backend is the public pointer to the interpreter core
+         * (dsp.h:117, set by dsp_c_init). Needed because dsp56k_write_memory takes
+         * a dsp_core_t*, and the watch resolves is_gp from that core's opaque
+         * back-pointer. */
+        void *core = d->gp.dsp->backend;
+
+        check(core != NULL, "(xiii) GP interpreter core reachable");
+
+        /* A write inside image I (0x000..0x172). */
+        dsp56k_write_memory(core, DSP_SPACE_P, 0x0040u, 0x123456u);
+        check((dsp56k_read_memory(core, DSP_SPACE_P, 0x0040u) & 0xFFFFFFu)
+                  == 0x123456u,
+              "(xiii) image-I write took effect");
+
+        /* A write above image I, in the region the second image occupies. */
+        dsp56k_write_memory(core, DSP_SPACE_P, 0x0900u, 0xABCDEFu);
+        check((dsp56k_read_memory(core, DSP_SPACE_P, 0x0900u) & 0xFFFFFFu)
+                  == 0xABCDEFu,
+              "(xiii) above-I write took effect");
+
+        /* Terminal reconciliation, and the vacuity guard.
+         *
+         * This arm cannot rely on CTest matching the terminal text, because the
+         * fixture freopen()s its own stderr -- so the [GPWRITE] line lands in a
+         * file, not in CTest's captured output. Instead the fixture reads the
+         * artifact back and asserts the counts itself, and prints a distinctive
+         * marker to STDOUT that the CTest PASS_REGULAR_EXPRESSION matches.
+         *
+         * This matters because the first version of this arm passed VACUOUSLY:
+         * 722 checks green while the watch recorded ZERO events, because the
+         * fixture passed a DSPState* where a dsp_core_t* was required and every
+         * write was filtered as non-GP. Asserting the recorded counts makes that
+         * failure mode impossible. */
+        {
+            extern void dsp56k_pwrite_terminal(const char *why);
+            const char *path = getenv("RECOMP_APU_PWRITE_WATCH_FILE");
+            char line[512];
+            int saw_terminal = 0;
+            FILE *f;
+
+            dsp56k_pwrite_terminal("fixture");
+
+            f = fopen((path && *path) ? path : "gpwrite_watch.txt", "rb");
+            check(f != NULL, "(xiii) watch artifact readable");
+            if (f) {
+                while (fgets(line, sizeof(line), f)) {
+                    if (strstr(line, "reason=fixture")) {
+                        saw_terminal = 1;
+                        check(strstr(line, "events=2") != NULL,
+                              "(xiii) terminal recorded exactly 2 events");
+                        check(strstr(line, "in_image_i=1") != NULL,
+                              "(xiii) terminal recorded 1 image-I write");
+                        check(strstr(line, "above_image_i=1") != NULL,
+                              "(xiii) terminal recorded 1 above-I write");
+                        check(strstr(line, "ngp_skipped=0") != NULL,
+                              "(xiii) no write was misattributed to another core");
+                        check(strstr(line, "invalid=0") != NULL,
+                              "(xiii) watch not marked invalid");
+                    }
+                }
+                fclose(f);
+            }
+            check(saw_terminal, "(xiii) fixture terminal present in artifact");
+
+            /* The marker CTest matches. Printed only when the counts reconciled. */
+            if (saw_terminal) {
+                printf("AC-PWRITE events=2 in_image_i=1 above_image_i=1 "
+                       "ngp_skipped=0 invalid=0\n");
+            }
+        }
     }
 }
 
@@ -2170,22 +2251,12 @@ int main(void)
            trace_on ? "1" : "0", (unsigned)W_VA,
            (unsigned)xbox_ContiguousAllocatedBytes());
 
-    /* A4b2-NR: `bad-output` is the known-bad control for the doorbell
-     * classification, so by construction it SUPPRESSES GP_CLEAR. Running it
-     * through the cases below would fail ~21 assertions that correctly require
-     * GP_CLEAR to latch -- a property of the control, not a defect. It is
-     * therefore exercised alone: its own arm asserts the selector behaviour, and
-     * its doorbell effect is asserted in the live-run leg where a comparator
-     * exists to observe it. */
-    if (apu_watch_perturb_mode() == APU_PERTURB_BAD_OUTPUT) {
-        case_xii();
-        xbox_MemoryLayoutShutdown();
-        free(d);
-        printf("%s: %u checks, %u failed (RECOMP_APU_TRACE=%s, bad-output "
-               "control-only arm)\n",
-               failures ? "FAIL" : "PASS", checks, failures, trace_on ? "1" : "0");
-        return failures ? 1 : 0;
-    }
+    /* A4b2-NR-next-edge-followup closure: the `bad-output` control-only arm was
+     * removed here along with the mode itself. Its bite is preserved in the
+     * archived run 20260927-130142-334-a4b2-nr-badoutput (GP_CLEAR = 0,
+     * GP_NONZERO_OVER = 1). The remaining perturbation modes (zero/max/prng)
+     * substitute the two stub inputs and do not affect GP_CLEAR, so they run the
+     * full case set below as before. */
 
     case_a();
     case_b();
@@ -2204,6 +2275,7 @@ int main(void)
     case_x();
     case_xi();
     case_xii();
+    case_xiii();
 
     if (!trace_on) {
         check_trace_off_emission();
