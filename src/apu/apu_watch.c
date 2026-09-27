@@ -1005,6 +1005,17 @@ void apu_watch_freeze_at_clear(uint32_t seq)
      * write-once moment the input accounting is frozen, so the discovery
      * evidence shows what the GP actually consumed before the exchange. */
     apu_watch_perturb_report();
+
+    /* A4b2-NR-followup: the first exchange is the end of the bounded observed
+     * window for the P 00B9 trace, so emit its terminal record here -- both
+     * counters, the in-range tallies and the invalid latch -- which is what
+     * makes the trace checkable for completeness rather than a sample. Declared
+     * locally because dsp_cpu.h is outside this packet's write scope. Strict
+     * no-op unless the B9 gate is set. */
+    {
+        extern void dsp56k_b9_terminal(const char *why);
+        dsp56k_b9_terminal("first-exchange");
+    }
 }
 
 /* ============================================================
@@ -1019,6 +1030,16 @@ static void emit_counts(void)
     /* A4b2-NR: the substitution summary rides every counts emission, so the
      * discovery record has an uncapped series rather than one sample. */
     apu_watch_perturb_report();
+
+    /* A4b2-NR-followup: emit a running terminal for the P 00B9 trace alongside
+     * the counts, so a bounded run that ends without an exchange still leaves a
+     * terminal marker with both counters. The packet makes a deadline without a
+     * terminal marker INCONCLUSIVE, so the marker must exist on every path, not
+     * only the exchange path. Strict no-op unless the B9 gate is set. */
+    {
+        extern void dsp56k_b9_terminal(const char *why);
+        dsp56k_b9_terminal("counts");
+    }
     fprintf(stderr,
             "[GPWATCH] counts seq=%u boots=%u gp_frames=%u gp_insns=%llu "
             "GP_CLEAR=%u GP_ZERO_OVER_ZERO=%u GP_ZERO_OVER_OTHER=%u "

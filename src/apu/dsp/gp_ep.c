@@ -407,7 +407,13 @@ static void proc_rst_write(DSPState *dsp, uint32_t oldval, uint32_t val)
              * outside this packet's write scope. */
             {
                 extern void dsp56k_request_decode(void);
+                extern void dsp56k_b9_epoch_begin(void);
                 dsp56k_request_decode();
+                /* A4b2-NR-followup: mark the bootstrap epoch so every P 00B9
+                 * event is attributable and no earlier epoch can be silently
+                 * omitted from the trace. Strict no-op unless the B9 gate is
+                 * set. */
+                dsp56k_b9_epoch_begin();
             }
         }
     }

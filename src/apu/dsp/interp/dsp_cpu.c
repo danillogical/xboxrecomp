@@ -33,6 +33,12 @@
  * input accounting, for the MIXBUF read hook below. */
 #include "apu_watch.h"
 
+/* A4b2-NR-followup: DSPState, for the is_gp field reached through the core's
+ * opaque back-pointer. Needed because the interpreter core's own is_gp is never
+ * populated (dsp_c_sync_from_vm is registered but not called), so reading it
+ * would silently filter out every GP instruction. */
+#include "dsp.h"
+
 #define BITMASK(x)  ((1<<(x))-1)
 
 #define TRACE_DSP_DISASM 0
@@ -474,11 +480,315 @@ static int gp_decode_enabled(void)
 /* Defined below; the diagnostic decoder needs it. */
 static uint16_t disasm_instruction(dsp_core_t* dsp, dsp_trace_disasm_t mode);
 
+/* A4b2-NR-followup: the P 00B9 effective-address trace, defined below and used
+ * by dsp56k_execute_instruction() and dsp56k_read_memory(). */
+static int b9_core_is_gp(dsp_core_t *dsp);
+void dsp56k_b9_note_exec(dsp_core_t *dsp);
+void dsp56k_b9_note_read(dsp_core_t *dsp, uint32_t address, uint32_t value);
+void dsp56k_b9_terminal(const char *why);
+void dsp56k_b9_epoch_begin(void);
+
 /* A4b2-NR: set by dsp56k_request_decode() and serviced on the next executed
  * instruction. The request takes no argument because dsp_core_t is opaque
  * outside this translation unit, and gp_ep.c -- the packet's in-scope call
  * site -- cannot name it. */
 static int gp_decode_pending = 0;
+
+/* ============================================================
+ * A4b2-NR-followup: the P 00B9 effective-address trace
+ * ============================================================
+ *
+ * The predecessor packet left one gap open: at P 00B9 (`move x:(r1),b`) the
+ * address is `r1 = 0x80 + x:$0000`, and `x:$0000` is a guest-written mailbox, so
+ * a static decode cannot bound it and cannot exclude the mix-buffer range.
+ *
+ * This records the ACTUAL effective X address of every such read, at the
+ * dsp56k_read_memory call, so the question is answered by measurement rather
+ * than inference. It is a complete record of the bounded observed exchange, not
+ * a sample:
+ *
+ *   * one event per actual read, streamed synchronously, uncapped -- no first-N
+ *     limit, no ring, no sampling, no best-effort drop;
+ *   * an independent execution counter (gp_b9_exec_count) incremented at the
+ *     instruction-entry choke point, so a missing read event shows up as a
+ *     counter disagreement instead of being read as "no mix read happened";
+ *   * a monotonic ordinal on every event, and a terminal record carrying both
+ *     counters, so contiguity and completeness are checkable after the fact;
+ *   * every failure (open/write/flush/ordinal) latches TRACE INVALID and is
+ *     reported, because an incomplete trace must never be read as a negative.
+ *
+ * It is read-only with respect to the DSP: it observes the address and the
+ * returned value and changes neither. Strict no-op unless RECOMP_APU_GP_B9_TRACE
+ * is set, so a production run is unaffected.
+ *
+ * Stated limit, carried from the packet: this does NOT prove an address bound
+ * for all possible future mailbox values. It answers what THIS run reads.
+ */
+#define GP_B9_PC 0x00B9u
+#define GP_MIXBUF_LO  0x1400u
+#define GP_MIXBUF_HI  0x17FFu
+#define GP_MIXALIAS_LO 0x0C00u
+#define GP_MIXALIAS_HI 0x0FFFu
+
+static struct {
+    int inited;
+    int on;
+    FILE *fp;
+    int invalid;                 /* latched: an incomplete trace is never a negative */
+    uint64_t events;             /* read events written */
+    uint64_t execs;              /* independent P 00B9 executions entered */
+    uint64_t epoch;              /* bootstrap epoch, for provenance */
+    uint64_t ord_seq;            /* expected next ordinal */
+    uint64_t in_mixbuf, in_alias;
+    uint32_t first_bad;          /* first in-range address seen, or ~0 */
+    uint64_t first_bad_ord;
+    /* A4b2-NR-followup diagnostic: a PC histogram over the FULL P-memory
+     * (DSP_PRAM_SIZE = 4096 words), so "P 00B9 never executed" can be
+     * distinguished from "the trace is misattributing", and so the executed
+     * program's true extent is visible. This was originally bounded at 0x200
+     * (the decoded window) and that was WRONG for diagnosis: it silently dropped
+     * every execution above 0x1FF, while the range tracker still recorded them.
+     * A fixed key universe, so nothing is dropped. */
+    uint64_t pc_hist[DSP_PRAM_SIZE];
+    uint64_t gp_pc_hist[DSP_PRAM_SIZE];
+    uint64_t exec_total;
+    uint64_t gp_exec_total;
+    uint64_t ngp_exec_total;
+    uint32_t first_pc_seen;
+    uint32_t gp_pc_min, gp_pc_max;
+    uint32_t ngp_pc_min, ngp_pc_max;
+    uint32_t gp_pc_first_high;   /* first GP PC >= 0x200 seen, or ~0 */
+    int is_gp_seen;
+    int gp_pc_seen;
+    int ngp_pc_seen;
+    int hist_dumped;
+} b9;
+
+static void b9_fail(const char *why)
+{
+    if (!b9.invalid) {
+        b9.invalid = 1;
+        fprintf(stderr, "[GPB9] TRACE INVALID: %s (events=%llu execs=%llu)\n", why,
+                (unsigned long long)b9.events, (unsigned long long)b9.execs);
+        fflush(stderr);
+    }
+}
+
+/* Is this core the GP?
+ *
+ * NOT dsp->is_gp on the interpreter core: that field is only ever written by
+ * dsp_c_sync_from_vm(), which is registered in the ops table but never called on
+ * this path, so it is permanently 0 and would silently filter out every GP
+ * instruction. (Measured: with it, the trace reported gp_exec_total=0 while the
+ * PC histogram showed 288 distinct PCs of the GP image executing, P 00B9 among
+ * them exactly 6 times -- the dor #$0006 count.)
+ *
+ * The reliable source is core->opaque, which dsp_c_init() points back at the
+ * DSPState (dsp_c.c:282) and whose is_gp IS set correctly at dsp_init()
+ * (dsp.c:143). dsp.h is included below for that one field. */
+static int b9_core_is_gp(dsp_core_t *dsp)
+{
+    return (dsp && dsp->opaque) ? (((DSPState *)dsp->opaque)->is_gp ? 1 : 0) : 0;
+}
+
+static int gp_b9_enabled(void)
+{
+    if (!b9.inited) {
+        const char *e = getenv("RECOMP_APU_GP_B9_TRACE");
+        b9.inited = 1;
+        b9.on = (e && *e) ? 1 : 0;
+        b9.first_bad = 0xFFFFFFFFu;
+        if (b9.on) {
+            const char *p = getenv("RECOMP_APU_GP_B9_TRACE_FILE");
+            b9.fp = fopen((p && *p) ? p : "gpb9_trace.txt", "wb");
+            if (!b9.fp) {
+                b9_fail("cannot open trace artifact");
+            } else {
+                fprintf(b9.fp, "# A4b2-NR-followup P 00B9 effective-address trace\n");
+                fprintf(b9.fp, "# pc=00B9 every execution; uncapped; ordinal is contiguous\n");
+                fprintf(b9.fp, "# fields: ord epoch r1 x0000 derived effaddr value mixbuf alias\n");
+                fflush(b9.fp);
+                fprintf(stderr, "[GPB9] trace enabled -> %s\n",
+                        (p && *p) ? p : "gpb9_trace.txt");
+                fflush(stderr);
+            }
+        }
+    }
+    return b9.on;
+}
+
+/* Called at the instruction-entry choke point, before execution. */
+void dsp56k_b9_note_exec(dsp_core_t *dsp)
+{
+    if (!gp_b9_enabled() || !dsp) {
+        return;
+    }
+    /* Histogram every core, tagged by is_gp, so the trace can show which core is
+     * running which PC rather than assuming the GP is the one at 00B9. */
+    if (!b9.is_gp_seen) {
+        b9.is_gp_seen = 1;
+        b9.first_pc_seen = dsp->pc;
+        fprintf(stderr, "[GPB9] first instruction: is_gp=%d pc=%04X\n",
+                b9_core_is_gp(dsp), dsp->pc);
+        fflush(stderr);
+    }
+    b9.exec_total++;
+    if (dsp->pc < DSP_PRAM_SIZE) {
+        b9.pc_hist[dsp->pc]++;
+    }
+    if (b9_core_is_gp(dsp)) {
+        b9.gp_exec_total++;
+        if (dsp->pc < DSP_PRAM_SIZE) {
+            b9.gp_pc_hist[dsp->pc]++;
+        }
+        if (!b9.gp_pc_seen) {
+            b9.gp_pc_seen = 1;
+            b9.gp_pc_min = b9.gp_pc_max = dsp->pc;
+        } else {
+            if (dsp->pc < b9.gp_pc_min) b9.gp_pc_min = dsp->pc;
+            if (dsp->pc > b9.gp_pc_max) b9.gp_pc_max = dsp->pc;
+        }
+        if (dsp->pc >= 0x200u && b9.gp_pc_first_high == 0) {
+            b9.gp_pc_first_high = dsp->pc ? dsp->pc : 1u;
+        }
+        if (dsp->pc == GP_B9_PC) {
+            b9.execs++;
+        }
+    } else {
+        b9.ngp_exec_total++;
+        if (!b9.ngp_pc_seen) {
+            b9.ngp_pc_seen = 1;
+            b9.ngp_pc_min = b9.ngp_pc_max = dsp->pc;
+        } else {
+            if (dsp->pc < b9.ngp_pc_min) b9.ngp_pc_min = dsp->pc;
+            if (dsp->pc > b9.ngp_pc_max) b9.ngp_pc_max = dsp->pc;
+        }
+    }
+}
+
+/* Called at the read, after the address is computed and the value is known. */
+void dsp56k_b9_note_read(dsp_core_t *dsp, uint32_t address, uint32_t value)
+{
+    uint32_t r1, mb0;
+    int in_mix, in_alias;
+
+    if (!gp_b9_enabled() || !dsp || !b9_core_is_gp(dsp)) {
+        return;
+    }
+    /* Only reads attributed to the executing P 00B9 are events. `pc` still
+     * holds the executing instruction at this point, which is what makes the
+     * attribution exact rather than heuristic. */
+    if (dsp->pc != GP_B9_PC) {
+        return;
+    }
+
+    r1  = dsp->registers[DSP_REG_R1] & 0xFFFFFFu;
+    mb0 = dsp->xram[0] & 0xFFFFFFu;   /* x:$0000, the guest mailbox word */
+    in_mix   = (address >= GP_MIXBUF_LO   && address <= GP_MIXBUF_HI);
+    in_alias = (address >= GP_MIXALIAS_LO && address <= GP_MIXALIAS_HI);
+
+    if (in_mix)   b9.in_mixbuf++;
+    if (in_alias) b9.in_alias++;
+    if ((in_mix || in_alias) && b9.first_bad == 0xFFFFFFFFu) {
+        b9.first_bad = address;
+        b9.first_bad_ord = b9.ord_seq;
+    }
+
+    /* The packet requires the recorded address to be the effective address and
+     * to agree with r1; a disagreement means the trace is not measuring what it
+     * claims, so it is an evidence failure rather than a silent discrepancy. */
+    if (address != r1) {
+        b9_fail("effective address != r1 at P 00B9");
+    }
+
+    if (!b9.fp || b9.invalid) {
+        return;
+    }
+    if (fprintf(b9.fp, "%llu %llu %06X %06X %06X %06X %06X %d %d\n",
+                (unsigned long long)b9.ord_seq, (unsigned long long)b9.epoch,
+                r1, mb0, (0x80u + mb0) & 0xFFFFFFu, address, value & 0xFFFFFFu,
+                in_mix, in_alias) < 0) {
+        b9_fail("write failed");
+        return;
+    }
+    b9.ord_seq++;
+    b9.events++;
+}
+
+/* Called at the first-exchange latch and at run end. Emits the terminal record
+ * with both counters so completeness is checkable. */
+void dsp56k_b9_terminal(const char *why)
+{
+    if (!gp_b9_enabled() || !b9.fp) {
+        return;
+    }
+    if (fflush(b9.fp) != 0) {
+        b9_fail("flush failed at terminal");
+    }
+    fprintf(stderr,
+            "[GPB9] terminal reason=%s events=%llu execs=%llu in_mixbuf=%llu "
+            "in_alias=%llu first_bad=%s invalid=%d\n",
+            why, (unsigned long long)b9.events, (unsigned long long)b9.execs,
+            (unsigned long long)b9.in_mixbuf, (unsigned long long)b9.in_alias,
+            (b9.first_bad == 0xFFFFFFFFu) ? "none" : "PRESENT",
+            b9.invalid);
+    fflush(stderr);
+    fprintf(b9.fp, "# terminal reason=%s events=%llu execs=%llu in_mixbuf=%llu "
+                   "in_alias=%llu invalid=%d\n",
+            why, (unsigned long long)b9.events, (unsigned long long)b9.execs,
+            (unsigned long long)b9.in_mixbuf, (unsigned long long)b9.in_alias,
+            b9.invalid);
+    if (b9.first_bad != 0xFFFFFFFFu) {
+        fprintf(b9.fp, "# FIRST_IN_RANGE addr=%06X ord=%llu\n", b9.first_bad,
+                (unsigned long long)b9.first_bad_ord);
+    }
+    /* Dump the PC histogram on every terminal, so the record shows the running
+     * state rather than a single early sample. The output is bounded (at most
+     * 0x200 lines per terminal) and the histogram is a fixed key universe, so
+     * nothing is dropped. Dumping once was wrong: the first terminal arrives at
+     * an early counts emission, before the GP has executed anything. */
+    {
+        uint32_t pc;
+        fprintf(b9.fp, "# exec_total=%llu gp_exec_total=%llu ngp_exec_total=%llu "
+                       "first_pc=%04X is_gp_seen=%d gp_pc_range=%04X..%04X "
+                       "ngp_pc_range=%04X..%04X gp_first_high=%04X\n",
+                (unsigned long long)b9.exec_total,
+                (unsigned long long)b9.gp_exec_total,
+                (unsigned long long)b9.ngp_exec_total, b9.first_pc_seen,
+                b9.is_gp_seen, b9.gp_pc_min, b9.gp_pc_max,
+                b9.ngp_pc_min, b9.ngp_pc_max, b9.gp_pc_first_high);
+        fprintf(b9.fp, "# pc_hist (pc count) for PCs with nonzero count:\n");
+        for (pc = 0; pc < DSP_PRAM_SIZE; pc++) {
+            if (b9.pc_hist[pc]) {
+                fprintf(b9.fp, "#H %04X %llu\n", pc,
+                        (unsigned long long)b9.pc_hist[pc]);
+            }
+        }
+        fprintf(b9.fp, "# gp_pc_hist (pc count) for GP PCs with nonzero count:\n");
+        for (pc = 0; pc < DSP_PRAM_SIZE; pc++) {
+            if (b9.gp_pc_hist[pc]) {
+                fprintf(b9.fp, "#G %04X %llu\n", pc,
+                        (unsigned long long)b9.gp_pc_hist[pc]);
+            }
+        }
+        fflush(b9.fp);
+    }
+    fflush(b9.fp);
+}
+
+/* Called when a GP bootstrap begins, so every epoch is distinguishable and no
+ * earlier epoch can be silently omitted. */
+void dsp56k_b9_epoch_begin(void)
+{
+    if (!gp_b9_enabled()) {
+        return;
+    }
+    b9.epoch++;
+    if (b9.fp) {
+        fprintf(b9.fp, "# epoch %llu begin\n", (unsigned long long)b9.epoch);
+        fflush(b9.fp);
+    }
+}
 
 /* A4b2-NR: request a one-shot decode of the loaded program image. Called from
  * the in-scope gp_ep.c immediately after the bootstrap that loaded it. Takes no
@@ -704,7 +1014,12 @@ void dsp56k_execute_instruction(dsp_core_t* dsp)
      * loaded. Cleared unconditionally so a failed decode cannot retry forever. */
     if (gp_decode_pending) {
         gp_decode_pending = 0;
-        dsp56k_decode_p_range(dsp, 0, 0x1FF);
+        /* A4b2-NR-followup: decode the FULL P-memory, not just the 0x200-word
+         * window the predecessor used. The B9 trace showed the GP executing PCs
+         * up to 0x0F28, so a slice built over 0x0000-0x01FF would silently omit
+         * most of the program -- exactly the kind of partial enumeration
+         * AGENTS.md warns about. DSP_PRAM_SIZE is the true bound. */
+        dsp56k_decode_p_range(dsp, 0, DSP_PRAM_SIZE - 1);
     }
 
     uint32_t disasm_return = 0;
@@ -712,6 +1027,12 @@ void dsp56k_execute_instruction(dsp_core_t* dsp)
 
     /* Decode and execute current instruction */
     dsp->cur_inst = read_memory_p(dsp, dsp->pc);
+
+    /* A4b2-NR-followup: count this P 00B9 execution at the instruction-entry
+     * choke point, BEFORE it executes. Independent of the read-event counter, so
+     * an executed-but-unrecorded read shows up as a counter disagreement rather
+     * than being read as "no mix read happened". */
+    dsp56k_b9_note_exec(dsp);
 
     /* Initialize instruction size and cycle counter */
     dsp->cur_inst_len = 1;
@@ -1013,44 +1334,35 @@ uint32_t dsp56k_read_memory(dsp_core_t* dsp, int space, uint32_t address)
 {
     assert((address & 0xFF000000) == 0);
 
+    /* A4b2-NR-followup: record the effective X address of every P 00B9 read at
+     * the read itself, so the mix-buffer question is answered by measurement
+     * rather than by inferring r1. Strict no-op unless the gate is set; the
+     * attribution uses dsp->pc, which still holds the executing instruction. */
     if (space == DSP_SPACE_X) {
+        uint32_t v;
         if (address >= DSP_PERIPH_BASE) {
-            assert(dsp->read_peripheral);
-            return dsp->read_peripheral(dsp, address);
+            v = dsp->read_peripheral(dsp, address);
+            dsp56k_b9_note_read(dsp, address, v);
+            return v;
         } else if (address >= DSP_MIXBUFFER_BASE && address < DSP_MIXBUFFER_BASE+DSP_MIXBUFFER_SIZE) {
-            /* A4b1 LOCAL MODIFICATION (dsp_cpu.c:906 upstream): the MIXBUF input
-             * hook. Device semantics 6 keys this array by bin over the finite
-             * universe NUM_MIXBINS = 32, with bin = (addr - 0x1400) / 32, and
-             * counts reads_while_stub against the per-frame provenance flag the
-             * pinned frame path sets. Observation only: the returned word is
-             * the mixbuffer's, untouched.
-             *
-             * A4b2-NR LOCAL MODIFICATION: the A4b2-NR diagnostic substitution
-             * runs AFTER the memory lookup and BEFORE the accounting hook, so
-             * the accounting records the value the GP actually observed. It is
-             * a strict no-op unless RECOMP_APU_GP_INPUT_PERTURB is set. */
-            uint32_t v = apu_watch_perturb_mixbuf(
-                dsp->mixbuffer[address-DSP_MIXBUFFER_BASE]);
+            v = apu_watch_perturb_mixbuf(dsp->mixbuffer[address-DSP_MIXBUFFER_BASE]);
             apu_gpin_mixbuf_read(address - DSP_MIXBUFFER_BASE, v);
+            dsp56k_b9_note_read(dsp, address, v);
             return v;
         } else if (address >= 0xc00 && address < 0xc00+DSP_MIXBUFFER_SIZE) {
-            /* The 0xc00 alias of the same buffer. Recorded too: it is the same
-             * 1024 words, and a read here is a mix-buffer read.
-             *
-             * A4b2-NR LOCAL MODIFICATION: same diagnostic substitution as the
-             * 0x1400 range above. Both alias and primary are covered because a
-             * perturbation that missed one would leave a live stub path. */
-            uint32_t v = apu_watch_perturb_mixbuf(
-                dsp->mixbuffer[address-0xc00]);
+            v = apu_watch_perturb_mixbuf(dsp->mixbuffer[address-0xc00]);
             apu_gpin_mixbuf_read(address - 0xc00, v);
+            dsp56k_b9_note_read(dsp, address, v);
+            return v;
+        } else if (address < DSP_XRAM_SIZE) {
+            v = dsp->xram[address];
+            dsp56k_b9_note_read(dsp, address, v);
             return v;
         } else {
-            if (address < DSP_XRAM_SIZE) {
-                return dsp->xram[address];
-            } else {
-                fprintf(stderr, "Out of bounds read at %x!\n", address);
-                return 0x00FFFFFF; // FIXME: What does the DSP actually do in this case?
-            }
+            fprintf(stderr, "Out of bounds read at %x!\n", address);
+            v = 0x00FFFFFF; // FIXME: What does the DSP actually do in this case?
+            dsp56k_b9_note_read(dsp, address, v);
+            return v;
         }
     } else if (space == DSP_SPACE_Y) {
         assert(address < DSP_YRAM_SIZE);
