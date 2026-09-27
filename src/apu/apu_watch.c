@@ -92,6 +92,22 @@ static struct {
     uint32_t unmapped_set[APU_WATCH_UNMAPPED_SET];
 } s;
 
+/* A4b2-NR-epoch-slice-followup: the DMA descriptor block currently being consumed.
+ * Published by dsp_dma_run() via dsp_dma_descriptor_trace() and read at the
+ * GP_CLEAR latch in apu_gp_dma_write(), which is defined BELOW this point -- hence
+ * the declaration here rather than beside the trace function. Zero = none yet. */
+static uint32_t dmad_current_block;
+
+void apu_watch_set_current_dma_block(uint32_t block_addr)
+{
+    dmad_current_block = block_addr;
+}
+
+uint32_t apu_watch_current_dma_block(void)
+{
+    return dmad_current_block;
+}
+
 /* ============================================================
  * A4b2-NR diagnostic GP input perturbation (discovery instrumentation)
  * ============================================================
@@ -633,6 +649,16 @@ void apu_gp_dma_write(uint8_t *dst, const uint8_t *src, uint32_t guest_va,
 
         if (observed == 3) {
             record_latch(APU_WATCH_GP_CLEAR, seq, w_va, 3, 0, 0, dsp_addr);
+            /* A4b2-NR-epoch-slice-followup: record WHICH DMA descriptor block
+             * produced this exchange, so the block-to-exchange link is measured
+             * rather than inferred. Emitted to stderr so it lands in the run log
+             * beside the latch line; no-op unless the descriptor gate is set. */
+            if (dmad_current_block != 0) {
+                fprintf(stderr, "[GPDMADESC] GP_CLEAR produced by block_addr=%04X "
+                                "(dsp_addr=%06X)\n",
+                        dmad_current_block, dsp_addr);
+                fflush(stderr);
+            }
         } else if (observed == 0) {
             record_latch(APU_WATCH_GP_ZERO_OVER_ZERO, seq, w_va, 0, 0, 0,
                          dsp_addr);
@@ -968,6 +994,124 @@ void apu_watch_cpu_store(uint32_t site_va, uint32_t target_va, uint32_t value)
  * at_clear freeze (Device semantics 6)
  * ============================================================ */
 
+/* ============================================================
+ * A4b2-NR-epoch-slice-followup: which descriptor does the DMA consume?
+ * ============================================================
+ *
+ * The Session's static slice could not settle whether the doorbell trigger drives
+ * the descriptor at x:[6..10] (built by the P 0007 call) or the one the mixbin loop
+ * builds at x:[0x25..]. dsp_dma_run() reads seven words at block_addr = next_block
+ * & 0x3fff, so recording next_block at each pass answers it directly.
+ *
+ * Read-only, GP-only, off by default, uncapped with a monotonic ordinal and a
+ * terminal carrying the count, so a truncated trace is detectable.
+ */
+static struct {
+    int inited;
+    int on;
+    FILE *fp;
+    uint64_t events;
+    uint64_t ord;
+    uint64_t first_block;
+    int have_first;
+    uint64_t in_doorbell_region;   /* block_addr in 6..10 */
+    uint64_t in_mixbin_region;     /* block_addr in 0x25..0x2B */
+    uint64_t ngp_skipped;          /* non-GP (EP) reads excluded */
+} dmad;
+
+/* The block the DMA is currently consuming, published by dsp_dma_run() and read by
+ * the DMA write hook at the GP_CLEAR latch. Declared near the top of the file,
+ * ahead of apu_gp_dma_write(), because that function reads it. */
+
+void dsp_dma_descriptor_trace(DSPDMAState *s, uint32_t next_block)
+{
+    uint32_t addr;
+
+    if (!dmad.inited) {
+        const char *e = getenv("RECOMP_APU_DMA_DESC_TRACE");
+        dmad.inited = 1;
+        dmad.on = (e && *e) ? 1 : 0;
+        if (dmad.on) {
+            const char *p = getenv("RECOMP_APU_DMA_DESC_TRACE_FILE");
+            dmad.fp = fopen((p && *p) ? p : "dma_desc_trace.txt", "wb");
+            if (dmad.fp) {
+                fprintf(dmad.fp, "# A4b2-NR-epoch-slice-followup DMA descriptor trace\n");
+                fprintf(dmad.fp, "# GP ONLY (dsp_dma.c is shared by GP and EP)\n");
+                fprintf(dmad.fp, "# fields: ord next_block block_addr eol control\n");
+                fflush(dmad.fp);
+            }
+            fprintf(stderr, "[GPDMADESC] trace enabled (GP only)\n");
+            fflush(stderr);
+        }
+    }
+    if (!dmad.on || !s) {
+        return;
+    }
+    /* dsp_dma_run() is shared by the GP and the EP. An ungated trace would mix two
+     * programs' descriptor chains -- the exact hazard the Advisor flagged for the
+     * P-write watch, and the first version of THIS trace made that mistake: it
+     * reported 8445 events where the terminal (also ungated) showed 766, and the
+     * interleaved 0x06/0x25/0x1E cycle it printed was GP and EP chains alternating.
+     * Gate on the DMA's own is_gp, which dsp_init sets and nothing overwrites. */
+    if (!s->is_gp) {
+        dmad.ngp_skipped++;
+        return;
+    }
+
+    addr = next_block & 0x3FFFu;          /* NODE_POINTER_VAL */
+    /* Publish the block currently being consumed, so the DMA write hook can record
+     * WHICH descriptor produced each transfer. This is what ties a block to the
+     * observed dsp_addr / W_va exchange. */
+    apu_watch_set_current_dma_block(addr);
+    if (!dmad.have_first) {
+        dmad.have_first = 1;
+        dmad.first_block = addr;
+    }
+    if (addr >= 6u && addr <= 10u) {
+        dmad.in_doorbell_region++;
+    }
+    if (addr >= 0x25u && addr <= 0x2Bu) {
+        dmad.in_mixbin_region++;
+    }
+    if (dmad.fp) {
+        fprintf(dmad.fp, "%llu %08X %04X %d %04X\n",
+                (unsigned long long)dmad.ord, next_block, addr,
+                (next_block & (1u << 14)) ? 1 : 0, s->control & 0xFFFFu);
+        fflush(dmad.fp);
+    }
+    dmad.ord++;
+    dmad.events++;
+}
+
+void apu_watch_dma_desc_terminal(const char *why)
+{
+    if (!dmad.on) {
+        return;
+    }
+    if (dmad.fp) {
+        fflush(dmad.fp);
+    }
+    fprintf(stderr,
+            "[GPDMADESC] terminal reason=%s events=%llu ngp_skipped=%llu "
+            "first_block=%04X in_doorbell_region=%llu in_mixbin_region=%llu\n",
+            why, (unsigned long long)dmad.events,
+            (unsigned long long)dmad.ngp_skipped,
+            (unsigned)dmad.first_block,
+            (unsigned long long)dmad.in_doorbell_region,
+            (unsigned long long)dmad.in_mixbin_region);
+    fflush(stderr);
+    if (dmad.fp) {
+        fprintf(dmad.fp, "# terminal reason=%s events=%llu ngp_skipped=%llu "
+                         "first_block=%04X in_doorbell_region=%llu "
+                         "in_mixbin_region=%llu\n",
+                why, (unsigned long long)dmad.events,
+                (unsigned long long)dmad.ngp_skipped, (unsigned)dmad.first_block,
+                (unsigned long long)dmad.in_doorbell_region,
+                (unsigned long long)dmad.in_mixbin_region);
+        fflush(dmad.fp);
+    }
+}
+
 void apu_watch_freeze_at_clear(uint32_t seq)
 {
     if (InterlockedCompareExchange((volatile LONG *)&s.at_clear.taken, 1, 0)
@@ -1006,6 +1150,10 @@ void apu_watch_freeze_at_clear(uint32_t seq)
         extern void dsp56k_pwrite_terminal(const char *why);
         dsp56k_pwrite_terminal("first-exchange");
     }
+    /* A4b2-NR-epoch-slice-followup: the DMA descriptor trace terminal, at the same
+     * write-once moment, so the descriptor-consumption record covers the window
+     * through the first exchange. Strict no-op unless the gate is set. */
+    apu_watch_dma_desc_terminal("first-exchange");
 }
 
 /* ============================================================

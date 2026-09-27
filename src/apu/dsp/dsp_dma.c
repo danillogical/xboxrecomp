@@ -113,6 +113,16 @@ static void dsp_dma_run(DSPDMAState *s)
         return;
     }
 
+    /* A4b2-NR-epoch-slice-followup: bounded, env-gated trace of WHICH descriptor
+     * block the DMA actually consumes. The Session's static analysis could not
+     * settle whether the doorbell trigger drives the descriptor at x:[6..10] or
+     * the one the mixbin loop builds at x:[0x25..]; this records the answer rather
+     * than arguing it. Read-only, off by default, GP-only. */
+    {
+        extern void dsp_dma_descriptor_trace(DSPDMAState *s, uint32_t next_block);
+        dsp_dma_descriptor_trace(s, s->next_block);
+    }
+
     while (!(s->next_block & NODE_POINTER_EOL)) {
         uint32_t addr = s->next_block & NODE_POINTER_VAL;
         uint32_t block_addr = 0;
