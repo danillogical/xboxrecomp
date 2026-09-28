@@ -13,8 +13,16 @@
 
 #include "kernel.h"
 #include "nv2a/nv2a_mmio_hook.h"
+#include <stdio.h>
+#include <stdlib.h>
 #if defined(_WIN32)
 #include <intrin.h>
+#endif
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma intrinsic(_ReturnAddress)
+#define IRQL_CALLER() _ReturnAddress()
+#else
+#define IRQL_CALLER() __builtin_return_address(0)
 #endif
 
 /* ============================================================================
@@ -163,6 +171,133 @@ uint64_t xbox_ReadTimeStampCounter(void)
 
 static XBOX_THREAD_LOCAL KIRQL g_current_irql = PASSIVE_LEVEL;
 
+/* How many threads are holding IRQL at or above DISPATCH_LEVEL.
+ *
+ * The level itself is per-thread, which is right for a guest that asks "what
+ * is my IRQL". It is wrong for the question a device model has to answer:
+ * raising IRQL on hardware masks the interrupt for the whole processor, and
+ * the title raises it precisely to keep an ISR out of structures it is in the
+ * middle of editing. With the level thread-local, a controller thread sees
+ * PASSIVE_LEVEL, calls the ISR anyway, and the two race over exactly the
+ * state the guest was protecting -- which surfaces as an intermittent fault
+ * on a garbage pointer, far from the code that dropped it.
+ *
+ * A count rather than a flag, because several threads can be raised at once
+ * and the last one out is what re-opens the gate. */
+static volatile LONG g_irql_raised_count = 0;
+
+/* Non-zero while any thread is at or above DISPATCH_LEVEL. Device models call
+ * this before delivering an interrupt; OHCI and the NV2A are level-triggered,
+ * so a deferred interrupt is delivered on the next poll rather than lost. */
+int xbox_IrqlBlocksInterrupts(void)
+{
+    return InterlockedCompareExchange(&g_irql_raised_count, 0, 0) != 0;
+}
+
+/* The raw depth, for callers that want to report it. A count that only ever
+ * grows is a leak somewhere in the raise/lower pairs, and the number says so
+ * where a yes/no cannot. */
+int xbox_IrqlRaisedCount(void)
+{
+    return (int)InterlockedCompareExchange(&g_irql_raised_count, 0, 0);
+}
+
+static int  s_trace = -1;
+static volatile LONG s_traced = 0;
+
+/* Every crossing of the DISPATCH boundary, ever.
+ *
+ * The depth on its own cannot tell a leaked raise from a guest that is
+ * genuinely sitting there: both read non-zero for as long as you look. A
+ * count that stops moving says the first; one that races says the second.
+ * That distinction is the whole difference between "the title is busy" and
+ * "no device will ever get an interrupt again". */
+static volatile LONG s_transitions = 0;
+
+int xbox_IrqlTransitions(void)
+{
+    return (int)InterlockedCompareExchange(&s_transitions, 0, 0);
+}
+
+/* Which threads are holding the boundary up, and where they raised.
+ *
+ * A depth that stops changing has to be attributed to code, and the raise
+ * that did it happened seconds earlier on a thread that has since gone
+ * quiet -- there is nothing left to look at by the time anyone notices.
+ * Keeping the caller's address per raised thread turns the number into a
+ * name: these are host addresses inside the recompiled image, so nm resolves
+ * them to the generated function, which is the guest function. */
+#define IRQL_HOLDERS 8
+static struct { volatile LONG tid; void *ra; } s_holders[IRQL_HOLDERS];
+
+static void irql_holder_add(void *ra)
+{
+    LONG me = (LONG)GetCurrentThreadId();
+    int i;
+
+    for (i = 0; i < IRQL_HOLDERS; i++)
+        if (InterlockedCompareExchange(&s_holders[i].tid, me, 0) == 0) {
+            s_holders[i].ra = ra;
+            return;
+        }
+}
+
+static void irql_holder_drop(void)
+{
+    LONG me = (LONG)GetCurrentThreadId();
+    int i;
+
+    for (i = 0; i < IRQL_HOLDERS; i++)
+        if (InterlockedCompareExchange(&s_holders[i].tid, 0, me) == me)
+            return;
+}
+
+void xbox_IrqlDumpHolders(void)
+{
+    int i;
+
+    fprintf(stderr, "  [IRQLHOLD] depth=%d transitions=%d, raised threads:\n",
+            xbox_IrqlRaisedCount(), xbox_IrqlTransitions());
+    for (i = 0; i < IRQL_HOLDERS; i++) {
+        LONG t = InterlockedCompareExchange(&s_holders[i].tid, 0, 0);
+        if (t)
+            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p\n",
+                    (unsigned long)t, s_holders[i].ra);
+    }
+    fflush(stderr);
+}
+
+static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
+{
+    int was = (old_level >= DISPATCH_LEVEL);
+    int now = (new_level >= DISPATCH_LEVEL);
+    LONG d;
+
+    if (now == was)
+        return;
+
+    d = now ? InterlockedIncrement(&g_irql_raised_count)
+            : InterlockedDecrement(&g_irql_raised_count);
+    InterlockedIncrement(&s_transitions);
+    if (now)
+        irql_holder_add(ra);
+    else
+        irql_holder_drop();
+
+    /* RECOMP_IRQL_TRACE prints the first few transitions. The pairing is what
+     * matters: a raise to 2 followed by a lower from 2 nets out, and a lower
+     * whose old level is not the level the raise set is a calling-convention
+     * bug upstream of here, not a title doing something exotic. */
+    if (s_trace < 0)
+        s_trace = getenv("RECOMP_IRQL_TRACE") ? 1 : 0;
+    if (s_trace && InterlockedIncrement(&s_traced) <= 20) {
+        fprintf(stderr, "  [IRQL] tid %lu %s %d->%d depth=%ld\n",
+                (unsigned long)GetCurrentThreadId(),
+                now ? "raise" : "lower", old_level, new_level, (long)d);
+        fflush(stderr);
+    }
+}
+
 /*
  * KfRaiseIrql - Raises IRQL to the specified level.
  * Returns the previous IRQL. Uses __fastcall (ECX = NewIrql).
@@ -177,6 +312,7 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
             old, NewIrql);
     }
 
+    irql_track(old, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
     return old;
 }
@@ -188,11 +324,31 @@ KIRQL __fastcall xbox_KfRaiseIrql(KIRQL NewIrql)
 VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 {
     if (NewIrql > g_current_irql) {
+        /* A lower that raises the count.
+         *
+         * irql_track works on the edge, so this call crosses the boundary
+         * upwards and increments. The pair that would bring it back down has
+         * already happened, so the depth is now permanently one too high --
+         * and the count is what every device model reads before delivering.
+         * One of these ends interrupts for the rest of the run.
+         *
+         * Loud rather than a filtered warning because of that consequence:
+         * the symptom is a device going silent minutes later, with nothing
+         * connecting it back to here. */
+        static volatile LONG n;
+        if (InterlockedIncrement(&n) <= 20) {
+            fprintf(stderr, "  [IRQLBUG] tid %lu KfLowerIrql(%d) while at %d"
+                    " -- counted as a raise, depth is now stuck\n",
+                    (unsigned long)GetCurrentThreadId(),
+                    (int)NewIrql, (int)g_current_irql);
+            fflush(stderr);
+        }
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_HAL,
             "KfLowerIrql: attempt to raise IRQL from %d to %d (use KfRaiseIrql)",
             g_current_irql, NewIrql);
     }
 
+    irql_track(g_current_irql, NewIrql, IRQL_CALLER());
     g_current_irql = NewIrql;
 }
 
@@ -202,6 +358,8 @@ VOID __fastcall xbox_KfLowerIrql(KIRQL NewIrql)
 KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
 {
     KIRQL old = g_current_irql;
+
+    irql_track(old, DISPATCH_LEVEL, IRQL_CALLER());
     g_current_irql = DISPATCH_LEVEL;
     return old;
 }
@@ -250,10 +408,56 @@ LARGE_INTEGER __stdcall xbox_KeQueryPerformanceFrequency(void)
  * January 1, 1601). Direct Win32 mapping.
  * ============================================================================ */
 
+static LONGLONG s_time_anchor_100ns;
+static LONGLONG s_time_anchor_counts;
+static LONGLONG s_time_freq_counts;
+static INIT_ONCE s_time_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK anchor_system_time(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    FILETIME ft;
+    LARGE_INTEGER f, now;
+    (void)once; (void)param; (void)ctx;
+    QueryPerformanceFrequency(&f);
+    GetSystemTimeAsFileTime(&ft);
+    QueryPerformanceCounter(&now);
+    s_time_freq_counts = f.QuadPart ? f.QuadPart : 1;
+    s_time_anchor_100ns = ((LONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    s_time_anchor_counts = now.QuadPart;
+    return TRUE;
+}
+
 VOID __stdcall xbox_KeQuerySystemTime(PLARGE_INTEGER CurrentTime)
 {
-    if (CurrentTime)
-        GetSystemTimeAsFileTime((LPFILETIME)CurrentTime);
+    /* Anchored once to the wall clock, advanced by the performance counter.
+     *
+     * GetSystemTimeAsFileTime alone moves in steps of about 15.6 ms, the
+     * host's scheduler tick. The console's clock is far finer, and a title
+     * that busy-waits on this -- reading it until enough time has passed --
+     * spins for the whole of each step instead of a few iterations.
+     *
+     * Measured on Shin Megami Tensei: Nine: one such wait called this
+     * **11.8 million times in two seconds**, which is most of what the
+     * title was doing at that moment, and it came out of the spin in a
+     * state where it no longer polled the gamepad.
+     *
+     * The anchor keeps the absolute value right; the counter supplies the
+     * resolution between ticks.
+     *
+     * Whole seconds and the remainder are scaled separately: scaling the
+     * whole count by 10^7 overflows after about a day at 10 MHz. */
+    LARGE_INTEGER now;
+    LONGLONG delta;
+
+    if (!CurrentTime)
+        return;
+
+    InitOnceExecuteOnce(&s_time_once, anchor_system_time, NULL, NULL);
+    QueryPerformanceCounter(&now);
+    delta = now.QuadPart - s_time_anchor_counts;
+    CurrentTime->QuadPart = s_time_anchor_100ns
+        + (delta / s_time_freq_counts) * 10000000LL
+        + (delta % s_time_freq_counts) * 10000000LL / s_time_freq_counts;
 }
 
 /* ============================================================================

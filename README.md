@@ -22,7 +22,7 @@ on, or find out what people are stuck on before you duplicate the effort.
 
 ### Recent Changes
 
-**Current version: v0.11.0 — _"Nothing Said So"_ (September 2026).**
+**Current version: v0.12.0 — _"Never Taken"_ (September 2026).**
 See the [Changelog](#changelog) for what landed and when.
 
 ---
@@ -233,7 +233,7 @@ cp -r templates/new-game ../mygame        # Windows cmd: xcopy /E /I templates\n
 #    --gen-dir writes the generated code into your game project, where the
 #    template's CMakeLists globs src/recomp/gen/*.c. Without it the output
 #    lands in this repo (src/game/recomp/gen/) and nothing compiles it.
-py -3 -m tools.recomp game_files/default.xbe --all --split 1000 --gen-dir ../mygame/src/recomp/gen
+py -3 -m tools.recomp game_files/default.xbe --all --split 250 --gen-dir ../mygame/src/recomp/gen
 #    Output: recomp_0000.c ... recomp_dispatch.c, recomp_funcs.h (millions of
 #    lines of C), plus recomp_types.h — the runtime register model the
 #    generated code includes. You do not supply that one; if the build says
@@ -423,7 +423,7 @@ definitions — they are the real proof for the shift, flag and x87 work, and
 each is paired with a negative control that feeds the harness the pre-fix
 expression and requires it to fail. They need a C compiler on `PATH`, and
 **skip rather than fail without one**, so check the skip count: a clean run is
-386 passed / 0 skipped. If clang is installed but not on `PATH`:
+579 passed / 0 skipped. If clang is installed but not on `PATH`:
 
 ```bash
 export PATH="/c/Program Files/LLVM/bin:$PATH"   # Git Bash
@@ -536,6 +536,133 @@ third-party code we build on is credited in [NOTICE](NOTICE).
 Versions start at v0.1.0 with the initial public release; earlier entries were
 reconstructed from the commit history, so they are dated by when the work
 actually landed rather than by any tag that existed at the time.
+
+### v0.12.0 — *"Never Taken"* (September 2026)
+
+*Forty-one contributed PRs, and the bug that keeps turning up is a branch that
+compiles and can never go the way the guest meant. A* `loop` *whose back edge
+was always false, so every counted loop ran once. A* `js` *after a byte
+subtract that read a zero-extended copy and was never taken. A join reached by*
+`test X, X` *on one edge and* `cmp X, 0` *on the other that inherited no flags
+and compiled dead. An* `rcl`*/*`rcr` *pair lifted as a comment, which took every
+64-bit divide with it. None of these fail loudly; each one is a path the guest
+takes on the hardware and the generated C never does. Alongside them, a set of
+bring-up instruments whose whole purpose is to make a silent path say something.*
+
+**Lifter and recompiler correctness**
+
+- **`loop`/`loope`/`loopne` never decremented ECX** and branched on a flag
+  variable nothing assigns, so a counted loop ran its body once and wiped the
+  tracked comparison for the jcc after it —
+  *[@NoRain211](https://github.com/NoRain211)* (#110)
+- **After an 8- or 16-bit arithmetic or logic op, `js` was never taken and
+  `jns` always was** — the sign test read the zero-extended result at 32 bits —
+  *[@NoRain211](https://github.com/NoRain211)* (#120)
+- **`test X, X` and `cmp X, 0` could not meet at a join.** They leave every flag
+  identical, but the snapshot reconstructs them differently, so a block reached
+  by one on each edge inherited no state and its branch compiled as never
+  taken. SMT: Nine's video decoder has exactly that shape, and the dead branch
+  smeared every picture horizontally —
+  *[@fearkov](https://github.com/fearkov)* (#122)
+- **`rcl` and `rcr` were emitted as comments.** MSVC's 64-bit divide helper uses
+  them, so every `long long` division came out wrong —
+  *[@fearkov](https://github.com/fearkov)* (#104)
+- **`repe cmps`/`scas` never set CF**, so `memcmp` and `std::string::compare`
+  never answered "less", and a zero-count compare reported "unequal" —
+  *[@andeecollard](https://github.com/andeecollard)* (#124)
+- **`frndint` rounded in the host's mode, not the guest's.** The CRT's `floor`
+  and `ceil` load a rounding control and call it, so `floor(2.7)` was 3 — JSRF's
+  animation tables read one past the end —
+  *[@andeecollard](https://github.com/andeecollard)* (#126)
+- **An untranslated instruction vanished into a comment.** It now carries
+  `RECOMP_UNIMPL(text, va)`, which logs the first time the site is reached and
+  stops there under `RECOMP_UNIMPL_TRAP=1`. *Existing game projects: copy
+  `recomp_unimpl()` from `templates/new-game/src/recomp_manual.c` into yours,
+  or the next regeneration will not link* —
+  *[@andeecollard](https://github.com/andeecollard)* (#117)
+- **Switch arms past a function's recorded end had no generated body**, so
+  taking that case stopped on an unresolved indirect call (DOAXBV leaving View
+  Collection). They get their own entries; existing bodies are byte-identical —
+  *[@NoRain211](https://github.com/NoRain211)* (#131)
+- **A function reached only by address that opens with a switch was never
+  detected**, and its jump table was decoded as bogus functions —
+  *[@andeecollard](https://github.com/andeecollard)* (#129)
+- **Opt-in function coalescence**, `--coalesce-functions`: merge fragments that
+  function identification wrongly split, from explicit JSON bounds, refusing
+  any merge it cannot prove. The series also hardens CFG recovery for every
+  title — callback tables reachable only through recovered code, non-dword
+  jump-table scales, `iret` as a terminator —
+  *[@NoRain211](https://github.com/NoRain211)* (#111–#116)
+- **Indirect calls name their site**, and a small, fully translated target set
+  recorded at runtime becomes guarded direct calls on the next generation. A
+  miss falls back to normal dispatch, so a guard can only be slow, never wrong —
+  *[@andeecollard](https://github.com/andeecollard)* (#130)
+- **Every MMX helper checked against the instruction it stands for**, 4.7
+  million cases — *[@fearkov](https://github.com/fearkov)* (#105)
+
+**Runtime: kernel, USB, video, audio**
+
+- **Guest buffers are bounds-checked before the host touches them.** A file
+  read with a bad buffer or length walked the host past the end of guest memory
+  and crashed inside the kernel; it now fails with `STATUS_ACCESS_VIOLATION` —
+  *[@andeecollard](https://github.com/andeecollard)* (#89)
+- **ADPCM blocks with a non-zero reserved byte were rejected**, which hardware
+  accepts — about 4% of JSRF's audio went silent —
+  *[@andeecollard](https://github.com/andeecollard)* (#121)
+- **USB: four root-hub ports, a 4 ms frame tick and the done-queue
+  handshake.** Ports 3 and 4 reset forever, enumeration raced the driver's
+  timeouts, and the done queue was overwritten while the driver owned it. A
+  raised IRQL now holds the interrupt off, bounded, so it cannot land in
+  XAPI's half-built pipe setup; `RECOMP_USB_HC` picks the controller —
+  *[@fearkov](https://github.com/fearkov)* (#90, #91, #96)
+- **The stuck-interrupt watchdog turned off a working pad** after two seconds
+  of ordinary 100 Hz reports; it now asks whether the driver acknowledged, not
+  whether the status repeated. An unanswered `GET_REPORT` no longer ends input —
+  *[@fearkov](https://github.com/fearkov)* (#107, #118)
+- **`KeQuerySystemTime` advanced in 15.6 ms steps**, the host scheduler tick,
+  not the console's resolution — *[@fearkov](https://github.com/fearkov)* (#119)
+- **NV2A: the flip methods were matched 0x18 too low**, so the frame counter
+  counted the wrong method and `WAIT_FOR_IDLE` was swallowed as a flip —
+  *[@Heromachine](https://github.com/Heromachine)* (#101)
+- **Every NV2A primitive number was one too low** — strips drew as fans, fans
+  as quads — *[@fearkov](https://github.com/fearkov)* (#102)
+- **Pushbuffer GET ran ahead of the executor**, letting D3D overwrite commands
+  not yet read, and a ring wrap dropped a submission per lap —
+  *[@fearkov](https://github.com/fearkov)* (#97)
+- **YUV textures sampled as flat colour**, alpha blending was ignored, and the
+  window showed the frame being drawn instead of the one finished —
+  *[@fearkov](https://github.com/fearkov)* (#103, #108, #99)
+- **Asynchronous reads answer `STATUS_PENDING` under `RECOMP_ASYNC_IO`**, and
+  a crash report with no stack left says so instead of printing an empty chain —
+  *[@fearkov](https://github.com/fearkov)* (#93, #95)
+
+**Bring-up instruments**, all opt-in — *[@fearkov](https://github.com/fearkov)*
+
+- `RECOMP_WATCH=<va>` names the guest code that writes a value (#92);
+  `--force-return ADDR=VALUE` answers a function with a constant instead of
+  hand-editing generated C (#100); `RECOMP_DSP_ACK` and `RECOMP_POKE` complete a
+  DSP command word and hold a guest global (#98); `RECOMP_PAD_PRESS` and
+  `RECOMP_KEYBOARD` stand in for a pad nobody has (#94, #106);
+  `RECOMP_TEX_DUMP_EVERY` (#123); raised-IRQL holder tracing (#125); and the
+  docs now recommend `--split 250`, since 1000 does not build in 15 GB (#109).
+
+**Also in this release**
+
+- A "Runs, Never Draws a Frame" section in `docs/pipeline/06-debugging.md`,
+  prompted by a Discord question about Black: the Wreckless lesson that a failed
+  audio probe can skip a title's entire engine init, and which switches tell
+  the cases apart.
+- Merge fixups: a per-thread floor in the buffer check that refused worker
+  threads' reads; a fused `test`+`jcc` that disagreed with its own snapshot; an
+  `iret` in data that aborted all of Wreckless's generation; MSVC builds of
+  #125 and `apu_mmio_hook.c`.
+
+**Held:** #128, the X-Men Legends bring-up, is careful work that changes
+threading, IRQL, heap and APU behaviour for every title at once; it has been
+asked to split so each part can be checked on the titles that already run.
+
+A clean run is now **579 passed / 0 skipped**, up from 386, plus 5,741
+conformance vectors with no mismatches.
 
 ### v0.11.0 — *"Nothing Said So"* (September 2026)
 

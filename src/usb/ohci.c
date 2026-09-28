@@ -9,6 +9,7 @@
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
 #include "../kernel/xbox_memory_layout.h"
+#include "../kernel/kernel.h"
 #include "usb_gamepad.h"
 
 #include <stdio.h>
@@ -118,14 +119,55 @@ static void wr32(uint32_t va, uint32_t v);
  * the console's four front sockets, which is what a title enumerates over. */
 #define OHCI_PORTS              2
 
+/* Passes this thread will keep an interrupt back while the guest is at
+ * DISPATCH_LEVEL or above. One pass is the OHCI_TICK_MS (4 ms) loop tick, so
+ * this is two seconds.
+ *
+ * It was 80 ms, on the reasoning that no real critical section lasts longer.
+ * True of the hardware and false here: recompiled code under an emulated
+ * kernel is slower than the console by a wide and variable margin, and the
+ * section XAPI holds while it opens the gamepad's interrupt pipe overran it.
+ * The interrupt then landed in the middle of that setup and the title faulted
+ * on a half-built structure. Two seconds is still not forever -- a guest that
+ * genuinely never lowers is still not allowed to switch the device off -- but
+ * it is long enough that a slow critical section is not mistaken for one. */
+#define OHCI_IRQ_HOLDOFF        500
+
+/* Milliseconds per pass of the controller thread, which is also how many USB
+ * frames a pass is worth.
+ *
+ * It was 20. A control transfer needs a pass per stage and enumeration needs
+ * several transfers, so twenty milliseconds put the whole sequence in the
+ * hundreds of milliseconds and left it racing the driver's own timeouts: the
+ * same build would enumerate fully on one run and stop half way on the next,
+ * with nothing to tell the two apart but how many register reads happened.
+ * Four is close enough to a real frame to stop losing that race and still
+ * cheap -- this thread does nothing but read a few guest dwords per pass. */
+#define OHCI_TICK_MS            4u
+
 typedef struct {
     uint32_t base;                      /* Xbox VA of the register block   */
     uint32_t reg[OHCI_REG_MAX / 4];
     unsigned reads, writes, decode_fail;
     int      index;
+    int      periodic_seen;
+    int      ple_seen;
+    /* Bumped every time the driver writes HcInterruptStatus. The interrupt
+     * thread watches it to tell a source nobody is servicing from one that
+     * is simply busy -- see the delivery loop. */
+    volatile unsigned ack_seq;
 } OhciController;
 
 static OhciController s_hc[2];
+/* Which controller carries the device, and so which one this thread services.
+ * XAPI numbers its four gamepad slots across both controllers, and which end
+ * it starts from decides whether a pad shows up as player 1 or player 3 --
+ * a mapping worth finding by measurement, not by assertion. */
+static int s_device_hc;
+/* Downstream ports the root hub reports in HcRhDescriptorA. Two is what the
+ * MCPX's own hubs have; RECOMP_USB_NDP exists because which slot XAPI gives a
+ * pad is decided somewhere in here and the mapping is worth measuring. */
+static unsigned s_ndp = OHCI_PORTS;
 static int s_enabled;
 static int s_trace;
 
@@ -225,6 +267,7 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
             hc->reg[HcDoneHead / 4] = 0;
         }
         *r &= ~v;                       /* write 1 to clear                 */
+        hc->ack_seq++;
         return;
 
     case HcInterruptEnable:
@@ -246,9 +289,19 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
         return;
 
     case HcRhPortStatus1:
-    case HcRhPortStatus1 + 4: {
+    case HcRhPortStatus1 + 4:
+    case HcRhPortStatus1 + 8:
+    case HcRhPortStatus1 + 12: {
         /* Writes here are set/clear requests by bit position, not a value to
-         * store. Getting that wrong looks like a port that will not enable. */
+         * store. Getting that wrong looks like a port that will not enable.
+         *
+         * All four, not the two this root hub usually advertises. The read
+         * path already answers four, because a driver reads every port
+         * register whatever the descriptor says; the write path did not, so a
+         * device placed on port 3 was seen, reset, and never reset-completed
+         * -- the request fell through to the plain store and PRSC was never
+         * raised. The driver reset it forever. A hub that reports N ports has
+         * to give all N the same semantics. */
         unsigned port = (aligned - HcRhPortStatus1) / 4;
         uint32_t *ps = &hc->reg[(HcRhPortStatus1 + port * 4) / 4];
 
@@ -463,6 +516,16 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
                 g_ctrl_len = usb_gamepad_control(&g_setup, g_ctrl_buf,
                                                  (int)sizeof g_ctrl_buf);
                 if (g_ctrl_len < 0) {
+                    /* Worth saying out loud. A stall here halts the
+                     * endpoint until the driver clears it, and a driver
+                     * that sees one usually stops using the device -- so
+                     * an unhandled request is not a gap that degrades
+                     * gracefully, it is one that ends input. */
+                    fprintf(stderr, "  [OHCI%d] STALL: unhandled control "
+                            "request %02X %02X value %04X index %04X len %u\n",
+                            hc->index, g_setup.bmRequestType, g_setup.bRequest,
+                            g_setup.wValue, g_setup.wIndex, g_setup.wLength);
+                    fflush(stderr);
                     g_setup_pending = 0;
                     return TD_CC_STALL;
                 }
@@ -609,8 +672,19 @@ static int ohci_run_periodic_list(OhciController *hc)
     completed = 0;
     for (slot = 0; slot < 32u; slot++) {
         ed = rd32(hcca + slot * 4u) & ED_PTR_MASK;
-        if (ed)
-            completed += ohci_walk_eds(hc, ed, &done_head);
+        if (!ed)
+            continue;
+        /* The first interrupt endpoint the driver publishes is the one the
+         * input reports ride on, so say so once: an enumerated pad whose
+         * table stays empty is a pad nobody opened, which is a different
+         * problem from a pad nobody serviced. */
+        if (!hc->periodic_seen) {
+            hc->periodic_seen = 1;
+            fprintf(stderr, "  [OHCI%d] periodic slot %u -> ED %08X "
+                    "info=%08X\n", hc->index, slot, ed, rd32(ed));
+            fflush(stderr);
+        }
+        completed += ohci_walk_eds(hc, ed, &done_head);
     }
     if (completed)
         ohci_publish_done(hc, done_head);
@@ -723,7 +797,7 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
     /* Root hub: OHCI_PORTS downstream, ports always powered, no over-current
      * reporting. NoPowerSwitching keeps a driver from waiting on a power-on
      * sequence that has nothing to switch. */
-    hc->reg[HcRhDescriptorA / 4]  = (uint32_t)OHCI_PORTS | (1u << 9);
+    hc->reg[HcRhDescriptorA / 4]  = (uint32_t)s_ndp | (1u << 9);
     hc->reg[HcRhDescriptorB / 4]  = 0x00000000u;
     hc->reg[HcRhStatus / 4]       = 0x00000000u;
 
@@ -741,8 +815,19 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
      * A console detects the port change after the controller is running, so
      * that is what the controller thread does: it waits for operational with
      * the interrupt unmasked, and only then plugs the device in. */
-    hc->reg[HcRhPortStatus1 / 4]       = PORT_PPS;
-    hc->reg[(HcRhPortStatus1 + 4) / 4] = PORT_PPS;
+    /* Every port the descriptor claims, not the first two.
+     *
+     * A root hub that reports four downstream ports and powers two has two
+     * ports a driver will skip: no PortPowerStatus is an unpowered socket,
+     * and nothing is expected to arrive on one. That made a device placed on
+     * port 3 invisible, which read as "the driver only scans two ports" and
+     * is really "we only powered two". */
+    {
+        unsigned p;
+        for (p = 0; p < 4u; p++)
+            hc->reg[(HcRhPortStatus1 + p * 4) / 4] =
+                (p < s_ndp) ? PORT_PPS : 0u;
+    }
 }
 
 /* The controller, running on its own thread.
@@ -775,6 +860,9 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     int plugged = 0;
     uint32_t last_status = 0;
     unsigned repeats = 0;
+    unsigned held_off = 0;
+    int      held_off_warned = 0, held_off_forced = 0;
+    unsigned last_ack = 0;
 
     (void)unused;
     {
@@ -789,10 +877,10 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     }
 
     for (;;) {
-        OhciController *hc = &s_hc[0];
+        OhciController *hc = &s_hc[s_device_hc];
         uint32_t control, enable, status;
 
-        Sleep(20);
+        Sleep(OHCI_TICK_MS);
         control = hc->reg[HcControl / 4];
         enable  = hc->reg[HcInterruptEnable / 4];
 
@@ -818,7 +906,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              * mapping can be found by measurement rather than assumed. */
             const char *pspec = getenv("RECOMP_USB_PORT");
             unsigned port = pspec ? (unsigned)atoi(pspec) : 0u;
-            if (port > 1u) port = 1u;
+            if (port >= s_ndp) port = s_ndp - 1u;
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
             hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
             plugged = 1;
@@ -845,7 +933,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             uint32_t hcca = hc->reg[HcHCCA / 4];
 
             hc->reg[HcFmNumber / 4] =
-                (hc->reg[HcFmNumber / 4] + 20u) & 0xFFFFu;
+                (hc->reg[HcFmNumber / 4] + OHCI_TICK_MS) & 0xFFFFu;
             /* HccaFrameNumber is 16 bits at +0x80 with a pad above it that the
              * controller zeroes, so a dword write is what hardware does. */
             if (hcca)
@@ -858,9 +946,32 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * on it. Walking on the tick rather than only when CLF is written
          * costs a read of a guest dword and means a descriptor queued without
          * rewriting CLF is still moved -- which is legal, and drivers do it. */
+        /* Not while the driver still owes us an acknowledgement.
+         *
+         * HccaDoneHead belongs to the driver from the moment WDH is set
+         * until it clears it. Writing a second done list over the first
+         * loses every descriptor on it -- the driver walks a chain whose
+         * links now point into the new list, and the structures it keeps
+         * alongside go with it. At a twenty-millisecond tick that overlap
+         * was rare enough to look like bad luck; at four it corrupted the
+         * host controller's pending list within a second or two of the
+         * gamepad's reports starting. Leaving the descriptors on their
+         * endpoints for another pass costs a few milliseconds of latency
+         * and is what the controller is specified to do. */
+        if (hc->reg[HcInterruptStatus / 4] & INTR_WDH)
+            goto deliver;
+
         /* PeriodicListEnable, bit 2 of HcControl. */
-        if (control & 0x04u)
+        if (control & 0x04u) {
+            if (!hc->ple_seen) {
+                hc->ple_seen = 1;
+                fprintf(stderr, "  [OHCI%d] periodic list enabled "
+                        "(HcControl=%08X HCCA=%08X)\n",
+                        hc->index, control, hc->reg[HcHCCA / 4]);
+                fflush(stderr);
+            }
             ohci_run_periodic_list(hc);
+        }
 
         /* BulkListEnable, bit 5. Nothing on this device uses bulk, but the
          * list is walked the same way and a driver that puts a transfer
@@ -885,23 +996,64 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * set, the line is asserted. The handler clears the status bit, so
          * this stops on its own -- and if it ever does not, the cap below says
          * so rather than spinning the ISR forever. */
+    deliver:
         status = hc->reg[HcInterruptStatus / 4] & enable & 0x7Fu;
         if (!status)
             continue;
 
-        /* A stuck source is one the handler never clears, which shows up as
-         * the same status delivered over and over. Counting deliveries alone
-         * would trip on a device that is simply busy. */
-        if (status == last_status) {
+        /* Bounded, because the mask is a model and not the hardware.
+         *
+         * The depth is a count of raise/lower pairs across every thread, and
+         * one unmatched raise anywhere leaves the gate shut for the rest of
+         * the run -- which is how this first showed up: no interrupt was ever
+         * delivered and enumeration stopped at two empty control EDs. Real
+         * hardware is never masked for 80 ms, so past that the line is
+         * asserted anyway. The common case still holds the ISR out of the
+         * guest's critical section; the pathological case costs a delay
+         * instead of the device. */
+        if (xbox_IrqlBlocksInterrupts() && ++held_off <= OHCI_IRQ_HOLDOFF) {
+            if (!held_off_warned) {
+                held_off_warned = 1;
+                fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "
+                        "(depth %d, status=0x%02X)\n",
+                        hc->index, xbox_IrqlRaisedCount(), status);
+                fflush(stderr);
+            }
+            continue;
+        }
+        if (held_off > OHCI_IRQ_HOLDOFF && !held_off_forced) {
+            held_off_forced = 1;
+            fprintf(stderr, "  [OHCI%d] guest IRQL never dropped (depth %d); "
+                    "delivering anyway\n", hc->index, xbox_IrqlRaisedCount());
+            fflush(stderr);
+        }
+        held_off = 0;
+
+        /* A stuck source is one the handler never clears. Repeating the
+         * same status value is not that.
+         *
+         * This counted deliveries of an unchanged status and gave up at
+         * 200, and a working gamepad trips that in two seconds: the pad
+         * reports at 100 Hz, every report completes a transfer descriptor,
+         * every completion raises WritebackDoneHead, and every one of them
+         * is the same status value. The driver was acknowledging each one
+         * -- 141 writes to HcInterruptStatus in the run this was found on
+         * -- and the count climbed anyway, because nothing reset it.
+         *
+         * What distinguishes the two is whether the driver wrote the
+         * register at all between one delivery and the next. */
+        if (status == last_status && hc->ack_seq == last_ack) {
             if (++repeats > 200) {
-                fprintf(stderr, "  [OHCI0] status %08X delivered 200 times "
-                                "without being cleared; stopping\n", status);
+                fprintf(stderr, "  [OHCI%d] status %08X delivered 200 times "
+                                "with no acknowledgement; stopping\n",
+                        hc->index, status);
                 fflush(stderr);
                 break;
             }
         } else {
             last_status = status;
-            repeats = 0;
+            last_ack    = hc->ack_seq;
+            repeats     = 0;
         }
         ohci_raise(hc, status);
     }
@@ -924,6 +1076,15 @@ void xbox_OhciInit(void)
 
     s_enabled = 1;
     s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
+    {
+        const char *hcspec = getenv("RECOMP_USB_HC");
+        const char *ndpspec = getenv("RECOMP_USB_NDP");
+        s_device_hc = (hcspec && atoi(hcspec) == 1) ? 1 : 0;
+        if (ndpspec) {
+            int n = atoi(ndpspec);
+            if (n >= 1 && n <= 4) s_ndp = (unsigned)n;
+        }
+    }
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
 

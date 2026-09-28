@@ -133,6 +133,17 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 }
 
 /* NV097 methods this executor acts on. */
+/* Blending. The pair this title programs, read from its own pushbuffer
+ * rather than guessed: BLEND_ENABLE written 1168 times and left on,
+ * SFACTOR 0x0302 (SRC_ALPHA) and DFACTOR 0x0303 (ONE_MINUS_SRC_ALPHA).
+ * ALPHA_TEST_ENABLE is written 390 times and left at zero, so this is
+ * blending and not an alpha test. */
+#define NV097_SET_BLEND_ENABLE            0x0304
+#define NV097_SET_BLEND_FUNC_SFACTOR      0x0344
+#define NV097_SET_BLEND_FUNC_DFACTOR      0x0348
+#define NV_BLEND_SRC_ALPHA                0x0302
+#define NV_BLEND_ONE_MINUS_SRC_ALPHA      0x0303
+
 #define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
 #define NV097_SET_SURFACE_CLIP_VERTICAL   0x0204
 #define NV097_SET_SURFACE_FORMAT          0x0208
@@ -254,6 +265,7 @@ static struct {
      * identical on screen and want opposite fixes: the batch carried no
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
+    uint32_t blend_enable, blend_sfactor, blend_dfactor;
     Texture  tex;
 } s_gpu;
 
@@ -312,6 +324,12 @@ static int s_tex_use_count;
 /* Defined below, next to the sampler it goes through. */
 static void dump_texture_bmp(uint32_t seq);
 
+/* Repeat dumps are numbered from well past the first-use sequence, so a
+ * listing sorts them after the textures they came from and no first-use file
+ * is ever overwritten by one. */
+#define TEX_DUMP_SEQ_BASE 1000u
+#define TEX_DUMP_SEQ_MAX  40u
+
 static void note_texture_use(void)
 {
     int i;
@@ -322,6 +340,33 @@ static void note_texture_use(void)
         if (s_tex_use[i].offset == s_gpu.tex.offset
          && s_tex_use[i].color  == s_gpu.tex.color) {
             s_tex_use[i].batches++;
+            /* Dump a surface that is redrawn, every Nth time it is bound.
+             *
+             * First use alone cannot tell a decode error that is wrong in
+             * every frame from one that accumulates across them. A block
+             * transform that is wrong is wrong on its own, in the keyframe
+             * as much as anywhere; motion compensation that is wrong starts
+             * from a clean keyframe and smears further with each predicted
+             * frame after it. In a single frame the two look identical, and
+             * in a sequence they look nothing alike -- so the sequence is
+             * what has to be captured.
+             *
+             * It belongs on this side of the return: a video surface keeps
+             * one address for the whole film, so after the first frame it is
+             * only ever found here, and the first-use dump below never fires
+             * for it again. RECOMP_TEX_DUMP_EVERY=<n> sets the interval, and
+             * RECOMP_TEX_DUMP still names the files. */
+            {
+                static int every = -1;
+                static unsigned binds, seq;
+                if (every < 0) {
+                    const char *e = getenv("RECOMP_TEX_DUMP_EVERY");
+                    every = e ? atoi(e) : 0;
+                }
+                if (every > 0 && ++binds % (unsigned)every == 0
+                    && seq < TEX_DUMP_SEQ_MAX)
+                    dump_texture_bmp(TEX_DUMP_SEQ_BASE + seq++);
+            }
             return;
         }
     }
@@ -597,7 +642,11 @@ static void clear_surface(uint32_t param)
      * would show the one nothing is writing. */
     /* The window has to read where the pixels actually are, which is the
      * resolved address rather than the DMA-object offset. */
-    xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+    /* Only until the title flips. Following the draw surface on every scan
+     * shows the buffer being written right now, half a frame at a time; past
+     * the first flip the window is repointed at the finished one instead. */
+    if (s_gpu.flips == 0)
+        xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
 
     /* And open the window, rather than waiting for AvSetDisplayMode to do it.
      *
@@ -797,6 +846,37 @@ static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb)
         *argb = ((uint32_t)p[u] << 24) | 0x00FFFFFFu;
         return 1;
 
+    /* 4:2:2 packed YUV, two texels per four bytes.
+     *
+     * This is how a title hands over a decoded video frame, and without it
+     * the frame falls through to `default` -- which returns 0, so the caller
+     * paints the quad's vertex colour and the movie is a flat rectangle.
+     *
+     * The chroma pair is shared between an even texel and the one after it,
+     * so the group is found by masking the bottom bit of the index. BT.601,
+     * the same coefficients the D3D8 upload path converts with, so the two
+     * paths agree rather than each having its own idea of the colour. */
+    case 0x24:                                      /* LC_CR8YB8CB8YA8, YUY2 */
+    case 0x25: {                                    /* LC_YB8CR8YA8CB8, UYVY */
+        uint32_t yoff = (fmt == 0x24) ? 0u : 1u;
+        const uint8_t *g = p + (size_t)(u & ~1u) * 2;
+        int c  = (int)g[(u & 1u) ? 2 + yoff : yoff] - 16;
+        int cu = (int)g[1 - yoff] - 128;
+        int cv = (int)g[3 - yoff] - 128;
+        int r = (298 * c + 409 * cv + 128) >> 8;
+        int gg = (298 * c - 100 * cu - 208 * cv + 128) >> 8;
+        int b = (298 * c + 516 * cu + 128) >> 8;
+        if (r < 0) r = 0;
+        if (r > 255) r = 255;
+        if (gg < 0) gg = 0;
+        if (gg > 255) gg = 255;
+        if (b < 0) b = 0;
+        if (b > 255) b = 255;
+        *argb = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)gg << 8)
+              | (uint32_t)b;
+        return 1;
+    }
+
     default:
         return 0;
     }
@@ -904,6 +984,43 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     if ((argb & 0x00FFFFFFu) > (s_gpu.pixel_max & 0x00FFFFFFu))
         s_gpu.pixel_max = argb;
     row = s_surface + (size_t)y * s_gpu.pitch;
+
+    /* src*srcAlpha + dst*(1-srcAlpha), and only that pair.
+     *
+     * Any other factor combination falls through to an opaque write rather
+     * than being approximated: a wrong blend is harder to recognise on
+     * screen than no blend, and this is the only pair this title sets.
+     *
+     * Fully opaque is left alone deliberately. It is the same arithmetic,
+     * but skipping it keeps the full-screen quads -- which are drawn with
+     * blending enabled and alpha 255 -- on exactly the path they were on
+     * before, so this cannot change what they produce. */
+    if (s_gpu.blend_enable
+        && s_gpu.blend_sfactor == NV_BLEND_SRC_ALPHA
+        && s_gpu.blend_dfactor == NV_BLEND_ONE_MINUS_SRC_ALPHA
+        && (argb >> 24) != 0xFF) {
+        uint32_t sa = argb >> 24;
+        uint32_t dst = 0;
+        if (sa == 0)
+            return;                        /* nothing of the source survives */
+        if (bpp == 4) {
+            dst = ((const uint32_t *)row)[x];
+        } else if (bpp == 2) {
+            uint32_t t = ((const uint16_t *)row)[x];
+            dst = (((t & 0xF800u) << 8) | ((t & 0x07E0u) << 5)
+                 | ((t & 0x001Fu) << 3));
+        }
+        {
+            uint32_t r = (((argb >> 16) & 0xFF) * sa
+                        + ((dst >> 16) & 0xFF) * (255u - sa) + 127u) / 255u;
+            uint32_t g = (((argb >>  8) & 0xFF) * sa
+                        + ((dst >>  8) & 0xFF) * (255u - sa) + 127u) / 255u;
+            uint32_t b = (((argb      ) & 0xFF) * sa
+                        + ((dst      ) & 0xFF) * (255u - sa) + 127u) / 255u;
+            argb = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+
     if (bpp == 4) {
         ((uint32_t *)row)[x] = argb;
     } else if (bpp == 2) {
@@ -1135,12 +1252,27 @@ static int batch_is_screen_space(void)
     return 1;
 }
 
-/* NV097 primitive types that are triangles under some winding. */
-#define NV_PRIM_TRIANGLES      4
-#define NV_PRIM_TRIANGLE_STRIP 5
-#define NV_PRIM_TRIANGLE_FAN   6
-#define NV_PRIM_QUADS          7
-#define NV_PRIM_QUAD_STRIP     8
+/* NV097 primitive types.
+ *
+ * These are the operand of SET_BEGIN_END, where 0 is END and the list starts
+ * at 1. They were each one too low, so every title's geometry was decomposed
+ * as the primitive below the one it asked for -- a strip as a fan, a fan as
+ * quads, and TRIANGLES, the one case whose vertex count must be a multiple
+ * of three, as a strip.
+ *
+ * The vertex order says which numbering is right without taking a table on
+ * trust: a strip arrives in Z order and a fan in cyclic order, and they only
+ * line up with the primitive under this one. */
+#define NV_PRIM_POINTS         1
+#define NV_PRIM_LINES          2
+#define NV_PRIM_LINE_LOOP      3
+#define NV_PRIM_LINE_STRIP     4
+#define NV_PRIM_TRIANGLES      5
+#define NV_PRIM_TRIANGLE_STRIP 6
+#define NV_PRIM_TRIANGLE_FAN   7
+#define NV_PRIM_QUADS          8
+#define NV_PRIM_QUAD_STRIP     9
+#define NV_PRIM_POLYGON        10
 
 /* How many post-draw captures to keep: enough to see whether the geometry
  * is stable from frame to frame, few enough not to fill a directory. */
@@ -1210,13 +1342,32 @@ static void raster_batch(void)
                            vertex_color(s_gpu.idx[i]));
         break;
     case NV_PRIM_TRIANGLE_FAN:
-    case NV_PRIM_QUADS:
-    case NV_PRIM_QUAD_STRIP:
-        /* A fan and a quad both rasterise as a triangle fan around index 0;
-         * for a quad that is exactly its two triangles. */
+    case NV_PRIM_POLYGON:
         for (i = 1; i + 1 < s_gpu.idx_count; i++)
             raster_indexed(s_gpu.idx[0], s_gpu.idx[i], s_gpu.idx[i+1],
                            vertex_color(s_gpu.idx[0]));
+        break;
+    case NV_PRIM_QUADS:
+        /* Independent quads, four vertices each. A batch of eight is two
+         * quads, not one six-triangle fan around the first vertex; with
+         * exactly four the two agreed, which is why sharing the fan arm
+         * looked right. */
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 4) {
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+2], s_gpu.idx[i+3],
+                           vertex_color(s_gpu.idx[i]));
+        }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        /* Each vertex pair past the first closes another quad against the
+         * pair before it. */
+        for (i = 0; i + 3 < s_gpu.idx_count; i += 2) {
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+1], s_gpu.idx[i+3],
+                           vertex_color(s_gpu.idx[i]));
+            raster_indexed(s_gpu.idx[i], s_gpu.idx[i+3], s_gpu.idx[i+2],
+                           vertex_color(s_gpu.idx[i]));
+        }
         break;
     default:
         break;                             /* points and lines: not yet */
@@ -1591,6 +1742,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_COLOR_CLEAR_VALUE:
         s_gpu.clear_color = param;
         break;
+    case NV097_SET_BLEND_ENABLE:
+        s_gpu.blend_enable = param;
+        break;
+    case NV097_SET_BLEND_FUNC_SFACTOR:
+        s_gpu.blend_sfactor = param;
+        break;
+    case NV097_SET_BLEND_FUNC_DFACTOR:
+        s_gpu.blend_dfactor = param;
+        break;
     case NV097_CLEAR_SURFACE:
         clear_surface(param);
         break;
@@ -1685,6 +1845,23 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
+        /* Hand the window a copy of the frame just finished.
+         *
+         * The buffer the title has finished is the one the last batch drew
+         * into, which is what drawn_offset holds and why it exists: by the
+         * flip, color_offset has already moved to the next buffer. Copying
+         * here, rather than letting the window read guest memory on its own
+         * clock, is what stops it showing a surface the rasteriser is still
+         * writing. */
+        if (s_gpu.pitch) {
+            extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
+            uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
+                                               : s_gpu.color_offset;
+            if (done) {
+                xbox_FramebufferWindowSet(dma_resolve(done), s_gpu.pitch);
+                xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);
+            }
+        }
         if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
             static unsigned n;
             if (n++ < 8) {

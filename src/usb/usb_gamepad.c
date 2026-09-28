@@ -13,6 +13,9 @@
  */
 #include "usb_gamepad.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
 #include <string.h>
 
 /* ---- descriptors ------------------------------------------------------- */
@@ -130,6 +133,30 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
         }
     }
 
+    /* Class requests on the interface -- GET_REPORT.
+     *
+     * XAPI reads the pad through the interrupt endpoint and also asks for
+     * the same report over the control pipe. Stalling that is not a small
+     * omission: a stalled control transfer reads to the driver as a broken
+     * device, and because the stall also halts the endpoint, the pad stops
+     * being polled for good.
+     *
+     * Measured on Shin Megami Tensei: Nine, the periodic list runs at about
+     * a hundred descriptors a second and then collapses to nothing the
+     * moment one `A1 01 value 0100 len 20` arrives.
+     *
+     * The answer is the report the interrupt endpoint would have sent.
+     */
+    if ((setup->bmRequestType & 0x60u) == 0x20u        /* class */
+        && setup->bRequest == 0x01u                    /* GET_REPORT */
+        && is_in) {
+        uint8_t report[20];
+        int n = usb_gamepad_report(report, (int)sizeof report);
+        if (n <= 0)
+            return -1;
+        return copy_out(out, max, report, n, setup->wLength);
+    }
+
     /* Vendor requests on the interface -- the XID protocol.
      *
      * This is how XAPI tells a controller from any other USB device. The
@@ -202,10 +229,59 @@ int usb_gamepad_control(const UsbSetup *setup, uint8_t *out, int max)
  *   4..11  analog buttons A B X Y Black White, then the two triggers
  *   12..19 four signed 16-bit stick axes, little endian
  */
+/* A synthetic press, for bringing a title up without a pad on the desk.
+ *
+ * RECOMP_PAD_PRESS=0x10 holds Start for a quarter of a second every two
+ * seconds. A title sitting on a "press Start" screen needs an edge, not a
+ * level, so this pulses rather than latching -- and it repeats because the
+ * moment the title starts reading input is not knowable from here.
+ *
+ * Bit values are the Xbox digital button mask: 0x01/02/04/08 dpad
+ * up/down/left/right, 0x10 Start, 0x20 Back, 0x40/0x80 thumb clicks.
+ *
+ * This is a bring-up probe and nothing else. It is off unless the variable
+ * is set, and a real pad on the host is always the better input.
+ */
+static uint8_t synthetic_buttons(void)
+{
+    static int      configured = -1;
+    static unsigned mask, period_ms, hold_ms;
+    static unsigned long t0;
+    unsigned long now, phase;
+
+    if (configured < 0) {
+        const char *spec = getenv("RECOMP_PAD_PRESS");
+        configured = 0;
+        if (spec && *spec) {
+            char *end;
+            mask = (unsigned)strtoul(spec, &end, 0) & 0xFFu;
+            period_ms = (*end == ',') ? (unsigned)strtoul(end + 1, &end, 0)
+                                      : 2000u;
+            hold_ms   = (*end == ',') ? (unsigned)strtoul(end + 1, &end, 0)
+                                      : 250u;
+            if (!period_ms) period_ms = 2000u;
+            if (!hold_ms || hold_ms >= period_ms) hold_ms = period_ms / 4u;
+            if (mask) {
+                configured = 1;
+                t0 = (unsigned long)GetTickCount();
+                fprintf(stderr, "  PAD: synthesising button mask 0x%02X for "
+                        "%u ms every %u ms\n", mask, hold_ms, period_ms);
+                fflush(stderr);
+            }
+        }
+    }
+    if (!configured)
+        return 0;
+    now = (unsigned long)GetTickCount();
+    phase = (now - t0) % period_ms;
+    return (uint8_t)((phase < hold_ms) ? mask : 0u);
+}
+
 int usb_gamepad_report(uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
     const XBOX_GAMEPAD *g;
+    uint8_t synth = synthetic_buttons();
     int i;
 
     if (max < 20)
@@ -216,11 +292,47 @@ int usb_gamepad_report(uint8_t *out, int max)
 
     /* A disconnected host pad is not an error here: the device is present on
      * the bus either way, it just reports nothing pressed. */
-    if (xbox_InputGetState(0, &state) != 0)
+    /* RECOMP_INPUT_DIAG: the whole chain on one line, once a second.
+     *
+     * "Nothing happens when I press a key" has several candidate causes and
+     * guessing between them costs a rebuild each: the variable not read,
+     * XInput claiming a pad so the keyboard fallback never runs, the window
+     * not receiving the key, or the report going out without it. Printing
+     * all four together answers it in one run.
+     *
+     * It samples the held state, so pair it with the window's own
+     * RECOMP_KEY_TRACE: that answers "did the key arrive", this answers
+     * "is the chain wired". */
+    {
+        static int diag = -1;
+        if (diag < 0)
+            diag = getenv("RECOMP_INPUT_DIAG") != NULL;
+        if (diag) {
+            extern int xbox_FramebufferKeyDown(int vk);
+            static unsigned long last;
+            unsigned long now = (unsigned long)GetTickCount();
+            if (now - last > 1000) {
+                XBOX_INPUT_STATE probe;
+                DWORD rc = xbox_InputGetState(0, &probe);
+                last = now;
+                fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
+                        "InputGetState=%lu buttons=0x%04X\n",
+                        getenv("RECOMP_KEYBOARD") ? 1 : 0,
+                        xbox_FramebufferKeyDown(0x0D),
+                        (unsigned long)rc,
+                        rc == 0 ? probe.Gamepad.wButtons : 0);
+                fflush(stderr);
+            }
+        }
+    }
+
+    if (xbox_InputGetState(0, &state) != 0) {
+        out[2] = synth;
         return 20;
+    }
 
     g = &state.Gamepad;
-    out[2] = (uint8_t)(g->wButtons & 0xFF);
+    out[2] = (uint8_t)((g->wButtons & 0xFF) | synth);
     out[3] = (uint8_t)((g->wButtons >> 8) & 0xFF);
     for (i = 0; i < 8; i++)
         out[4 + i] = g->bAnalogButtons[i];

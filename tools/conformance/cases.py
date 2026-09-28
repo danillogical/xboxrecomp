@@ -129,6 +129,17 @@ CASES = [
     Case("neg_adc", "neg's carry into adc",
          ["neg eax", "adc ecx, 0", "mov eax, ecx"], _PAIRS),
 
+    # -- rotate through carry ------------------------------------------------
+    Case("rcr_divide_normaliser", "shr's carry into rcr, as MSVC's 64-bit divide",
+         ["shr ecx, 1", "rcr eax, 1"], _PAIRS),
+    Case("rcl_i32_cl", "rcl by a variable count",
+         ["stc", "rcl eax, cl"], _PAIRS),
+    Case("rcr_i8_cl_setc", "byte rcr, count mod 9, carry out read by setc",
+         ["stc", "rcr al, cl", "setc ah"], _PAIRS),
+    Case("rcl_i16_cl_setc", "word rcl, count mod 17, carry out read by setc",
+         ["clc", "rcl ax, cl", "setc cl", "movzx ecx, cl",
+          "shl ecx, 16", "movzx eax, ax", "or eax, ecx"], _PAIRS),
+
     # -- sign/zero extension -------------------------------------------------
     Case("movsx_8_32", "sign-extend byte to dword",
          ["movsx eax, al"], _PAIRS),
@@ -415,6 +426,14 @@ CASES = [
          ["test ax, ax", "setns al", "movzx eax, al"], _PAIRS),
     Case("js_cmp_i8", "sign flag after an 8-bit cmp, which truncates first",
          ["cmp al, cl", "sets al", "movzx eax, al"], _PAIRS),
+    Case("js_add_i8", "sign flag after an 8-bit add reads bit 7 of the result",
+         ["add al, cl", "sets al", "movzx eax, al"], _PAIRS),
+    Case("js_sub_i16", "sign flag after a 16-bit sub reads bit 15",
+         ["sub ax, cx", "sets al", "movzx eax, al"], _PAIRS),
+    Case("js_xor_i8", "sign flag after an 8-bit xor",
+         ["xor al, cl", "sets al", "movzx eax, al"], _PAIRS),
+    Case("js_sar_i8", "sign flag after an 8-bit sar",
+         ["sar al, 1", "sets al", "movzx eax, al"], _PAIRS),
 
     # Unsigned word saturation must clamp each lane, not wrap or drop the op.
     *[Case("mmx_" + op + "_" + form + "_" + str(half),

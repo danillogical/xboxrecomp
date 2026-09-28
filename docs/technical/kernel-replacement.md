@@ -234,7 +234,11 @@ Xbox input is nearly 1:1 with the Win32 XInput API. The main difference is the X
 | DirectSoundCreateBuffer | Returns stub buffer |
 | DirectSoundDoWork | No-op |
 
-Audio is fully stubbed in the current implementation. XAudio2 integration is planned but not yet implemented.
+These rows describe the HLE path only. Most titles link the XDK's own
+DirectSound, which is ordinary recompiled code driving the AC'97 and MCPX APU
+directly; `src/apu/` emulates the APU (XAudio2 output). A title whose codec
+probe fails there can skip its whole engine init -- see "Runs, Never Draws a
+Frame" in `docs/pipeline/06-debugging.md` and `RECOMP_AC97_READY`.
 
 ### HAL and System (~20 ordinals)
 

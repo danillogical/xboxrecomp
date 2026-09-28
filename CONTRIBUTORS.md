@@ -213,6 +213,28 @@ direction.
 - **An inventory of flat basic-block dispatch (#63)** — measures what a
   byte-indexed x64 dispatch table would cost before anyone writes one.
 
+*v0.12.0 — branches that could not be taken, and fragments that were one function (#110–#116, #120, #131)*
+- **`loop`, `loope` and `loopne` were never lifted (#110)** — they neither
+  decremented ECX nor branched on anything but a `_flags` variable nothing
+  assigns, so every counted loop ran its body exactly once, and the tracked
+  comparison was wiped for the jcc after it.
+- **The sign of a narrow result was read at 32 bits (#120)** — after an 8- or
+  16-bit add, sub, logic op, neg or shift the result is zero-extended, so `js`
+  was never taken and `jns` always was.
+- **Switch arms past their function's recorded end had no body (#131)** — when
+  the function list cuts a function at its own switch, the lifter emits the
+  indexed jump as an indirect tail call and the runtime has nothing to dispatch
+  to. Each such arm is recovered as an entry of its own, only when it can run
+  whole; on Wreckless that is 33 new entries and every existing body
+  byte-identical.
+- **Opt-in, fail-closed function coalescence (#111–#116)** — a six-PR series
+  adding `--coalesce-functions`: explicit JSON owner bounds merge fragments
+  that identification wrongly split, and every merge that cannot be proven is
+  refused rather than forced. Along the way it made recovered CFG evidence
+  authoritative for ownership, kept callback tables reachable only through
+  recovered code, refused jump tables whose scale is not a dword stride, and
+  made `iret` terminal.
+
 ### DarthSidious666 — [@DarthSidious666](https://github.com/DarthSidious666)
 - **Implemented the missing `tools/abi_analysis` (#6)** — the pipeline had a
   hole in it: `tools.recomp` looked for `abi_functions.json`, warned when it
@@ -553,6 +575,29 @@ real thunk through synthetic guest memory, so they need no game files.
 All seven found by differential fuzzing against an independent x86 core, and
 every one paired with the negative control described above.
 
+*v0.12.0 (#89, #117, #121, #124, #126, #129, #130)*
+- **Guest buffers bounds-checked before the host touches them (#89)** — the
+  file and info exports passed a guest pointer and a guest length straight to
+  the host, so a bad buffer walked the host past the end of guest memory and
+  crashed inside the kernel implementation. It now fails with
+  `STATUS_ACCESS_VIOLATION`, which the title has a branch for.
+- **An untranslated instruction says so at runtime (#117)** — it used to become
+  a bare comment, which the compiler reads as nothing, so the instruction
+  vanished and the failure surfaced somewhere downstream. `RECOMP_UNIMPL`
+  names the site the first time it is reached.
+- **`repe cmps`/`scas` produce CF (#124)** — without it `memcmp` and
+  `std::string::compare` never answered "less", and a zero-count compare
+  reported "unequal", breaking sorted lookups.
+- **`frndint` rounds under the guest's control word (#126)** — it used the
+  host's mode, so the CRT's `floor` and `ceil` both rounded to nearest and
+  JSRF read its animation tables out of range.
+- **ADPCM's reserved header byte is not validated (#121)** — hardware accepts
+  any value there, and rejecting it silenced about 4% of JSRF's audio blocks.
+- **The returning-body probe follows a switch (#129)** — a function reached
+  only by address that opens with a switch was never detected.
+- **Indirect calls name their site (#130)** — per-site target sets recorded at
+  runtime become exact-match guarded direct calls on the next generation.
+
 ### fearkov — [@fearkov](https://github.com/fearkov)
 A bring-up batch on *Shin Megami Tensei: Nine* and DDS9, each item a place
 where the runtime stopped one step short of something a title needed and said
@@ -631,6 +676,39 @@ nothing about it.
   epilogue cut the stack back to it. A title can also link more than one:
   DDS9 carries both forms, and returning the first match meant which one won
   depended on nothing but the lower address.
+
+*v0.12.0 — twenty-four PRs (#90–#100, #102–#109, #118, #119, #122, #123, #125)*
+- **A join reached by `test X, X` and `cmp X, 0` inherited no flags (#122)** —
+  the two leave every flag identical, but the snapshot reconstructs them
+  differently, so the join refused to merge and the branch compiled dead. In
+  SMT: Nine's video decoder that fired the IDCT's DC-only shortcut for every
+  coefficient group and smeared every picture horizontally.
+- **`rcl` and `rcr` were never lifted (#104)** — emitted as comments, which
+  silently broke MSVC's 64-bit divide helper and with it every `long long`
+  division. Plus a differential test of every MMX helper against the host's own
+  instructions (#105).
+- **USB brought to a working pad (#90, #91, #96, #107, #118)** — four root-hub
+  ports, a 4 ms frame tick, the done-queue handshake, an interrupt held off
+  while the guest is at raised IRQL, a watchdog that asks whether the driver
+  acknowledged rather than whether the status repeated, and a `GET_REPORT`
+  answered instead of stalled.
+- **The NV2A path (#97, #99, #102, #103, #108)** — primitive numbers one too
+  low, GET running ahead of the executor, a ring wrap dropping a submission, no
+  YUV sampler, no alpha blend, and a window showing the frame being drawn
+  rather than the one finished.
+- **`KeQuerySystemTime` at the console's resolution (#119)**, asynchronous
+  reads answered the way they were asked (#93), and a crash report that says
+  when the stack is gone (#95).
+- **Bring-up instruments** — `RECOMP_WATCH` (#92), `--force-return` (#100),
+  `RECOMP_DSP_ACK`/`RECOMP_POKE` (#98), `RECOMP_PAD_PRESS` (#94),
+  `RECOMP_KEYBOARD` (#106), `RECOMP_TEX_DUMP_EVERY` (#123), raised-IRQL
+  holder tracing (#125), and the `--split 250` guidance (#109).
+
+### HEROTRUTH — [@Heromachine](https://github.com/Heromachine)
+- **The NV2A flip methods were matched 0x18 too low (#101)** — the executor
+  compared against hand-typed offsets instead of the header's constants, so the
+  frame counter counted the wrong method, `WAIT_FOR_IDLE` was swallowed as a
+  flip, and the real flip methods fell through to the unhandled path.
 
 ---
 

@@ -295,6 +295,34 @@ void sub_001CFDD0(void) {  // NtFlushBuffersFile or push buffer wait
 ```
 Then add a stub in `recomp_manual.c` that returns immediately.
 
+### Runs, Never Draws a Frame
+
+**Symptom**: vblank and DPCs fire, threads run, nothing crashes, and no frame
+ever reaches the screen. Often a later wait never returns, or a crash much
+later on a NaN matrix or a half-built object.
+
+**Cause, most often**: a device the title probes at startup said no, and the
+title quietly skipped everything that depended on it. The known case is audio:
+a title that links the XDK's own DirectSound checks the AC'97 codec, and when
+`DirectSoundCreate` fails it skips its *entire* engine init, not just sound.
+Wreckless did exactly this and reached its main loop with no renderer set up.
+
+**Diagnose before shimming**:
+- `RECOMP_AC97_READY=1` reports the codec ready and routes the APU aperture to
+  the emulated APU. If behaviour changes with it, the audio probe was the gate.
+- NV2A register space has no semantics by default and nothing raises a GPU
+  interrupt, so a D3D callback driven by one (swap, fence, notifier) never
+  fires. `RECOMP_NV2A_TRACE=1` shows whether `DMA_PUT` moves at all;
+  `RECOMP_PB_EXEC=1` actually consumes the pushbuffer.
+- `RECOMP_WATCHDOG_SECS=N` dumps registers, PUT/GET and the guest stack when
+  the title stops making progress -- it names the wait.
+- `RECOMP_WATCH=<va>` names the guest code that writes a value (a callback
+  table slot, a "ready" flag); `RECOMP_UNIMPL_TRAP=1` stops at the first
+  untranslated instruction that is actually reached.
+
+A shim that makes a wait return without making the thing it waits for happen
+usually moves the stall rather than fixing it. Find the probe that failed.
+
 ### Access Violation at 0x00000000
 
 **Symptom**: crash reading or writing address 0.
