@@ -8969,15 +8969,48 @@ static int a2h_watch_on(void)
     return g_a2h_watch;
 }
 
+/* The acknowledgement half of the handshake.
+ *
+ * WITHOUT THIS THE HANDSHAKE IS FATAL. The collector receives the exception, arms, and returns
+ * DBG_EXCEPTION_NOT_HANDLED -- which is correct, because that is what lets the target's own
+ * handlers see it -- and the OS then resumes the search INSIDE the target. Nothing in the game
+ * handles 0xE0424452, so the process would terminate on its own diagnostic. Measured, not
+ * assumed: the first version of this seam died with exit code 0xE0424452 before this handler
+ * existed.
+ *
+ * It is registered at priority 1, alongside the game's own VEH (src/main.c:212) and AC'97's, and
+ * returns EXCEPTION_CONTINUE_SEARCH for everything else, so it neither shadows nor reorders them.
+ * It changes no register: execution resumes at the instruction after RaiseException, which is the
+ * install store, exactly where it would have continued had the diagnostic never raised. */
+static LONG CALLBACK a2h_handshake_veh(PEXCEPTION_POINTERS ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode != A2H_DR_HANDSHAKE_CODE)
+        return EXCEPTION_CONTINUE_SEARCH;   /* never shadow anyone else's exception */
+    fprintf(stderr, "  [A2HSLOT] handshake VEH entered code=%08X\n",
+            (unsigned)ep->ExceptionRecord->ExceptionCode);
+    fflush(stderr);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void *g_a2h_handshake_veh = NULL;
+
 static void a2h_install_handshake(void)
 {
+    if (!g_a2h_handshake_veh)
+        g_a2h_handshake_veh = AddVectoredExceptionHandler(1, a2h_handshake_veh);
+    if (!g_a2h_handshake_veh) {
+        /* No acknowledgement is possible, so raising would kill the process. FAIL CLOSED by
+         * reporting that the instrument is unarmed rather than by crashing the run. */
+        fprintf(stderr, "  [A2HSLOT] handshake FAILED: no VEH, install left UNARMED\n");
+        fflush(stderr);
+        return;
+    }
     fprintf(stderr, "  [A2HSLOT] handshake tid=%lu slot=%08X state=raise\n",
             GetCurrentThreadId(), A2H_SLOT_VA);
     fflush(stderr);
-    /* First-chance, continuable: the collector sees this, arms, and acknowledges. If no collector
-     * is attached this returns immediately through the normal VEH chain, so a run without the
-     * debugger is not blocked by a diagnostic -- it is simply unarmed, and the toolkit's own
-     * arming summary is what reports that. */
+    /* First-chance, continuable: the collector sees this BEFORE any vectored handler runs and
+     * before this instruction resumes, arms every live thread, and acknowledges. Only then does
+     * RaiseException return -- so the install store below cannot execute unarmed. */
     RaiseException(A2H_DR_HANDSHAKE_CODE, 0, 0, NULL);
     fprintf(stderr, "  [A2HSLOT] handshake tid=%lu slot=%08X state=ack\n",
             GetCurrentThreadId(), A2H_SLOT_VA);
