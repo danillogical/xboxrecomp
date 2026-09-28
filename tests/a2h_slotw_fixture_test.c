@@ -634,6 +634,288 @@ static void fixture_fourth_read_latch(void)
            " write-once\n", later_seq);
 }
 
+/* ── 8. Q3(c): THE ADDRESS-IDENTITY CROSS-VALIDATION ─────────────────────────────────────────────
+ *
+ * THE OVERLAP THE ADVISOR REQUIRES, AT ITS MOST BASIC: the instrument and the guest must be reading
+ * the SAME PHYSICAL DWORD. Two completely independent address computations have to agree:
+ *
+ *   (1) THE INSTRUMENT'S READ ADDRESS -- `st.page0 + st.page_offset`, i.e. the page base ARM captured
+ *       and PAGE_READONLY-protected plus the slot's offset. Every fault record and every step read
+ *       goes through exactly this address.
+ *   (2) THE GUEST'S OWN TRANSLATION -- `slot_va + g_xbox_mem_offset`, which is precisely what the
+ *       generated code's `MEM32(slot_va)` computes and therefore the address the title's own store
+ *       to the slot actually lands on.
+ *
+ * ⚠ IF THESE DIFFER, THE WATCH IS PROTECTING AND READING A DIFFERENT PAGE FROM THE ONE THE TITLE
+ * WRITES, AND EVERY VALUE IN THE LEDGER IS ABOUT THE WRONG DWORD. Nothing else in the ledger could
+ * show it: the protected page still faults, the counters still move, the records still look
+ * well-formed. This is exactly the byte-order-trap class of defect, and it is why the check is
+ * structural rather than optional.
+ *
+ * The check is a REAL store through each address, not an arithmetic comparison alone: a store to the
+ * GUEST translation must raise a relevant AV (the page really is the protected one), and a store to
+ * the INSTRUMENT's address must raise one too. A wrong page would simply not fault. */
+static void fixture_address_identity(void)
+{
+    uintptr_t guest_host = (uintptr_t)FIX_SLOT_VA + (uintptr_t)g_xbox_mem_offset;
+    uintptr_t instr_host = (uintptr_t)st.page0 + st.page_offset;
+    XboxA2hSlotwLedger *L = xbox_A2hSlotWatchFixtureLedger();
+
+    current_fixture = "address-identity";
+
+    printf("  [fixture] address-identity: guest_translation=%p instrument_read=%p%s\n",
+           (void *)guest_host, (void *)instr_host, guest_host == instr_host ? "" : "  <-- MISMATCH");
+    CHECK(guest_host == instr_host,
+          "THE INSTRUMENT AND THE GUEST DISAGREE ABOUT WHERE THE SLOT IS: the guest's own"
+          " translation of %08X is %p, but the watch read/protected %p (page0=%p off=%03X)."
+          " Every value in the ledger would describe the WRONG DWORD",
+          FIX_SLOT_VA, (void *)guest_host, (void *)instr_host, st.page0, st.page_offset);
+
+    /* ...AND THE STORE PROVES IT RATHER THAN THE ARITHMETIC. A store through the GUEST's own
+     * translation of the slot must fault: that is the page the title's store lands on, and if the
+     * watch did not protect it the store would pass silently and the watch would be blind. */
+    {
+        uint64_t av_before = L->loss.relevant_av;
+        uint64_t hits_before = L->loss.slot_hits;
+        volatile uint32_t *guest_slot = (volatile uint32_t *)guest_host;
+
+        *guest_slot = 0x0BADF00Du;
+        CHECK(L->loss.relevant_av == av_before + 1,
+              "a store through the GUEST's own translation of the slot raised NO AV"
+              " (%llu -> %llu): the watch is not protecting the page the title writes",
+              (unsigned long long)av_before, (unsigned long long)L->loss.relevant_av);
+        CHECK(L->loss.slot_hits == hits_before + 1,
+              "a store through the GUEST's own translation was not recognised as a SLOT HIT"
+              " (%llu -> %llu)", (unsigned long long)hits_before,
+              (unsigned long long)L->loss.slot_hits);
+        CHECK(*guest_slot == 0x0BADF00Du, "the guest-translation store did not complete: reads %08X",
+              *guest_slot);
+        printf("  [fixture] address-identity: a store through the GUEST translation faulted and was"
+               " counted as a slot hit (value=%08X)\n", *guest_slot);
+    }
+}
+
+/* ── 9. Q3(b): VALUE FIDELITY END-TO-END ─────────────────────────────────────────────────────────
+ *
+ * THE ADVISOR: "the existing controls proved ARMING/FIRING, never VALUES." This fixture proves the
+ * VALUES, end to end, on the real handlers and real page faults:
+ *
+ *   1. Plant a KNOWN value at a KNOWN address (the slot).
+ *   2. Arm. The page is genuinely PAGE_READONLY.
+ *   3. Store a SECOND KNOWN value through the guest's own translation of that address.
+ *   4. Assert the instrument's published record carries `pre` == the true BEFORE value and `post` ==
+ *      the true AFTER value -- and that those are the values the MEMORY actually held, read back
+ *      independently after the store.
+ *
+ * ⚠ WHY THIS IS NOT CIRCULAR. The `pre`/`post` values come from the INSTRUMENT's own reads through
+ * its cached alias base. The confirmation reads below go through the GUEST's translation. The two
+ * address computations are independent, so agreement between them is evidence and not a tautology --
+ * and the address-identity fixture above is what makes that independence checkable.
+ *
+ * ⚠ IT ALSO PROVES `pre` IS READ BEFORE THE STORE EXECUTES. If the handler read `pre` after
+ * CONTINUE_EXECUTION the store would already have landed and `pre` would equal `post`; a store of a
+ * value DIFFERENT from the planted one distinguishes the two cases exactly. */
+static void fixture_value_fidelity(void)
+{
+    XboxA2hSlotwLedger *L = xbox_A2hSlotWatchFixtureLedger();
+    volatile uint32_t *guest_slot = (volatile uint32_t *)((uintptr_t)FIX_SLOT_VA
+                                                          + (uintptr_t)g_xbox_mem_offset);
+    const uint32_t before_value = 0xA5A5C3C3u;
+    const uint32_t after_value  = 0x5A5A3C3Cu;
+    uint32_t records_before, idx, write_idx = 0, step_idx = 0;
+    DWORD old;
+
+    current_fixture = "value-fidelity";
+
+    /* (1) PLANT THE KNOWN BEFORE-VALUE. Written while the page is RW, then the page is returned to
+     *     READONLY, so the plant is not itself a watched write and cannot be confused with one. */
+    VirtualProtect(st.page0, XBOX_A2H_SLOTW_PAGE_SIZE, PAGE_READWRITE, &old);
+    *guest_slot = before_value;
+    VirtualProtect(st.page0, XBOX_A2H_SLOTW_PAGE_SIZE, PAGE_READONLY, &old);
+    CHECK(*guest_slot == before_value,
+          "the plant did not take: the slot reads %08X, expected %08X", *guest_slot, before_value);
+
+    records_before = L->event_count;
+
+    /* (2) THE WATCHED STORE. Through the GUEST's translation, so this is the address the title's own
+     *     store would use, and the value is one no other fixture wrote. */
+    *guest_slot = after_value;
+
+    /* (3) THE MEMORY REALLY HOLDS THE AFTER-VALUE, read back through the guest's translation. If the
+     *     handler had swallowed the store or written something else, this is where it shows. */
+    CHECK(*guest_slot == after_value,
+          "the watched store did not complete: memory reads %08X, expected %08X",
+          *guest_slot, after_value);
+
+    /* (4) FIND THE RECORD PAIR THIS STORE PRODUCED. Newest-first so a later fixture cannot be
+     *     mistaken for this one, and the pair is identified by its `fault_va` being the slot. */
+    for (idx = L->event_count; idx > records_before; idx--) {
+        const XboxA2hSlotwEvent *ev = &L->events[idx - 1];
+        if (!ev->seq) continue;
+        if (ev->kind == 1u && ev->slot_hit) { write_idx = idx; break; }
+    }
+    CHECK(write_idx != 0, "the watched store published NO slot-hit WRITE record");
+    if (!write_idx) return;
+
+    for (idx = L->event_count; idx > write_idx; idx--) {
+        const XboxA2hSlotwEvent *ev = &L->events[idx - 1];
+        if (!ev->seq) continue;
+        if (ev->kind == 2u) { step_idx = idx; break; }
+    }
+    CHECK(step_idx != 0, "the watched store published NO STEP record");
+
+    {
+        const XboxA2hSlotwEvent *w = &L->events[write_idx - 1];
+        const XboxA2hSlotwEvent *s = step_idx ? &L->events[step_idx - 1] : NULL;
+
+        printf("  [fixture] value-fidelity: plant=%08X stored=%08X | WRITE pre=%08X | STEP pre=%08X"
+               " post=%08X\n", before_value, after_value, w->pre_value,
+               s ? s->pre_value : 0u, s ? s->post_value : 0u);
+
+        /* THE `pre` VALUE IS THE TRUE BEFORE-VALUE. This is the claim the Advisor says was never
+         * proven: not that the trap armed, but that the number it recorded was right. */
+        CHECK(w->pre_value == before_value,
+              "THE INSTRUMENT'S pre IS WRONG: recorded %08X, but the slot truly held %08X before the"
+              " store -- value fidelity FAILS", w->pre_value, before_value);
+
+        /* THE `post` VALUE IS THE TRUE AFTER-VALUE, and it is a DIFFERENT number from `pre`, so a
+         * handler that echoed one field into the other is caught here. */
+        if (s) {
+            CHECK(s->pre_value == before_value,
+                  "the STEP record's pre is %08X, expected the true before-value %08X",
+                  s->pre_value, before_value);
+            CHECK(s->post_value == after_value,
+                  "THE INSTRUMENT'S post IS WRONG: recorded %08X, but the slot truly held %08X after"
+                  " the store -- value fidelity FAILS", s->post_value, after_value);
+            CHECK(s->post_value != s->pre_value,
+                  "the STEP record has pre == post (%08X): `pre` was read AFTER the store executed,"
+                  " so it is not a pre-value at all", s->post_value);
+        }
+
+        /* THE CROSS-VALIDATION, ON THIS VERY EVENT. The instrument's own read (above) and the
+         * guest-translation read (here) cover the same address; they must agree, and they must agree
+         * with what the memory actually holds. */
+        CHECK(*guest_slot == (s ? s->post_value : after_value),
+              "CROSS-VALIDATION: the guest's translation reads %08X but the instrument recorded"
+              " post=%08X -- the two readers of one address DISAGREE", *guest_slot,
+              s ? s->post_value : 0u);
+    }
+    printf("  [fixture] value-fidelity: pre and post are the TRUE before/after values, confirmed"
+           " against an independent guest-translation read\n");
+}
+
+/* ── 10. THE CAPACITY REPAIR: TRAFFIC COSTS NO RECORDS ───────────────────────────────────────────
+ *
+ * THE MEASURED DEFECT THIS REPAIRS. ON trial 1 recorded every page write AND its step, so each write
+ * cost TWO of 256 records; 129 writes exhausted the buffer, the fail-closed path fired (correctly
+ * refusing to turn a lost write into a silent absence), and the propagated fault ENDED THE RUN.
+ *
+ * THE REPAIR IS THE PACKET'S OWN DESIGN, AND THIS IS THE FIXTURE THAT PROVES IT IS IMPLEMENTED:
+ * non-slot page writes are TRAFFIC -- counted, and censused by FIRST TOUCH -- and publish no
+ * per-write record. So N non-slot writes to DISTINCT addresses cost at most N census entries and
+ * ZERO event records, and N non-slot writes to the SAME address cost ZERO records and ZERO census
+ * entries after the first.
+ *
+ * ⚠ WHAT WOULD MAKE THIS FIXTURE VACUOUS, AND HOW IT IS AVOIDED. If the stores silently did not
+ * fault -- because the page had been left open by an earlier fixture -- then "no records" would be
+ * trivially true and would prove nothing. So the fault count is asserted to rise by exactly N, which
+ * is what makes "and yet no records were consumed" a real statement about the DESIGN rather than
+ * about a page that was never protected. */
+static void fixture_traffic_capacity(void)
+{
+    XboxA2hSlotwLedger *L = xbox_A2hSlotWatchFixtureLedger();
+    uint32_t records_before, count_before;
+    uint64_t av_before, traffic_before, distinct_before;
+    const unsigned N = 64;
+    unsigned i;
+
+    current_fixture = "traffic-capacity";
+
+    /* (a) N DISTINCT non-slot offsets: each must fault, each must be counted, and the event array
+     *     must gain NOTHING while the first-touch census gains at most N entries. */
+    records_before = L->event_count;
+    count_before = L->first_touch_count;
+    av_before = L->loss.relevant_av;
+    traffic_before = L->loss.nonslot_writes;
+    distinct_before = L->loss.nonslot_distinct;
+
+    for (i = 0; i < N; i++) {
+        /* Offsets chosen to be inside the page and NOT the slot: the low half of the page, stepping
+         * by 4 from the base, which is the same shape as the observed linear fill. */
+        uint32_t off = (i * 4u) & 0x7FFu;
+        if (off == (st.slot_va & (XBOX_A2H_SLOTW_PAGE_SIZE - 1))) continue;
+        *(volatile uint32_t *)((char *)st.page0 + off) = 0x11110000u + i;
+    }
+
+    printf("  [fixture] traffic-capacity: %u distinct non-slot writes -> events +%u (was %u),"
+           " traffic +%llu, distinct +%llu, census +%u\n", N,
+           L->event_count - records_before, records_before,
+           (unsigned long long)(L->loss.nonslot_writes - traffic_before),
+           (unsigned long long)(L->loss.nonslot_distinct - distinct_before),
+           L->first_touch_count - count_before);
+
+    CHECK(L->loss.relevant_av == av_before + N,
+          "only %llu of %u non-slot stores faulted: the page was NOT protected, so this fixture"
+          " would prove nothing about capacity",
+          (unsigned long long)(L->loss.relevant_av - av_before), N);
+    CHECK(L->loss.nonslot_writes == traffic_before + N,
+          "the traffic counter moved by %llu, expected %u",
+          (unsigned long long)(L->loss.nonslot_writes - traffic_before), N);
+    /* ⚠ THE ACTUAL REPAIR, ASSERTED. THIS IS THE LINE THAT WOULD HAVE FAILED BEFORE IT. */
+    CHECK(L->event_count == records_before,
+          "TRAFFIC CONSUMED %u EVENT RECORDS (was %u, now %u): non-slot page writes are still being"
+          " retained as records, which is the defect that ended ON trial 1",
+          L->event_count - records_before, records_before, L->event_count);
+    CHECK(L->first_touch_count <= count_before + N,
+          "the first-touch census grew by %u for %u distinct addresses: it is not one-per-address",
+          L->first_touch_count - count_before, N);
+
+    /* (b) REPEATS COST NOTHING AT ALL -- not a record and not a census entry. This is what makes a
+     *     long linear fill harmless rather than merely survivable. */
+    {
+        uint32_t records2 = L->event_count, census2 = L->first_touch_count;
+        uint64_t av2 = L->loss.relevant_av;
+        for (i = 0; i < N; i++)
+            *(volatile uint32_t *)page_other = 0x22220000u + i;
+        CHECK(L->loss.relevant_av == av2 + N, "the repeat stores did not all fault");
+        CHECK(L->event_count == records2,
+              "REPEAT traffic consumed %u event records", L->event_count - records2);
+        CHECK(L->first_touch_count == census2,
+              "a REPEAT touch of an already-censused address added %u census entries",
+              L->first_touch_count - census2);
+        printf("  [fixture] traffic-capacity: %u REPEAT writes to one address -> events +0,"
+               " census +0\n", N);
+    }
+
+    /* (c) THE SLOT STILL GETS ITS FULL RECORD. The repair must not have silenced the thing the
+     *     instrument exists to record: a slot write still publishes the write record AND the step
+     *     record, which is what carries the values. */
+    {
+        uint32_t records3 = L->event_count;
+        uint64_t hits3 = L->loss.slot_hits;
+        *(volatile uint32_t *)slot_ptr = 0x33334444u;
+        CHECK(L->loss.slot_hits == hits3 + 1, "a slot store was not counted as a slot hit");
+        CHECK(L->event_count == records3 + 2,
+              "a SLOT store published %u records, expected 2 (the write and its step): the repair"
+              " has silenced the slot, not just the traffic", L->event_count - records3);
+        printf("  [fixture] traffic-capacity: a SLOT store still publishes 2 records (write+step)"
+               " while %u traffic writes published 0\n", N * 2);
+    }
+
+    /* (d) THE FAIL-CLOSED PATH IS STILL ARMED. It must not fire on traffic volume -- asserted above
+     *     -- but it must still exist for a genuinely full array. Checked here as a fact about the
+     *     latch rather than by exhausting 1024 records: `event_overflow` stays clear through all of
+     *     the traffic above, which is the "cannot fire on ordinary volume" half of the claim. */
+    CHECK(L->event_overflow == 0,
+          "the event overflow latch is SET after traffic alone: the fail-closed path fires on"
+          " ordinary page volume");
+    CHECK(L->loss.dropped_events == 0,
+          "%llu records were dropped during traffic alone",
+          (unsigned long long)L->loss.dropped_events);
+    printf("  [fixture] traffic-capacity: overflow latch clear, dropped=0 -- traffic cannot reach"
+           " the fail-closed path\n");
+}
+
 /* ── THE GATE-OFF CONTROL ────────────────────────────────────────────────────────────────────── */
 static void fixture_gate_off(void)
 {
@@ -789,6 +1071,9 @@ int main(int argc, char **argv)
     fixture_info0_filter();
     fixture_slot_vs_page();
     fixture_encoding_classifier();
+    fixture_address_identity();     /* Q3(c): instrument and guest read the SAME dword */
+    fixture_value_fidelity();       /* Q3(b): pre/post are the TRUE before/after values */
+    fixture_traffic_capacity();     /* TASK 1: traffic costs no records; slot still gets two */
     fixture_db_ownership();
     fixture_fourth_read_latch();
 

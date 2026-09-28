@@ -2726,6 +2726,10 @@ static RECOMP_TLS uint32_t s_a2h_slotw_pending_alias = 0;
 static RECOMP_TLS uint32_t s_a2h_slotw_pending_slot = 0;
 static RECOMP_TLS uint32_t s_a2h_slotw_pending_pre = 0;
 static RECOMP_TLS uint32_t s_a2h_slotw_pending_seq = 0;
+/* THE ADDRESS THE OPERATING SYSTEM REPORTED FOR THIS FAULT. Kept so the step handler can compare the
+ * OS's own report against the address this facility computes for its post-value read: for a slot
+ * store the two must be the SAME HOST ADDRESS, and that agreement is the Q3(c) cross-validation. */
+static RECOMP_TLS uint32_t s_a2h_slotw_pending_fault = 0;
 
 static int a2h_slotw_on(void)
 {
@@ -2741,7 +2745,19 @@ static uint32_t a2h_slotw_next_seq(void)
 
 /* Publish one FULL record. Returns 1 when the record is in the ledger, 0 when the bounded array is
  * full -- in which case the overflow latch is set and the caller must NOT treat the write as
- * unobserved. A full record per event, never a sample and never first-N. */
+ * unobserved. A full record per event, never a sample and never first-N.
+ *
+ * ⚠ WHAT CALLS THIS, AND WHAT NO LONGER DOES. The packet's design admits detailed records for
+ * exactly two things: SLOT BYTE writes (the fault record and its step record, which together carry
+ * the slot's before/after values) and the FIRST-TOUCH census. A write to the watched page whose
+ * effective address is not the slot CANNOT CHANGE THE SLOT; the packet calls it TRAFFIC and requires
+ * it COUNTED, not transcribed. ON trial 1 recorded every page write and its step, so 129 writes
+ * consumed 258 of 256 records and the fail-closed path ended the run on ordinary volume. Traffic now
+ * takes a2h_slotw_note_traffic() below and consumes no record at all after the page is first walked.
+ *
+ * THE FAIL-CLOSED PATH IS UNCHANGED AND IS NOT WEAKENED: this still returns 0 when the array is
+ * full, and the caller still leaves the page CLOSED and lets the fault propagate. What changed is
+ * that ordinary page traffic can no longer reach the array. */
 static int a2h_slotw_publish(uint32_t kind, uint32_t alias_index, uint32_t slot_hit,
                              uint32_t fault_va, uint32_t pre_value, uint32_t post_value,
                              uint64_t rip, uint32_t enc)
@@ -2772,6 +2788,74 @@ static int a2h_slotw_publish(uint32_t kind, uint32_t alias_index, uint32_t slot_
     L->events[slot].kind = kind;
     L->events[slot].seq = seq;          /* LAST: the record becomes visible here */
     return 1;
+}
+
+/* ── TRAFFIC: COUNTED, NOT RECORDED ────────────────────────────────────────────────────────────
+ *
+ * A write to the watched page at an address that is NOT the slot cannot change the slot. The packet
+ * is explicit that these are TRAFFIC and that they are counted; retaining them as records was the
+ * implementation's violation of its own design and the direct cause of the ON-trial-1 overflow.
+ *
+ * WHAT IS KEPT, AND WHY IT IS NOT "NOTHING". The packet also requires a FIRST-TOUCH CENSUS: the SET
+ * of addresses the page's traffic has touched, each recorded ONCE, with the value that was there
+ * before the first touch. That is what makes the census informative about the fill without being a
+ * transcript of it -- and it is why a linear fill costs ONE record per DISTINCT dword and ZERO for
+ * every repeat. `loss.nonslot_writes` remains the uncapped multiplicity.
+ *
+ * ⚠ "FIRST TOUCH" MEANS FIRST TOUCH **OF THAT ADDRESS**, AND THE FIRST VERSION GOT THIS WRONG. It
+ * claimed a census entry unconditionally, so 64 writes to one address produced 64 entries: a census
+ * of WRITES wearing the name of a census of ADDRESSES. The fixture's repeat arm caught it. The
+ * address must therefore be LOOKED UP before an entry is claimed -- and the lookup is a linear scan
+ * because the table is small, is written once per address, and is only ever walked by a thread that
+ * has just taken a fault. A hash would add a failure mode (collisions, resizing) to save time on a
+ * path that has already paid for an exception.
+ *
+ * CONCURRENCY: the scan and the claim are not one atomic step, so two threads first-touching the
+ * SAME address concurrently can each add an entry. That is a bounded, benign duplication -- the
+ * census stays a SET for the reader (duplicates carry the same offset) and the count is reported
+ * alongside `nonslot_distinct` so a reader can see it. It never loses a touch, which is the property
+ * that matters: a missing entry would make a touched address look untouched. */
+static void a2h_slotw_note_traffic(uint32_t alias_index, uint32_t fault_va, uint32_t offset,
+                                   uint32_t pre_at_fault, uint32_t slot_value, uint64_t rip,
+                                   uint32_t enc)
+{
+    XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+    LONG slot;
+    uint32_t i, seen = L->first_touch_count;
+
+    /* `loss.nonslot_writes` is NOT incremented here: the fault handler counts it alongside
+     * `slot_hits`, so every relevant AV is classified exactly once. Incrementing it in both places
+     * would double every traffic write, and the fixture's `+N` assertion is what would catch it. */
+    /* ALREADY CENSUSED? Then this is a repeat touch of a known address: it costs NOTHING -- no
+     * entry, no allocation, no overflow risk. This is the arm that makes a long linear fill
+     * harmless rather than merely survivable. */
+    for (i = 0; i < seen && i < XBOX_A2H_SLOTW_FIRST_TOUCH_MAX; i++) {
+        if (L->first_touch[i].valid && L->first_touch[i].offset == offset
+                && L->first_touch[i].alias_index == alias_index)
+            return;
+    }
+    A2H_SLOTW_INC64(&L->loss.nonslot_distinct);
+    slot = InterlockedIncrement((volatile LONG *)&L->first_touch_count) - 1;
+    if (slot < 0 || slot >= XBOX_A2H_SLOTW_FIRST_TOUCH_MAX) {
+        /* A LATCH, and only for the census -- a first touch beyond the census capacity costs the
+         * CENSUS's completeness, never the write's coverage: the write was still protected, still
+         * faulted, and is still counted in `nonslot_writes`. It is not silently dropped. */
+        InterlockedExchange((volatile LONG *)&L->first_touch_overflow, 1);
+        A2H_SLOTW_INC64(&L->loss.first_touch_overflow);
+        A2H_SLOTW_INC64(&L->loss.first_touch_dropped);
+        A2H_SLOTW_SET64(&L->loss.overflow, 1);
+        return;
+    }
+    L->first_touch[slot].offset = offset;
+    L->first_touch[slot].alias_index = alias_index;
+    L->first_touch[slot].tid = (uint32_t)GetCurrentThreadId();
+    L->first_touch[slot].pre_value = pre_at_fault;
+    L->first_touch[slot].slot_value_at_touch = slot_value;
+    L->first_touch[slot].enc = enc;
+    L->first_touch[slot].reserved = 0;
+    L->first_touch[slot].rip = rip;
+    L->first_touch[slot].ticks = (uint64_t)GetTickCount64();
+    InterlockedExchange((volatile LONG *)&L->first_touch[slot].valid, 1);   /* LAST */
 }
 
 /* Classify the FAULTING INSTRUCTION from the bytes at the recorded native RIP.
@@ -2857,14 +2941,67 @@ static void a2h_slotw_service_own(PEXCEPTION_POINTERS ep)
     post = *(volatile uint32_t *)(base + (a2h_slotw_slot_va() & (XBOX_A2H_SLOTW_PAGE_SIZE - 1)));
 
     A2H_SLOTW_INC64(&L->loss.steps);
-    if (!a2h_slotw_publish(A2H_SLOTW_EV_STEP, alias, s_a2h_slotw_pending_slot,
-                           (uint32_t)(base + (a2h_slotw_slot_va()
-                                             & (XBOX_A2H_SLOTW_PAGE_SIZE - 1))),
-                           s_a2h_slotw_pending_pre, post,
-                           (uint64_t)ep->ContextRecord->Rip, XBOX_A2H_SLOTW_ENC_UNKNOWN)) {
-        /* The step record is lost. The page is STILL closed below, because leaving it open would
-         * convert a bounded loss into an unbounded one -- and the overflow latch already marks
-         * every absence/order row invalid. */
+
+    /* ── A STEP RECORD IS A SLOT-BYTE RECORD, AND ONLY THAT ──────────────────────────────────────
+     *
+     * The step of a TRAFFIC write is housekeeping: the page must be re-protected and the step
+     * counted, but no slot byte changed, so the packet's design gives it no record. Publishing one
+     * anyway is what made a page write cost TWO records on ON trial 1 and exhausted the buffer.
+     * `loss.steps` and `loss.rearm_ok` still count every step, so the re-arm coverage claim is
+     * unchanged and remains uncapped. */
+    if (s_a2h_slotw_pending_slot) {
+        /* ── Q3(c), HALF ONE: THE STRUCTURAL ADDRESS INVARIANT ───────────────────────────────────
+         *
+         * The fault handler was handed `fault` BY THE OPERATING SYSTEM; the step handler computes
+         * where to read the post value ITSELF. For a slot store both must name the SAME HOST
+         * ADDRESS, so this asserts that the pending state round-tripped the OS's report intact and
+         * that `a2h_slotw_slot_va()` did not move between the fault and its step.
+         *
+         * ⚠ THIS HALF IS STRUCTURAL AND NEARLY TAUTOLOGICAL, AND SAYING SO IS THE POINT. Both sides
+         * derive from `g_a2h_slotw_pages[alias-1] + (slot_va & 0xFFF)`, so it can only fail if the
+         * pending state or the arm moved underneath the step. It is kept because that failure mode
+         * is real (a re-arm, a re-scope, a corrupted TLS word) and cheap to exclude -- NOT because it
+         * is the overlap control.
+         *
+         * ⚠ THE OVERLAP CONTROL IS HALF TWO, AND IT IS IN xbox_A2hSlotWatchTerminal(): the
+         * instrument's read of the slot through its CACHED RAW ALIAS POINTER against the guest's own
+         * read of the same dword through `g_xbox_mem_offset`. Those are two genuinely different
+         * address computations for one physical dword, which is the property that caught the
+         * byte-order trap. A disagreement there is an instrument bug and fails closed. */
+        uint32_t read_va = (uint32_t)(base + (a2h_slotw_slot_va()
+                                              & (XBOX_A2H_SLOTW_PAGE_SIZE - 1)));
+        A2H_SLOTW_INC64(&L->loss.cross_checks);
+        if (read_va != s_a2h_slotw_pending_fault) {
+            InterlockedIncrement((volatile LONG *)&L->cross_mismatch);
+            A2H_SLOTW_INC64(&L->loss.cross_mismatch);
+            A2H_SLOTW_SET64(&L->loss.overflow, 1);
+            fprintf(stderr, "  [A2HSLOTW] CROSS-VALIDATION MISMATCH: the OS reported the fault at"
+                            " %08X but this facility read the post-value at %08X (alias=%u"
+                            " slot=%08X) -- INSTRUMENT BUG, failing closed\n",
+                    s_a2h_slotw_pending_fault, read_va, alias, a2h_slotw_slot_va());
+            fflush(stderr);
+        } else {
+            InterlockedIncrement((volatile LONG *)&L->cross_checks);
+        }
+        L->last_slot_read_value = post;
+        L->last_slot_read_seq = (uint32_t)g_a2h_slotw_seq;
+        L->last_slot_read_alias = alias;
+        /* The positive half of value fidelity: a facility that reported every store as a no-op would
+         * leave this at 0, and a reader would then see that the value fields were never exercised
+         * rather than trusting them. */
+        if (post != s_a2h_slotw_pending_pre)
+            L->last_slot_change_seen = 1;
+        /* THE GUARD THAT MAKES HALF TWO SOUND: the slot-hit count AT the moment of this read. A
+         * later reader that finds the count unchanged knows no slot write landed between this read
+         * and its own, so the two cover the same value and must agree. */
+        L->last_slot_read_hits = (uint32_t)L->loss.slot_hits;
+        if (!a2h_slotw_publish(A2H_SLOTW_EV_STEP, alias, s_a2h_slotw_pending_slot,
+                               read_va, s_a2h_slotw_pending_pre, post,
+                               (uint64_t)ep->ContextRecord->Rip, XBOX_A2H_SLOTW_ENC_UNKNOWN)) {
+            /* The step record is lost. The page is STILL closed below, because leaving it open would
+             * convert a bounded loss into an unbounded one -- and the overflow latch already marks
+             * every absence/order row invalid. */
+        }
     }
 
     /* RE-PROTECT. A failure here leaves the page OPEN, which is a coverage hole and is counted as
@@ -2881,6 +3018,7 @@ static void a2h_slotw_service_own(PEXCEPTION_POINTERS ep)
     s_a2h_slotw_pending_slot = 0;
     s_a2h_slotw_pending_pre = 0;
     s_a2h_slotw_pending_seq = 0;
+    s_a2h_slotw_pending_fault = 0;
     A2H_SLOTW_INC64(&L->loss.db_own_serviced);
 }
 
@@ -2937,7 +3075,7 @@ static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
     /* ── THE WRITE FAULT ─────────────────────────────────────────────────────────────────────── */
     if (code == EXCEPTION_ACCESS_VIOLATION) {
         uintptr_t fault;
-        uint32_t alias, enc, pre, slot_hit, slot_va, off;
+        uint32_t alias, enc, pre, pre_at_fault, slot_hit, slot_va, off, fault_off;
         DWORD old;
 
         /* `ExceptionInformation[0] == 1` is the belt-and-suspenders filter the preflight requires to
@@ -2973,19 +3111,50 @@ static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
             A2H_SLOTW_INC64(&L->loss.concurrent_overlap);
         }
 
+        /* TWO DIFFERENT READS, TWO DIFFERENT MEANINGS -- AND BOTH ARE NEEDED.
+         *
+         * `pre` is THE SLOT'S value at the fault, read at the faulting alias's page base plus the
+         * SLOT's offset. `off` derives from `slot_va`, NOT from `fault`, so `pre` is alias-consistent
+         * and is the slot's pre-write value whichever alias the store arrived through. That is by
+         * design (Q3(a)) and is not changed here.
+         *
+         * `pre_at_fault` is the value at the FAULTING ADDRESS. It is a different field with a
+         * different meaning, and it is what the first-touch census records -- "what was at the
+         * address this fill touched, before the fill touched it". Conflating the two is the naming
+         * ambiguity the Q3(a) record had to resolve, so they are kept apart by name and by record. */
         pre = *(volatile uint32_t *)((uintptr_t)g_a2h_slotw_pages[alias - 1] + off);
+        fault_off = (uint32_t)(fault & (XBOX_A2H_SLOTW_PAGE_SIZE - 1));
+        pre_at_fault = *(volatile uint32_t *)((uintptr_t)g_a2h_slotw_pages[alias - 1] + fault_off);
         enc = a2h_slotw_classify_store((uint64_t)ep->ContextRecord->Rip);
 
-        /* PUBLISH FIRST. The record is written BEFORE the page is opened: a page opened without a
-         * published record could absorb a concurrent write that is then neither recorded nor the
-         * first touch. If publication fails the page is left CLOSED and the fault propagates. */
-        if (!a2h_slotw_publish(A2H_SLOTW_EV_WRITE, alias, slot_hit, (uint32_t)fault, pre, 0,
-                               (uint64_t)ep->ContextRecord->Rip, enc)) {
-            A2H_SLOTW_INC64(&L->loss.publish_failed);
-            fprintf(stderr, "  [A2HSLOTW] write NOT published alias=%u fault=%p -- page left CLOSED"
-                            " (coverage failure)\n", alias, (void *)fault);
-            fflush(stderr);
-            return EXCEPTION_CONTINUE_SEARCH;
+        /* ── THE PACKET'S OWN DESIGN: TRAFFIC IS COUNTED, SLOT BYTES ARE RECORDED ────────────────
+         *
+         * A write to the watched page that is NOT the slot cannot change the slot. ON trial 1
+         * recorded every such write AND its step, so 129 page writes consumed 258 of 256 records,
+         * the bounded array overflowed, and the fail-closed path -- correctly refusing to convert a
+         * lost write into a silent absence -- ended the run on ordinary traffic volume.
+         *
+         * The repair is the packet's design, not a larger buffer: non-slot writes move the uncapped
+         * counters and at most ONE first-touch census record per distinct address, and publish no
+         * per-write record at all. A page-write stream of any length now consumes no records once
+         * the page has been walked. */
+        if (slot_hit) {
+            /* PUBLISH FIRST. The record is written BEFORE the page is opened: a page opened without
+             * a published record could absorb a concurrent write that is then neither recorded nor
+             * the first touch. If publication fails the page is left CLOSED and the fault
+             * propagates. THIS IS THE FAIL-CLOSED PATH, AND IT IS UNCHANGED -- what changed is that
+             * only writes that can actually change the slot can reach it. */
+            if (!a2h_slotw_publish(A2H_SLOTW_EV_WRITE, alias, slot_hit, (uint32_t)fault, pre, 0,
+                                   (uint64_t)ep->ContextRecord->Rip, enc)) {
+                A2H_SLOTW_INC64(&L->loss.publish_failed);
+                fprintf(stderr, "  [A2HSLOTW] write NOT published alias=%u fault=%p -- page left"
+                                " CLOSED (coverage failure)\n", alias, (void *)fault);
+                fflush(stderr);
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+        } else {
+            a2h_slotw_note_traffic(alias, (uint32_t)fault, fault_off, pre_at_fault, pre,
+                                   (uint64_t)ep->ContextRecord->Rip, enc);
         }
 
         /* THE REQUIRED POSITIVE CONTROL. The installer's own ENCODING, on the derived slot. Its
@@ -3018,6 +3187,7 @@ static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
         s_a2h_slotw_pending_slot = slot_hit;
         s_a2h_slotw_pending_pre = pre;
         s_a2h_slotw_pending_seq = (uint32_t)g_a2h_slotw_seq;
+        s_a2h_slotw_pending_fault = (uint32_t)fault;
         InterlockedExchange(&g_a2h_slotw_step_owner, (LONG)GetCurrentThreadId());
         ep->ContextRecord->EFlags |= 0x100u;      /* step exactly the one faulting store */
         return EXCEPTION_CONTINUE_EXECUTION;
@@ -3099,8 +3269,31 @@ uint32_t xbox_A2hSlotWatchArm(void)
         size_t map_size = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
 
         if (i == 0) {
+            /* ⚠⚠ THE CANONICAL ALIAS IS `va + g_memory_offset`, AND THE OLD FORMULA HERE WAS WRONG.
+             *
+             * This used to read `g_memory_base + (slot - XBOX_BASE_ADDRESS)`, i.e. it assumed
+             * g_memory_base was the host address OF GUEST VA 0x10000. It is not: g_memory_base is the
+             * host address of XBOX_MAP_START (0), because `g_memory_offset = g_memory_base -
+             * XBOX_MAP_START`. The loader's own log states the ground truth unambiguously --
+             * `XBE header: 2440 bytes at 0x0000000000020000 (Xbox VA 0x00010000)` -- so guest VA V
+             * lives at host `V + g_memory_offset`, which is exactly what `XBOX_PTR` computes for the
+             * guest's own `MEM32()`.
+             *
+             * MEASURED CONSEQUENCE OF THE OLD FORMULA: with g_memory_offset = 0x10000 the canonical
+             * alias was protected 64 KiB BELOW the slot -- guest page 0x0018D000 instead of
+             * 0x0019D000. The watch therefore faulted on, read, and recorded a page the title never
+             * writes the slot to. It could not have reported a slot hit, and its `pre`/`post` values
+             * described a different dword. The 28 mirror aliases were already correct, which is why
+             * the coverage claim looked healthy while the canonical view -- the one a sub-64 MB guest
+             * VA actually uses -- was pointed at the wrong page.
+             *
+             * The Q3(c) address-identity fixture is what caught this, and it is the reason that
+             * fixture exists: the instrument and the guest must be shown to read the SAME dword, not
+             * assumed to. Nothing about the TARGET changes -- the slot is still
+             * `MEM32(0x19DCE0) + 0x242C`, still derived by checked addition, still slot-keyed. This
+             * only makes the page the watch protects the page that VA is actually in. */
             gva = (uint64_t)slot;
-            host = (uintptr_t)g_memory_base + (uintptr_t)(slot - XBOX_BASE_ADDRESS);
+            host = (uintptr_t)slot + (uintptr_t)g_memory_offset;
         } else {
             if (!g_mirror_views[i - 1]) continue;      /* not mapped: accounted, not assumed */
             guest_lo = (uint64_t)i * map_size;
@@ -3210,6 +3403,63 @@ void xbox_A2hSlotWatchTerminal(uint32_t target)
     L->terminal_target = target;
     L->terminal_seen = 1;
     L->terminal_ticks = (uint64_t)GetTickCount64();
+
+    /* ── Q3(c), HALF TWO: THE OVERLAP CONTROL, AND IT IS THE ONE THAT MATTERS ─────────────────────
+     *
+     * TWO INDEPENDENT ADDRESS COMPUTATIONS, ONE PHYSICAL DWORD, READ BACK TO BACK:
+     *
+     *   (a) THIS FACILITY'S CACHED ALIAS READ -- `g_a2h_slotw_pages[0] + (arm_slot & 0xFFF)`. That
+     *       base was captured ONCE at ARM and has been used for every fault record and every step
+     *       read since. If it is stale, wrong, or was computed from the wrong alias, every value the
+     *       instrument published is wrong and nothing else in the ledger would show it.
+     *   (b) THE GUEST'S OWN TRANSLATION -- `arm_slot + g_memory_offset`, which is exactly what
+     *       `MEM32(slot_va)` computes in the generated code (`XBOX_PTR`), re-derived here rather
+     *       than cached.
+     *
+     * THESE MUST AGREE. A disagreement is an INSTRUMENT BUG: it is counted, the overflow latch is
+     * set (invalidating absence/order rows), and it is printed. This is the check the Advisor
+     * requires, and it is the same shape as the control that caught the byte-order trap.
+     *
+     * THE QUIET-WINDOW GUARD APPLIES HERE TOO. A slot write landing between the two reads would make
+     * them legitimately differ, so the slot-hit count is sampled either side and the comparison is
+     * made only when it did not move; otherwise the pair is counted SKIPPED, never as agreement. */
+    if (g_a2h_slotw_armed && g_a2h_slotw_pages[0] && L->slot_stable) {
+        uint32_t hits_before = (uint32_t)L->loss.slot_hits;
+        uint32_t via_alias = *(volatile uint32_t *)((uintptr_t)g_a2h_slotw_pages[0]
+                                  + (L->arm_slot & (XBOX_A2H_SLOTW_PAGE_SIZE - 1)));
+        uint32_t via_guest = *(volatile uint32_t *)((uintptr_t)L->arm_slot
+                                  + (uintptr_t)g_memory_offset);
+        uint32_t hits_after = (uint32_t)L->loss.slot_hits;
+
+        L->terminal_alias_value = via_alias;
+        L->terminal_guest_value = via_guest;
+        if (hits_before != hits_after) {
+            A2H_SLOTW_INC64(&L->loss.cross_skipped);
+            L->terminal_cross_ok = 0;      /* NOT compared: the window was not quiet */
+        } else {
+            A2H_SLOTW_INC64(&L->loss.cross_checks);
+            InterlockedIncrement((volatile LONG *)&L->cross_checks);
+            if (via_alias != via_guest) {
+                InterlockedIncrement((volatile LONG *)&L->cross_mismatch);
+                A2H_SLOTW_INC64(&L->loss.cross_mismatch);
+                A2H_SLOTW_SET64(&L->loss.overflow, 1);
+                L->terminal_cross_ok = 0;
+                fprintf(stderr, "  [A2HSLOTW] CROSS-VALIDATION MISMATCH at TERMINAL: the cached"
+                                " alias read gives %08X but the guest's own translation of %08X gives"
+                                " %08X -- INSTRUMENT BUG, failing closed\n",
+                        via_alias, L->arm_slot, via_guest);
+                fflush(stderr);
+            } else {
+                L->terminal_cross_ok = 1;
+            }
+        }
+        fprintf(stderr, "  [A2HSLOTW] cross-validation terminal slot=%08X alias=%08X guest=%08X"
+                        " agree=%u hits_quiet=%u\n",
+                L->arm_slot, via_alias, via_guest, L->terminal_cross_ok,
+                hits_before == hits_after ? 1u : 0u);
+        fflush(stderr);
+    }
+
     fprintf(stderr, "  [A2HSLOTW] terminal base=%08X base_ok=%u slot=%08X target=%08X stable=%u"
                     " reads=%u fourth=%u(%08X)\n",
             base, base_ok, slot, target, L->slot_stable, L->read_count, L->fourth_reached,
@@ -3271,6 +3521,112 @@ void xbox_A2hSlotWatchNoteFourthRead(uint32_t value, uint32_t read_index)
 int xbox_A2hSlotWatchEnabled(void)
 {
     return a2h_slotw_on();
+}
+
+/* ── Q3(c): CROSS-VALIDATION WHERE THE FAULT RECORD AND A HOOK READ OVERLAP ──────────────────────
+ *
+ * THE OVERLAP, STATED PRECISELY. Two INDEPENDENT address computations cover the same physical dword:
+ *
+ *   (1) THE FAULT RECORD'S READ -- `a2h_slotw_service_own()` reads the slot through the faulting
+ *       alias's RAW HOST PAGE BASE, `g_a2h_slotw_pages[alias-1] + (slot_va & 0xFFF)`, and publishes
+ *       it as the STEP record's post_value and as `last_slot_read_value`. That base was captured at
+ *       ARM and cached; nothing re-derives it per event.
+ *   (2) THE GUEST'S OWN READ -- `MEM32(slot_va)` in the game's generated code, which goes through
+ *       `g_xbox_mem_offset` and the canonical view, re-derived on every access.
+ *
+ * Those are different arithmetic on different bases for one dword. If they disagree, one of them is
+ * reading the wrong place, and every value the instrument publishes is suspect -- which is exactly
+ * the class of defect that the byte-order trap was, and why the Advisor requires this structurally.
+ *
+ * ⚠ WHAT MAKES THE COMPARISON SOUND RATHER THAN RACY. A concurrent slot write would make the two
+ * readers legitimately disagree. So the guard is `last_slot_read_hits`: the instrument's slot-hit
+ * count at the moment it published `last_slot_read_value`. A caller reads the pair, performs its own
+ * read, then reads the count again:
+ *
+ *   * count UNCHANGED -> no slot write landed across the caller's window, so both readers cover the
+ *     same value at the same time. The values MUST agree, and a disagreement is an INSTRUMENT BUG.
+ *   * count MOVED -> the window was not quiet. The pair is counted as SKIPPED, never as agreement,
+ *     so "no comparison" can never be read as "agreement".
+ *
+ * ⚠ A DISAGREEMENT IS FAIL-CLOSED: `cross_mismatch` is incremented, `loss.overflow` is latched
+ * (which invalidates absence/order rows), it is printed, and this returns 0. The caller must treat 0
+ * as a failure. Nothing here changes guest state.
+ *
+ * `guest_va` must be the slot the caller actually read. A caller that read some other address is
+ * comparing two different things, so it is SKIPPED and counted as such rather than passed. */
+int xbox_A2hSlotWatchCrossCheck(uint32_t guest_va, uint32_t fault_record_value, uint32_t hook_value)
+{
+    XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+
+    if (!L->magic || !g_a2h_slotw_armed)
+        return 1;                    /* nothing armed: nothing to cross-validate */
+
+    if (guest_va != L->arm_slot) {
+        A2H_SLOTW_INC64(&L->loss.cross_skipped);
+        return 1;
+    }
+    /* ⚠ ONLY CANONICAL-ALIAS READS ARE COMPARABLE, AND THIS IS A MEASURED HOST PROPERTY RATHER THAN
+     * A CONVENIENCE. A slot write through a MIRROR view is read back through that mirror by design
+     * (the step handler's own comment explains why), and the toolkit's fixture MEASURED that on this
+     * host a store through mirror view 1 does NOT become visible in the canonical view. The guest's
+     * own read is canonical. So comparing a mirror read against a canonical one would report a host
+     * mapping property as an instrument disagreement -- and a check that fails closed on correct
+     * behaviour is worse than no check. Every other alias is counted SKIPPED, so the archive shows
+     * how many pairs were NOT comparable instead of implying they agreed. */
+    if (L->last_slot_read_alias != 1u) {
+        A2H_SLOTW_INC64(&L->loss.cross_skipped);
+        return 1;
+    }
+    if (fault_record_value != hook_value) {
+        InterlockedIncrement((volatile LONG *)&L->cross_mismatch);
+        A2H_SLOTW_INC64(&L->loss.cross_mismatch);
+        A2H_SLOTW_SET64(&L->loss.overflow, 1);
+        fprintf(stderr, "  [A2HSLOTW] CROSS-VALIDATION MISMATCH slot=%08X fault_record=%08X"
+                        " hook=%08X seq=%u -- the instrument's cached alias read and the guest's"
+                        " own translation DISAGREE: INSTRUMENT BUG, failing closed\n",
+                guest_va, fault_record_value, hook_value, L->last_slot_read_seq);
+        fflush(stderr);
+        return 0;
+    }
+    A2H_SLOTW_INC64(&L->loss.cross_checks);
+    InterlockedIncrement((volatile LONG *)&L->cross_checks);
+    return 1;
+}
+
+/* The slot VA this arm derived, for a caller that must read the SAME address the instrument reads.
+ * Returns 0 when unarmed, so a caller cannot accidentally cross-check against address zero. */
+uint32_t xbox_A2hSlotWatchSlotVa(void)
+{
+    return g_a2h_slotw_armed ? g_xbox_a2h_slotw.arm_slot : 0u;
+}
+
+/* The instrument's last published slot read, as a (value, seq, hit_count) triple. A caller reads the
+ * triple, performs its own read of the same address, then reads the hit count again: an unchanged
+ * count proves no slot write landed across its window, which is what makes the comparison a
+ * same-address same-time one rather than a race. Returns 1 when a read has been published. */
+int xbox_A2hSlotWatchLastSlotRead(uint32_t *out_value, uint32_t *out_seq, uint32_t *out_hits)
+{
+    XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+    if (!g_a2h_slotw_armed)
+        return 0;
+    if (out_value) *out_value = L->last_slot_read_value;
+    if (out_seq) *out_seq = L->last_slot_read_seq;
+    if (out_hits) *out_hits = L->last_slot_read_hits;
+    return 1;
+}
+
+/* The alias the instrument last read the slot through: 1 = canonical, m+1 = mirror m, 0 = none yet.
+ * The hook cross-validates only canonical reads; see xbox_A2hSlotWatchCrossCheck(). */
+uint32_t xbox_A2hSlotWatchLastSlotReadAlias(void)
+{
+    return g_a2h_slotw_armed ? g_xbox_a2h_slotw.last_slot_read_alias : 0u;
+}
+
+/* The instrument's slot-hit count right now. The caller reads it after its own read to decide
+ * whether its window was quiet; see xbox_A2hSlotWatchCrossCheck(). */
+uint32_t xbox_A2hSlotWatchSlotHits(void)
+{
+    return (uint32_t)g_xbox_a2h_slotw.loss.slot_hits;
 }
 
 /* ── THE FIXTURE SEAM ──────────────────────────────────────────────────────────────────────────
@@ -3386,7 +3742,7 @@ int xbox_A2hSlotWatchFixtureArmAc97(uint32_t page_va, void **out_page)
 
     if (!a2h_slotw_on() || !g_memory_base)
         return 0;
-    host = (void *)((uintptr_t)g_memory_base + (uintptr_t)(page_va - XBOX_BASE_ADDRESS));
+    host = (void *)((uintptr_t)page_va + (uintptr_t)g_memory_offset);
     if (!VirtualProtect(host, AC97_TRAP_BYTES, PAGE_READONLY, &old))
         return 0;
     g_ac97_page = host;

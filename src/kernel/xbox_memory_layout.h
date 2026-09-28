@@ -485,9 +485,23 @@ void xbox_A2hAliasCensusDisarm(void);
 #define XBOX_A2H_SLOTW_SLOT_OFFSET 0x242Cu       /* context+0x1C4 == software_device+0x242C */
 #define XBOX_A2H_SLOTW_PAGE_SIZE   4096u
 #define XBOX_A2H_SLOTW_PAGES_MAX   (1 + XBOX_NUM_MIRRORS)
-#define XBOX_A2H_SLOTW_EVENTS_MAX  256
+/* ⚠ CAPACITY, AND WHY IT IS NOT THE POINT. MEASURED: ON trial 1 exhausted a 256-record buffer with
+ * 129 page writes, because EVERY write consumed TWO records (the fault and its step), and the
+ * fail-closed propagation then ended the run. The repair is not "a bigger buffer": the packet's own
+ * design already says non-slot page writes are TRAFFIC, and traffic is COUNTED, not recorded. With
+ * that implemented, a page-write stream of any length consumes ZERO records here.
+ *
+ * The array is nonetheless enlarged, because "zero headroom" was itself part of the defect: 1024
+ * records is 512 slot writes plus their step records, and the observed run had 128 steps in a
+ * partial boot. A reader must never have to reason about the buffer filling on ordinary traffic,
+ * because ordinary traffic cannot reach it. */
+#define XBOX_A2H_SLOTW_EVENTS_MAX  1024
+/* The FIRST-TOUCH CENSUS: one bounded record per DISTINCT faulting address on the watched page,
+ * written once. This is the second and last class of detailed record the packet's design admits.
+ * 512 distinct dwords is one eighth of the 4 KiB page and is far above any observed touch count. */
+#define XBOX_A2H_SLOTW_FIRST_TOUCH_MAX 512
 #define XBOX_A2H_SLOTW_THREADS_MAX 64
-#define XBOX_A2H_SLOTW_VERSION     2u
+#define XBOX_A2H_SLOTW_VERSION     3u
 
 /* The required positive control, as an ENCODING signature rather than a guessed native address.
  *
@@ -514,18 +528,27 @@ void xbox_A2hAliasCensusDisarm(void);
 #define XBOX_A2H_SLOTW_INSTALL_VALUE 0x0015F9D0u   /* what the installer writes */
 #define XBOX_A2H_SLOTW_CANDIDATE_SIB 0x000003ECu   /* the candidate's SIB displacement */
 
-/* One bounded, full record per observed page write. Nothing here is sampled and nothing is
- * first-N: a full record is written for every fault until the capacity is reached, and the
- * overflow latch is set when it is exceeded. Overflow invalidates absence/order rows; it does not
- * invalidate a positive record, which stands on its own evidence. */
+/* One bounded, full record per SLOT-BYTE WRITE, plus the first-touch census below. Nothing here is
+ * sampled and nothing is first-N: a full record is written for every fault that can change the slot
+ * until the capacity is reached, and the overflow latch is set when it is exceeded. Overflow
+ * invalidates absence/order rows; it does not invalidate a positive record, which stands on its own
+ * evidence.
+ *
+ * ⚠ WHAT DOES **NOT** GET A RECORD, AND WHY THAT IS THE PACKET'S DESIGN RATHER THAN A SHORTCUT.
+ * A write to the watched page whose effective address is NOT the slot cannot change the slot. The
+ * packet calls those TRAFFIC and requires them COUNTED; retaining them as records is what exhausted
+ * the buffer on ON trial 1 (129 writes x 2 records > 256) and made the fail-closed path fire on
+ * ordinary volume. Traffic now moves `loss.nonslot_writes` (uncapped), `loss.nonslot_distinct`, and
+ * at most ONE first-touch census record per distinct address -- so a page-write stream of any length
+ * consumes no records at all after the page is first walked. */
 typedef struct {
     uint32_t seq;          /* ordered event id, monotonic from ARM; THE ordering key */
     uint32_t kind;         /* 1 write fault, 2 step re-arm, 3 fourth-read sample, 4 installer control */
     uint32_t alias_index;  /* 0 = canonical view, m+1 = mirror view m */
     uint32_t slot_hit;     /* 1 = the effective address IS the re-derived slot VA for this alias */
     uint32_t fault_va;     /* low 32 bits of the host fault address */
-    uint32_t pre_value;    /* canonical slot value BEFORE the store executed */
-    uint32_t post_value;   /* canonical slot value AFTER the store executed (step events only) */
+    uint32_t pre_value;    /* the SLOT's value BEFORE the store executed */
+    uint32_t post_value;   /* the SLOT's value AFTER the store executed (step events only) */
     uint32_t tid;          /* native thread id that took the fault */
     uint32_t enc;          /* XBOX_A2H_SLOTW_ENC_* classified from the bytes at rip */
     uint32_t reserved;
@@ -556,9 +579,40 @@ typedef struct {
     uint64_t db_dual_serviced;       /* #DB with BOTH owners pending: both serviced once */
     uint64_t read_samples;           /* instrumented fourth-read-path samples */
     uint64_t installer_control_hits; /* the required positive control fired */
+    uint64_t nonslot_distinct;       /* distinct page offsets touched (the first-touch census) */
+    uint64_t first_touch_overflow;   /* the first-touch census array is full (a LATCH) */
+    uint64_t first_touch_dropped;    /* first touches beyond the census capacity */
+    uint64_t cross_checks;           /* fault-record / step-read pairs compared */
+    uint64_t cross_mismatch;         /* of those, how many DISAGREED (0 required) */
+    uint64_t cross_skipped;          /* a cross-check was requested with nothing to compare */
     uint64_t overflow;               /* 1 = any bounded array overflowed (a LATCH, not a count) */
     uint64_t base_changed;           /* 1 = MEM32(0x19DCE0) moved between ARM and TERMINAL */
 } XboxA2hSlotwLoss;
+
+/* ── THE FIRST-TOUCH CENSUS ────────────────────────────────────────────────────────────────────
+ *
+ * One bounded record per DISTINCT faulting address on the watched page, claimed once. This is what
+ * replaces the per-write records for non-slot traffic: the packet asks for the page's touch SET and
+ * the count of touches, not a transcript of every one of them. A repeat touch of an address already
+ * in the census moves only the counter, so a linear fill of a million dwords costs a million
+ * counter increments and ZERO new records.
+ *
+ * `pre_value` is the value at THAT address before the first touch, read through the faulting alias.
+ * `slot_value_at_touch` is the SLOT's value at the same instant -- kept separate because the two are
+ * different fields with different meanings, and conflating them is the naming ambiguity the Q3(a)
+ * record had to resolve. */
+typedef struct {
+    uint32_t valid;          /* 1 = this census slot is claimed; written LAST */
+    uint32_t offset;         /* page offset of the touched dword (fault_va & 0xFFF) */
+    uint32_t alias_index;    /* which alias the first touch arrived through */
+    uint32_t tid;            /* native thread id that made the first touch */
+    uint32_t pre_value;      /* the value at THAT offset before the store */
+    uint32_t slot_value_at_touch; /* the SLOT's value at the same instant */
+    uint32_t enc;            /* XBOX_A2H_SLOTW_ENC_* classified from the bytes at rip */
+    uint32_t reserved;
+    uint64_t rip;            /* native instruction pointer of the first touch, verbatim */
+    uint64_t ticks;
+} XboxA2hSlotwFirstTouch;
 
 typedef struct {
     uint32_t magic;       /* 'A2SW' */
@@ -605,8 +659,66 @@ typedef struct {
     uint32_t last_write_value;  /* its post-value */
     uint64_t last_write_rip;
     uint64_t last_write_ticks;
+    /* THE STEP-READ / FAULT-RECORD CROSS-CHECK (Q3(c)). The step handler reads the slot back
+     * through the same alias the store used and reports that value in the STEP record's post_value;
+     * the fault handler read the slot's pre_value at the same instant through the same alias. For a
+     * store that lands ON the slot those two readings cover the SAME ADDRESS, so they must AGREE --
+     * this is the overlap the Advisor requires to be cross-validated, and it is the check that
+     * caught the byte-order trap on the older line.
+     *
+     * `cross_mismatch != 0` means the instrument's own two reads of one address disagreed, which is
+     * an INSTRUMENT BUG and fails the packet closed. `cross_checks` is the denominator, so "0
+     * mismatches" is never confused with "the check never ran". */
+    uint32_t cross_checks;      /* slot-hit fault/step pairs actually compared */
+    uint32_t cross_mismatch;    /* of those, how many DISAGREED (must be 0) */
+    uint32_t first_touch_count; /* first-touch census records written */
+    uint32_t first_touch_overflow;
+    /* THE LAST SLOT VALUE THIS INSTRUMENT READ, AND THE EVENT ID IT WAS READ AT. Published so an
+     * INDEPENDENT reader -- the game-side hook, which reaches the same guest address through the
+     * guest's own translation rather than through this facility's raw alias base -- can cross-check
+     * it. `last_slot_read_seq` is what makes the comparison sound: a hook that reads the pair,
+     * reads the slot, and finds the seq UNCHANGED knows no new slot read was published in its
+     * window, so the two readers cover the SAME address at the SAME time and must agree. Without
+     * the seq the comparison would race a concurrent write and report the race as a disagreement. */
+    uint32_t last_slot_read_value;
+    uint32_t last_slot_read_seq;
+    /* THE GUARD THAT MAKES THE CROSS-VALIDATION SOUND. The slot-hit count at the moment
+     * `last_slot_read_value` was published. A later independent reader that finds this count
+     * UNCHANGED knows no slot write landed in between, so the two readings cover the same value and
+     * must agree; if it moved, the pair is a race and is counted as SKIPPED rather than as
+     * agreement. Without this, a concurrent write would be reported as a disagreement and the
+     * check would fail closed on correct behaviour. */
+    uint32_t last_slot_read_hits;
+    /* ⚠ WHICH ALIAS THE INSTRUMENT READ THROUGH, AND WHY THE HOOK MUST KNOW. A slot write through a
+     * MIRROR view is read back through that mirror by design, and this host's mirror views are NOT
+     * coherent with the canonical view -- the fixture measured that a store through mirror view 1 did
+     * not become visible canonically. The guest's own read is canonical, so comparing a MIRROR read
+     * against a canonical one would report a host mapping property as an instrument disagreement.
+     * The hook therefore cross-validates ONLY canonical-alias reads (alias 1) and counts every other
+     * case as SKIPPED, which keeps "not comparable" distinct from "agreement". */
+    uint32_t last_slot_read_alias;
+    /* 1 once a slot store was observed to CHANGE the slot (post != pre). This is the positive half
+     * of value fidelity: a facility that reported every store as a no-op would show 0 here, and a
+     * reader would see that the value fields were never exercised rather than trusting them. */
+    uint32_t last_slot_change_seen;
+    /* ── THE TERMINAL CROSS-VALIDATION (Q3(c), HALF TWO) ─────────────────────────────────────────
+     *
+     * At the terminal point the slot is read TWICE, back to back, by two independent address
+     * computations: through this facility's CACHED alias base (the one every fault record used) and
+     * through the guest's OWN translation (`g_memory_base + (slot - XBOX_BASE_ADDRESS)`, which is
+     * what `MEM32(slot_va)` computes in generated code). Those two values are published here
+     * alongside the verdict, so a reader sees the comparison rather than being told its result.
+     *
+     * `terminal_cross_ok == 1` means the two AGREED on a quiet window. `== 0` means either they
+     * DISAGREED (an instrument bug, also latched in `loss.cross_mismatch` and `loss.overflow`) or
+     * the window was not quiet and no comparison was made -- and `loss.cross_skipped` separates the
+     * second from the first, so "not compared" is never read as "agreed". */
+    uint32_t terminal_alias_value;   /* read through g_a2h_slotw_pages[0] + (slot & 0xFFF) */
+    uint32_t terminal_guest_value;   /* read through the guest's own translation of the slot */
+    uint32_t terminal_cross_ok;      /* 1 = compared AND agreed; 0 = disagreed or not compared */
     XboxA2hSlotwLoss loss;
     XboxA2hSlotwEvent events[XBOX_A2H_SLOTW_EVENTS_MAX];
+    XboxA2hSlotwFirstTouch first_touch[XBOX_A2H_SLOTW_FIRST_TOUCH_MAX];
 } XboxA2hSlotwLedger;
 
 /* The live ledger. NON-STATIC AND STABLE-NAMED on purpose: tools/harness/collect.c is a separate
@@ -647,6 +759,32 @@ void xbox_A2hSlotWatchNoteFourthRead(uint32_t value, uint32_t read_index);
 /* 1 when the gate is set. The game checks this instead of reading the environment itself, so the
  * gate is read exactly once and OFF is provably inert. */
 int xbox_A2hSlotWatchEnabled(void);
+/* THE Q3(c) CROSS-VALIDATION, ASKED FROM OUTSIDE. The instrument's own two reads of the slot are
+ * reconciled inside the step handler, but the game-side hook can read the same address at the same
+ * moment through the guest's own translation. This entry point reports a fault-record read and an
+ * independent hook read of the SAME guest address and asserts they agree; a disagreement is an
+ * instrument bug and returns 0, which the caller must treat as fail-closed.
+ *
+ * Returns 1 when the pair agrees or when there is nothing to compare (the read is then counted as
+ * `cross_skipped` so "no comparison" cannot be read as "agreement"). */
+int xbox_A2hSlotWatchCrossCheck(uint32_t guest_va, uint32_t fault_record_value,
+                                uint32_t hook_value);
+/* The slot VA this arm derived, or 0 when unarmed. A cross-checking caller must read the SAME
+ * address the instrument reads, so it asks rather than re-deriving it. */
+uint32_t xbox_A2hSlotWatchSlotVa(void);
+/* The instrument's last published slot read, as a (value, seq, hit_count) triple. A hook reads the
+ * triple, performs its own read of the same address, then reads the hit count again via
+ * xbox_A2hSlotWatchSlotHits(): an unchanged count proves no slot write landed across its window,
+ * which is what makes the comparison a same-address same-time one rather than a race. Returns 1 when
+ * a read has been published. */
+int xbox_A2hSlotWatchLastSlotRead(uint32_t *out_value, uint32_t *out_seq, uint32_t *out_hits);
+/* The alias the instrument last read the slot through: 1 = canonical, m+1 = mirror m, 0 = none yet.
+ * The hook cross-validates only canonical reads, because the mirror views are NOT coherent with the
+ * canonical view on this host and comparing across them would report a mapping property as an
+ * instrument disagreement. See xbox_A2hSlotWatchCrossCheck(). */
+uint32_t xbox_A2hSlotWatchLastSlotReadAlias(void);
+/* The instrument's slot-hit count right now; the quiet-window test for xbox_A2hSlotWatchCrossCheck. */
+uint32_t xbox_A2hSlotWatchSlotHits(void);
 
 /**
  * Free a block from the Xbox heap. Currently a no-op (bump allocator).
