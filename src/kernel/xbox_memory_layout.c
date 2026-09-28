@@ -3187,6 +3187,50 @@ static uint32_t a2h_slotw_corroborate_form(uint64_t rip)
 }
 
 /* Which of OUR pages, if any, holds this fault address? Returns the alias index + 1, or 0. */
+/* ⚠ RECORD ONE UNPLACEABLE RIP, ONCE. `range_unknown` counts them all; this samples the first few
+ * DISTINCT ones so a reader can tell an instrument bug inside the recompiled extent from a writer
+ * that is genuinely outside the image -- two findings that demand OPPOSITE responses and that a bare
+ * count cannot distinguish.
+ *
+ * The distinctness scan is bounded by the sample size, so a hot loop of unplaceable faults costs a
+ * comparison against at most 16 addresses rather than an unbounded table. Duplicates are NOT
+ * re-recorded: the sample is a SET of RIPs, and `range_unknown` already carries the multiplicity. */
+static void a2h_slotw_note_unknown_rip(uint64_t rip)
+{
+    XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+    uint32_t n, i;
+
+    n = L->unknown_rip_count;
+    if (n >= XBOX_A2H_SLOTW_UNKNOWN_SAMPLE_MAX)
+        return;
+    for (i = 0; i < n && i < XBOX_A2H_SLOTW_UNKNOWN_SAMPLE_MAX; i++) {
+        if (L->unknown_rips[i] == rip)
+            return;                        /* already sampled: the counter has the multiplicity */
+    }
+    /* A benign race: two threads can claim the same index and one write wins. Both RIPs are
+     * unplaceable, so the sample stays a set of unplaceable RIPs either way -- it can lose one entry
+     * under contention, which is why `unknown_rip_count` is reported as the sample's size and
+     * `range_unknown` remains the authoritative count. */
+    L->unknown_rips[n] = rip;
+    /* ⚠ AND WHICH REGION IT LIVES IN, FROM THE OS. The first question about an unplaceable RIP is
+     * "which mapped region is this?", and the two answers demand OPPOSITE responses: a RIP inside
+     * THIS image means the classifier failed on its own code (an instrument bug), while a RIP in
+     * another module means the writer is genuinely outside anything this facility can place. Asking
+     * the OS once per sampled RIP makes that answerable from the archive instead of by a re-run.
+     * This is an OBSERVATION about the address; it changes no classification. */
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        uint64_t base = 0;
+        if (VirtualQuery((LPCVOID)(uintptr_t)rip, &mbi, sizeof(mbi)) != 0)
+            base = (uint64_t)(uintptr_t)mbi.AllocationBase;
+        L->unknown_rip_bases[n] = base;
+        L->unknown_same_image[n] = (base && s_a2h_slotw_image_lo
+                                    && base == s_a2h_slotw_image_lo) ? 1u : 0u;
+        L->unknown_reserved[n] = 0;
+    }
+    L->unknown_rip_count = n + 1;
+}
+
 static uint32_t a2h_slotw_owning_alias(uintptr_t fault)
 {
     uint32_t i;
@@ -3440,12 +3484,19 @@ static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
         case XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST: A2H_SLOTW_INC64(&L->loss.range_host); break;
         default:
             /* ⚠ UNKNOWN IS INFRA FAILURE, NOT A WARNING. A RIP this facility cannot place must stop
-             * the packet rather than be attributed, so it is counted, latched, and printed. */
+             * the packet rather than be attributed, so it is counted, latched, and printed.
+             *
+             * ⚠ AND THE RIP ITSELF IS SAMPLED, because the count alone cannot tell an instrument bug
+             * inside the recompiled extent from a writer that is genuinely outside the image -- and
+             * those demand opposite responses. See XBOX_A2H_SLOTW_UNKNOWN_SAMPLE_MAX. */
             A2H_SLOTW_INC64(&L->loss.range_unknown);
             InterlockedExchange((volatile LONG *)&L->loss.overflow, 1);
+            a2h_slotw_note_unknown_rip((uint64_t)ep->ContextRecord->Rip);
             fprintf(stderr, "  [A2HSLOTW] RIP %016llX is in NO known range (recomp_valid=%u"
-                            " recomp=%016llX..%016llX image=%016llX..%016llX) -- INFRA FAILURE\n",
+                            " recomp_count=%u recomp=%016llX..%016llX image=%016llX..%016llX)"
+                            " -- INFRA FAILURE\n",
                     (unsigned long long)ep->ContextRecord->Rip, s_a2h_slotw_recomp_valid,
+                    s_a2h_slotw_recomp_count,
                     (unsigned long long)s_a2h_slotw_recomp_lo,
                     (unsigned long long)s_a2h_slotw_recomp_hi,
                     (unsigned long long)s_a2h_slotw_image_lo,
@@ -3586,6 +3637,11 @@ uint32_t xbox_A2hSlotWatchArm(void)
     L->recomp_bound_probes = s_a2h_slotw_recomp_probes;
     L->recomp_start_count = s_a2h_slotw_recomp_count;
     L->recomp_start_overflow = s_a2h_slotw_recomp_overflow;
+    L->unknown_rip_count = 0;
+    memset(L->unknown_rips, 0, sizeof(L->unknown_rips));
+    memset(L->unknown_rip_bases, 0, sizeof(L->unknown_rip_bases));
+    memset(L->unknown_same_image, 0, sizeof(L->unknown_same_image));
+    memset(L->unknown_reserved, 0, sizeof(L->unknown_reserved));
     L->image_lo = s_a2h_slotw_image_lo;
     L->image_hi = s_a2h_slotw_image_hi;
     /* ⚠ THE SET ITSELF GOES INTO THE LEDGER, so the archive carries the classifier's ACTUAL input and
@@ -3964,6 +4020,14 @@ void xbox_A2hSlotWatchRangeBounds(uint64_t *recomp_lo, uint64_t *recomp_hi, uint
 uint32_t xbox_A2hSlotWatchRecompStartCount(void)
 {
     return s_a2h_slotw_recomp_count;
+}
+
+/* Record an unplaceable RIP through the REAL sampler, so a fixture can prove the sample is a SET of
+ * distinct RIPs and that its allocation-base attribution works -- rather than leaving new
+ * diagnostic code untested. */
+void xbox_A2hSlotWatchFixtureNoteUnknownRip(uint64_t rip)
+{
+    a2h_slotw_note_unknown_rip(rip);
 }
 
 /* The embedder's own overflow report. See the declaration above for why it is a separate latch. */

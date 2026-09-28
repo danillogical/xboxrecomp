@@ -567,6 +567,30 @@ void xbox_A2hAliasCensusDisarm(void);
  * only ones a reader has to re-classify, and they are few. */
 #define XBOX_A2H_SLOTW_RECOMP_ARCHIVE 512
 
+/* ── BOUNDED SAMPLING OF RIPs THAT CLASSIFIED `UNKNOWN` ─────────────────────────────────────────
+ *
+ * ⚠ WHY THIS EXISTS, AND WHY IT IS A COUNT PLUS A FEW SAMPLES RATHER THAN A LOG. `UNKNOWN` is INFRA
+ * FAILURE by the packet's rule, so a run with `range_unknown > 0` cannot be promoted. That rule was
+ * written on the assumption that every write to the watched page comes from the guest; MEASURED on a
+ * live run, 264 of 10 592 relevant AVs classified UNKNOWN. Before that can be called an instrument
+ * defect the RIPs must be IDENTIFIED, and a count alone cannot do it: "264 unknown" is equally
+ * consistent with a classifier bug inside the recompiled extent and with writes from outside the
+ * image entirely (a system DLL or the D3D driver), and those two demand OPPOSITE responses -- fix
+ * the classifier, or accept that some writers are genuinely unplaceable.
+ *
+ * So the first N distinct unplaceable RIPs are recorded verbatim, with the range bounds in force when
+ * they were seen, and `range_unknown` stays the uncapped count. `range_unknown_sampled` says how many
+ * distinct RIPs the sample actually holds, so a reader never mistakes a bounded sample for the whole
+ * population.
+ *
+ * ⚠ AND EACH SAMPLE CARRIES THE RIP'S OWN `VirtualQuery` ALLOCATION BASE, because the FIRST question
+ * about an unplaceable RIP is which mapped region it lives in, and that question has to be answerable
+ * FROM THE ARCHIVE. `unknown_same_image[]` says whether that base is THIS process's own image -- so
+ * "the classifier failed inside our own code" (an instrument bug) and "the writer is in another
+ * loaded module" (a genuinely unplaceable writer) are DISTINGUISHED by the record rather than by a
+ * re-run. The base is a fact the OS reports; nothing here changes the classification. */
+#define XBOX_A2H_SLOTW_UNKNOWN_SAMPLE_MAX 16
+
 /* OPTIONAL NATIVE-DISASSEMBLY CORROBORATION, AND IT IS CORROBORATION ONLY.
  *
  * The range class is the classification; this is a SECOND, INDEPENDENT observation about the same
@@ -805,7 +829,19 @@ typedef struct {
     uint64_t window_close_ticks_last; /* tick at which it was last re-armed RO */
     uint64_t window_open_count;       /* how many RW windows this arm has opened */
     uint32_t window_open;             /* 1 = a window is open RIGHT NOW (never silently assumed 0) */
+    /* ── THE UNPLACEABLE-RIP SAMPLE ──────────────────────────────────────────────────────────────
+     *
+     * See XBOX_A2H_SLOTW_UNKNOWN_SAMPLE_MAX for why a count is not enough. `unknown_rips[]` holds the
+     * first N DISTINCT unplaceable RIPs, and `unknown_rip_count` is how many the sample holds -- so a
+     * reader sees the bounded sample AS a sample. Each entry is written once and never rewritten. */
+    uint32_t unknown_rip_count;
     uint32_t reserved0;
+    uint64_t unknown_rips[XBOX_A2H_SLOTW_UNKNOWN_SAMPLE_MAX];
+    /* The allocation base of each sampled RIP, as `VirtualQuery` reports it, and whether that base is
+     * THIS image. Together they answer "which module is this RIP in?" from the archive. */
+    uint64_t unknown_rip_bases[XBOX_A2H_SLOTW_UNKNOWN_SAMPLE_MAX];
+    uint32_t unknown_same_image[XBOX_A2H_SLOTW_UNKNOWN_SAMPLE_MAX];
+    uint32_t unknown_reserved[XBOX_A2H_SLOTW_UNKNOWN_SAMPLE_MAX];
     /* ⚠ THE TERMINAL BASE CAN FAIL TO BE A POINTER AT ALL, AND THAT IS NOT THE SAME FINDING AS A
      * MOVED ONE. MEASURED on an archived run: at the terminal point MEM32(0x19DCE0) held
      * 0x30766A64 -- ASCII "djv0", string data from the 0x001D5078 region -- rather than a device

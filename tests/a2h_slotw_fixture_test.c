@@ -109,6 +109,7 @@ extern uint32_t xbox_A2hSlotWatchFixtureDecideCoherence(uint32_t last_write_valu
                                                         uint32_t terminal_value,
                                                         uint32_t terminal_seen);
 extern void xbox_A2hSlotWatchFixtureResetCoherence(void);
+extern void xbox_A2hSlotWatchFixtureNoteUnknownRip(uint64_t rip);
 extern void xbox_A2hSlotWatchFixtureNoteRead(uint32_t value, uint32_t read_index);
 extern int  xbox_A2hSlotWatchFixturePublishWrite(uint32_t slot_hit, uint32_t range_class,
                                                  uint32_t pre_value);
@@ -1476,6 +1477,121 @@ static void fixture_coherence_gate(void)
     (void)lws;
 }
 
+/* ── 10. THE UNPLACEABLE-RIP SAMPLE: `UNKNOWN` MUST BE DIAGNOSABLE FROM THE ARCHIVE ───────────────
+ *
+ * ⚠ WHY THIS ARM EXISTS. `UNKNOWN` is INFRA FAILURE by the packet's rule, so a run with
+ * `range_unknown > 0` cannot be promoted. MEASURED on the first live run with the new classifier,
+ * `unknown=264`. Before that can be called an instrument defect the RIPs must be IDENTIFIED -- and a
+ * count cannot do it, because "the classifier failed INSIDE the recompiled extent" and "the writer is
+ * in a DIFFERENT module" demand OPPOSITE responses: fix the classifier, or accept that some writers
+ * are genuinely unplaceable.
+ *
+ * So the first N distinct unplaceable RIPs are recorded with their `VirtualQuery` allocation base and
+ * whether that base is THIS image. This arm proves the sampler is a SET (a repeat is not re-recorded)
+ * and that its attribution actually distinguishes the two cases -- using a real address from ANOTHER
+ * module as the foreign witness, so the arm cannot pass by accident.
+ *
+ * ⚠ THE FOREIGN WITNESS IS A REAL MAPPED ADDRESS, TAKEN FROM THE OS. If the arm cannot find one it
+ * says so rather than skipping, because a skipped arm reads as coverage. */
+static void fixture_unknown_sample(void)
+{
+    XboxA2hSlotwLedger *L = xbox_A2hSlotWatchFixtureLedger();
+    uint64_t self = (uint64_t)(uintptr_t)&fixture_unknown_sample;
+    uint64_t foreign = 0;
+    MEMORY_BASIC_INFORMATION mbi;
+    uint64_t probe;
+    uint32_t before;
+
+    current_fixture = "unknown-sample";
+
+    /* FIND A REAL ADDRESS IN A DIFFERENT MODULE. `GetModuleHandleA("kernel32.dll")` is a module this
+     * process has loaded and that is by construction NOT our image; its own function address is
+     * therefore a genuine foreign RIP. */
+    {
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        if (k32) {
+            FARPROC fn = GetProcAddress(k32, "GetCurrentProcessId");
+            if (fn)
+                foreign = (uint64_t)(uintptr_t)fn;
+        }
+    }
+    CHECK(foreign != 0,
+          "no foreign witness could be obtained (GetModuleHandleA/GetProcAddress failed, error %lu):"
+          " the arm cannot run and must not be read as passing", GetLastError());
+    if (!foreign)
+        return;
+    /* AND IT MUST GENUINELY BE FOREIGN, or the arm proves nothing. */
+    {
+        uint64_t ilo = 0, ihi = 0, rlo = 0, rhi = 0;
+        uint32_t valid = 0;
+        xbox_A2hSlotWatchRangeBounds(&rlo, &rhi, &valid, &ilo, &ihi);
+        CHECK(foreign < ilo || foreign >= ihi,
+              "the 'foreign' witness %016llX is INSIDE our own image [%016llX, %016llX): the arm"
+              " would not distinguish the two cases", (unsigned long long)foreign,
+              (unsigned long long)ilo, (unsigned long long)ihi);
+    }
+
+    /* (a) A RIP IN OUR OWN IMAGE THAT THE SET DOES NOT PLACE -- the "instrument bug" case. */
+    before = L->unknown_rip_count;
+    xbox_A2hSlotWatchFixtureNoteUnknownRip(self);
+    CHECK(L->unknown_rip_count == before + 1,
+          "the sampler did not record an unplaceable RIP (count %u -> %u)", before,
+          L->unknown_rip_count);
+    {
+        uint32_t i = L->unknown_rip_count - 1;
+        CHECK(L->unknown_rips[i] == self,
+              "the sampler recorded %016llX, expected the RIP it was given (%016llX)",
+              (unsigned long long)L->unknown_rips[i], (unsigned long long)self);
+        CHECK(L->unknown_same_image[i] == 1,
+              "a RIP in OUR OWN image was attributed same_image=%u, expected 1 -- the sample could"
+              " not tell an instrument bug from a foreign writer", L->unknown_same_image[i]);
+        CHECK(L->unknown_rip_bases[i] != 0,
+              "the sampler recorded no allocation base for a real address");
+    }
+    /* (b) A REAL RIP IN ANOTHER MODULE -- the "genuinely unplaceable writer" case. */
+    xbox_A2hSlotWatchFixtureNoteUnknownRip(foreign);
+    {
+        uint32_t i = L->unknown_rip_count - 1;
+        CHECK(L->unknown_rips[i] == foreign,
+              "the sampler recorded %016llX, expected the foreign RIP %016llX",
+              (unsigned long long)L->unknown_rips[i], (unsigned long long)foreign);
+        CHECK(L->unknown_same_image[i] == 0,
+              "a RIP in ANOTHER MODULE was attributed same_image=%u, expected 0: the archive could"
+              " not tell a foreign writer from an instrument bug", L->unknown_same_image[i]);
+        CHECK(L->unknown_rip_bases[i] != 0 && L->unknown_rip_bases[i] != L->unknown_rip_bases[i - 1],
+              "the two sampled RIPs report the SAME allocation base (%016llX): the attribution does"
+              " not actually distinguish the modules",
+              (unsigned long long)L->unknown_rip_bases[i]);
+    }
+    printf("  [fixture] unknown-sample: self=%016llX same_image=1, foreign=%016llX same_image=0,"
+           " distinct bases -- the archive can tell an instrument bug from a foreign writer\n",
+           (unsigned long long)self, (unsigned long long)foreign);
+
+    /* (c) THE SAMPLE IS A SET, NOT A LOG. A repeat must NOT be re-recorded, so a hot loop of
+     *     unplaceable faults cannot fill the sample with one address. */
+    before = L->unknown_rip_count;
+    xbox_A2hSlotWatchFixtureNoteUnknownRip(self);
+    xbox_A2hSlotWatchFixtureNoteUnknownRip(self);
+    CHECK(L->unknown_rip_count == before,
+          "a REPEATED unplaceable RIP was re-recorded (count %u -> %u): the sample is a log, and a"
+          " hot loop would fill it with one address", before, L->unknown_rip_count);
+
+    /* (d) AND THE SAMPLE IS BOUNDED, so it can never grow without limit. */
+    for (probe = 0; probe < 64; probe++)
+        xbox_A2hSlotWatchFixtureNoteUnknownRip(0x1000000000ull + probe * 0x1000ull);
+    CHECK(L->unknown_rip_count <= XBOX_A2H_SLOTW_UNKNOWN_SAMPLE_MAX,
+          "the sample grew to %u entries, above its cap of %u", L->unknown_rip_count,
+          (unsigned)XBOX_A2H_SLOTW_UNKNOWN_SAMPLE_MAX);
+    printf("  [fixture] unknown-sample: repeats NOT re-recorded; %u entries after 64 more distinct"
+           " RIPs (cap %u)\n", L->unknown_rip_count,
+           (unsigned)XBOX_A2H_SLOTW_UNKNOWN_SAMPLE_MAX);
+
+    /* ⚠ THE COUNT IS NOT THE SAMPLE, AND THE TWO ARE REPORTED SEPARATELY. `loss.range_unknown` is the
+     * UNCAPPED multiplicity; `unknown_rip_count` is how many DISTINCT RIPs the bounded sample holds.
+     * A reader must never mistake the second for the first. */
+    (void)mbi;
+}
+
 int main(int argc, char **argv)
 {
     const char *gate = getenv(XBOX_A2H_SLOTW_GATE);
@@ -1573,6 +1689,7 @@ int main(int argc, char **argv)
     fixture_db_ownership();
     fixture_fourth_read_latch();
     fixture_coherence_gate();       /* FIX 2: last-recorded vs terminal; mismatch => UNKNOWN */
+    fixture_unknown_sample();       /* UNKNOWN must be DIAGNOSABLE from the archive, not just counted */
 
     xbox_A2hSlotWatchFixtureDisarmAc97();
     xbox_A2hSlotWatchDisarm();
