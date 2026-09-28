@@ -354,6 +354,13 @@ static RECOMP_TLS int s_ac97_stepping = 0;
 
 /* ── A2h LIVE slot-write watch: the SHARED per-thread pending-ownership state ───────────────────
  *
+ * The POSIX host layer (platform/win32_compat.h) provides the 32-bit interlocked primitives and the
+ * page constants but not the 64-bit ones, and it has no PAGE_GUARD. The loss counters are 64-bit
+ * because a bounded run can still exceed 2^32 writes on a hot page in principle, so they are routed
+ * through one pair of macros rather than spelled per host. The POSIX build is the conformance test,
+ * not a live title, so a plain read-modify-write is adequate there. The macros live HERE, above the
+ * AC'97 handler, because that handler now accounts through them too.
+ *
  * Declared here, ABOVE ac97_write_veh(), because the AC'97 trap is a SECOND owner of the same
  * single-step machinery and must record its own pending bit through the same protocol. Putting this
  * state below the AC'97 handler is what would force the AC'97 path to keep its own private flag --
@@ -370,6 +377,17 @@ static RECOMP_TLS int s_ac97_stepping = 0;
 #define A2H_SLOTW_PEND_OWN   0x1u
 #define A2H_SLOTW_PEND_AC97  0x2u
 
+#if defined(_WIN32)
+#  define A2H_SLOTW_INC64(p)     InterlockedIncrement64((volatile LONG64 *)(p))
+#  define A2H_SLOTW_SET64(p, v)  InterlockedExchange64((volatile LONG64 *)(p), (LONG64)(v))
+#else
+#  define A2H_SLOTW_INC64(p)     ((uint64_t)(++(*(uint64_t *)(p))))
+#  define A2H_SLOTW_SET64(p, v)  ((void)(*(uint64_t *)(p) = (uint64_t)(v)))
+#endif
+#ifndef PAGE_GUARD
+#  define PAGE_GUARD 0x100u
+#endif
+
 static volatile LONG g_a2h_slotw_armed = 0;
 static RECOMP_TLS uint32_t s_a2h_slotw_pending = 0;
 static RECOMP_TLS uint32_t s_a2h_slotw_saved_tf = 0;
@@ -385,12 +403,21 @@ static void a2h_slotw_take_pending(uint32_t bit, DWORD eflags)
 }
 
 /* Release one pending bit and return the TF state the thread must now have: still set while any
- * owner remains, otherwise the pre-entry TF bit EXACTLY (cleared only if it was originally 0). */
+ * owner remains, otherwise the pre-entry TF bit EXACTLY (cleared only if it was originally 0).
+ *
+ * THE DUAL-OWNER COUNT IS TAKEN HERE, AND THAT PLACEMENT IS THE WHOLE POINT. "This #DB had two
+ * pending owners" is only observable at the FIRST release, because that is the only moment at which
+ * both bits are known to have been pending together -- and it is symmetric: whichever handler runs
+ * first, releasing its bit leaves the other still set. Counting it in either handler instead made
+ * the number a record of "which handler ran first", which is exactly what the synthetic-overlap
+ * fixture caught: the slot-first order reported dual=0 for a #DB that had plainly been dual. */
 static DWORD a2h_slotw_release_pending(uint32_t bit, DWORD eflags)
 {
     s_a2h_slotw_pending &= ~bit;
-    if (s_a2h_slotw_pending)
+    if (s_a2h_slotw_pending) {
+        A2H_SLOTW_INC64(&g_xbox_a2h_slotw.loss.db_dual_serviced);
         return (DWORD)(eflags | 0x100u);
+    }
     return (DWORD)((eflags & ~0x100u) | s_a2h_slotw_saved_tf);
 }
 
@@ -436,10 +463,40 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
      * this owner armed rather than being cleared unconditionally, which is what the packet requires
      * and what keeps a guest's own single-step from being silently cancelled. */
     if (code == EXCEPTION_SINGLE_STEP && (s_a2h_slotw_pending & A2H_SLOTW_PEND_AC97)) {
+        XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+        /* ACCOUNTED HERE, WHERE THE AC'97 WORK IS ACTUALLY DONE.
+         *
+         * MEASURED, NOT PREFERRED. The first version incremented this in the SLOT handler's "pass it
+         * on to AC'97" branch, which made it a record of "the slot handler happened to run first"
+         * rather than of "the AC'97 owner was serviced". Under the opposite registration order the
+         * AC'97 handler runs first and the slot handler then sees only its own bit, so the AC'97
+         * count stayed 0 for a step that had plainly been serviced -- and the synthetic-overlap
+         * fixture failed on the ORDER rather than on the protocol. Counting at the point of work
+         * makes both orders report the same thing, which is what "serviced exactly once" has to mean
+         * if it is to be independent of handler order. The dual-owner count is taken in the shared
+         * release helper for the same reason. */
         ac97_clear_reset_bits();
         VirtualProtect(g_ac97_page, AC97_TRAP_BYTES, PAGE_READONLY, &old);
         ep->ContextRecord->EFlags = a2h_slotw_release_pending(A2H_SLOTW_PEND_AC97,
                                                              ep->ContextRecord->EFlags);
+        A2H_SLOTW_INC64(&L->loss.db_ac97_serviced);
+        /* ⚠ THIS RETURN IS ORDER-DEPENDENT AND MUST NOT SWALLOW THE OTHER OWNER.
+         *
+         * The two handlers are both registered at priority 1, and Windows calls equal-priority
+         * vectored handlers in the order they were added -- this one FIRST, because the AC'97 trap
+         * arms during memory-layout init and the slot watch arms later. So on a #DB with BOTH bits
+         * pending, this handler runs first, and returning EXCEPTION_CONTINUE_EXECUTION here would
+         * resume the thread with the slot watch's own-TF still pending and its page left open: the
+         * slot watch would never see its #DB, never read the post-value, and never re-protect.
+         *
+         * So when the other owner is still pending the #DB is RELEASED down the chain instead, with
+         * TF left set (a2h_slotw_release_pending did that because the word is non-zero). The slot
+         * watch then services its own bit and is the one that finally resumes the thread. Under the
+         * opposite registration order the same two steps happen in the other sequence and converge
+         * on the same state -- which is what the synthetic-overlap fixture asserts for BOTH orders
+         * rather than assuming the one this build happens to install. */
+        if (s_a2h_slotw_pending & A2H_SLOTW_PEND_OWN)
+            return EXCEPTION_CONTINUE_SEARCH;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
@@ -2653,22 +2710,6 @@ void xbox_A2hAliasCensusDisarm(void)
 
 #define A2H_SLOTW_MAGIC 0x57533241u   /* 'A2SW' */
 
-/* The POSIX host layer (platform/win32_compat.h) provides the 32-bit interlocked primitives and the
- * page constants but not the 64-bit ones, and it has no PAGE_GUARD. The loss counters are 64-bit
- * because a bounded run can still exceed 2^32 writes on a hot page in principle, so they are routed
- * through one pair of macros rather than spelled per host. The POSIX build is the conformance test,
- * not a live title, so a plain read-modify-write is adequate there. */
-#if defined(_WIN32)
-#  define A2H_SLOTW_INC64(p)     InterlockedIncrement64((volatile LONG64 *)(p))
-#  define A2H_SLOTW_SET64(p, v)  InterlockedExchange64((volatile LONG64 *)(p), (LONG64)(v))
-#else
-#  define A2H_SLOTW_INC64(p)     ((uint64_t)(++(*(uint64_t *)(p))))
-#  define A2H_SLOTW_SET64(p, v)  ((void)(*(uint64_t *)(p) = (uint64_t)(v)))
-#endif
-#ifndef PAGE_GUARD
-#  define PAGE_GUARD 0x100u
-#endif
-
 XboxA2hSlotwLedger g_xbox_a2h_slotw;
 
 static void *g_a2h_slotw_veh = NULL;
@@ -2884,10 +2925,8 @@ static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
              * work, re-protects, releases ITS bit and restores TF. Clearing the bit here would make
              * the AC'97 handler skip its work and strand its page open -- so "service every pending
              * owner exactly once" is enforced by each owner releasing only its OWN bit, in the
-             * handler that actually does that owner's work. */
-            A2H_SLOTW_INC64(&L->loss.db_ac97_serviced);
-            if (pending & A2H_SLOTW_PEND_OWN)
-                A2H_SLOTW_INC64(&L->loss.db_dual_serviced);
+             * handler that actually does that owner's work. The AC'97 accounting is done THERE for
+             * the same reason -- see the comment in ac97_write_veh. */
             return EXCEPTION_CONTINUE_SEARCH;
         }
 
@@ -3213,6 +3252,142 @@ void xbox_A2hSlotWatchNoteFourthRead(uint32_t value, uint32_t read_index)
 int xbox_A2hSlotWatchEnabled(void)
 {
     return a2h_slotw_on();
+}
+
+/* ── THE FIXTURE SEAM ──────────────────────────────────────────────────────────────────────────
+ *
+ * The fixtures must prove properties of the REAL handlers, not of a reimplementation -- a fixture
+ * that re-derives the protocol tests itself. These two entry points therefore call the very same
+ * ac97_write_veh() and a2h_slotw_veh() bodies that the OS calls, with a real EXCEPTION_POINTERS and
+ * a real CONTEXT, so the fixture observes the actual return values, the actual EFlags.TF the
+ * handlers leave behind, and the actual ledger the handlers write.
+ *
+ * They are OBSERVATION-ONLY SEAMS FOR TESTS: they are declared only here, are not in any public
+ * header, and are reachable only from the fixture translation unit that declares them extern. */
+typedef struct {
+    uint32_t armed;
+    uint32_t page_offset;
+    uint32_t slot_va;
+    uint32_t alias_count;
+    uint32_t protected_count;
+    void    *page0;          /* the canonical protected page, for the fixtures' own stores */
+    void    *mirror0;        /* mirror view 1's protected page */
+} XboxA2hSlotwFixtureState;
+
+int xbox_A2hSlotWatchFixtureArm(uint32_t device_va, XboxA2hSlotwFixtureState *out)
+{
+    uint32_t rc;
+
+    if (!a2h_slotw_on())
+        return 0;                    /* the gate is the gate: fixtures do not bypass it */
+    if (!g_memory_base)
+        return 0;
+
+    /* Point the device global at a scratch object inside guest RAM, so the derivation runs exactly
+     * as it does live (read the pointer, checked add, protect that page) rather than against a
+     * hardcoded address. */
+    *(volatile uint32_t *)((uintptr_t)XBOX_A2H_SLOTW_DEVICE_PTR + g_xbox_mem_offset) = device_va;
+
+    rc = xbox_A2hSlotWatchArm();
+    if (out) {
+        memset(out, 0, sizeof(*out));
+        out->armed = rc;
+        out->page_offset = g_xbox_a2h_slotw.page_offset;
+        out->slot_va = g_xbox_a2h_slotw.arm_slot;
+        out->alias_count = g_xbox_a2h_slotw.alias_count;
+        out->protected_count = g_xbox_a2h_slotw.protected_count;
+        out->page0 = g_a2h_slotw_pages[0];
+        out->mirror0 = g_a2h_slotw_pages[1];
+    }
+    return (int)rc;
+}
+
+/* Deliver one exception to the REAL slot-watch handler. Returns its return value verbatim. */
+LONG xbox_A2hSlotWatchFixtureDeliver(DWORD code, ULONG_PTR info0, ULONG_PTR info1,
+                                     void *context, ULONG_PTR *params, DWORD nparams)
+{
+    EXCEPTION_RECORD rec;
+    EXCEPTION_POINTERS ep;
+
+    memset(&rec, 0, sizeof(rec));
+    rec.ExceptionCode = code;
+    rec.ExceptionAddress = (PVOID)context;
+    rec.NumberParameters = nparams;
+    for (DWORD i = 0; i < nparams && i < EXCEPTION_MAXIMUM_PARAMETERS; i++)
+        rec.ExceptionInformation[i] = params[i];
+    if (nparams >= 1) rec.ExceptionInformation[0] = info0;
+    if (nparams >= 2) rec.ExceptionInformation[1] = info1;
+    ep.ExceptionRecord = &rec;
+    ep.ContextRecord = (CONTEXT *)context;
+    return a2h_slotw_veh(&ep);
+}
+
+/* The same, for the REAL AC'97 handler: the fixture needs both halves of the overlap. */
+LONG xbox_A2hSlotWatchFixtureDeliverAc97(DWORD code, ULONG_PTR info0, ULONG_PTR info1,
+                                         void *context, DWORD nparams)
+{
+    EXCEPTION_RECORD rec;
+    EXCEPTION_POINTERS ep;
+
+    memset(&rec, 0, sizeof(rec));
+    rec.ExceptionCode = code;
+    rec.ExceptionAddress = (PVOID)context;
+    rec.NumberParameters = nparams;
+    if (nparams >= 1) rec.ExceptionInformation[0] = info0;
+    if (nparams >= 2) rec.ExceptionInformation[1] = info1;
+    ep.ExceptionRecord = &rec;
+    ep.ContextRecord = (CONTEXT *)context;
+    return ac97_write_veh(&ep);
+}
+
+/* Point the AC'97 trap at a scratch page inside guest RAM so the overlap fixture can arm BOTH
+ * owners without the MCPX aperture existing. Returns 1 when the page is RO and the VEH is live. */
+int xbox_A2hSlotWatchFixtureArmAc97(uint32_t page_va, void **out_page)
+{
+    DWORD old;
+    void *host;
+
+    if (!a2h_slotw_on() || !g_memory_base)
+        return 0;
+    host = (void *)((uintptr_t)g_memory_base + (uintptr_t)(page_va - XBOX_BASE_ADDRESS));
+    if (!VirtualProtect(host, AC97_TRAP_BYTES, PAGE_READONLY, &old))
+        return 0;
+    g_ac97_page = host;
+    if (out_page) *out_page = host;
+    return 1;
+}
+
+void xbox_A2hSlotWatchFixtureDisarmAc97(void)
+{
+    DWORD old;
+    if (g_ac97_page)
+        VirtualProtect(g_ac97_page, AC97_TRAP_BYTES, PAGE_READWRITE, &old);
+    g_ac97_page = NULL;
+    s_a2h_slotw_pending = 0;
+    s_a2h_slotw_saved_tf = 0;
+}
+
+/* Read/write the per-thread pending word directly, so the fixture can construct an OVERLAP that a
+ * single fault cannot produce on its own, and can assert exactly what each handler left behind. */
+void xbox_A2hSlotWatchFixtureSetPending(uint32_t bits, uint32_t saved_tf)
+{
+    s_a2h_slotw_pending = bits;
+    s_a2h_slotw_saved_tf = saved_tf;
+}
+
+uint32_t xbox_A2hSlotWatchFixturePending(void)
+{
+    return s_a2h_slotw_pending;
+}
+
+uint32_t xbox_A2hSlotWatchFixtureSavedTf(void)
+{
+    return s_a2h_slotw_saved_tf;
+}
+
+XboxA2hSlotwLedger *xbox_A2hSlotWatchFixtureLedger(void)
+{
+    return &g_xbox_a2h_slotw;
 }
 
 /* ── THE ALL-THREAD CENSUS, AND WHY IT IS A POLLING THREAD RATHER THAN A THREAD CALLBACK ────────
