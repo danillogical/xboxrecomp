@@ -93,6 +93,7 @@ extern void xbox_A2hSlotWatchFixtureSetPending(uint32_t bits, uint32_t saved_tf)
 extern uint32_t xbox_A2hSlotWatchFixturePending(void);
 extern uint32_t xbox_A2hSlotWatchFixtureSavedTf(void);
 extern XboxA2hSlotwLedger *xbox_A2hSlotWatchFixtureLedger(void);
+extern uint32_t xbox_A2hSlotWatchFixtureClassify(uint64_t rip);
 
 static unsigned checks_run, checks_failed;
 static const char *current_fixture = "?";
@@ -106,6 +107,82 @@ static const char *current_fixture = "?";
             fprintf(stderr, "\n");                                                   \
         }                                                                            \
     } while (0)
+
+/* ── 6. THE ENCODING CLASSIFIER, AGAINST THE REAL INSTRUCTIONS ────────────────────────────────────
+ *
+ * THE CONTROL'S VALIDITY RESTS ENTIRELY ON THIS. The installer trap is "a store with the installer's
+ * encoding landed on the derived slot"; the discriminator is that the installer's `mov [ecx+0x242c],
+ * eax` is a ModRM-disp32 store carrying 0x242C while the candidate's `mov [esi+ebp*4+0x3ec], eax` is
+ * a SIB store carrying 0x3EC. If the classifier cannot separate those two, the control fires on the
+ * wrong instruction -- or never fires at all -- and the packet's fail-closed rule would then be
+ * applied to a run in which the control was fine.
+ *
+ * So this reads the ACTUAL bytes out of the loaded image, at the ACTUAL guest VAs the packet names,
+ * and runs the REAL classifier over them. Bytes come from the XBE the loader mapped, so this is the
+ * instruction the title will execute and not a reconstruction of it.
+ *
+ * The native RIP the classifier is handed at run time is a host address, so the fixture reaches the
+ * guest bytes by translating the guest VA through g_xbox_mem_offset -- which is exactly the
+ * relationship the classifier relies on when it reads memory at a recorded native RIP. */
+#define FIX_INSTALLER_VA 0x0018CE3Au   /* mov [ecx+0x242c], eax  -- the required control */
+#define FIX_CANDIDATE_VA 0x00199F45u   /* mov [esi+ebp*4+0x3ec], eax -- the candidate */
+
+static void fixture_encoding_classifier(void)
+{
+    const uint8_t *installer = (const uint8_t *)(uintptr_t)(FIX_INSTALLER_VA + g_xbox_mem_offset);
+    const uint8_t *candidate = (const uint8_t *)(uintptr_t)(FIX_CANDIDATE_VA + g_xbox_mem_offset);
+    uint32_t enc_i, enc_c;
+
+    current_fixture = "encoding-classifier";
+
+    /* The bytes the packet names, verified here rather than trusted: `89 81 2C 24 00 00` and
+     * `89 84 AE EC 03 00 00`. A wrong address would make every conclusion below vacuous. */
+    CHECK(installer[0] == 0x89 && installer[1] == 0x81
+          && installer[2] == 0x2C && installer[3] == 0x24
+          && installer[4] == 0x00 && installer[5] == 0x00,
+          "the installer's bytes at %08X are %02X %02X %02X %02X %02X %02X, expected 89 81 2C 24 00 00",
+          FIX_INSTALLER_VA, installer[0], installer[1], installer[2], installer[3], installer[4],
+          installer[5]);
+    CHECK(candidate[0] == 0x89 && candidate[1] == 0x84 && candidate[2] == 0xAE
+          && candidate[3] == 0xEC && candidate[4] == 0x03
+          && candidate[5] == 0x00 && candidate[6] == 0x00,
+          "the candidate's bytes at %08X are %02X %02X %02X %02X %02X %02X %02X, expected"
+          " 89 84 AE EC 03 00 00",
+          FIX_CANDIDATE_VA, candidate[0], candidate[1], candidate[2], candidate[3], candidate[4],
+          candidate[5], candidate[6]);
+
+    enc_i = xbox_A2hSlotWatchFixtureClassify((uint64_t)(uintptr_t)installer);
+    enc_c = xbox_A2hSlotWatchFixtureClassify((uint64_t)(uintptr_t)candidate);
+
+    CHECK(enc_i == XBOX_A2H_SLOTW_ENC_MODRM,
+          "the installer's own instruction classified as enc=%u, expected MODRM(%u) -- the required"
+          " control would never fire", enc_i, XBOX_A2H_SLOTW_ENC_MODRM);
+    CHECK(enc_c == XBOX_A2H_SLOTW_ENC_SIB,
+          "the candidate's instruction classified as enc=%u, expected SIB(%u) -- it would be"
+          " attributed to the control", enc_c, XBOX_A2H_SLOTW_ENC_SIB);
+    /* THE DISCRIMINATION ITSELF: distinct classes, which is what makes the two signatures
+     * unmistakable in both RIP and VALUE. */
+    CHECK(enc_i != enc_c, "the control and the candidate classified IDENTICALLY (enc=%u)", enc_i);
+    printf("  [fixture] encoding-classifier: installer(%08X)=MODRM candidate(%08X)=SIB distinct=1\n",
+           FIX_INSTALLER_VA, FIX_CANDIDATE_VA);
+
+    /* A store with neither displacement must fall to OTHER, so an unrelated page writer can never
+     * satisfy the control by accident. */
+    {
+        static uint8_t other[8] = { 0x89, 0x81, 0x00, 0x10, 0x00, 0x00, 0, 0 };
+        uint32_t enc_o = xbox_A2hSlotWatchFixtureClassify((uint64_t)(uintptr_t)other);
+        CHECK(enc_o == XBOX_A2H_SLOTW_ENC_OTHER,
+              "an unrelated ModRM store classified as enc=%u, expected OTHER(%u)", enc_o,
+              XBOX_A2H_SLOTW_ENC_OTHER);
+        /* ...and a NON-STORE first byte must not be mistaken for one either. */
+        other[0] = 0x8B;   /* mov r32, r/m32 -- a LOAD, not a store */
+        CHECK(xbox_A2hSlotWatchFixtureClassify((uint64_t)(uintptr_t)other)
+              == XBOX_A2H_SLOTW_ENC_OTHER,
+              "a LOAD was classified as a store: a read could be attributed to the control");
+    }
+    printf("  [fixture] encoding-classifier: unrelated stores and loads fall to OTHER\n");
+}
+
 
 /* ── The scratch object ────────────────────────────────────────────────────────────────────────
  *
@@ -631,6 +708,7 @@ int main(int argc, char **argv)
     fixture_ro_write_av();
     fixture_info0_filter();
     fixture_slot_vs_page();
+    fixture_encoding_classifier();
     fixture_db_ownership();
 
     xbox_A2hSlotWatchFixtureDisarmAc97();

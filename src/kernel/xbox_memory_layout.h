@@ -497,12 +497,20 @@ void xbox_A2hAliasCensusDisarm(void);
  * no 0x242C anywhere. A native RIP is NOT a guest VA and cannot be compared to one; the bytes AT
  * the recorded RIP can be read, and they name the instruction exactly. Both forms are therefore
  * classified from the faulting instruction itself, and the installer's value 0x0015F9D0 is
- * recorded alongside. */
+ * recorded alongside.
+ *
+ * ⚠ THE CONTROL IS THE ENCODING, NOT THE VALUE. Requiring the pre-value to be zero as well was a
+ * defect: it made the control depend on nothing having touched the slot earlier, so a run in which
+ * the control DID fire could still be reported as INFRA FAILURE. The value is carried in the step
+ * record's post_value and compared offline. */
 #define XBOX_A2H_SLOTW_ENC_UNKNOWN  0u
 #define XBOX_A2H_SLOTW_ENC_MODRM    1u   /* disp32 == 0x242C: the installer's own encoding */
 #define XBOX_A2H_SLOTW_ENC_SIB      2u   /* disp32 == 0x3EC with SIB: the candidate's encoding */
 #define XBOX_A2H_SLOTW_ENC_OTHER    3u   /* a store to the page with neither displacement */
 
+/* WHAT A READER KEYS ON. `enc == MODRM` with `slot_hit == 1` IS the control; the value is a
+ * comparison made offline against these two constants, and the two encodings are distinct so the
+ * control and the target cannot be confused. */
 #define XBOX_A2H_SLOTW_INSTALL_VALUE 0x0015F9D0u   /* what the installer writes */
 #define XBOX_A2H_SLOTW_CANDIDATE_SIB 0x000003ECu   /* the candidate's SIB displacement */
 

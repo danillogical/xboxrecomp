@@ -2988,14 +2988,20 @@ static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
             return EXCEPTION_CONTINUE_SEARCH;
         }
 
-        /* THE REQUIRED POSITIVE CONTROL. The installer's own encoding, with the installer's own
-         * value, ON the derived slot. Its absence is INFRA FAILURE and fails the packet closed; it
-         * is never inferred from a log line. */
-        if (slot_hit && enc == XBOX_A2H_SLOTW_ENC_MODRM && pre == 0
-                && (fault == (uintptr_t)g_a2h_slotw_pages[alias - 1] + off)) {
-            /* The installer writes ARG1, which the sole caller at 0x00012319 pushes as 0 and which
-             * the wrapper at 0x0015F9E0 rewrites to 0x0015F9D0. The pre-value is recorded so the
-             * control is a comparison against the run, not against a constant baked in here. */
+        /* THE REQUIRED POSITIVE CONTROL. The installer's own ENCODING, on the derived slot. Its
+         * absence is INFRA FAILURE and fails the packet closed; it is never inferred from a log
+         * line.
+         *
+         * ⚠ THE PRE-VALUE IS NOT PART OF THE TEST, AND MAKING IT PART OF THE TEST WAS A DEFECT.
+         * The first version also required `pre == 0`, on the theory that the install is the slot's
+         * first write. That is an assumption about the title, not about the control: if anything
+         * had touched the slot before the installer ran, the control would have silently not
+         * counted, and the packet's fail-closed rule would have fired on a run where the control
+         * had in fact been observed. The control is "a store with the installer's encoding landed
+         * on the derived slot" -- that is what makes it a control -- and the VALUE is recorded in
+         * the step record's post_value so a reader compares it against 0x0015F9D0 offline rather
+         * than having the comparison silently gate the hit count here. */
+        if (slot_hit && enc == XBOX_A2H_SLOTW_ENC_MODRM) {
             A2H_SLOTW_INC64(&L->loss.installer_control_hits);
         }
 
@@ -3388,6 +3394,16 @@ uint32_t xbox_A2hSlotWatchFixtureSavedTf(void)
 XboxA2hSlotwLedger *xbox_A2hSlotWatchFixtureLedger(void)
 {
     return &g_xbox_a2h_slotw;
+}
+
+/* Classify an arbitrary address's bytes with the REAL classifier, so a fixture can point it at the
+ * ACTUAL bytes of the two store instructions in the loaded image. The control's validity rests
+ * entirely on this function separating the installer's encoding from the candidate's, and a
+ * classifier tested only against synthetic bytes would prove nothing about the image it will
+ * actually run against. */
+uint32_t xbox_A2hSlotWatchFixtureClassify(uint64_t rip)
+{
+    return a2h_slotw_classify_store(rip);
 }
 
 /* ── THE ALL-THREAD CENSUS, AND WHY IT IS A POLLING THREAD RATHER THAN A THREAD CALLBACK ────────
