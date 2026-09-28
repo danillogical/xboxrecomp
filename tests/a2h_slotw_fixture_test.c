@@ -597,6 +597,14 @@ int main(int argc, char **argv)
           st.protected_count, st.alias_count);
     printf("  [fixture] armed: slot=%08X page=%08X off=%03X aliases=%u/%u\n",
            st.slot_va, st.slot_va & ~0xFFFu, st.page_offset, st.protected_count, st.alias_count);
+    /* THE CROSS-PROCESS LAYOUT CHECK. tools/harness/collect.c cannot include this header -- it links
+     * no toolkit code -- so it mirrors the struct and validates `magic` and `size` before reading a
+     * field. Printing the authoritative size HERE is what makes that validation checkable from the
+     * archive: the collector's `collector=` value in a size-mismatch report must equal this number,
+     * and a reader can compare them without rebuilding anything. */
+    printf("  [fixture] ledger sizeof=%u magic=%08X version=%u events_max=%u\n",
+           (unsigned)sizeof(XboxA2hSlotwLedger), xbox_A2hSlotWatchFixtureLedger()->magic,
+           xbox_A2hSlotWatchFixtureLedger()->version, (unsigned)XBOX_A2H_SLOTW_EVENTS_MAX);
 
     slot_ptr = (uint32_t *)((char *)st.page0 + st.page_offset);
     page_other = (uint32_t *)((char *)st.page0 + ((st.page_offset + 8u) & 0xFFCu));

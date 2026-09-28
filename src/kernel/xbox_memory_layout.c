@@ -3426,10 +3426,16 @@ static DWORD WINAPI a2h_slotw_census_thread(LPVOID param)
         HANDLE snap;
         /* DEFERRED ARM. The device is allocated at runtime, so the pointer is polled here until it
          * names a plausible object; the slot is then derived from THAT read. Retried at the census
-         * cadence rather than once, because a single early attempt would simply miss. */
+         * cadence rather than once, because a single early attempt would simply miss.
+         *
+         * ⚠ THE ARM MEMSETS THE LEDGER, so the census counts are re-published immediately after it:
+         * leaving them to be restored only when the next thread arrives would report a live census
+         * of one thread as zero, which is the kind of quiet undercount this whole facility exists to
+         * avoid. */
         if (!g_a2h_slotw_armed && xbox_A2hSlotWatchArm())
             fprintf(stderr, "  [A2HSLOTW] deferred ARM completed base=%08X slot=%08X\n",
                     g_xbox_a2h_slotw.arm_base, g_xbox_a2h_slotw.arm_slot);
+        L->thread_count = seen_count;
 
         snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap != INVALID_HANDLE_VALUE) {
