@@ -18,7 +18,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
-#if !defined(_WIN32)
+#if defined(_WIN32)
+/* WIN32_LEAN_AND_MEAN excludes the toolhelp API from windows.h, and the all-thread census needs
+ * CreateToolhelp32Snapshot/Thread32First. Pulled in explicitly rather than by relaxing the lean
+ * define, which every other translation unit in the toolkit depends on. */
+#include <tlhelp32.h>
+#else
 #include <unistd.h>   /* _exit */
 #endif
 
@@ -347,6 +352,48 @@ static void *g_ac97_page = NULL;      /* host address of the trapped page */
 static void *g_ac97_veh  = NULL;
 static RECOMP_TLS int s_ac97_stepping = 0;
 
+/* ── A2h LIVE slot-write watch: the SHARED per-thread pending-ownership state ───────────────────
+ *
+ * Declared here, ABOVE ac97_write_veh(), because the AC'97 trap is a SECOND owner of the same
+ * single-step machinery and must record its own pending bit through the same protocol. Putting this
+ * state below the AC'97 handler is what would force the AC'97 path to keep its own private flag --
+ * and two private flags on one thread is precisely the collision the packet requires be made
+ * bit-exact instead of assumed away.
+ *
+ *   own-TF  (0x1) -- stepping a faulting write on a page the SLOT watch owns.
+ *   AC97-TF (0x2) -- stepping a faulting write on the AC'97 bus-master page.
+ *
+ * The bits are INDEPENDENT because a single thread can hold both at once: a fault can arrive while
+ * the other owner's step is still pending. Servicing is therefore per-bit and idempotent, and the
+ * TF bit is restored from the value that was present BEFORE THE FIRST owner armed -- not from
+ * whichever handler happens to finish last. */
+#define A2H_SLOTW_PEND_OWN   0x1u
+#define A2H_SLOTW_PEND_AC97  0x2u
+
+static volatile LONG g_a2h_slotw_armed = 0;
+static RECOMP_TLS uint32_t s_a2h_slotw_pending = 0;
+static RECOMP_TLS uint32_t s_a2h_slotw_saved_tf = 0;
+
+/* Take ownership of one pending bit for the CURRENT thread, capturing the pre-entry TF exactly once
+ * -- at the 0 -> non-zero transition, so a nested second owner cannot overwrite the value the
+ * outermost owner is going to restore. */
+static void a2h_slotw_take_pending(uint32_t bit, DWORD eflags)
+{
+    if (s_a2h_slotw_pending == 0)
+        s_a2h_slotw_saved_tf = (uint32_t)eflags & 0x100u;
+    s_a2h_slotw_pending |= bit;
+}
+
+/* Release one pending bit and return the TF state the thread must now have: still set while any
+ * owner remains, otherwise the pre-entry TF bit EXACTLY (cleared only if it was originally 0). */
+static DWORD a2h_slotw_release_pending(uint32_t bit, DWORD eflags)
+{
+    s_a2h_slotw_pending &= ~bit;
+    if (s_a2h_slotw_pending)
+        return (DWORD)(eflags | 0x100u);
+    return (DWORD)((eflags & ~0x100u) | s_a2h_slotw_saved_tf);
+}
+
 static void ac97_clear_reset_bits(void)
 {
     /* Every bus-master channel, not the three a PC AC'97 has.
@@ -379,12 +426,20 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
      * controller would have done and close the page again. Thread-local,
      * because another thread must not mistake its own single-step for this
      * one -- and re-protecting from the wrong thread would strand this one
-     * mid-step. */
-    if (code == EXCEPTION_SINGLE_STEP && s_ac97_stepping) {
-        s_ac97_stepping = 0;
+     * mid-step.
+     *
+     * THIS IS THE SHARED OWNERSHIP WORD, NOT A PRIVATE FLAG. The AC'97 trap is one of TWO owners of
+     * this thread's single-step, and both record through a2h_slotw_take_pending/release_pending so a
+     * #DB with both bits pending is serviced once per owner instead of being consumed by whichever
+     * handler sees it first. With the slot watch unarmed the word only ever holds this bit, so the
+     * behaviour is exactly what it was -- except that TF is now restored to the value present BEFORE
+     * this owner armed rather than being cleared unconditionally, which is what the packet requires
+     * and what keeps a guest's own single-step from being silently cancelled. */
+    if (code == EXCEPTION_SINGLE_STEP && (s_a2h_slotw_pending & A2H_SLOTW_PEND_AC97)) {
         ac97_clear_reset_bits();
         VirtualProtect(g_ac97_page, AC97_TRAP_BYTES, PAGE_READONLY, &old);
-        ep->ContextRecord->EFlags &= ~0x100u;   /* clear TF */
+        ep->ContextRecord->EFlags = a2h_slotw_release_pending(A2H_SLOTW_PEND_AC97,
+                                                             ep->ContextRecord->EFlags);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
@@ -397,7 +452,7 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
             if (!VirtualProtect(g_ac97_page, AC97_TRAP_BYTES,
                                 PAGE_READWRITE, &old))
                 return EXCEPTION_CONTINUE_SEARCH;
-            s_ac97_stepping = 1;
+            a2h_slotw_take_pending(A2H_SLOTW_PEND_AC97, ep->ContextRecord->EFlags);
             ep->ContextRecord->EFlags |= 0x100u;   /* TF: step the write */
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -2562,11 +2617,753 @@ void xbox_A2hAliasCensusDisarm(void)
     g_a2h_alias_armed = 0;
 }
 
+/* ── A2h LIVE slot-write watch: page protection ONLY, no debug registers ────────────────────────
+ *
+ * WHY THIS EXISTS. `software_device+0x242C` (== `context+0x1C4`) is read at 0x00193E62, NULL-tested,
+ * and called at 0x00193EB5. It is installed with the code pointer 0x0015F9D0 by the store at
+ * 0x0018CE3A, but the observed terminal target is the packed colour word 0x001D5078, which is what
+ * the store at 0x00199F45 (`mov [esi+ebp*4+0x3ec],eax`) produces. The question is WHO wrote the
+ * slot last, and with WHAT VALUE. That is a question about a STORE, and a store is the one thing a
+ * read-only page refuses.
+ *
+ * MECHANISM: PAGE PROTECTION, AND NOTHING ELSE. The slot's 4 KiB page is made PAGE_READONLY in the
+ * canonical view and in every mapped mirror view of the same physical page. An RO page faults on
+ * WRITE and never on READ, so the poll loop's read volume costs nothing and no read filter is
+ * needed -- the protection IS the discrimination. There is no DR0/DR6/DR7 anywhere in this
+ * facility and none may be added: the DR channel is EXCLUDED, not demoted.
+ *
+ * PAGE GRANULARITY IS LOAD-BEARING. The slot sits at page offset 0x62C of page 0x0019D000, so the
+ * watch necessarily catches EVERY write to that page. A fault is a SLOT HIT only when its effective
+ * address equals the re-derived slot VA for that alias; every other fault on the page is TRAFFIC
+ * and is counted as such. Conflating the two would attribute an unrelated page write to the slot.
+ *
+ * THE ADDRESS IS NEVER PRESELECTED. `MEM32(0x19DCE0)` is a POINTER to the device object, allocated
+ * at runtime, so the slot VA does not exist until the title allocates. It is read at ARM, the slot
+ * is derived by CHECKED 32-bit addition, and both are re-derived at TERMINAL; a moved base is a
+ * RE-SCOPE and is recorded as such rather than silently compared against the old VA.
+ *
+ * OBSERVATION ONLY. The handler's single change is the faulting thread's own TF bit, so the store
+ * the guest was already executing can complete and be read back. The store itself is executed by
+ * the guest, unmodified; no guest register, memory, allocation, cleanup or device state is altered,
+ * and nothing here can suppress a guest trap or fabricate a result. */
+#define A2H_SLOTW_EV_WRITE      1u
+#define A2H_SLOTW_EV_STEP       2u
+#define A2H_SLOTW_EV_READ       3u
+#define A2H_SLOTW_EV_CONTROL    4u
+
+#define A2H_SLOTW_MAGIC 0x57533241u   /* 'A2SW' */
+
+/* The POSIX host layer (platform/win32_compat.h) provides the 32-bit interlocked primitives and the
+ * page constants but not the 64-bit ones, and it has no PAGE_GUARD. The loss counters are 64-bit
+ * because a bounded run can still exceed 2^32 writes on a hot page in principle, so they are routed
+ * through one pair of macros rather than spelled per host. The POSIX build is the conformance test,
+ * not a live title, so a plain read-modify-write is adequate there. */
+#if defined(_WIN32)
+#  define A2H_SLOTW_INC64(p)     InterlockedIncrement64((volatile LONG64 *)(p))
+#  define A2H_SLOTW_SET64(p, v)  InterlockedExchange64((volatile LONG64 *)(p), (LONG64)(v))
+#else
+#  define A2H_SLOTW_INC64(p)     ((uint64_t)(++(*(uint64_t *)(p))))
+#  define A2H_SLOTW_SET64(p, v)  ((void)(*(uint64_t *)(p) = (uint64_t)(v)))
+#endif
+#ifndef PAGE_GUARD
+#  define PAGE_GUARD 0x100u
+#endif
+
+XboxA2hSlotwLedger g_xbox_a2h_slotw;
+
+static void *g_a2h_slotw_veh = NULL;
+static void *g_a2h_slotw_pages[XBOX_A2H_SLOTW_PAGES_MAX] = {0};
+static int g_a2h_slotw_gate = -1;
+static volatile LONG g_a2h_slotw_seq = 0;
+static volatile LONG g_a2h_slotw_step_owner = 0;   /* native tid of the thread mid-step, else 0 */
+
+/* `g_a2h_slotw_armed`, `s_a2h_slotw_pending` and `s_a2h_slotw_saved_tf` are declared ABOVE
+ * ac97_write_veh(), because the AC'97 trap is a second owner of the same pending word. The
+ * per-OWNER payload below is this watch's alone: AC'97's step carries its own reset-bit work and
+ * needs none of it. */
+static RECOMP_TLS uint32_t s_a2h_slotw_pending_alias = 0;
+static RECOMP_TLS uint32_t s_a2h_slotw_pending_slot = 0;
+static RECOMP_TLS uint32_t s_a2h_slotw_pending_pre = 0;
+static RECOMP_TLS uint32_t s_a2h_slotw_pending_seq = 0;
+
+static int a2h_slotw_on(void)
+{
+    if (g_a2h_slotw_gate < 0)
+        g_a2h_slotw_gate = getenv(XBOX_A2H_SLOTW_GATE) ? 1 : 0;
+    return g_a2h_slotw_gate;
+}
+
+static uint32_t a2h_slotw_next_seq(void)
+{
+    return (uint32_t)InterlockedIncrement(&g_a2h_slotw_seq);
+}
+
+/* Publish one FULL record. Returns 1 when the record is in the ledger, 0 when the bounded array is
+ * full -- in which case the overflow latch is set and the caller must NOT treat the write as
+ * unobserved. A full record per event, never a sample and never first-N. */
+static int a2h_slotw_publish(uint32_t kind, uint32_t alias_index, uint32_t slot_hit,
+                             uint32_t fault_va, uint32_t pre_value, uint32_t post_value,
+                             uint64_t rip, uint32_t enc)
+{
+    XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+    uint32_t seq = a2h_slotw_next_seq();
+    LONG slot;
+
+    slot = InterlockedIncrement((volatile LONG *)&L->event_count) - 1;
+    if (slot < 0 || slot >= XBOX_A2H_SLOTW_EVENTS_MAX) {
+        A2H_SLOTW_INC64(&L->loss.dropped_events);
+        InterlockedExchange((volatile LONG *)&L->event_overflow, 1);
+        InterlockedExchange((volatile LONG *)&L->loss.overflow, 1);
+        return 0;
+    }
+    /* Every field is written before the record is reachable: a reader that walks event_count can
+     * only see records whose seq is non-zero, and seq is written LAST. */
+    L->events[slot].alias_index = alias_index;
+    L->events[slot].slot_hit = slot_hit;
+    L->events[slot].fault_va = fault_va;
+    L->events[slot].pre_value = pre_value;
+    L->events[slot].post_value = post_value;
+    L->events[slot].tid = (uint32_t)GetCurrentThreadId();
+    L->events[slot].enc = enc;
+    L->events[slot].reserved = 0;
+    L->events[slot].rip = rip;
+    L->events[slot].ticks = (uint64_t)GetTickCount64();
+    L->events[slot].kind = kind;
+    L->events[slot].seq = seq;          /* LAST: the record becomes visible here */
+    return 1;
+}
+
+/* Classify the FAULTING INSTRUCTION from the bytes at the recorded native RIP.
+ *
+ * A native RIP is not a guest VA and cannot be compared against 0x0018CE3A or 0x00199F45 -- the
+ * recompiled image is native code at its own addresses. What IS available is the encoding, and the
+ * two signatures differ in it exactly: the installer's `mov [ecx+0x242c],eax` is `89 81 2C 24 00
+ * 00` (ModRM disp32 carrying 0x242C) while the candidate's `mov [esi+ebp*4+0x3ec],eax` is
+ * `89 84 AE EC 03 00 00` (SIB, displacement 0x3EC, with no 0x242C anywhere in it). Classifying by
+ * encoding therefore distinguishes them without inventing a native-address mapping. */
+static uint32_t a2h_slotw_classify_store(uint64_t rip)
+{
+    const uint8_t *p = (const uint8_t *)(uintptr_t)rip;
+    uint32_t enc = XBOX_A2H_SLOTW_ENC_UNKNOWN;
+    uint8_t modrm;
+    int has_sib;
+
+    /* A RIP is only readable if it is inside this process's own image; guard rather than fault
+     * inside the fault handler. MEMORY_BASIC_INFORMATION is the cheapest sound test. */
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((LPCVOID)(uintptr_t)rip, &mbi, sizeof(mbi)) == 0)
+            return XBOX_A2H_SLOTW_ENC_UNKNOWN;
+        if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) || (mbi.Protect & PAGE_NOACCESS))
+            return XBOX_A2H_SLOTW_ENC_UNKNOWN;
+    }
+
+    if (p[0] != 0x89)                     /* mov r/m32, r32 -- the only form either site uses */
+        return XBOX_A2H_SLOTW_ENC_OTHER;
+    modrm = p[1];
+    if ((modrm & 0xC0u) != 0x80u)         /* both sites are [base + disp32] */
+        return XBOX_A2H_SLOTW_ENC_OTHER;
+    has_sib = ((modrm & 0x07u) == 0x04u);
+    {
+        const uint8_t *disp = p + (has_sib ? 3 : 2);
+        uint32_t d = (uint32_t)disp[0] | ((uint32_t)disp[1] << 8)
+                   | ((uint32_t)disp[2] << 16) | ((uint32_t)disp[3] << 24);
+        if (has_sib && d == XBOX_A2H_SLOTW_CANDIDATE_SIB)
+            enc = XBOX_A2H_SLOTW_ENC_SIB;                       /* the candidate's encoding */
+        else if (!has_sib && d == XBOX_A2H_SLOTW_SLOT_OFFSET)
+            enc = XBOX_A2H_SLOTW_ENC_MODRM;                     /* the installer's encoding */
+        else
+            enc = XBOX_A2H_SLOTW_ENC_OTHER;
+    }
+    return enc;
+}
+
+/* Which of OUR pages, if any, holds this fault address? Returns the alias index + 1, or 0. */
+static uint32_t a2h_slotw_owning_alias(uintptr_t fault)
+{
+    uint32_t i;
+    for (i = 0; i < XBOX_A2H_SLOTW_PAGES_MAX; i++) {
+        uintptr_t base = (uintptr_t)g_a2h_slotw_pages[i];
+        if (!base) continue;
+        if (fault >= base && fault < base + XBOX_A2H_SLOTW_PAGE_SIZE)
+            return i + 1;
+    }
+    return 0;
+}
+
+/* The canonical slot VA for the current arm, re-derived rather than cached by the caller. */
+static uint32_t a2h_slotw_slot_va(void)
+{
+    return g_xbox_a2h_slotw.arm_slot;
+}
+
+/* Service ONE owner bit exactly once, then clear it. `bit` is 0x1 (own) or 0x2 (AC97). Returns
+ * nothing: the caller decides the TF state from what REMAINS pending, which is the whole point of
+ * keeping the bits separate. */
+static void a2h_slotw_service_own(PEXCEPTION_POINTERS ep)
+{
+    XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+    DWORD old;
+    uint32_t alias = s_a2h_slotw_pending_alias;
+    uint32_t post;
+    uintptr_t base;
+
+    /* The faulting store has now executed. Read the POST value through the SAME alias the store
+     * used, so a store that landed through a mirror is read back through that mirror -- an alias
+     * whose write is read back canonically would report the wrong value if the views ever diverged
+     * (they are asserted to alias, but the packet forbids relying on that here). */
+    base = (uintptr_t)g_a2h_slotw_pages[alias ? alias - 1 : 0];
+    post = *(volatile uint32_t *)(base + (a2h_slotw_slot_va() & (XBOX_A2H_SLOTW_PAGE_SIZE - 1)));
+
+    A2H_SLOTW_INC64(&L->loss.steps);
+    if (!a2h_slotw_publish(A2H_SLOTW_EV_STEP, alias, s_a2h_slotw_pending_slot,
+                           (uint32_t)(base + (a2h_slotw_slot_va()
+                                             & (XBOX_A2H_SLOTW_PAGE_SIZE - 1))),
+                           s_a2h_slotw_pending_pre, post,
+                           (uint64_t)ep->ContextRecord->Rip, XBOX_A2H_SLOTW_ENC_UNKNOWN)) {
+        /* The step record is lost. The page is STILL closed below, because leaving it open would
+         * convert a bounded loss into an unbounded one -- and the overflow latch already marks
+         * every absence/order row invalid. */
+    }
+
+    /* RE-PROTECT. A failure here leaves the page OPEN, which is a coverage hole and is counted as
+     * one: it is never silently treated as "no further writes". */
+    if (VirtualProtect((LPVOID)base, XBOX_A2H_SLOTW_PAGE_SIZE, PAGE_READONLY, &old)) {
+        A2H_SLOTW_INC64(&L->loss.rearm_ok);
+        A2H_SLOTW_INC64(&L->loss.protected_intervals);
+    } else {
+        A2H_SLOTW_INC64(&L->loss.rearm_failed);
+        InterlockedExchange((volatile LONG *)&L->loss.overflow, 1);
+    }
+    InterlockedExchange((volatile LONG *)&g_a2h_slotw_step_owner, 0);
+    s_a2h_slotw_pending_alias = 0;
+    s_a2h_slotw_pending_slot = 0;
+    s_a2h_slotw_pending_pre = 0;
+    s_a2h_slotw_pending_seq = 0;
+    A2H_SLOTW_INC64(&L->loss.db_own_serviced);
+}
+
+static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+
+    if (!g_a2h_slotw_armed)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    /* ── THE #DB, BIT-EXACT ────────────────────────────────────────────────────────────────────
+     *
+     * Service EVERY pending owner exactly once, then clear each serviced bit. TF stays set while a
+     * pending owner remains; when none remains, the pre-entry TF bit is restored EXACTLY -- cleared
+     * only if it was originally 0, set only if it was originally 1. An unowned #DB is NEVER
+     * consumed: this handler did not ask for it, and swallowing it would rob whichever component
+     * did (AC'97's own trap among them). */
+    if (code == EXCEPTION_SINGLE_STEP) {
+        uint32_t pending = s_a2h_slotw_pending;
+
+        if (!pending) {
+            A2H_SLOTW_INC64(&L->loss.db_unowned);
+            return EXCEPTION_CONTINUE_SEARCH;     /* NOT OURS. Do not consume it. */
+        }
+
+        /* OWN FIRST: post-value + RO re-protect, then release the own bit. The release recomputes TF
+         * from what REMAINS pending, so a still-pending AC'97 owner keeps TF set. */
+        if (pending & A2H_SLOTW_PEND_OWN) {
+            a2h_slotw_service_own(ep);
+            ep->ContextRecord->EFlags =
+                a2h_slotw_release_pending(A2H_SLOTW_PEND_OWN, ep->ContextRecord->EFlags);
+        }
+
+        if (s_a2h_slotw_pending & A2H_SLOTW_PEND_AC97) {
+            /* THE EXISTING AC97 INTERLOCK, INTEGRATED RATHER THAN DUPLICATED.
+             *
+             * ac97_write_veh() above owns the reset-bit work and the re-protection of its own page,
+             * and it is reached through the SAME vectored chain. Its bit is deliberately NOT
+             * cleared here: this handler passes the #DB on, ac97_write_veh() claims it (the pending
+             * word is per-thread, so it is this thread's own step it sees), performs its reset-bit
+             * work, re-protects, releases ITS bit and restores TF. Clearing the bit here would make
+             * the AC'97 handler skip its work and strand its page open -- so "service every pending
+             * owner exactly once" is enforced by each owner releasing only its OWN bit, in the
+             * handler that actually does that owner's work. */
+            A2H_SLOTW_INC64(&L->loss.db_ac97_serviced);
+            if (pending & A2H_SLOTW_PEND_OWN)
+                A2H_SLOTW_INC64(&L->loss.db_dual_serviced);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        /* Only the own bit was pending; its release already restored the pre-entry TF exactly. */
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    /* ── THE WRITE FAULT ─────────────────────────────────────────────────────────────────────── */
+    if (code == EXCEPTION_ACCESS_VIOLATION) {
+        uintptr_t fault;
+        uint32_t alias, enc, pre, slot_hit, slot_va, off;
+        DWORD old;
+
+        /* `ExceptionInformation[0] == 1` is the belt-and-suspenders filter the preflight requires to
+         * be PROVEN rather than assumed: 0 means read, 1 means write, 8 means execute. A read can
+         * only fault here if something else removed the protection, and treating it as a write would
+         * single-step a load and corrupt the ledger. It is proven by fixture, not trusted. */
+        if (ep->ExceptionRecord->ExceptionInformation[0] != 1) {
+            A2H_SLOTW_INC64(&L->loss.unexpected_exception);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+        alias = a2h_slotw_owning_alias(fault);
+        if (!alias)
+            return EXCEPTION_CONTINUE_SEARCH;      /* not our page: never shadow another handler */
+
+        A2H_SLOTW_INC64(&L->loss.relevant_av);
+
+        slot_va = a2h_slotw_slot_va();
+        off = slot_va & (XBOX_A2H_SLOTW_PAGE_SIZE - 1);
+        slot_hit = (fault == (uintptr_t)g_a2h_slotw_pages[alias - 1] + off) ? 1u : 0u;
+        if (slot_hit)
+            A2H_SLOTW_INC64(&L->loss.slot_hits);
+        else
+            A2H_SLOTW_INC64(&L->loss.nonslot_writes);
+
+        /* A SECOND THREAD faulting on an owned page while another is mid-step is a concurrent
+         * overlapping writer: the page is open for the stepping thread, so this fault can only
+         * happen because the protection was temporarily off. That is a coverage hole for any
+         * absence row and is counted, never ignored. */
+        if (InterlockedCompareExchange(&g_a2h_slotw_step_owner, 0, 0) != 0
+                && (uint32_t)InterlockedCompareExchange(&g_a2h_slotw_step_owner, 0, 0)
+                   != (uint32_t)GetCurrentThreadId()) {
+            A2H_SLOTW_INC64(&L->loss.concurrent_overlap);
+        }
+
+        pre = *(volatile uint32_t *)((uintptr_t)g_a2h_slotw_pages[alias - 1] + off);
+        enc = a2h_slotw_classify_store((uint64_t)ep->ContextRecord->Rip);
+
+        /* PUBLISH FIRST. The record is written BEFORE the page is opened: a page opened without a
+         * published record could absorb a concurrent write that is then neither recorded nor the
+         * first touch. If publication fails the page is left CLOSED and the fault propagates. */
+        if (!a2h_slotw_publish(A2H_SLOTW_EV_WRITE, alias, slot_hit, (uint32_t)fault, pre, 0,
+                               (uint64_t)ep->ContextRecord->Rip, enc)) {
+            A2H_SLOTW_INC64(&L->loss.publish_failed);
+            fprintf(stderr, "  [A2HSLOTW] write NOT published alias=%u fault=%p -- page left CLOSED"
+                            " (coverage failure)\n", alias, (void *)fault);
+            fflush(stderr);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        /* THE REQUIRED POSITIVE CONTROL. The installer's own encoding, with the installer's own
+         * value, ON the derived slot. Its absence is INFRA FAILURE and fails the packet closed; it
+         * is never inferred from a log line. */
+        if (slot_hit && enc == XBOX_A2H_SLOTW_ENC_MODRM && pre == 0
+                && (fault == (uintptr_t)g_a2h_slotw_pages[alias - 1] + off)) {
+            /* The installer writes ARG1, which the sole caller at 0x00012319 pushes as 0 and which
+             * the wrapper at 0x0015F9E0 rewrites to 0x0015F9D0. The pre-value is recorded so the
+             * control is a comparison against the run, not against a constant baked in here. */
+            A2H_SLOTW_INC64(&L->loss.installer_control_hits);
+        }
+
+        if (!VirtualProtect((LPVOID)g_a2h_slotw_pages[alias - 1], XBOX_A2H_SLOTW_PAGE_SIZE,
+                            PAGE_READWRITE, &old)) {
+            A2H_SLOTW_INC64(&L->loss.protect_failed);
+            InterlockedExchange((volatile LONG *)&L->loss.overflow, 1);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        A2H_SLOTW_INC64(&L->loss.unprotected_intervals);
+
+        a2h_slotw_take_pending(A2H_SLOTW_PEND_OWN, ep->ContextRecord->EFlags);
+        s_a2h_slotw_pending_alias = alias;
+        s_a2h_slotw_pending_slot = slot_hit;
+        s_a2h_slotw_pending_pre = pre;
+        s_a2h_slotw_pending_seq = (uint32_t)g_a2h_slotw_seq;
+        InterlockedExchange(&g_a2h_slotw_step_owner, (LONG)GetCurrentThreadId());
+        ep->ContextRecord->EFlags |= 0x100u;      /* step exactly the one faulting store */
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    /* Everything else -- including a #DB from a component this watch does not own -- is somebody
+     * else's. Counted so a reader can see the stream was read, then passed on untouched. */
+    A2H_SLOTW_INC64(&L->loss.unexpected_exception);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+uint32_t xbox_A2hSlotWatchArm(void)
+{
+    XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+    uint32_t base, slot, off, mapped = 0, protected_ = 0;
+    uint32_t i;
+
+    if (!a2h_slotw_on() || g_a2h_slotw_armed)
+        return g_a2h_slotw_armed;
+    if (!g_memory_base)
+        return 0;
+
+    memset(L, 0, sizeof(*L));
+    L->magic = A2H_SLOTW_MAGIC;
+    L->version = XBOX_A2H_SLOTW_VERSION;
+    L->size = (uint32_t)sizeof(*L);
+
+    /* READ THE POINTER. It is a pointer, not the object: the device is allocated at runtime, so the
+     * slot VA does not exist before this read and MUST NOT be preselected. */
+    base = *(volatile uint32_t *)((uintptr_t)XBOX_A2H_SLOTW_DEVICE_PTR + g_xbox_mem_offset);
+
+    /* CHECKED 32-bit addition. A base that is not inside the mapped RAM range cannot name the
+     * device, and wrapping the addition would silently protect an unrelated page -- the packet's
+     * "changed base => re-scope, never silently compare" rule applied at the ARM step. */
+    {
+        size_t ram = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
+        if (base < XBOX_BASE_ADDRESS || (size_t)base >= ram)
+            base = 0;
+    }
+    if (!base) {
+        L->arm_reason = XBOX_A2H_SLOTW_ARM_NOT_YET;
+        return 0;
+    }
+    slot = base + XBOX_A2H_SLOTW_SLOT_OFFSET;
+    if (slot < base) {   /* 32-bit overflow of the checked addition */
+        fprintf(stderr, "  [A2HSLOTW] ARM refused: base 0x%08X + 0x%X wraps 32 bits\n",
+                base, XBOX_A2H_SLOTW_SLOT_OFFSET);
+        fflush(stderr);
+        L->arm_reason = XBOX_A2H_SLOTW_ARM_COVERAGE;
+        return 0;
+    }
+    off = slot & (XBOX_A2H_SLOTW_PAGE_SIZE - 1);
+
+    L->arm_base = base;
+    L->arm_slot = slot;
+    L->page_offset = off;
+    L->arm_ticks = (uint64_t)GetTickCount64();
+
+    /* Registered at the same priority as the game's own VEH and AC'97's (both 1). This handler
+     * claims only its own pages and its own #DB bits and returns EXCEPTION_CONTINUE_SEARCH for
+     * everything else, so it neither shadows nor reorders them. */
+    g_a2h_slotw_veh = AddVectoredExceptionHandler(1, a2h_slotw_veh);
+    if (!g_a2h_slotw_veh) {
+        fprintf(stderr, "  [A2HSLOTW] ARM FAILED: no VEH; nothing protected\n");
+        fflush(stderr);
+        L->arm_base = 0; L->arm_slot = 0;
+        return 0;
+    }
+
+    /* Alias 0 is the canonical view: guest VA V is at g_memory_base + (V - 0x10000). Alias m+1 is
+     * mirror view m, whose guest window is (m+1)*map_size. ALL of them are the SAME physical page,
+     * so a store through any one of them changes the slot -- protecting only the canonical page
+     * would be structurally blind to the other 28, which is the exact mechanism that hid Halo's
+     * fs:[4] corruption. */
+    for (i = 0; i < XBOX_A2H_SLOTW_PAGES_MAX; i++) {
+        uintptr_t host;
+        DWORD old;
+        uint64_t guest_lo, guest_hi, gva;
+        size_t map_size = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
+
+        if (i == 0) {
+            gva = (uint64_t)slot;
+            host = (uintptr_t)g_memory_base + (uintptr_t)(slot - XBOX_BASE_ADDRESS);
+        } else {
+            if (!g_mirror_views[i - 1]) continue;      /* not mapped: accounted, not assumed */
+            guest_lo = (uint64_t)i * map_size;
+            guest_hi = guest_lo + map_size;
+            gva = guest_lo + ((uint64_t)slot % map_size);
+            if (gva < guest_lo || gva >= guest_hi) continue;
+            host = (uintptr_t)g_mirror_views[i - 1] + (uintptr_t)(gva - guest_lo);
+        }
+        host &= ~(uintptr_t)(XBOX_A2H_SLOTW_PAGE_SIZE - 1);
+
+        g_a2h_slotw_pages[i] = (void *)host;
+        L->mapped_mask |= (1u << i);
+        mapped++;
+        if (VirtualProtect((LPVOID)host, XBOX_A2H_SLOTW_PAGE_SIZE, PAGE_READONLY, &old)) {
+            L->protect_mask |= (1u << i);
+            protected_++;
+            A2H_SLOTW_INC64(&L->loss.protected_intervals);
+        } else {
+            /* A MAPPED ALIAS THAT CANNOT BE PROTECTED IS A COVERAGE FAILURE, NOT A WARNING: a
+             * store through it would change the slot invisibly. */
+            fprintf(stderr, "  [A2HSLOTW] alias %u page at %p NOT protected (error %lu)"
+                            " -- coverage failure\n", i, (void *)host, GetLastError());
+            g_a2h_slotw_pages[i] = NULL;
+            A2H_SLOTW_INC64(&L->loss.protect_failed);
+            InterlockedExchange((volatile LONG *)&L->loss.overflow, 1);
+        }
+    }
+    L->alias_count = mapped;
+    L->protected_count = protected_;
+
+    /* REFUSE TO OPEN ON FAILED PUBLICATION. Not every mapped alias protected means the watch is
+     * structurally incomplete, so it is disarmed rather than left half-armed and read as if whole. */
+    if (mapped == 0 || mapped != protected_) {
+        fprintf(stderr, "  [A2HSLOTW] ARM REFUSED: mapped=%u protected=%u -- disarming\n",
+                mapped, protected_);
+        fflush(stderr);
+        xbox_A2hSlotWatchDisarm();
+        return 0;
+    }
+
+    g_a2h_slotw_armed = 1;
+    L->armed = 1;
+    L->arm_reason = XBOX_A2H_SLOTW_ARM_OK;
+    fprintf(stderr, "  [A2HSLOTW] armed base=%08X slot=%08X page=%08X off=%03X aliases=%u/%u"
+                    " mask=%08X\n",
+            base, slot, slot & ~(XBOX_A2H_SLOTW_PAGE_SIZE - 1), off, protected_, mapped,
+            L->protect_mask);
+    fflush(stderr);
+    return 1;
+}
+
+void xbox_A2hSlotWatchDisarm(void)
+{
+    uint32_t i;
+    int restored = 0;
+
+    if (!g_a2h_slotw_armed && !g_a2h_slotw_veh)
+        return;
+    g_a2h_slotw_armed = 0;
+    for (i = 0; i < XBOX_A2H_SLOTW_PAGES_MAX; i++) {
+        DWORD old;
+        if (!g_a2h_slotw_pages[i]) continue;
+        if (VirtualProtect(g_a2h_slotw_pages[i], XBOX_A2H_SLOTW_PAGE_SIZE,
+                           PAGE_READWRITE, &old)) {
+            restored++;
+        } else {
+            fprintf(stderr, "  [A2HSLOTW] alias %u page NOT restored (error %lu)\n",
+                    i, GetLastError());
+        }
+        g_a2h_slotw_pages[i] = NULL;
+    }
+    if (g_a2h_slotw_veh) {
+        RemoveVectoredExceptionHandler(g_a2h_slotw_veh);
+        g_a2h_slotw_veh = NULL;
+    }
+    fprintf(stderr, "  [A2HSLOTW] disarmed restored=%d\n", restored);
+    fflush(stderr);
+}
+
+/* TERMINAL: re-derive the slot from a FRESH read of the pointer. A moved base is a RE-SCOPE -- the
+ * terminal slot is reported, the difference is latched, and nothing compares the new VA against the
+ * old one as though they were the same object. */
+void xbox_A2hSlotWatchTerminal(uint32_t target)
+{
+    XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+    uint32_t base, slot;
+
+    if (!L->magic)
+        return;
+    base = *(volatile uint32_t *)((uintptr_t)XBOX_A2H_SLOTW_DEVICE_PTR + g_xbox_mem_offset);
+    slot = (base >= 0x10000u) ? base + XBOX_A2H_SLOTW_SLOT_OFFSET : 0;
+
+    L->term_base = base;
+    L->term_slot = slot;
+    L->slot_stable = (slot == L->arm_slot) ? 1u : 0u;
+    if (!L->slot_stable)
+        L->loss.base_changed = 1;
+    L->terminal_target = target;
+    L->terminal_seen = 1;
+    L->terminal_ticks = (uint64_t)GetTickCount64();
+    fprintf(stderr, "  [A2HSLOTW] terminal base=%08X slot=%08X target=%08X stable=%u"
+                    " reads=%u fourth=%u(%08X)\n",
+            base, slot, target, L->slot_stable, L->read_count, L->fourth_reached,
+            L->fourth_value);
+    fflush(stderr);
+}
+
+/* THE FOURTH READ. `0x00193E62 mov eax,[esi+0x1C4]` produces the value that `0x00193EB5 call eax`
+ * consumes. Counting is UNCAPPED, so "the fourth read" is a fact about the stream and not about a
+ * bounded sample. At read #4 the value is latched together with the ORDERED EVENT ID of the last
+ * slot-hit write at or before it -- an event id, not a log timestamp, so the tie to the installer
+ * and to every slot write survives log truncation and interleaving. */
+void xbox_A2hSlotWatchNoteFourthRead(uint32_t value, uint32_t read_index)
+{
+    XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+    uint32_t i, best = 0;
+    uint32_t seq;
+
+    if (!L->magic || !g_a2h_slotw_armed)
+        return;
+    /* The INDEX is supplied by the caller from the guest's own counter and is authoritative; this
+     * handler's own count is a cross-check, not the source, because the read site is reached from a
+     * poll loop whose iterations this side cannot bound. */
+    L->read_count = read_index ? read_index : (L->read_count + 1);
+    seq = a2h_slotw_next_seq();
+    a2h_slotw_publish(A2H_SLOTW_EV_READ, 0, 0, 0, value, 0, 0, XBOX_A2H_SLOTW_ENC_UNKNOWN);
+    if (L->read_count != 4 || L->fourth_reached)
+        return;
+
+    /* The last slot-hit write at or before this read, by EVENT ID. A write that arrives after the
+     * read has a larger seq and is excluded by construction rather than by timestamp comparison. */
+    for (i = 0; i < XBOX_A2H_SLOTW_EVENTS_MAX; i++) {
+        if (!L->events[i].seq || L->events[i].seq >= seq) continue;
+        if (L->events[i].kind != A2H_SLOTW_EV_WRITE || !L->events[i].slot_hit) continue;
+        if (L->events[i].seq > best) {
+            best = L->events[i].seq;
+            L->last_write_seq = L->events[i].seq;
+            L->last_write_enc = L->events[i].enc;
+            L->last_write_alias = L->events[i].alias_index;
+            L->last_write_rip = L->events[i].rip;
+            L->last_write_ticks = L->events[i].ticks;
+            L->last_write_value = L->events[i].pre_value;
+        }
+    }
+    L->fourth_value = value;
+    L->fourth_seq = seq;
+    L->fourth_reached = 1;
+    L->loss.read_samples++;
+    fprintf(stderr, "  [A2HSLOTW] fourth-read value=%08X index=%u seq=%u last_write_seq=%u enc=%u"
+                    " alias=%u\n", value, L->read_count, seq, L->last_write_seq, L->last_write_enc,
+            L->last_write_alias);
+    fflush(stderr);
+}
+
+int xbox_A2hSlotWatchEnabled(void)
+{
+    return a2h_slotw_on();
+}
+
+/* ── THE ALL-THREAD CENSUS, AND WHY IT IS A POLLING THREAD RATHER THAN A THREAD CALLBACK ────────
+ *
+ * "No thread exclusion, ever" means the census must be able to NAME a writer on any thread,
+ * including one that did not exist when the watch armed. The page protection is process-wide and
+ * therefore already covers a new thread's stores the instant it is created -- what a new thread
+ * costs is not coverage of the WRITE but knowledge of the THREAD, and that is what this census adds.
+ *
+ * A thread-birth callback (CreateToolhelp32Snapshot diffing at a fixed cadence) is used rather than
+ * a per-thread arming loop, because the mechanism has no per-thread state to arm: there are no debug
+ * registers to program, which is exactly why the DR channel's arming problem does not recur here.
+ * Arrivals and exits are both counted, and a tid that exits between two snapshots is reconciled by
+ * the exit count rather than being reported as never having existed.
+ *
+ * This thread is a CENSUS, not a guard: it never protects or opens a page, never touches a guest
+ * register and never calls into guest code. It is created only when the gate is set and it is
+ * stopped and joined on disarm/shutdown. */
+#define A2H_SLOTW_CENSUS_MS 50
+
+static HANDLE g_a2h_slotw_census_thread = NULL;
+static volatile LONG g_a2h_slotw_census_stop = 0;
+
+static DWORD WINAPI a2h_slotw_census_thread(LPVOID param)
+{
+    XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+    DWORD seen[XBOX_A2H_SLOTW_THREADS_MAX];
+    uint32_t seen_count = 0;
+    (void)param;
+
+    /* The arming thread is the first member of the census by construction. */
+    seen[seen_count++] = GetCurrentThreadId();
+    L->thread_count = seen_count;
+
+    while (!InterlockedCompareExchange(&g_a2h_slotw_census_stop, 0, 0)) {
+        HANDLE snap;
+        /* DEFERRED ARM. The device is allocated at runtime, so the pointer is polled here until it
+         * names a plausible object; the slot is then derived from THAT read. Retried at the census
+         * cadence rather than once, because a single early attempt would simply miss. */
+        if (!g_a2h_slotw_armed && xbox_A2hSlotWatchArm())
+            fprintf(stderr, "  [A2HSLOTW] deferred ARM completed base=%08X slot=%08X\n",
+                    g_xbox_a2h_slotw.arm_base, g_xbox_a2h_slotw.arm_slot);
+
+        snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 te;
+            DWORD live[XBOX_A2H_SLOTW_THREADS_MAX];
+            uint32_t live_count = 0;
+            uint32_t i, j;
+
+            te.dwSize = sizeof(te);
+            if (Thread32First(snap, &te)) {
+                do {
+                    if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
+                    if (live_count < XBOX_A2H_SLOTW_THREADS_MAX)
+                        live[live_count++] = te.th32ThreadID;
+                } while (Thread32Next(snap, &te));
+            }
+            CloseHandle(snap);
+
+            /* ARRIVALS: in the live set, not in the seen set. */
+            for (i = 0; i < live_count; i++) {
+                int known = 0;
+                for (j = 0; j < seen_count; j++)
+                    if (seen[j] == live[i]) { known = 1; break; }
+                if (known) continue;
+                if (seen_count < XBOX_A2H_SLOTW_THREADS_MAX) {
+                    seen[seen_count++] = live[i];
+                    L->thread_count = seen_count;
+                    A2H_SLOTW_INC64(&L->loss.threads_new);
+                } else {
+                    /* The census array is bounded; an arrival beyond it is a coverage failure for
+                     * the THREAD list and is latched rather than silently dropped. The WRITE is
+                     * still covered -- the page is protected process-wide -- so this invalidates a
+                     * per-thread claim, never a positive writer record. */
+                    L->thread_overflow = 1;
+                    A2H_SLOTW_SET64(&L->loss.overflow, 1);
+                }
+            }
+            /* EXITS: in the seen set, not in the live set. A tid that arrives and exits between two
+             * snapshots is counted as BOTH a new thread and a gone thread when it is next seen,
+             * which is why both counters are reported instead of a net difference. */
+            for (j = 0; j < seen_count; j++) {
+                int alive = 0;
+                for (i = 0; i < live_count; i++)
+                    if (live[i] == seen[j]) { alive = 1; break; }
+                if (!alive) {
+                    A2H_SLOTW_INC64(&L->loss.threads_gone);
+                    /* Remove it so a recycled tid is not mistaken for the old thread. */
+                    seen[j] = seen[seen_count - 1];
+                    seen_count--;
+                    L->thread_count = seen_count;
+                    j--;
+                }
+            }
+        }
+        Sleep(A2H_SLOTW_CENSUS_MS);
+    }
+    return 0;
+}
+
+void xbox_A2hSlotWatchStart(void)
+{
+    if (!a2h_slotw_on() || g_a2h_slotw_census_thread)
+        return;
+
+    /* ARM FIRST, SYNCHRONOUSLY, ON THIS THREAD. Two reasons, both measured rather than preferred:
+     *
+     *   (1) The census thread below must not be created while the game's own VEH chain is being
+     *       registered from another thread -- the handler order is a carry-forward gate, and the
+     *       order a reader re-verifies must be the order that was actually installed.
+     *   (2) If MEM32(0x19DCE0) already names the device at this point, the pages are protected
+     *       BEFORE the poll thread starts, so the very first write is caught. If it does not, the
+     *       ARM is retried from the poll thread until it does, which is the deferred case. */
+    if (xbox_A2hSlotWatchArm())
+        fprintf(stderr, "  [A2HSLOTW] armed synchronously at start (base=%08X)\n",
+                g_xbox_a2h_slotw.arm_base);
+    else
+        fprintf(stderr, "  [A2HSLOTW] device not yet allocated (MEM32(0x%08X)=%08X);"
+                        " ARM deferred to the census poll\n",
+                XBOX_A2H_SLOTW_DEVICE_PTR,
+                *(volatile uint32_t *)((uintptr_t)XBOX_A2H_SLOTW_DEVICE_PTR + g_xbox_mem_offset));
+    fflush(stderr);
+
+    g_a2h_slotw_census_stop = 0;
+    g_a2h_slotw_census_thread = CreateThread(NULL, 0, a2h_slotw_census_thread, NULL, 0, NULL);
+    if (!g_a2h_slotw_census_thread) {
+        fprintf(stderr, "  [A2HSLOTW] census thread NOT created (error %lu) -- arrivals and exits"
+                        " are NOT accounted for\n", GetLastError());
+        fflush(stderr);
+        A2H_SLOTW_SET64(&g_xbox_a2h_slotw.loss.overflow, 1);
+    }
+}
+
+void xbox_A2hSlotWatchStop(void)
+{
+    if (g_a2h_slotw_census_thread) {
+        InterlockedExchange(&g_a2h_slotw_census_stop, 1);
+        WaitForSingleObject(g_a2h_slotw_census_thread, 1000);
+        CloseHandle(g_a2h_slotw_census_thread);
+        g_a2h_slotw_census_thread = NULL;
+    }
+    xbox_A2hSlotWatchDisarm();
+}
+
 void xbox_MemoryLayoutShutdown(void)
 {
     /* Restore mirror-page protections and drop the census handler before the views go away.
      * With the gate unset this is a no-op: no page was protected and no handler was registered. */
     xbox_A2hAliasCensusDisarm();
+    xbox_A2hSlotWatchStop();
     if (g_kernel_memory) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;

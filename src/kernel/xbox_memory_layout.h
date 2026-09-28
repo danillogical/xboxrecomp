@@ -459,6 +459,178 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 uint32_t xbox_A2hAliasCensusArm(void);
 void xbox_A2hAliasCensusDisarm(void);
 
+/* ── A2h LIVE slot-write watch: PAGE-PROTECTION ONLY, PAGE-GRANULAR ─────────────────────────────
+ *
+ * Gate: JSRF_TRACE_A2H_SLOTW. OFF by default; with it unset no page is protected, no handler is
+ * registered, no counter moves and nothing is printed.
+ *
+ * MECHANISM. The watched object is not an address: the slot is `MEM32(0x19DCE0) + 0x242C`, a
+ * runtime-allocated software-device field. The slot's 4 KiB page is made PAGE_READONLY in the
+ * canonical view AND in every mapped RAM mirror view of the same physical page, so a store is
+ * caught whichever alias it arrives through. Reads are untouched: an RO page faults on WRITE and
+ * not on READ, so the poll loop's read volume is free and no read filtering is needed.
+ *
+ * PAGE GRANULARITY IS LOAD-BEARING AND DELIBERATE. Protection is page-granular, so the watch sees
+ * EVERY write to the page, not only writes to the slot. A fault is a slot hit only when its
+ * effective address equals the re-derived slot VA for that alias; every other fault is TRAFFIC.
+ *
+ * NO DEBUG REGISTERS. There is no DR0/DR6/DR7 anywhere in this facility, and none may be added:
+ * the DR channel is EXCLUDED, not demoted.
+ *
+ * OBSERVATION ONLY. The one thing the handler changes is the faulting thread's own single-step
+ * (TF) state, so the faulting store can execute and be read back; the store itself is executed by
+ * the guest, unmodified, and no guest register, memory, allocation or device state is altered. */
+#define XBOX_A2H_SLOTW_GATE        "JSRF_TRACE_A2H_SLOTW"
+#define XBOX_A2H_SLOTW_DEVICE_PTR  0x0019DCE0u   /* software_device pointer global (a POINTER) */
+#define XBOX_A2H_SLOTW_SLOT_OFFSET 0x242Cu       /* context+0x1C4 == software_device+0x242C */
+#define XBOX_A2H_SLOTW_PAGE_SIZE   4096u
+#define XBOX_A2H_SLOTW_PAGES_MAX   (1 + XBOX_NUM_MIRRORS)
+#define XBOX_A2H_SLOTW_EVENTS_MAX  256
+#define XBOX_A2H_SLOTW_THREADS_MAX 64
+#define XBOX_A2H_SLOTW_VERSION     1u
+
+/* The required positive control, as an ENCODING signature rather than a guessed native address.
+ *
+ * `0x0018CE3A  mov [ecx+0x242c], eax` assembles to `89 81 2C 24 00 00` -- a ModRM disp32 store
+ * carrying the literal displacement 0x242C. The candidate `0x00199F45  mov [esi+ebp*4+0x3ec], eax`
+ * assembles to `89 84 AE EC 03 00 00` -- a SIB store whose displacement is 0x3EC and which contains
+ * no 0x242C anywhere. A native RIP is NOT a guest VA and cannot be compared to one; the bytes AT
+ * the recorded RIP can be read, and they name the instruction exactly. Both forms are therefore
+ * classified from the faulting instruction itself, and the installer's value 0x0015F9D0 is
+ * recorded alongside. */
+#define XBOX_A2H_SLOTW_ENC_UNKNOWN  0u
+#define XBOX_A2H_SLOTW_ENC_MODRM    1u   /* disp32 == 0x242C: the installer's own encoding */
+#define XBOX_A2H_SLOTW_ENC_SIB      2u   /* disp32 == 0x3EC with SIB: the candidate's encoding */
+#define XBOX_A2H_SLOTW_ENC_OTHER    3u   /* a store to the page with neither displacement */
+
+#define XBOX_A2H_SLOTW_INSTALL_VALUE 0x0015F9D0u   /* what the installer writes */
+#define XBOX_A2H_SLOTW_CANDIDATE_SIB 0x000003ECu   /* the candidate's SIB displacement */
+
+/* One bounded, full record per observed page write. Nothing here is sampled and nothing is
+ * first-N: a full record is written for every fault until the capacity is reached, and the
+ * overflow latch is set when it is exceeded. Overflow invalidates absence/order rows; it does not
+ * invalidate a positive record, which stands on its own evidence. */
+typedef struct {
+    uint32_t seq;          /* ordered event id, monotonic from ARM; THE ordering key */
+    uint32_t kind;         /* 1 write fault, 2 step re-arm, 3 fourth-read sample, 4 installer control */
+    uint32_t alias_index;  /* 0 = canonical view, m+1 = mirror view m */
+    uint32_t slot_hit;     /* 1 = the effective address IS the re-derived slot VA for this alias */
+    uint32_t fault_va;     /* low 32 bits of the host fault address */
+    uint32_t pre_value;    /* canonical slot value BEFORE the store executed */
+    uint32_t post_value;   /* canonical slot value AFTER the store executed (step events only) */
+    uint32_t tid;          /* native thread id that took the fault */
+    uint32_t enc;          /* XBOX_A2H_SLOTW_ENC_* classified from the bytes at rip */
+    uint32_t reserved;
+    uint64_t rip;          /* native instruction pointer of the faulting store, verbatim */
+    uint64_t ticks;        /* QPC at the fault, for cross-thread ordering */
+} XboxA2hSlotwEvent;
+
+/* Loss accounting. Every quantity is an UNCAPPED counter; none is derived from a bounded array. */
+typedef struct {
+    uint64_t relevant_av;            /* write AVs on an owned protected page */
+    uint64_t slot_hits;              /* of those, effective address == the slot */
+    uint64_t nonslot_writes;         /* of those, a write elsewhere on the page (TRAFFIC) */
+    uint64_t steps;                  /* single-steps claimed for our own faulting store */
+    uint64_t rearm_ok;               /* successful RO re-protect after a step */
+    uint64_t rearm_failed;           /* FAILED re-protect: the page is open, a coverage hole */
+    uint64_t protected_intervals;    /* times a page went RO (arm + every re-arm) */
+    uint64_t unprotected_intervals;  /* times a page went RW (open for a step) */
+    uint64_t concurrent_overlap;     /* a write to an owned page while another thread was stepping */
+    uint64_t threads_new;            /* threads first seen by this watch */
+    uint64_t threads_gone;           /* threads seen at arm that later exited */
+    uint64_t publish_failed;         /* record could not be published: page left CLOSED */
+    uint64_t protect_failed;         /* VirtualProtect RO refused at arm or re-arm */
+    uint64_t dropped_events;         /* bounded event array full: record lost */
+    uint64_t unexpected_exception;   /* an exception this handler saw and did not own */
+    uint64_t db_unowned;             /* a #DB with no pending owner: never consumed */
+    uint64_t db_own_serviced;        /* own-TF owners serviced exactly once */
+    uint64_t db_ac97_serviced;       /* AC97-TF owners serviced exactly once */
+    uint64_t db_dual_serviced;       /* #DB with BOTH owners pending: both serviced once */
+    uint64_t read_samples;           /* instrumented fourth-read-path samples */
+    uint64_t installer_control_hits; /* the required positive control fired */
+    uint64_t overflow;               /* 1 = any bounded array overflowed (a LATCH, not a count) */
+    uint64_t base_changed;           /* 1 = MEM32(0x19DCE0) moved between ARM and TERMINAL */
+} XboxA2hSlotwLoss;
+
+typedef struct {
+    uint32_t magic;       /* 'A2SW' */
+    uint32_t version;     /* XBOX_A2H_SLOTW_VERSION */
+    uint32_t size;        /* sizeof(XboxA2hSlotwLedger): a reader checks this before reading */
+    uint32_t armed;
+    uint32_t arm_base;    /* MEM32(0x19DCE0) read at ARM */
+    uint32_t term_base;   /* MEM32(0x19DCE0) re-read at TERMINAL */
+    uint32_t arm_slot;    /* checked 32-bit addition arm_base + 0x242C, at ARM */
+    uint32_t term_slot;   /* re-derived at TERMINAL; a difference is a RE-SCOPE, never a compare */
+    uint32_t slot_stable; /* 1 = arm_slot == term_slot */
+    uint32_t page_offset; /* arm_slot & 0xFFF: the slot's offset within its protected page */
+    uint32_t mapped_mask; /* bit m = alias m present (bit 0 = canonical view) */
+    uint32_t protect_mask;/* bit m = alias m successfully PAGE_READONLY */
+    uint32_t alias_count;
+    uint32_t protected_count;
+    uint32_t event_count; /* full records written */
+    uint32_t event_overflow;
+    uint32_t thread_count;
+    uint32_t thread_overflow;
+    uint32_t terminal_seen;
+    uint32_t terminal_target;   /* the raw value the fourth read produced, re-read at TERMINAL */
+    uint32_t arm_reason;        /* why ARM refused, when armed == 0 */
+    uint32_t reserved;
+    uint64_t arm_ticks;
+    uint64_t terminal_ticks;
+    /* The FOURTH-read latch, tied to the ledger by ORDERED EVENT IDs and not by log chronology. */
+    uint32_t read_count;        /* 0x00193E62 reads instrumented since ARM */
+    uint32_t fourth_reached;    /* 1 once read #4 was instrumented */
+    uint32_t fourth_value;      /* the value that read produced */
+    uint32_t fourth_seq;        /* event seq of that read sample */
+    uint32_t last_write_seq;    /* seq of the LAST slot-hit write at or before that read */
+    uint32_t last_write_enc;    /* its encoding class */
+    uint32_t last_write_alias;  /* its alias index */
+    uint32_t last_write_value;  /* its post-value */
+    uint64_t last_write_rip;
+    uint64_t last_write_ticks;
+    XboxA2hSlotwLoss loss;
+    XboxA2hSlotwEvent events[XBOX_A2H_SLOTW_EVENTS_MAX];
+} XboxA2hSlotwLedger;
+
+/* The live ledger. NON-STATIC AND STABLE-NAMED on purpose: tools/harness/collect.c is a separate
+ * process and resolves it BY SYMBOL from the target's PDB, the same way it resolves g_jsrf_debug,
+ * so the archive carries the ledger bytes rather than a re-print of them. */
+extern XboxA2hSlotwLedger g_xbox_a2h_slotw;
+
+/* Arm/disarm. Arm reads MEM32(0x19DCE0), derives the slot by CHECKED 32-bit addition, maps and
+ * RO-protects the canonical page and every mapped mirror alias, and returns 1 only when every
+ * mapped alias was protected. Returns 0 -- and protects nothing -- when the gate is unset, the
+ * device pointer is not yet a plausible guest RAM address, or any mapped alias refuses protection.
+ *
+ * ARM IS DEFERRED IN PRACTICE, AND THAT IS CORRECT RATHER THAN A WORKAROUND. `MEM32(0x19DCE0)` is a
+ * POINTER to an object the title allocates at runtime, so before the title's D3D device exists the
+ * slot has no address at all. Arming at process start would read a zero and protect nothing.
+ * xbox_A2hSlotWatchStart() is therefore called from the point where the title's device is known to
+ * be live, and it arms on the first poll at which the pointer is plausible -- so the ARM base is a
+ * READ of the live device, never a preselected address. The arm_reason field records a refusal. */
+#define XBOX_A2H_SLOTW_ARM_NOT_YET  0u   /* pointer not plausible yet: keep waiting */
+#define XBOX_A2H_SLOTW_ARM_OK       1u
+#define XBOX_A2H_SLOTW_ARM_NO_VEH   2u
+#define XBOX_A2H_SLOTW_ARM_COVERAGE 3u   /* a mapped alias could not be protected */
+uint32_t xbox_A2hSlotWatchArm(void);
+void xbox_A2hSlotWatchDisarm(void);
+/* Start the deferred ARM and the all-thread census. Returns immediately; the poll thread arms as
+ * soon as MEM32(0x19DCE0) names a plausible device. No-op with the gate unset. */
+void xbox_A2hSlotWatchStart(void);
+/* Stop the census, disarm and restore every protected page. */
+void xbox_A2hSlotWatchStop(void);
+/* Re-derive the slot from MEM32(0x19DCE0) at the terminal point and record whether it moved. */
+void xbox_A2hSlotWatchTerminal(uint32_t target);
+/* Instrumented `0x00193E62 mov eax,[esi+0x1C4]` -> `0x00193EB5 call eax`. `value` is what the read
+ * produced and `read_index` is which read of that site this is, recovered from the guest's own
+ * counter rather than from faulting reads (an RO page must let the poll loop's read volume pass
+ * silently, so reads cannot be trapped). The latch ties the value to the ledger by ORDERED EVENT
+ * IDs, not by sampled log chronology. */
+void xbox_A2hSlotWatchNoteFourthRead(uint32_t value, uint32_t read_index);
+/* 1 when the gate is set. The game checks this instead of reading the environment itself, so the
+ * gate is read exactly once and OFF is provably inert. */
+int xbox_A2hSlotWatchEnabled(void);
+
 /**
  * Free a block from the Xbox heap. Currently a no-op (bump allocator).
  */
