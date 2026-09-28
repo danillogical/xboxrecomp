@@ -871,20 +871,56 @@ static void fixture_traffic_capacity(void)
           L->first_touch_count - count_before, N);
 
     /* (b) REPEATS COST NOTHING AT ALL -- not a record and not a census entry. This is what makes a
-     *     long linear fill harmless rather than merely survivable. */
+     *     long linear fill harmless rather than merely survivable.
+     *
+     *     ⚠ THE FIRST WRITE MUST BE A GENUINELY FRESH ADDRESS, AND THE FIXTURE MUST SAY SO. An
+     *     earlier version reused an address an earlier fixture had already touched, so "repeat costs
+     *     nothing" passed for a reason that depended on fixture ORDER rather than on the property
+     *     itself. A fresh offset is chosen here, its FIRST touch is asserted to add exactly ONE
+     *     census entry, and only THEN are the repeats asserted to add none -- so the one-per-address
+     *     rule and the free-repeat rule are stated as two separate, order-independent facts. */
     {
-        uint32_t records2 = L->event_count, census2 = L->first_touch_count;
-        uint64_t av2 = L->loss.relevant_av;
+        const uint32_t fresh_off = 0x800u;
+        uint32_t records2, census2;
+        uint64_t av2, distinct2;
+
+        CHECK(fresh_off != (st.slot_va & (XBOX_A2H_SLOTW_PAGE_SIZE - 1)),
+              "the fixture's 'fresh' offset IS the slot; the arm would be a slot write");
+        CHECK(fresh_off != ((st.page_offset + 8u) & 0xFFCu),
+              "the fixture's 'fresh' offset was already touched by an earlier fixture");
+
+        records2 = L->event_count;
+        census2 = L->first_touch_count;
+        av2 = L->loss.relevant_av;
+        distinct2 = L->loss.nonslot_distinct;
+
+        /* THE FIRST TOUCH OF A FRESH ADDRESS: exactly one census entry, still no event record. */
+        *(volatile uint32_t *)((char *)st.page0 + fresh_off) = 0x22220000u;
+        CHECK(L->first_touch_count == census2 + 1,
+              "the FIRST touch of a fresh address added %u census entries, expected exactly 1",
+              L->first_touch_count - census2);
+        CHECK(L->loss.nonslot_distinct == distinct2 + 1,
+              "the first touch of a fresh address moved nonslot_distinct by %llu, expected 1",
+              (unsigned long long)(L->loss.nonslot_distinct - distinct2));
+        CHECK(L->event_count == records2,
+              "the first touch of a fresh address consumed %u event records",
+              L->event_count - records2);
+
+        /* ...AND THE REPEATS OF IT COST NOTHING. */
+        census2 = L->first_touch_count;
+        records2 = L->event_count;
         for (i = 0; i < N; i++)
-            *(volatile uint32_t *)page_other = 0x22220000u + i;
-        CHECK(L->loss.relevant_av == av2 + N, "the repeat stores did not all fault");
+            *(volatile uint32_t *)((char *)st.page0 + fresh_off) = 0x22220000u + i;
+        CHECK(L->loss.relevant_av == av2 + N + 1,
+              "the repeat stores did not all fault (%llu of %u)",
+              (unsigned long long)(L->loss.relevant_av - av2 - 1), N);
         CHECK(L->event_count == records2,
               "REPEAT traffic consumed %u event records", L->event_count - records2);
         CHECK(L->first_touch_count == census2,
               "a REPEAT touch of an already-censused address added %u census entries",
               L->first_touch_count - census2);
-        printf("  [fixture] traffic-capacity: %u REPEAT writes to one address -> events +0,"
-               " census +0\n", N);
+        printf("  [fixture] traffic-capacity: 1 fresh address -> census +1; then %u REPEAT writes"
+               " -> events +0, census +0\n", N);
     }
 
     /* (c) THE SLOT STILL GETS ITS FULL RECORD. The repair must not have silenced the thing the
