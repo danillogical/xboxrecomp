@@ -9535,12 +9535,29 @@ void xbox_kernel_bridge_init(void)
              * VA, so the pair must match that prediction. If it does not, the control FAILED and
              * every downstream attribution is unsafe, which is why the game records the
              * comparison result rather than assuming it. */
-            if (va == A2H_SLOT_VA && a2h_slot_trace_on()) {
+            if (va == A2H_SLOT_VA && (a2h_slot_trace_on() || a2h_watch_on())) {
+                /* THE INSTALL CONTROL IS PUBLISHED UNDER EITHER GATE, and that is load-bearing for
+                 * the DR delivery gate rather than a convenience. The collector's delivery decision
+                 * requires STORE EVIDENCE: without a store there is no write for a watch to miss, so
+                 * a zero #DB count could not be read as NON_FIRING at all. The archived record of
+                 * that store is this latch, and before this change it was written ONLY when
+                 * JSRF_TRACE_A2H_SLOT was set -- so an ON trial run under JSRF_TRACE_A2H_DR alone
+                 * would have had install_seen=0, store_evidence=0, complete=0, and NON_FIRING
+                 * unreachable again: the very defect this repair removes, merely relocated to a
+                 * second environment variable.
+                 *
+                 * The latch call itself is unchanged and remains observation-only (it writes
+                 * diagnostic records into the registry and touches no guest state). The [A2HSLOT]
+                 * transport line stays exactly as it was and is still printed only under its own
+                 * gate, so the SLOT artifact is byte-for-byte unchanged. With BOTH gates off this
+                 * whole block is unreachable, so OFF inertness is preserved. */
                 jsrf_slot_latch_install(current, synthetic);
-                fprintf(stderr, "  [A2HSLOT] install tid=%lu slot=%08X raw=%08X installed=%08X "
-                                "index=%u\n",
-                        GetCurrentThreadId(), A2H_SLOT_VA, current, synthetic, i);
-                fflush(stderr);
+                if (a2h_slot_trace_on()) {
+                    fprintf(stderr, "  [A2HSLOT] install tid=%lu slot=%08X raw=%08X installed=%08X "
+                                    "index=%u\n",
+                            GetCurrentThreadId(), A2H_SLOT_VA, current, synthetic, i);
+                    fflush(stderr);
+                }
             }
             /* C1: THE STORE, and the witness that is tied to it. When the gate is on the store is
              * performed BY the witness, so `install_executed` cannot be set for a store that did not
