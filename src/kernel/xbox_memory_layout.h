@@ -518,9 +518,9 @@ void xbox_A2hAliasCensusDisarm(void);
  * EXPECTATIONS ARE FORBIDDEN FOR NATIVE RIPs. There is no encoding test left anywhere in this
  * facility, and none may be reintroduced:
  *
- *     RIP inside the RECOMPILED MODULE's code bounds   -> GAME_MODULE
- *     else RIP inside the loaded image's OWN bounds    -> TOOLKIT_HOST
- *     else                                             -> UNKNOWN
+ *     RIP inside a RECOMPILED function's body       -> GAME_MODULE
+ *     else RIP inside the loaded image's OWN bounds  -> TOOLKIT_HOST
+ *     else                                           -> UNKNOWN
  *
  * Both bounds are READ FROM THE REAL ARTIFACT at ARM, never hardcoded:
  *   * the recompiled bound is derived from the REAL recompiled function addresses the embedder
@@ -529,12 +529,43 @@ void xbox_A2hAliasCensusDisarm(void);
  *   * the image bound is read from this process's OWN PE headers (`__ImageBase` + the optional
  *     header's SizeOfImage), which is the module the RIP actually lives in.
  *
- * An UNKNOWN or ambiguous range is INFRA FAILURE: it is counted, the overflow latch is set, and
- * the packet stops rather than attributing a RIP it cannot place. */
+ * ⚠⚠ AND THE RECOMPILED TEST IS A SET OF FUNCTION STARTS, NOT ONE INTERVAL -- WITH A STATED LIMIT.
+ *
+ * The obvious implementation is `lo <= RIP < hi` over one contiguous span. Both it and the set test
+ * were implemented, and the fixture's discriminating arm then showed they have EQUIVALENT COVERAGE:
+ * a host run lying strictly between two published starts falls inside the interval attributed to the
+ * RECOMPILED function below it under EITHER test. Distinguishing them would need function ENDS, and
+ * the generated dispatch answers only function ENTRIES -- so this is a limit of what the embedder can
+ * publish, not a defect in the test. MEASURED on the real image, that residual is one 0x1690-byte run
+ * of the game's own probe objects (`harness_probes`/`video_probes`/`gpu_probes`) linked into the
+ * middle of the recompiled extent; it contains `probe_worker_fault` and `jsrf_probe_gpu`, which run
+ * during a probe run and touch memory. It is ASSERTED in the fixture and stated here rather than
+ * claimed away.
+ *
+ * The set is published rather than a bare interval because it is the REAL data the dispatch can
+ * answer -- so the archive carries the actual function starts and a reader can re-classify the
+ * recorded RIPs by hand -- and because it makes the extent's definition explicit (first start to last
+ * start) instead of a min/max over a strided probe that could silently narrow it. */
 #define XBOX_A2H_SLOTW_RANGE_UNKNOWN      0u  /* outside every range this facility knows */
-#define XBOX_A2H_SLOTW_RANGE_GAME_MODULE  1u  /* inside the RECOMPILED module's code bounds */
+#define XBOX_A2H_SLOTW_RANGE_GAME_MODULE  1u  /* inside a RECOMPILED function's body */
 #define XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST 2u  /* inside the loaded image, but NOT recompiled code */
 #define XBOX_A2H_SLOTW_RANGE_COUNT        3u
+
+/* HOW MANY RECOMPILED FUNCTION STARTS THE EMBEDDER MAY PUBLISH.
+ *
+ * The real title has 8 658 of them (measured from the dispatch against the map). The cap is set
+ * above that with headroom, and it is a HARD FAIL-CLOSED limit rather than a truncation: a
+ * publication that exceeds it is REFUSED WHOLE and `range_unavailable` moves, because a partially
+ * recorded set would classify the functions it happened to keep and silently misplace the rest.
+ * Overflowing this is an INFRA FAILURE, never a smaller-but-working classifier. */
+#define XBOX_A2H_SLOTW_RECOMP_MAX  16384
+/* THE LEDGER'S COPY OF THE SET IS SMALLER THAN THE PUBLICATION CAP, AND THE DIFFERENCE IS DELIBERATE.
+ * The classifier needs the whole set; the ARCHIVE does not need 8 658 x 8 bytes of it. The ledger
+ * carries the first N starts so a reader can check the classification of the RIPs the run actually
+ * recorded, and `recomp_start_count` tells the reader how many there really were -- so a truncated
+ * archive copy is visible as a number rather than read as the whole set. The recorded RIPs are the
+ * only ones a reader has to re-classify, and they are few. */
+#define XBOX_A2H_SLOTW_RECOMP_ARCHIVE 512
 
 /* OPTIONAL NATIVE-DISASSEMBLY CORROBORATION, AND IT IS CORROBORATION ONLY.
  *
@@ -720,18 +751,35 @@ typedef struct {
      * The toolkit cannot enumerate the recompiled module's own function symbols -- those are the
      * game's generated translation units, and a static library cannot see them. The EMBEDDER can:
      * `recomp_lookup` is the generated dispatch, and the game resolves the REAL addresses of the
-     * REAL recompiled functions through it and hands back the observed [min, max] extent here.
+     * REAL recompiled functions through it and hands back the observed SET of function starts here.
      *
-     * `recomp_bound_valid == 1` means the bound was derived from addresses `recomp_lookup` actually
+     * ⚠⚠ THE SET IS THE TEST AND THE INTERVAL IS ONLY THE SUMMARY. An earlier version of this fix
+     * tested a single `[recomp_lo, recomp_hi)` interval, which MEASUREMENT against the real linker
+     * map showed to be wrong: the recompiled translation units are not contiguous, host and toolkit
+     * objects are linked between them, and 11 505 of the 50 099 symbols inside the span are NOT
+     * recompiled code. A single interval therefore classifies roughly a quarter of the host code in
+     * the gaps as GAME_MODULE -- which would let a toolkit or runtime store satisfy the installer
+     * control, the exact misattribution this fix exists to prevent. The classifier tests membership
+     * of `recomp_starts`; `recomp_lo`/`recomp_hi` are reported for the reader and are not the test.
+     *
+     * `recomp_bound_valid == 1` means the set was derived from addresses `recomp_lookup` actually
      * returned, never from an arithmetic guess. When it is 0 the range classifier REFUSES to
      * classify (every RIP becomes UNKNOWN and `range_unavailable` moves), because an invented bound
      * is exactly the kind of arithmetic this packet exists to remove. */
-    uint32_t recomp_bound_valid;   /* 1 = the bound below came from recomp_lookup's real answers */
+    uint32_t recomp_bound_valid;   /* 1 = the set below came from recomp_lookup's real answers */
     uint32_t recomp_bound_probes;  /* how many guest VAs were probed to derive it */
-    uint64_t recomp_lo;            /* lowest native address recomp_lookup returned (INCLUSIVE) */
-    uint64_t recomp_hi;            /* highest native address recomp_lookup returned (EXCLUSIVE) */
+    uint32_t recomp_start_count;   /* how many recompiled function STARTS were published */
+    uint32_t recomp_start_overflow;/* 1 = the publication exceeded RECOMP_MAX and was REFUSED whole */
+    uint64_t recomp_lo;            /* lowest recompiled function start (INCLUSIVE): EXTENT summary */
+    uint64_t recomp_hi;            /* highest recompiled start + 1 (EXCLUSIVE): EXTENT summary */
     uint64_t image_lo;             /* this process's own module base, from its PE headers */
     uint64_t image_hi;             /* image_lo + SizeOfImage (EXCLUSIVE) */
+    /* THE SORTED SET THE CLASSIFIER ACTUALLY TESTS. Ascending native addresses of every recompiled
+     * function START the embedder could resolve. A RIP is GAME_MODULE when it lies at or after some
+     * published start with NO OTHER PUBLISHED START between -- i.e. within one recompiled function's
+     * body. That is what makes a host function inside the extent classify TOOLKIT_HOST while the
+     * recompiled bodies around it classify GAME_MODULE. */
+    uint64_t recomp_starts[XBOX_A2H_SLOTW_RECOMP_ARCHIVE];
     /* ── THE TERMINAL-VALUE COHERENCE GATE (REQUIRED) ────────────────────────────────────────────
      *
      * PUBLISHED AS THE TWO OPERANDS AND THE VERDICT, so a reader sees the comparison rather than
@@ -878,6 +926,16 @@ void xbox_A2hSlotWatchDisarm(void);
  * which is the correct behaviour for a build whose dispatch the embedder could not read: an
  * invented bound is exactly the arithmetic this packet removes. */
 void xbox_A2hSlotWatchSetRecompBounds(uint64_t lo, uint64_t hi, uint32_t probes, uint32_t valid);
+/* ⚠ THE PUBLICATION THE GAME ACTUALLY USES: EVERY RECOMPILED FUNCTION START, not one interval.
+ *
+ * `starts` are the native addresses the generated dispatch returned for real guest VAs. They are
+ * copied and sorted internally, and the set becomes visible WHOLE (valid is set last), so a
+ * classifier running concurrently never sees a partial set. An empty set, a NULL pointer, or a count
+ * above XBOX_A2H_SLOTW_RECOMP_MAX is REFUSED WHOLE -- never truncated -- and clears the bound, so
+ * the classifier reports UNKNOWN and `range_unavailable` moves. Returns 1 on acceptance. */
+uint32_t xbox_A2hSlotWatchSetRecompStarts(const uint64_t *starts, uint32_t count, uint32_t probes);
+/* How many recompiled function starts are currently published (0 when the bound is refused). */
+uint32_t xbox_A2hSlotWatchRecompStartCount(void);
 /* The range class of one native RIP, using the bound above and this process's own image headers.
  * Exposed for the offline proof: Exp0 must classify KNOWN RIPs against the REAL loaded modules, and
  * a proof that could only be run from inside a live fault would not be offline. */

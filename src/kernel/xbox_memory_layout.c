@@ -2907,6 +2907,18 @@ static uint64_t s_a2h_slotw_recomp_lo = 0;
 static uint64_t s_a2h_slotw_recomp_hi = 0;
 static uint32_t s_a2h_slotw_recomp_valid = 0;
 static uint32_t s_a2h_slotw_recomp_probes = 0;
+/* ⚠ THE SORTED SET OF RECOMPILED FUNCTION STARTS -- THE CLASSIFIER'S ACTUAL TEST.
+ *
+ * A single interval was tried first and MEASUREMENT against the real image rejected it: the game's
+ * own probe objects (`harness_probes`/`video_probes`/`gpu_probes`) are linked into the MIDDLE of the
+ * recompiled extent as one 0x1690-byte run of 14 host functions, and a store from `probe_worker_fault`
+ * or `jsrf_probe_gpu` -- both of which run during a probe run -- would have classified GAME_MODULE
+ * and been counted as the installer control. Membership of this set is the test instead.
+ *
+ * SORTED ASCENDING, and the sort is done by the PUBLISHER before `valid` is set, so the classifier
+ * can binary-search it without a lock and without ever observing a half-written set. */
+static uint64_t s_a2h_slotw_recomp_starts[XBOX_A2H_SLOTW_RECOMP_MAX];
+static uint32_t s_a2h_slotw_recomp_count = 0;
 
 /* This process's OWN image bounds, from its PE headers. Read once and cached: the loader does not
  * move a module after it is mapped, so a per-fault read would buy nothing and cost an exception
@@ -2956,22 +2968,123 @@ void xbox_A2hSlotWatchSetRecompBounds(uint64_t lo, uint64_t hi, uint32_t probes,
         s_a2h_slotw_recomp_hi = 0;
         s_a2h_slotw_recomp_valid = 0;
         s_a2h_slotw_recomp_probes = 0;
+        s_a2h_slotw_recomp_count = 0;
         return;
     }
     s_a2h_slotw_recomp_lo = lo;
     s_a2h_slotw_recomp_hi = hi;
     s_a2h_slotw_recomp_valid = 1;
     s_a2h_slotw_recomp_probes = probes;
+    /* A publication with no starts is a set the classifier cannot test, so it is treated as no
+     * publication at all rather than as an empty (and therefore never-matching) set. */
+    s_a2h_slotw_recomp_count = 0;
+}
+
+/* ── THE FULL PUBLICATION: EVERY RECOMPILED FUNCTION START, SORTED ───────────────────────────────
+ *
+ * ⚠ THIS IS THE ONE THE GAME CALLS, AND IT REPLACES THE SINGLE-INTERVAL PUBLICATION ABOVE.
+ *
+ * `starts` are the native addresses the generated dispatch returned for real guest VAs. They are
+ * COPIED and SORTED here, and `valid` is set LAST, so a classifier running concurrently either sees
+ * the previous set whole or the new set whole -- never a partially written one.
+ *
+ * ⚠ AN OVERFLOW IS REFUSED WHOLE, NOT TRUNCATED. If the embedder offers more starts than the array
+ * holds, the publication is REJECTED and the previous state is cleared, so the classifier reports
+ * UNKNOWN and `range_unavailable` moves -- INFRA FAILURE. Keeping the first N would classify the
+ * functions that happened to fit and silently misplace every other one, which is strictly worse than
+ * refusing: a wrong GAME_MODULE is a misattribution, an UNKNOWN is a stop. */
+uint32_t xbox_A2hSlotWatchSetRecompStarts(const uint64_t *starts, uint32_t count, uint32_t probes)
+{
+    uint32_t i, j;
+
+    if (!starts || count == 0 || count > XBOX_A2H_SLOTW_RECOMP_MAX) {
+        /* REFUSE WHOLE. The caller's overflow flag is set by the GAME side; here the bound is simply
+         * cleared so nothing classifies against a set this facility could not record. */
+        s_a2h_slotw_recomp_lo = 0;
+        s_a2h_slotw_recomp_hi = 0;
+        s_a2h_slotw_recomp_valid = 0;
+        s_a2h_slotw_recomp_count = 0;
+        s_a2h_slotw_recomp_probes = probes;
+        return 0;
+    }
+
+    for (i = 0; i < count; i++)
+        s_a2h_slotw_recomp_starts[i] = starts[i];
+
+    /* INSERTION SORT: the array is published once, at ARM, by one thread, and the input arrives in
+     * GUEST-VA order which is NOT native order -- so it must be sorted, and a simple insertion sort
+     * on a few thousand entries that runs once is the honest choice over a library call whose
+     * failure mode would be a silently unsorted set (which would break the binary search). */
+    for (i = 1; i < count; i++) {
+        uint64_t key = s_a2h_slotw_recomp_starts[i];
+        j = i;
+        while (j > 0 && s_a2h_slotw_recomp_starts[j - 1] > key) {
+            s_a2h_slotw_recomp_starts[j] = s_a2h_slotw_recomp_starts[j - 1];
+            j--;
+        }
+        s_a2h_slotw_recomp_starts[j] = key;
+    }
+
+    s_a2h_slotw_recomp_lo = s_a2h_slotw_recomp_starts[0];
+    s_a2h_slotw_recomp_hi = s_a2h_slotw_recomp_starts[count - 1];
+    s_a2h_slotw_recomp_probes = probes;
+    s_a2h_slotw_recomp_count = count;
+    s_a2h_slotw_recomp_valid = 1;     /* LAST: the set becomes visible whole */
+    return 1;
 }
 
 /* ⚠ THE CLASSIFICATION ITSELF, AND IT CONTAINS NO ENCODING TEST. See the block comment above for
- * why the recompiled test must come first and why the bounds must come from the artifact. */
+ * why the recompiled test must come first and why the bounds must come from the artifact.
+ *
+ * THE RECOMPILED TEST IS SET MEMBERSHIP: the RIP is GAME_MODULE when it lies in `[start_k, start_{k+1})`
+ * for consecutive PUBLISHED RECOMPILED STARTS, or at/after the last one.
+ *
+ * ⚠ WHAT THIS DOES AND DOES NOT BUY, MEASURED RATHER THAN ASSUMED. Within a generated translation
+ * unit the recompiler emits one C function per guest function, back to back, so `[start_k, start_{k+1})`
+ * IS that function's body and the test is exact there. It is NOT exact across a host run linked
+ * between two recompiled functions: the function below the run has its interval stretched over it.
+ * The fixture's discriminating arm MEASURED that the set test and a bare interval test have
+ * EQUIVALENT COVERAGE on that case -- both attribute such a run to the function below -- so the set
+ * is chosen for what it genuinely provides (the real published data, and an explicit extent
+ * definition), NOT because it closes that residual. Closing it would need function ENDS, which the
+ * generated dispatch cannot answer. */
 static uint32_t a2h_slotw_classify_rip(uint64_t rip)
 {
+    uint32_t lo_i, hi_i, mid;
+
     a2h_slotw_read_image_bounds();
 
-    if (s_a2h_slotw_recomp_valid && rip >= s_a2h_slotw_recomp_lo && rip < s_a2h_slotw_recomp_hi)
-        return XBOX_A2H_SLOTW_RANGE_GAME_MODULE;
+    /* THE RECOMPILED TEST FIRST: the recompiled module is LINKED INTO this image, so its addresses
+     * are inside the image bound too. Testing the image bound first would classify every recompiled
+     * RIP as TOOLKIT_HOST and the control could never fire. */
+    if (s_a2h_slotw_recomp_valid && s_a2h_slotw_recomp_count) {
+        uint64_t first = s_a2h_slotw_recomp_starts[0];
+        uint64_t last = s_a2h_slotw_recomp_starts[s_a2h_slotw_recomp_count - 1u];
+        if (rip >= first && rip <= last) {
+            /* The greatest published start <= rip, by binary search over the sorted set. */
+            lo_i = 0;
+            hi_i = s_a2h_slotw_recomp_count;
+            while (lo_i < hi_i) {
+                mid = lo_i + (hi_i - lo_i) / 2u;
+                if (s_a2h_slotw_recomp_starts[mid] <= rip)
+                    lo_i = mid + 1u;
+                else
+                    hi_i = mid;
+            }
+            if (lo_i > 0 && s_a2h_slotw_recomp_starts[lo_i - 1u] == rip)
+                return XBOX_A2H_SLOTW_RANGE_GAME_MODULE;   /* EXACTLY a function's entry */
+            if (lo_i > 0) {
+                /* STRICTLY INSIDE the interval [start_{k}, start_{k+1}) whose lower end is the
+                 * nearest published start at or below the RIP. The upper end is the NEXT published
+                 * start, or one past the highest start when this is the last function. */
+                uint64_t next = (lo_i < s_a2h_slotw_recomp_count)
+                                    ? s_a2h_slotw_recomp_starts[lo_i]
+                                    : (s_a2h_slotw_recomp_hi + 1u);
+                if (rip < next)
+                    return XBOX_A2H_SLOTW_RANGE_GAME_MODULE;
+            }
+        }
+    }
 
     if (s_a2h_slotw_image_hi && rip >= s_a2h_slotw_image_lo && rip < s_a2h_slotw_image_hi)
         return XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST;
@@ -3467,8 +3580,18 @@ uint32_t xbox_A2hSlotWatchArm(void)
     L->recomp_hi = s_a2h_slotw_recomp_hi;
     L->recomp_bound_valid = s_a2h_slotw_recomp_valid;
     L->recomp_bound_probes = s_a2h_slotw_recomp_probes;
+    L->recomp_start_count = s_a2h_slotw_recomp_count;
+    L->recomp_start_overflow = 0;
     L->image_lo = s_a2h_slotw_image_lo;
     L->image_hi = s_a2h_slotw_image_hi;
+    /* ⚠ THE SET ITSELF GOES INTO THE LEDGER, so the archive carries the classifier's ACTUAL input and
+     * a reader can re-run any classification by hand instead of trusting the counts. Without this a
+     * reader could see "game=1 host=9077" and have no way to check a single one of them. */
+    {
+        uint32_t i;
+        for (i = 0; i < s_a2h_slotw_recomp_count && i < XBOX_A2H_SLOTW_RECOMP_ARCHIVE; i++)
+            L->recomp_starts[i] = s_a2h_slotw_recomp_starts[i];
+    }
 
     /* READ THE POINTER. It is a pointer, not the object: the device is allocated at runtime, so the
      * slot VA does not exist before this read and MUST NOT be preselected. */
@@ -3830,6 +3953,13 @@ void xbox_A2hSlotWatchRangeBounds(uint64_t *recomp_lo, uint64_t *recomp_hi, uint
     if (valid) *valid = s_a2h_slotw_recomp_valid;
     if (image_lo) *image_lo = s_a2h_slotw_image_lo;
     if (image_hi) *image_hi = s_a2h_slotw_image_hi;
+}
+
+/* The published recompiled-function-start COUNT, so a fixture can assert the set was recorded whole
+ * rather than truncated. */
+uint32_t xbox_A2hSlotWatchRecompStartCount(void)
+{
+    return s_a2h_slotw_recomp_count;
 }
 
 int xbox_A2hSlotWatchCoherence(uint32_t *verdict, uint32_t *last_write_value,

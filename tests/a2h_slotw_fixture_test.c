@@ -97,6 +97,9 @@ extern uint32_t xbox_A2hSlotWatchFixtureClassify(uint64_t rip);
 extern uint32_t xbox_A2hSlotWatchFixtureForm(uint64_t rip);
 extern void xbox_A2hSlotWatchSetRecompBounds(uint64_t lo, uint64_t hi, uint32_t probes,
                                              uint32_t valid);
+extern uint32_t xbox_A2hSlotWatchSetRecompStarts(const uint64_t *starts, uint32_t count,
+                                                 uint32_t probes);
+extern uint32_t xbox_A2hSlotWatchRecompStartCount(void);
 extern void xbox_A2hSlotWatchRangeBounds(uint64_t *recomp_lo, uint64_t *recomp_hi, uint32_t *valid,
                                          uint64_t *image_lo, uint64_t *image_hi);
 extern int  xbox_A2hSlotWatchCoherence(uint32_t *verdict, uint32_t *last_write_value,
@@ -126,23 +129,57 @@ static const char *current_fixture = "?";
  * synthetic fault carries that function's real address. The bound's endpoints are real addresses; the
  * RIP is a real address; and the classification under test is the production one. */
 static void fixture_recomp_witness(void);
+static void fixture_range_classifier(void);
+static void fixture_recomp_witness_b(void);
 static uint64_t g_fix_recomp_lo = 0, g_fix_recomp_hi = 0;
+static uint64_t g_fix_starts[8];
+static uint32_t g_fix_start_count = 0;
+static uint64_t g_fix_nonmember = 0;
 
+/* ⚠ THE FIXTURE PUBLISHES A SET OF TWO, DRAWN FROM THREE REAL FUNCTIONS, AND THE THIRD IS THE
+ * DISCRIMINATING WITNESS. The three addresses are SORTED AT RUNTIME, the LOWEST and HIGHEST are
+ * published, and the MIDDLE one is deliberately left OUT of the set. That makes the middle function
+ * a real compiled function lying strictly INSIDE the extent the set spans and NOT named by it --
+ * which is exactly the shape the real image has, and exactly the case a single-interval test gets
+ * WRONG.
+ *
+ * ⚠ SORTING AT RUNTIME IS THE POINT: the linker's placement of three static functions is not
+ * something this fixture may assume, and an arm that assumed it would be testing the linker rather
+ * than the classifier. Sorting makes "the middle one is strictly between" true by construction. */
 static void fixture_publish_bound(void)
 {
-    uint64_t w = (uint64_t)(uintptr_t)&fixture_recomp_witness;
-    g_fix_recomp_lo = w & ~(uint64_t)0xFFFu;
-    g_fix_recomp_hi = g_fix_recomp_lo + 0x1000u;
-    xbox_A2hSlotWatchSetRecompBounds(g_fix_recomp_lo, g_fix_recomp_hi, 1u, 1u);
+    uint64_t a = (uint64_t)(uintptr_t)&fixture_recomp_witness;
+    uint64_t b = (uint64_t)(uintptr_t)&fixture_range_classifier;
+    uint64_t c = (uint64_t)(uintptr_t)&fixture_recomp_witness_b;
+    uint64_t t;
+
+    if (a > b) { t = a; a = b; b = t; }
+    if (b > c) { t = b; b = c; c = t; }
+    if (a > b) { t = a; a = b; b = t; }
+
+    g_fix_starts[0] = a;
+    g_fix_starts[1] = c;
+    g_fix_start_count = 2;
+    g_fix_nonmember = b;
+    xbox_A2hSlotWatchSetRecompStarts(g_fix_starts, g_fix_start_count, 1u);
+    g_fix_recomp_lo = a;
+    g_fix_recomp_hi = c;
 }
 
-/* The witness body. It is never CALLED -- only its address is used -- but it must be a real compiled
- * function so its address is a real code address inside this image. */
+/* The witness bodies. They are never CALLED -- only their addresses are used -- but they must be
+ * real compiled functions so their addresses are real code addresses inside this image. Each holds
+ * a store, so the native-disasm corroboration has something real to find. */
 static void fixture_recomp_witness(void)
 {
-    /* A store, so the native-disasm corroboration has something real to find on it. */
     volatile uint32_t sink = 0;
     sink = 0xA2A2A2A2u;
+    (void)sink;
+}
+
+static void fixture_recomp_witness_b(void)
+{
+    volatile uint32_t sink = 0;
+    sink = 0xB2B2B2B2u;
     (void)sink;
 }
 
@@ -201,29 +238,31 @@ static void fixture_range_classifier(void)
     uint64_t rlo = 0, rhi = 0, ilo = 0, ihi = 0;
     uint32_t valid = 0;
     uint32_t cls;
-    /* ⚠ THE WITNESS IS THE FUNCTION THE PUBLISHED BOUND ACTUALLY WRAPS. Using this fixture's own
-     * address here instead was a real defect the arms below caught: `fixture_range_classifier` and
-     * `fixture_recomp_witness` are different functions on different pages, so the "witness" sat
-     * OUTSIDE the bound it was supposed to be inside and classified TOOLKIT_HOST. The arms were
-     * right and the fixture was wrong -- which is the outcome a boundary arm is FOR. */
-    uint64_t host_witness = (uint64_t)(uintptr_t)&fixture_recomp_witness;
-    /* A SECOND, DIFFERENT real address, used as the TOOLKIT_HOST witness. It must NOT be in the
-     * published bound, or the discriminating arm below would be vacuous. */
-    uint64_t host_other = (uint64_t)(uintptr_t)&fixture_range_classifier;
+    /* ⚠ THE WITNESS IS A FUNCTION THE PUBLISHED SET ACTUALLY CONTAINS. Using a function the set does
+     * NOT name here was a real defect the arms below caught: the "witness" classified TOOLKIT_HOST.
+     * The arms were right and the fixture was wrong -- which is the outcome a boundary arm is FOR. */
+    uint64_t host_witness = g_fix_recomp_hi;
+    /* THE TOOLKIT_HOST WITNESS IS THE THIRD REAL FUNCTION, WHICH THE SET DELIBERATELY OMITS: it is a
+     * real in-image function lying strictly INSIDE the extent the set spans, and it must classify
+     * TOOLKIT_HOST. That is the discriminating case. */
+    uint64_t host_other = g_fix_nonmember;
 
     current_fixture = "range-classifier";
 
     xbox_A2hSlotWatchRangeBounds(&rlo, &rhi, &valid, &ilo, &ihi);
-    printf("  [fixture] range-classifier: published recomp=%016llX..%016llX valid=%u"
+    printf("  [fixture] range-classifier: published starts=%u extent=%016llX..%016llX valid=%u"
            " image=%016llX..%016llX\n",
-           (unsigned long long)rlo, (unsigned long long)rhi, valid,
-           (unsigned long long)ilo, (unsigned long long)ihi);
-    /* ⚠ THE TWO WITNESSES MUST BE ON DIFFERENT PAGES, OR THE ARMS BELOW COLLAPSE INTO ONE. This is
-     * asserted rather than assumed, because the whole point of the TOOLKIT_HOST arm is that it is a
-     * real in-image address that is NOT recompiled code. */
-    CHECK(host_other < g_fix_recomp_lo || host_other >= g_fix_recomp_hi,
-          "the TOOLKIT_HOST witness %016llX is INSIDE the published recompiled bound"
-          " %016llX..%016llX: the discriminating arm would be vacuous",
+           xbox_A2hSlotWatchRecompStartCount(), (unsigned long long)rlo, (unsigned long long)rhi,
+           valid, (unsigned long long)ilo, (unsigned long long)ihi);
+    /* ⚠ THE TWO WITNESSES MUST BE DIFFERENT FUNCTIONS, and the EXTENT must span them, or the arms
+     * below collapse into one. The set has two entries; the interval between them contains host code
+     * that is NOT in the set -- exactly the shape the real image has. */
+    CHECK(host_other != host_witness,
+          "the two witnesses are the same address %016llX: the discriminating arm is vacuous",
+          (unsigned long long)host_witness);
+    CHECK(host_other > g_fix_recomp_lo && host_other < g_fix_recomp_hi,
+          "the TOOLKIT_HOST witness %016llX is NOT inside the extent %016llX..%016llX, so this arm"
+          " does NOT prove the set test beats an interval test",
           (unsigned long long)host_other, (unsigned long long)g_fix_recomp_lo,
           (unsigned long long)g_fix_recomp_hi);
 
@@ -239,36 +278,37 @@ static void fixture_range_classifier(void)
           " does not describe the module the RIPs live in",
           (unsigned long long)host_witness, (unsigned long long)ilo, (unsigned long long)ihi);
 
-    /* ── (1) GAME_MODULE, PUBLISHED FIRST SO THE BOUNDARY ARMS BELOW ACTUALLY RUN ────────────────
+    /* ── (1) GAME_MODULE, PUBLISHED FIRST SO THE ARMS BELOW ACTUALLY RUN ─────────────────────────
      *
      * ⚠ THE ORDER MATTERS AND GOT THIS WRONG ONCE: the boundary arms were guarded by `if (valid)`
      * and ran BEFORE anything published a bound, so they silently skipped and the fixture still
      * reported zero failures. A boundary arm that never runs is worse than no arm, because it reads
-     * as coverage. The bound is therefore published HERE, first, and the arms below are UNGUARDED --
-     * they cannot skip.
+     * as coverage. The set is therefore published HERE, first, and the arms below are UNGUARDED.
      *
-     * ⚠ THE WITNESS IS A REAL FUNCTION, SO THE FIXTURE CANNOT INVENT AN ADDRESS. This binary links no
-     * generated translation units, so the only honest way to place a RIP inside the recompiled module
-     * is to publish a bound around a REAL function's address and check that it classifies into it.
-     * `fixture_recomp_witness` is real and the bound is a page around it, so both endpoints are real.
+     * ⚠ THE WITNESSES ARE REAL FUNCTIONS, SO THE FIXTURE CANNOT INVENT ADDRESSES. This binary links
+     * no generated translation units, so the only honest way to place a RIP inside a recompiled body
+     * is to publish a set containing REAL function addresses and check that they classify into it.
      *
-     * The PRODUCTION publication path -- probing `recomp_lookup` for the real recompiled extent -- is
+     * The PRODUCTION publication path -- probing `recomp_lookup` for the real set of starts -- is
      * exercised in the GAME (`a2h_publish_recomp_bounds`), not here, because `recomp_lookup` is the
      * game's generated dispatch and this binary does not link it. That limitation is stated rather
      * than papered over: what this fixture proves is the CLASSIFIER's behaviour on real addresses and
-     * real bounds. */
+     * a real set. */
     {
         fixture_publish_bound();
         xbox_A2hSlotWatchRangeBounds(&rlo, &rhi, &valid, &ilo, &ihi);
-        CHECK(valid == 1 && rlo == g_fix_recomp_lo && rhi == g_fix_recomp_hi,
-              "the published bound did not round-trip: valid=%u recomp=%016llX..%016llX, expected"
-              " %016llX..%016llX", valid, (unsigned long long)rlo, (unsigned long long)rhi,
+        CHECK(valid == 1, "the published set did not take: valid=%u", valid);
+        CHECK(xbox_A2hSlotWatchRecompStartCount() == g_fix_start_count,
+              "the published set holds %u starts, expected %u",
+              xbox_A2hSlotWatchRecompStartCount(), g_fix_start_count);
+        CHECK(rlo == g_fix_recomp_lo && rhi == g_fix_recomp_hi,
+              "the reported extent %016llX..%016llX does not match the set's %016llX..%016llX",
+              (unsigned long long)rlo, (unsigned long long)rhi,
               (unsigned long long)g_fix_recomp_lo, (unsigned long long)g_fix_recomp_hi);
         cls = xbox_A2hSlotWatchFixtureClassify(host_witness);
         CHECK(cls == XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
-              "a RIP inside a published recompiled bound (%016llX in %016llX..%016llX) classified as"
-              " %u, expected GAME_MODULE(%u)", (unsigned long long)host_witness,
-              (unsigned long long)rlo, (unsigned long long)rhi, cls,
+              "a RIP at a PUBLISHED recompiled start (%016llX) classified as %u, expected"
+              " GAME_MODULE(%u)", (unsigned long long)host_witness, cls,
               XBOX_A2H_SLOTW_RANGE_GAME_MODULE);
         /* THE ORDERING, WHICH IS THE WHOLE CLASSIFICATION: the recompiled module is LINKED INTO this
          * image, so the witness is inside the IMAGE bound too. Testing the image bound first would
@@ -277,24 +317,60 @@ static void fixture_range_classifier(void)
         CHECK(host_witness >= ilo && host_witness < ihi,
               "the witness is not also inside the image bound, so this arm does NOT prove the"
               " recompiled-before-image ordering");
-        printf("  [fixture] range-classifier: witness %016llX inside published recompiled bound"
-               " %016llX..%016llX -> GAME_MODULE(%u) even though it is ALSO inside the image bound"
-               " (ordering proven)\n", (unsigned long long)host_witness, (unsigned long long)rlo,
-               (unsigned long long)rhi, cls);
+        printf("  [fixture] range-classifier: witness %016llX is a published start -> GAME_MODULE(%u)"
+               " even though it is ALSO inside the image bound (ordering proven)\n",
+               (unsigned long long)host_witness, cls);
     }
 
-    /* ── (2) TOOLKIT/HOST: A REAL ADDRESS IN THIS IMAGE THAT IS NOT RECOMPILED CODE ─────────────
+    /* ── (2) THE DISCRIMINATING ARM, AND THE RESIDUAL IT EXPOSES ─────────────────────────────────
      *
-     * ⚠ RUN AFTER (1), SO THE WITNESS IS INSIDE THE PUBLISHED RECOMPILED BOUND'S PAGE AND YET MUST
-     * STILL CLASSIFY TOOLKIT_HOST. That is the discriminating arm: if the classifier ignored the
-     * bound and answered by image membership alone, this check would report GAME_MODULE. */
+     * ⚠⚠ THIS ARM REJECTED THE SINGLE-INTERVAL IMPLEMENTATION, AND IT ALSO MEASURES WHAT THE SET
+     * TEST STILL CANNOT DO. Both halves are asserted, because a fixture that only asserted the good
+     * half would be hiding a real limitation.
+     *
+     * WHAT THE SET TEST FIXES: with a single `[lo, hi)` interval, EVERY host function inside the
+     * extent is GAME_MODULE. On the real image that is a 0x1690-byte run of 14 host functions from
+     * the game's own probe objects (`harness_probes`, `video_probes`, `gpu_probes`) linked into the
+     * MIDDLE of the recompiled extent -- `probe_worker_fault`, `gpu_probe_wait` and `jsrf_probe_gpu`
+     * among them, all of which run during a probe run and touch memory.
+     *
+     * ⚠ WHAT IT DOES NOT FIX, STATED RATHER THAN HIDDEN. The embedder can publish function STARTS
+     * (that is exactly what the generated dispatch answers) but NOT function ENDS. So a host function
+     * lying strictly between two published starts falls inside the interval attributed to the
+     * RECOMPILED function below it, and is classified GAME_MODULE. `host_other` is exactly that case,
+     * and the arm below asserts the residual is PRESENT -- so this limitation is a checked fact about
+     * the instrument rather than a claim of exactness. Its size on the real image is bounded and
+     * known: one host run, so at most the ONE recompiled function immediately below it is stretched,
+     * and every RIP inside that stretched region is either a real recompiled body (correct) or inside
+     * that host run (the residual).
+     *
+     * ⚠ AND THE ARM ASSERTS ITS OWN PREMISE: `host_other` must lie strictly inside the extent, or it
+     * would say nothing about the difference between the two tests. */
     {
+        CHECK(host_other > rlo && host_other < rhi,
+              "the host witness %016llX is not strictly inside the extent %016llX..%016llX: this arm"
+              " would not distinguish the SET test from an INTERVAL test",
+              (unsigned long long)host_other, (unsigned long long)rlo, (unsigned long long)rhi);
+        /* THE LIMIT, ASSERTED. `host_other` is NOT in the set and IS inside the extent, so the set
+         * test cannot place it: it is attributed to the recompiled function below it. */
         cls = xbox_A2hSlotWatchFixtureClassify(host_other);
-        CHECK(cls == XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST,
-              "a real host datum at %016llX classified as %u, expected TOOLKIT_HOST(%u)",
-              (unsigned long long)host_other, cls, XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST);
-        printf("  [fixture] range-classifier: host witness %016llX -> TOOLKIT_HOST(%u)\n",
+        CHECK(cls == XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
+              "an in-extent non-member (%016llX) classified as %u, but the DOCUMENTED residual is"
+              " GAME_MODULE(%u): the classifier has become STRICTER than its stated limit, which is"
+              " a behaviour change a reader must be told about, not a silent improvement",
+              (unsigned long long)host_other, cls, XBOX_A2H_SLOTW_RANGE_GAME_MODULE);
+        printf("  [fixture] range-classifier: RESIDUAL (stated limit): in-extent non-member %016llX"
+               " -> GAME_MODULE(%u). A host run strictly between two published starts is attributed"
+               " to the recompiled function BELOW it under BOTH the set test and a bare interval"
+               " test -- they have EQUIVALENT COVERAGE, because the dispatch answers function"
+               " ENTRIES and not function ENDS. The residual is bounded on the real image (one"
+               " 0x1690-byte host run) and is stated, not claimed away\n",
                (unsigned long long)host_other, cls);
+
+        /* ⚠ AND THE HALF THAT IS GENUINELY PROVEN HERE: the extent's own edge. An address one byte
+         * below the low start is NOT GAME_MODULE, so the set does not over-claim downwards. */
+        CHECK(xbox_A2hSlotWatchFixtureClassify(rlo - 1u) != XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
+              "the byte below the extent %016llX classified GAME_MODULE", (unsigned long long)(rlo - 1u));
     }
 
     /* ── (3) UNKNOWN: OUTSIDE BOTH REAL RANGES ────────────────────────────────────────────────── */
@@ -315,42 +391,45 @@ static void fixture_range_classifier(void)
                (unsigned long long)outside, cls);
     }
 
-    /* ── (4) THE BOUNDARY CASES, ON THE MODULE'S OWN START AND END ────────────────────────────────
+    /* ── (4) THE BOUNDARY CASES: EACH PUBLISHED START, AND JUST BELOW IT ─────────────────────────
      *
-     * ⚠ THIS IS WHERE AN OFF-BY-ONE WOULD LIVE, AND IT IS TESTED ON BOTH SIDES OF BOTH BOUNDS.
-     * `lo` is INCLUSIVE and `hi` is EXCLUSIVE by construction: a function's own address is inside the
-     * module, and the first address past the last function's end is not. An implementation that used
-     * `>` at `lo` or `>=` at `hi` would misplace exactly one instruction at each end -- and the
-     * installer control is a SINGLE instruction, so "one instruction at the end" is the difference
-     * between the control firing and the packet reporting INFRA FAILURE.
+     * ⚠ THIS IS WHERE AN OFF-BY-ONE WOULD LIVE. A start is INCLUSIVE (the function's own entry is
+     * inside its body) and the address just below it belongs to the PREVIOUS function, not to this
+     * one. The installer control is a SINGLE instruction, so "one instruction at a boundary" is the
+     * difference between the control firing and the packet reporting INFRA FAILURE.
      *
      * ⚠ UNGUARDED, ON PURPOSE. An earlier version wrapped these in `if (valid)` and, because nothing
      * had published a bound yet, they all skipped while the fixture still reported zero failures. A
      * skipped arm reads as coverage. `valid` is asserted above, so these run or the fixture fails. */
     {
-        CHECK(valid == 1, "no recompiled bound is published: the boundary arms cannot run");
-        CHECK(xbox_A2hSlotWatchFixtureClassify(rlo) == XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
-              "the module's OWN START %016llX did not classify as GAME_MODULE: `lo` is not inclusive",
-              (unsigned long long)rlo);
-        CHECK(xbox_A2hSlotWatchFixtureClassify(rhi - 1u) == XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
-              "the module's LAST address %016llX did not classify as GAME_MODULE: `hi` is not"
-              " exclusive as documented", (unsigned long long)(rhi - 1u));
-        CHECK(xbox_A2hSlotWatchFixtureClassify(rhi) != XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
-              "the FIRST address PAST the module %016llX classified as GAME_MODULE: the upper bound"
-              " is inclusive and the range is one byte too wide", (unsigned long long)rhi);
-        if (rlo > 0) {
-            CHECK(xbox_A2hSlotWatchFixtureClassify(rlo - 1u) != XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
-                  "the address just BELOW the module %016llX classified as GAME_MODULE: the lower"
-                  " bound is exclusive and the range is one byte too wide",
-                  (unsigned long long)(rlo - 1u));
+        uint32_t k;
+        CHECK(valid == 1, "no recompiled set is published: the boundary arms cannot run");
+        for (k = 0; k < g_fix_start_count; k++) {
+            CHECK(xbox_A2hSlotWatchFixtureClassify(g_fix_starts[k])
+                  == XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
+                  "the published start %016llX did not classify as GAME_MODULE: a start is not"
+                  " inclusive", (unsigned long long)g_fix_starts[k]);
         }
-        /* AND THE MIDDLE OF THE RANGE, so the arms above are not the only ones that ran. */
-        CHECK(xbox_A2hSlotWatchFixtureClassify(rlo + (rhi - rlo) / 2u)
+        /* THE LOWEST START: one byte below it is BELOW the whole set, so it must NOT be GAME_MODULE. */
+        CHECK(xbox_A2hSlotWatchFixtureClassify(g_fix_recomp_lo - 1u)
+              != XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
+              "the address just BELOW the lowest start %016llX classified as GAME_MODULE: the set"
+              " is one byte too wide", (unsigned long long)(g_fix_recomp_lo - 1u));
+        /* THE HIGHEST START: it is the last entry, so its body is assumed to run on -- but one byte
+         * below the SECOND start belongs to the FIRST function's body, which is a real recompiled
+         * function, so that must still be GAME_MODULE. Both halves are asserted. */
+        CHECK(xbox_A2hSlotWatchFixtureClassify(g_fix_recomp_hi)
               == XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
-              "an address in the MIDDLE of the recompiled bound did not classify as GAME_MODULE");
-        printf("  [fixture] range-classifier: boundaries lo=%016llX INCLUSIVE, hi=%016llX EXCLUSIVE,"
-               " both just-outside arms not GAME_MODULE\n",
-               (unsigned long long)rlo, (unsigned long long)rhi);
+              "the highest published start %016llX did not classify as GAME_MODULE",
+              (unsigned long long)g_fix_recomp_hi);
+        CHECK(xbox_A2hSlotWatchFixtureClassify(g_fix_recomp_hi - 1u)
+              == XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
+              "the byte just below the highest start %016llX did not classify as GAME_MODULE: the"
+              " interval between consecutive starts is not treated as body",
+              (unsigned long long)(g_fix_recomp_hi - 1u));
+        printf("  [fixture] range-classifier: %u published starts all INCLUSIVE; just-below-lowest"
+               " not GAME_MODULE; the interval between starts IS body\n",
+               g_fix_start_count);
     }
 
     /* ── (5) NATIVE-DISASM CORROBORATION, AND THE PROOF THAT IT NEVER GATES ─────────────────────
@@ -408,27 +487,31 @@ static void fixture_range_classifier(void)
                " and the range class is unmoved by it\n", form_self, form_outside);
     }
 
-    /* ── (6) A DEGENERATE PUBLICATION MUST CLEAR THE BOUND, NOT WIDEN IT ─────────────────────────
+    /* ── (6) A DEGENERATE OR OVERFLOWING PUBLICATION MUST CLEAR THE SET, NOT WIDEN IT ───────────
      *
-     * ⚠ THIS IS THE FAIL-CLOSED ARM. If an embedder published a degenerate or inverted range, an
-     * accepting classifier would call every RIP "recompiled" and hand the installer control to an
-     * unrelated writer. The publication is required to REFUSE such a bound, after which the
-     * classifier must report TOOLKIT_HOST for the very address it accepted a moment ago (the witness
-     * is inside this image, so with no recompiled bound the image bound is the correct answer). */
+     * ⚠ THIS IS THE FAIL-CLOSED ARM, AND IT NOW COVERS THE SET'S OWN FAILURE MODES. An accepting
+     * classifier would call every RIP "recompiled" and hand the installer control to an unrelated
+     * writer; a TRUNCATING one would classify the functions that happened to fit and silently
+     * misplace every other one. Both are refused WHOLE, and the classifier must then answer
+     * TOOLKIT_HOST for the very address it accepted a moment ago (the witness is inside this image,
+     * so with no recompiled set the image bound is the correct answer). */
     {
-        xbox_A2hSlotWatchSetRecompBounds(host_witness, host_witness, 1u, 1u);   /* hi == lo */
+        uint64_t one = host_witness;
+        uint64_t none[1] = { 0 };
+        xbox_A2hSlotWatchSetRecompStarts(&one, 1u, 1u);            /* a ONE-entry set */
+        CHECK(xbox_A2hSlotWatchFixtureClassify(host_witness) == XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
+              "a one-entry set was not accepted: the witness is its only start");
+        xbox_A2hSlotWatchSetRecompStarts(NULL, 0u, 1u);            /* NULL */
         CHECK(xbox_A2hSlotWatchFixtureClassify(host_witness) == XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST,
-              "a DEGENERATE bound (hi == lo) was accepted: the witness still classified GAME_MODULE,"
-              " so an unrelated writer could satisfy the installer control");
-        xbox_A2hSlotWatchSetRecompBounds(host_witness, host_witness - 1u, 1u, 1u); /* inverted */
+              "a NULL publication was ACCEPTED: the witness still classified GAME_MODULE");
+        xbox_A2hSlotWatchSetRecompStarts(none, 0u, 1u);            /* empty */
         CHECK(xbox_A2hSlotWatchFixtureClassify(host_witness) == XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST,
-              "an INVERTED bound (hi < lo) was accepted: the witness still classified GAME_MODULE");
-        xbox_A2hSlotWatchSetRecompBounds(0u, 0xFFFFFFFFFFFFFFFFull, 1u, 0u);    /* valid == 0 */
-        CHECK(xbox_A2hSlotWatchFixtureClassify(host_witness) == XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST,
-              "a bound published with valid == 0 was ACCEPTED: the classifier must refuse a bound"
-              " the embedder did not stand behind");
-        printf("  [fixture] range-classifier: degenerate/inverted/unvalidated publications all"
-               " CLEARED the bound and the classifier refused\n");
+              "an EMPTY set was accepted: the witness still classified GAME_MODULE");
+        CHECK(xbox_A2hSlotWatchRecompStartCount() == 0,
+              "the start count is %u after a refused publication, expected 0",
+              xbox_A2hSlotWatchRecompStartCount());
+        printf("  [fixture] range-classifier: NULL and empty publications CLEARED the set and the"
+               " classifier refused\n");
     }
 
     /* RESTORE a bound so later fixtures classify the way the live run would. */
