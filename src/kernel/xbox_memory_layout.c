@@ -2730,6 +2730,12 @@ static RECOMP_TLS uint32_t s_a2h_slotw_pending_seq = 0;
  * OS's own report against the address this facility computes for its post-value read: for a slot
  * store the two must be the SAME HOST ADDRESS, and that agreement is the Q3(c) cross-validation. */
 static RECOMP_TLS uint32_t s_a2h_slotw_pending_fault = 0;
+/* THE FAULTING RIP'S RANGE CLASS AND ITS OPTIONAL NATIVE-DISASM CORROBORATION, carried from the
+ * fault to its step so the STEP record carries the same classification the WRITE record did. They
+ * are carried rather than recomputed because the step's RIP is the NEXT instruction, and
+ * reclassifying it would label the step with a different instruction's class. */
+static RECOMP_TLS uint32_t s_a2h_slotw_pending_range = 0;
+static RECOMP_TLS uint32_t s_a2h_slotw_pending_form = 0;
 
 static int a2h_slotw_on(void)
 {
@@ -2760,7 +2766,7 @@ static uint32_t a2h_slotw_next_seq(void)
  * that ordinary page traffic can no longer reach the array. */
 static int a2h_slotw_publish(uint32_t kind, uint32_t alias_index, uint32_t slot_hit,
                              uint32_t fault_va, uint32_t pre_value, uint32_t post_value,
-                             uint64_t rip, uint32_t enc)
+                             uint64_t rip, uint32_t range_class, uint32_t form)
 {
     XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
     uint32_t seq = a2h_slotw_next_seq();
@@ -2781,8 +2787,8 @@ static int a2h_slotw_publish(uint32_t kind, uint32_t alias_index, uint32_t slot_
     L->events[slot].pre_value = pre_value;
     L->events[slot].post_value = post_value;
     L->events[slot].tid = (uint32_t)GetCurrentThreadId();
-    L->events[slot].enc = enc;
-    L->events[slot].reserved = 0;
+    L->events[slot].range_class = range_class;
+    L->events[slot].form = form;
     L->events[slot].rip = rip;
     L->events[slot].ticks = (uint64_t)GetTickCount64();
     L->events[slot].kind = kind;
@@ -2817,7 +2823,7 @@ static int a2h_slotw_publish(uint32_t kind, uint32_t alias_index, uint32_t slot_
  * that matters: a missing entry would make a touched address look untouched. */
 static void a2h_slotw_note_traffic(uint32_t alias_index, uint32_t fault_va, uint32_t offset,
                                    uint32_t pre_at_fault, uint32_t slot_value, uint64_t rip,
-                                   uint32_t enc)
+                                   uint32_t range_class, uint32_t form)
 {
     XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
     LONG slot;
@@ -2851,56 +2857,216 @@ static void a2h_slotw_note_traffic(uint32_t alias_index, uint32_t fault_va, uint
     L->first_touch[slot].tid = (uint32_t)GetCurrentThreadId();
     L->first_touch[slot].pre_value = pre_at_fault;
     L->first_touch[slot].slot_value_at_touch = slot_value;
-    L->first_touch[slot].enc = enc;
-    L->first_touch[slot].reserved = 0;
+    L->first_touch[slot].range_class = range_class;
+    L->first_touch[slot].form = form;
     L->first_touch[slot].rip = rip;
     L->first_touch[slot].ticks = (uint64_t)GetTickCount64();
     InterlockedExchange((volatile LONG *)&L->first_touch[slot].valid, 1);   /* LAST */
 }
 
-/* Classify the FAULTING INSTRUCTION from the bytes at the recorded native RIP.
+/* ── THE RANGE CLASSIFIER: NATIVE DOMAIN. THIS REPLACES A VOID PARADIGM ──────────────────────────
  *
- * A native RIP is not a guest VA and cannot be compared against 0x0018CE3A or 0x00199F45 -- the
- * recompiled image is native code at its own addresses. What IS available is the encoding, and the
- * two signatures differ in it exactly: the installer's `mov [ecx+0x242c],eax` is `89 81 2C 24 00
- * 00` (ModRM disp32 carrying 0x242C) while the candidate's `mov [esi+ebp*4+0x3ec],eax` is
- * `89 84 AE EC 03 00 00` (SIB, displacement 0x3EC, with no 0x242C anywhere in it). Classifying by
- * encoding therefore distinguishes them without inventing a native-address mapping. */
-static uint32_t a2h_slotw_classify_store(uint64_t rip)
+ * ⚠⚠ WHAT WAS HERE, AND WHY IT COULD NEVER HAVE WORKED.
+ *
+ * The previous body read the NATIVE instruction bytes at the faulting RIP and tested them for GUEST
+ * ENCODINGS: `p[0] == 0x89`, `(modrm & 0xC0) == 0x80`, then `disp32 == 0x242C` (the installer) or
+ * `disp32 == 0x3EC` with SIB (the candidate). Its comment asserted that "the bytes AT the recorded
+ * RIP name the instruction exactly".
+ *
+ * THAT PREMISE IS FALSE IN RECOMPILED CODE. A faulting RIP inside this program points at GENERATED
+ * C compiled by the host toolchain -- MSVC's own instruction selection for `MEM32(ecx + 0x242C) =
+ * eax` -- and not at the guest's `mov [ecx+0x242c],eax`. The guest encoding `89 81 2C 24 00 00` is
+ * not merely unlikely to appear there; there is no mechanism by which it could. The classifier was
+ * therefore structurally incapable of returning MODRM, and EVERY encoding classification this
+ * facility ever emitted from a fault RIP was UNSOUND -- ON-3's `enc=3` on the slot event and the
+ * `enc` fields on ON-1/ON-2 among them. The Advisor's ruling makes that categorical, not
+ * site-specific, so no encoding classification from a fault RIP may be cited as evidence anywhere.
+ *
+ * ⚠ THE REPLACEMENT CLASSIFIES BY ADDRESS RANGE, AND GUEST-BYTE EXPECTATIONS ARE FORBIDDEN HERE.
+ * There is no byte test left in this file and none may be reintroduced:
+ *
+ *     RIP in [recomp_lo, recomp_hi)   -> GAME_MODULE   (the recompiled module's own code)
+ *     RIP in [image_lo,  image_hi)    -> TOOLKIT_HOST  (this image, but not recompiled code)
+ *     otherwise                       -> UNKNOWN       (=> INFRA FAILURE; never attributed)
+ *
+ * BOTH BOUNDS COME FROM THE REAL ARTIFACT:
+ *   * the recompiled bound is PUBLISHED BY THE EMBEDDER through
+ *     xbox_A2hSlotWatchSetRecompBounds(), derived from addresses the generated dispatch
+ *     (`recomp_lookup`) actually returns -- the toolkit cannot enumerate the game's own generated
+ *     translation units, and an invented bound would reintroduce exactly the arithmetic this
+ *     replacement removes;
+ *   * the image bound is read from THIS PROCESS'S OWN PE HEADERS (`__ImageBase` plus the optional
+ *     header's SizeOfImage), i.e. the module the RIP actually lives in.
+ *
+ * ⚠ AND THE ORDER MATTERS. The recompiled test is made FIRST because the recompiled module is
+ * LINKED INTO this image: its addresses are inside [image_lo, image_hi) too. Testing the image
+ * bound first would classify every recompiled RIP as TOOLKIT_HOST and the control could never fire.
+ * The two ranges are therefore not disjoint by construction, and this ordering is the whole
+ * classification. */
+static uint64_t s_a2h_slotw_recomp_lo = 0;
+static uint64_t s_a2h_slotw_recomp_hi = 0;
+static uint32_t s_a2h_slotw_recomp_valid = 0;
+static uint32_t s_a2h_slotw_recomp_probes = 0;
+
+/* This process's OWN image bounds, from its PE headers. Read once and cached: the loader does not
+ * move a module after it is mapped, so a per-fault read would buy nothing and cost an exception
+ * handler's time. Returns 1 when the bounds are known. */
+static uint64_t s_a2h_slotw_image_lo = 0;
+static uint64_t s_a2h_slotw_image_hi = 0;
+static int s_a2h_slotw_image_read = 0;
+
+static void a2h_slotw_read_image_bounds(void)
+{
+    /* ⚠ `__ImageBase` IS A LINKER-PROVIDED SYMBOL AND IS NOT DECLARED BY <windows.h>. MSVC emits it
+     * for every image (EXE or DLL) and it names THIS module's own PE header, which is the one address
+     * that cannot be wrong about which image a RIP belongs to -- no API call, no symbol lookup and no
+     * debugger involved. The declaration is the documented MSVC form. */
+    extern IMAGE_DOS_HEADER __ImageBase;
+    const uint8_t *base;
+    const IMAGE_DOS_HEADER *dos;
+    const IMAGE_NT_HEADERS *nt;
+
+    if (s_a2h_slotw_image_read)
+        return;
+    s_a2h_slotw_image_read = 1;
+
+    /* `__ImageBase` is the linker-provided address of this module's own PE header. It is the one
+     * address that cannot be wrong about which image the RIP belongs to, and it needs no API call,
+     * no symbol lookup and no debugger. */
+    base = (const uint8_t *)&__ImageBase;
+    dos = (const IMAGE_DOS_HEADER *)base;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return;
+    nt = (const IMAGE_NT_HEADERS *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+        return;
+    s_a2h_slotw_image_lo = (uint64_t)(uintptr_t)base;
+    s_a2h_slotw_image_hi = s_a2h_slotw_image_lo + (uint64_t)nt->OptionalHeader.SizeOfImage;
+}
+
+void xbox_A2hSlotWatchSetRecompBounds(uint64_t lo, uint64_t hi, uint32_t probes, uint32_t valid)
+{
+    /* A bound is accepted only when the embedder says it came from real `recomp_lookup` answers AND
+     * it is a non-empty, correctly ordered interval. Anything else CLEARS the bound: the classifier
+     * then refuses to classify, which is the fail-closed behaviour the packet requires. Accepting a
+     * degenerate range would make every RIP "inside the recompiled module" and hand the control to
+     * an unrelated writer -- the exact misattribution this whole fix exists to prevent. */
+    if (!valid || hi <= lo) {
+        s_a2h_slotw_recomp_lo = 0;
+        s_a2h_slotw_recomp_hi = 0;
+        s_a2h_slotw_recomp_valid = 0;
+        s_a2h_slotw_recomp_probes = 0;
+        return;
+    }
+    s_a2h_slotw_recomp_lo = lo;
+    s_a2h_slotw_recomp_hi = hi;
+    s_a2h_slotw_recomp_valid = 1;
+    s_a2h_slotw_recomp_probes = probes;
+}
+
+/* ⚠ THE CLASSIFICATION ITSELF, AND IT CONTAINS NO ENCODING TEST. See the block comment above for
+ * why the recompiled test must come first and why the bounds must come from the artifact. */
+static uint32_t a2h_slotw_classify_rip(uint64_t rip)
+{
+    a2h_slotw_read_image_bounds();
+
+    if (s_a2h_slotw_recomp_valid && rip >= s_a2h_slotw_recomp_lo && rip < s_a2h_slotw_recomp_hi)
+        return XBOX_A2H_SLOTW_RANGE_GAME_MODULE;
+
+    if (s_a2h_slotw_image_hi && rip >= s_a2h_slotw_image_lo && rip < s_a2h_slotw_image_hi)
+        return XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST;
+
+    return XBOX_A2H_SLOTW_RANGE_UNKNOWN;
+}
+
+/* ── OPTIONAL NATIVE-DISASSEMBLY CORROBORATION, AND IT NEVER GATES ──────────────────────────────
+ *
+ * This decodes the NATIVE bytes at the RIP by NATIVE x86-64 semantics and answers one question: is
+ * this instruction a STORE TO MEMORY? That is a statement about the HOST's instruction set and
+ * carries no guest-byte expectation, which is what makes it admissible where the old classifier was
+ * not.
+ *
+ * ⚠ IT IS CORROBORATION ONLY. The range class above is the classification; the control and every
+ * record key on the RANGE CLASS alone. A RIP that does not decode, or decodes to something this
+ * decoder does not recognise, keeps its range class and is reported as UNDECODED. That separation
+ * is deliberate: a hand-written partial decoder must never be able to fail a run the range
+ * classifier placed correctly, and it must never be able to promote a RIP the range classifier did
+ * not place.
+ *
+ * The decoder is deliberately PARTIAL and says so. It handles the forms a compiled store actually
+ * takes -- REX prefixes, the 0x88/0x89 (mov r/m,r) and 0xC6/0xC7 (mov r/m,imm) families, the
+ * 0x00-0x3B ALU group with /0 and /1 (add/or), 0xFF /0,/1,/2 (inc/dec/call), and the
+ * 0x80/0x81/0x83 group -- and it must consume a ModRM byte whose mod field is NOT 0b11 (a register
+ * operand is not a memory store). Anything else returns UNDECODED rather than guessing. */
+static uint32_t a2h_slotw_corroborate_form(uint64_t rip)
 {
     const uint8_t *p = (const uint8_t *)(uintptr_t)rip;
-    uint32_t enc = XBOX_A2H_SLOTW_ENC_UNKNOWN;
-    uint8_t modrm;
-    int has_sib;
+    uint8_t op, modrm;
+    size_t i = 0;
 
     /* A RIP is only readable if it is inside this process's own image; guard rather than fault
      * inside the fault handler. MEMORY_BASIC_INFORMATION is the cheapest sound test. */
     {
         MEMORY_BASIC_INFORMATION mbi;
         if (VirtualQuery((LPCVOID)(uintptr_t)rip, &mbi, sizeof(mbi)) == 0)
-            return XBOX_A2H_SLOTW_ENC_UNKNOWN;
+            return XBOX_A2H_SLOTW_FORM_UNDECODED;
         if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD) || (mbi.Protect & PAGE_NOACCESS))
-            return XBOX_A2H_SLOTW_ENC_UNKNOWN;
+            return XBOX_A2H_SLOTW_FORM_UNDECODED;
     }
 
-    if (p[0] != 0x89)                     /* mov r/m32, r32 -- the only form either site uses */
-        return XBOX_A2H_SLOTW_ENC_OTHER;
-    modrm = p[1];
-    if ((modrm & 0xC0u) != 0x80u)         /* both sites are [base + disp32] */
-        return XBOX_A2H_SLOTW_ENC_OTHER;
-    has_sib = ((modrm & 0x07u) == 0x04u);
-    {
-        const uint8_t *disp = p + (has_sib ? 3 : 2);
-        uint32_t d = (uint32_t)disp[0] | ((uint32_t)disp[1] << 8)
-                   | ((uint32_t)disp[2] << 16) | ((uint32_t)disp[3] << 24);
-        if (has_sib && d == XBOX_A2H_SLOTW_CANDIDATE_SIB)
-            enc = XBOX_A2H_SLOTW_ENC_SIB;                       /* the candidate's encoding */
-        else if (!has_sib && d == XBOX_A2H_SLOTW_SLOT_OFFSET)
-            enc = XBOX_A2H_SLOTW_ENC_MODRM;                     /* the installer's encoding */
-        else
-            enc = XBOX_A2H_SLOTW_ENC_OTHER;
+    /* Legacy prefixes a store may carry: operand/address size and the segment overrides. Bounded, so
+     * a pathological prefix run cannot walk off the page. */
+    while (i < 8) {
+        uint8_t b = p[i];
+        if (b == 0x66 || b == 0x67 || b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26
+                || b == 0x64 || b == 0x65 || b == 0xF0 || b == 0xF2 || b == 0xF3) {
+            i++;
+            continue;
+        }
+        break;
     }
-    return enc;
+    /* REX, if present. Its presence is exactly one of the four causes the corrected question
+     * listed, and this decoder simply consumes it. */
+    if (i < 8 && (p[i] & 0xF0u) == 0x40u)
+        i++;
+    if (i >= 8)
+        return XBOX_A2H_SLOTW_FORM_UNDECODED;
+
+    op = p[i];
+    modrm = p[i + 1];
+
+    /* mov r/m8, r8 (0x88) and mov r/m32/64, r32/64 (0x89): a store exactly when mod != 0b11. */
+    if (op == 0x88 || op == 0x89)
+        return ((modrm & 0xC0u) != 0xC0u) ? XBOX_A2H_SLOTW_FORM_STORE
+                                          : XBOX_A2H_SLOTW_FORM_NOT_STORE;
+    /* mov r/m8, imm8 (0xC6) and mov r/m32, imm32 (0xC7): the same test. */
+    if (op == 0xC6 || op == 0xC7)
+        return ((modrm & 0xC0u) != 0xC0u) ? XBOX_A2H_SLOTW_FORM_STORE
+                                          : XBOX_A2H_SLOTW_FORM_NOT_STORE;
+    /* The ALU group 0x00-0x3B: /0 is `add`, /1 is `or` -- both write their destination, so a memory
+     * destination is a store. Other /n values in this range are compares or test-like and do not. */
+    if (op <= 0x3Bu) {
+        uint8_t reg = (uint8_t)((modrm >> 3) & 0x07u);
+        if ((modrm & 0xC0u) == 0xC0u)
+            return XBOX_A2H_SLOTW_FORM_NOT_STORE;
+        return (reg == 0u || reg == 1u) ? XBOX_A2H_SLOTW_FORM_STORE : XBOX_A2H_SLOTW_FORM_NOT_STORE;
+    }
+    /* The immediate group 0x80/0x81/0x83: /0 add and /1 or store; /7 cmp does not. */
+    if (op == 0x80 || op == 0x81 || op == 0x83) {
+        uint8_t reg = (uint8_t)((modrm >> 3) & 0x07u);
+        if ((modrm & 0xC0u) == 0xC0u)
+            return XBOX_A2H_SLOTW_FORM_NOT_STORE;
+        return (reg == 0u || reg == 1u) ? XBOX_A2H_SLOTW_FORM_STORE : XBOX_A2H_SLOTW_FORM_NOT_STORE;
+    }
+    /* 0xFF /0 inc and /1 dec write their operand; /2 call and /3 callf do not write memory. */
+    if (op == 0xFF) {
+        uint8_t reg = (uint8_t)((modrm >> 3) & 0x07u);
+        if (reg > 1u)
+            return XBOX_A2H_SLOTW_FORM_NOT_STORE;
+        return ((modrm & 0xC0u) != 0xC0u) ? XBOX_A2H_SLOTW_FORM_STORE
+                                          : XBOX_A2H_SLOTW_FORM_NOT_STORE;
+    }
+    return XBOX_A2H_SLOTW_FORM_UNDECODED;
 }
 
 /* Which of OUR pages, if any, holds this fault address? Returns the alias index + 1, or 0. */
@@ -2997,21 +3163,40 @@ static void a2h_slotw_service_own(PEXCEPTION_POINTERS ep)
         L->last_slot_read_hits = (uint32_t)L->loss.slot_hits;
         if (!a2h_slotw_publish(A2H_SLOTW_EV_STEP, alias, s_a2h_slotw_pending_slot,
                                read_va, s_a2h_slotw_pending_pre, post,
-                               (uint64_t)ep->ContextRecord->Rip, XBOX_A2H_SLOTW_ENC_UNKNOWN)) {
+                               (uint64_t)ep->ContextRecord->Rip,
+                               s_a2h_slotw_pending_range, s_a2h_slotw_pending_form)) {
             /* The step record is lost. The page is STILL closed below, because leaving it open would
              * convert a bounded loss into an unbounded one -- and the overflow latch already marks
              * every absence/order row invalid. */
         }
+        /* ⚠ THE LAST-RECORDED SLOT WRITE VALUE, KEPT FOR THE COHERENCE GATE. It is updated ONLY
+         * here, on a real slot-hit step, so it is the post-value of the LAST RECORDED slot write --
+         * exactly the operand the gate compares against the terminal read. Recording it anywhere
+         * else (or from a terminal read) would make the gate compare a value with itself. */
+        L->coherence_last_write_value = post;
+        L->coherence_last_write_seq = s_a2h_slotw_pending_seq;
     }
 
     /* RE-PROTECT. A failure here leaves the page OPEN, which is a coverage hole and is counted as
-     * one: it is never silently treated as "no further writes". */
+     * one: it is never silently treated as "no further writes".
+     *
+     * ⚠ THIS RUNS AFTER EVERY WRITE, SLOT OR NOT, AND THAT IS THE ACCEPTED SHAPE. `VirtualProtect`
+     * is PAGE-GRANULAR and the slot sits at offset 0x62C of its page, so opening the page for a
+     * non-slot write also makes the SLOT writable. The narrowing that would "leave RW after a
+     * non-slot write" is therefore NOT implemented and must never be: ON-3 had 9077 non-slot writes,
+     * so that optimization would have blinded the instrument after the first one. Every window is
+     * exactly one instruction wide, and each one is TICK-LOGGED here so the archive carries how
+     * much unprotected time the run contained instead of a reader having to assume it was zero. */
     if (VirtualProtect((LPVOID)base, XBOX_A2H_SLOTW_PAGE_SIZE, PAGE_READONLY, &old)) {
         A2H_SLOTW_INC64(&L->loss.rearm_ok);
         A2H_SLOTW_INC64(&L->loss.protected_intervals);
+        L->window_close_ticks_last = (uint64_t)GetTickCount64();
+        L->window_open = 0;
     } else {
         A2H_SLOTW_INC64(&L->loss.rearm_failed);
         InterlockedExchange((volatile LONG *)&L->loss.overflow, 1);
+        /* THE WINDOW STAYS OPEN AND SAYS SO. Leaving `window_open` set is the difference between a
+         * stated coverage hole and a silent one. */
     }
     InterlockedExchange((volatile LONG *)&g_a2h_slotw_step_owner, 0);
     s_a2h_slotw_pending_alias = 0;
@@ -3019,6 +3204,8 @@ static void a2h_slotw_service_own(PEXCEPTION_POINTERS ep)
     s_a2h_slotw_pending_pre = 0;
     s_a2h_slotw_pending_seq = 0;
     s_a2h_slotw_pending_fault = 0;
+    s_a2h_slotw_pending_range = 0;
+    s_a2h_slotw_pending_form = 0;
     A2H_SLOTW_INC64(&L->loss.db_own_serviced);
 }
 
@@ -3075,7 +3262,7 @@ static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
     /* ── THE WRITE FAULT ─────────────────────────────────────────────────────────────────────── */
     if (code == EXCEPTION_ACCESS_VIOLATION) {
         uintptr_t fault;
-        uint32_t alias, enc, pre, pre_at_fault, slot_hit, slot_va, off, fault_off;
+        uint32_t alias, range_class, form, pre, pre_at_fault, slot_hit, slot_va, off, fault_off;
         DWORD old;
 
         /* `ExceptionInformation[0] == 1` is the belt-and-suspenders filter the preflight requires to
@@ -3125,7 +3312,38 @@ static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
         pre = *(volatile uint32_t *)((uintptr_t)g_a2h_slotw_pages[alias - 1] + off);
         fault_off = (uint32_t)(fault & (XBOX_A2H_SLOTW_PAGE_SIZE - 1));
         pre_at_fault = *(volatile uint32_t *)((uintptr_t)g_a2h_slotw_pages[alias - 1] + fault_off);
-        enc = a2h_slotw_classify_store((uint64_t)ep->ContextRecord->Rip);
+        /* ⚠ THE CLASSIFICATION IS BY RANGE, IN THE NATIVE DOMAIN, AND IT READS NO INSTRUCTION
+         * BYTES TO DECIDE. See a2h_slotw_classify_rip(). The optional native-disasm corroboration
+         * is taken here too, and it NEVER gates anything -- it is recorded beside the range class so
+         * a reader can check the two against each other. */
+        range_class = a2h_slotw_classify_rip((uint64_t)ep->ContextRecord->Rip);
+        form = a2h_slotw_corroborate_form((uint64_t)ep->ContextRecord->Rip);
+        switch (range_class) {
+        case XBOX_A2H_SLOTW_RANGE_GAME_MODULE:  A2H_SLOTW_INC64(&L->loss.range_game); break;
+        case XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST: A2H_SLOTW_INC64(&L->loss.range_host); break;
+        default:
+            /* ⚠ UNKNOWN IS INFRA FAILURE, NOT A WARNING. A RIP this facility cannot place must stop
+             * the packet rather than be attributed, so it is counted, latched, and printed. */
+            A2H_SLOTW_INC64(&L->loss.range_unknown);
+            InterlockedExchange((volatile LONG *)&L->loss.overflow, 1);
+            fprintf(stderr, "  [A2HSLOTW] RIP %016llX is in NO known range (recomp_valid=%u"
+                            " recomp=%016llX..%016llX image=%016llX..%016llX) -- INFRA FAILURE\n",
+                    (unsigned long long)ep->ContextRecord->Rip, s_a2h_slotw_recomp_valid,
+                    (unsigned long long)s_a2h_slotw_recomp_lo,
+                    (unsigned long long)s_a2h_slotw_recomp_hi,
+                    (unsigned long long)s_a2h_slotw_image_lo,
+                    (unsigned long long)s_a2h_slotw_image_hi);
+            fflush(stderr);
+            break;
+        }
+        if (!s_a2h_slotw_recomp_valid) {
+            A2H_SLOTW_INC64(&L->loss.range_unavailable);
+        }
+        switch (form) {
+        case XBOX_A2H_SLOTW_FORM_STORE:     A2H_SLOTW_INC64(&L->loss.form_store); break;
+        case XBOX_A2H_SLOTW_FORM_NOT_STORE: A2H_SLOTW_INC64(&L->loss.form_not_store); break;
+        default:                            A2H_SLOTW_INC64(&L->loss.form_undecoded); break;
+        }
 
         /* ── THE PACKET'S OWN DESIGN: TRAFFIC IS COUNTED, SLOT BYTES ARE RECORDED ────────────────
          *
@@ -3145,7 +3363,7 @@ static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
              * propagates. THIS IS THE FAIL-CLOSED PATH, AND IT IS UNCHANGED -- what changed is that
              * only writes that can actually change the slot can reach it. */
             if (!a2h_slotw_publish(A2H_SLOTW_EV_WRITE, alias, slot_hit, (uint32_t)fault, pre, 0,
-                                   (uint64_t)ep->ContextRecord->Rip, enc)) {
+                                   (uint64_t)ep->ContextRecord->Rip, range_class, form)) {
                 A2H_SLOTW_INC64(&L->loss.publish_failed);
                 fprintf(stderr, "  [A2HSLOTW] write NOT published alias=%u fault=%p -- page left"
                                 " CLOSED (coverage failure)\n", alias, (void *)fault);
@@ -3154,23 +3372,33 @@ static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
             }
         } else {
             a2h_slotw_note_traffic(alias, (uint32_t)fault, fault_off, pre_at_fault, pre,
-                                   (uint64_t)ep->ContextRecord->Rip, enc);
+                                   (uint64_t)ep->ContextRecord->Rip, range_class, form);
         }
 
-        /* THE REQUIRED POSITIVE CONTROL. The installer's own ENCODING, on the derived slot. Its
-         * absence is INFRA FAILURE and fails the packet closed; it is never inferred from a log
-         * line.
+        /* ── THE REQUIRED POSITIVE CONTROL, RE-EXPRESSED IN THE NATIVE DOMAIN ────────────────────
          *
-         * ⚠ THE PRE-VALUE IS NOT PART OF THE TEST, AND MAKING IT PART OF THE TEST WAS A DEFECT.
-         * The first version also required `pre == 0`, on the theory that the install is the slot's
-         * first write. That is an assumption about the title, not about the control: if anything
-         * had touched the slot before the installer ran, the control would have silently not
-         * counted, and the packet's fail-closed rule would have fired on a run where the control
-         * had in fact been observed. The control is "a store with the installer's encoding landed
-         * on the derived slot" -- that is what makes it a control -- and the VALUE is recorded in
-         * the step record's post_value so a reader compares it against 0x0015F9D0 offline rather
-         * than having the comparison silently gate the hit count here. */
-        if (slot_hit && enc == XBOX_A2H_SLOTW_ENC_MODRM) {
+         * IT CAN NO LONGER TEST AN ENCODING, because there is no encoding to test: in recompiled
+         * code the faulting instruction is generated C, and the guest's `89 81 2C 24 00 00` can
+         * never appear at a native RIP. The old test `enc == ENC_MODRM` was therefore unsatisfiable
+         * by construction, which is why ON-3's slot event recorded `enc=3` -- the control's
+         * condition was simply never true, on any run, for any writer.
+         *
+         * THE CONTROL IS NOW: "a store LANDED ON THE DERIVED SLOT, and the faulting RIP is INSIDE
+         * THE RECOMPILED MODULE." That is the same claim in the only domain where it can be checked:
+         * the store reached the re-derived slot address (the slot_hit test, which is an ADDRESS
+         * comparison against `arm_slot` and has not changed), and it came from the title's own
+         * recompiled code rather than from the toolkit's runtime, a host callback, or anywhere else.
+         *
+         * ⚠ THE PRE-VALUE IS STILL NOT PART OF THE TEST. Requiring `pre == 0` was a defect: it made
+         * the control depend on nothing having touched the slot earlier, so a run in which the
+         * control DID fire could still be reported as INFRA FAILURE. The VALUE is recorded in the
+         * step record's post_value and compared against 0x0015F9D0 OFFLINE.
+         *
+         * ⚠ AND THE NATIVE-DISASM CORROBORATION IS DELIBERATELY NOT PART OF IT EITHER. The control
+         * keys on the RANGE CLASS alone, so a partial hand-written decoder can never fail a run the
+         * range classifier placed correctly. The corroboration is recorded beside the class for a
+         * reader to check, which is what "optional corroboration" means. */
+        if (slot_hit && range_class == XBOX_A2H_SLOTW_RANGE_GAME_MODULE) {
             A2H_SLOTW_INC64(&L->loss.installer_control_hits);
         }
 
@@ -3181,6 +3409,12 @@ static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
             return EXCEPTION_CONTINUE_SEARCH;
         }
         A2H_SLOTW_INC64(&L->loss.unprotected_intervals);
+        /* THE WINDOW IS OPEN, AND IT IS LOGGED RATHER THAN ASSUMED AWAY. It closes in the step
+         * handler below; `window_open` is what makes "a window is open right now" visible to a
+         * reader instead of inferable only from the counters. */
+        L->window_open_count++;
+        L->window_open_ticks_last = (uint64_t)GetTickCount64();
+        L->window_open = 1;
 
         a2h_slotw_take_pending(A2H_SLOTW_PEND_OWN, ep->ContextRecord->EFlags);
         s_a2h_slotw_pending_alias = alias;
@@ -3188,6 +3422,8 @@ static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
         s_a2h_slotw_pending_pre = pre;
         s_a2h_slotw_pending_seq = (uint32_t)g_a2h_slotw_seq;
         s_a2h_slotw_pending_fault = (uint32_t)fault;
+        s_a2h_slotw_pending_range = range_class;
+        s_a2h_slotw_pending_form = form;
         InterlockedExchange(&g_a2h_slotw_step_owner, (LONG)GetCurrentThreadId());
         ep->ContextRecord->EFlags |= 0x100u;      /* step exactly the one faulting store */
         return EXCEPTION_CONTINUE_EXECUTION;
@@ -3214,6 +3450,25 @@ uint32_t xbox_A2hSlotWatchArm(void)
     L->magic = A2H_SLOTW_MAGIC;
     L->version = XBOX_A2H_SLOTW_VERSION;
     L->size = (uint32_t)sizeof(*L);
+
+    /* ── PUBLISH THE RANGES THE CLASSIFIER WILL USE, SO THE ARCHIVE CARRIES THEM ─────────────────
+     *
+     * ⚠ THE BOUNDS ARE PUBLISHED HERE, BEFORE ANY FAULT CAN BE CLASSIFIED, because a classification
+     * whose inputs are not in the archive cannot be checked by a reader. They come from the REAL
+     * artifact: the recompiled bound from the embedder's `recomp_lookup` probes and the image bound
+     * from this process's own PE headers.
+     *
+     * ⚠ A MISSING RECOMPILED BOUND IS RECORDED, NOT SUBSTITUTED. If the embedder never published
+     * one, every RIP will classify UNKNOWN and `loss.range_unavailable` will move -- which is the
+     * packet's INFRA FAILURE, and is exactly right: a bound this facility invented would make the
+     * control satisfiable by an unrelated writer. */
+    a2h_slotw_read_image_bounds();
+    L->recomp_lo = s_a2h_slotw_recomp_lo;
+    L->recomp_hi = s_a2h_slotw_recomp_hi;
+    L->recomp_bound_valid = s_a2h_slotw_recomp_valid;
+    L->recomp_bound_probes = s_a2h_slotw_recomp_probes;
+    L->image_lo = s_a2h_slotw_image_lo;
+    L->image_hi = s_a2h_slotw_image_hi;
 
     /* READ THE POINTER. It is a pointer, not the object: the device is allocated at runtime, so the
      * slot VA does not exist before this read and MUST NOT be preselected. */
@@ -3373,6 +3628,41 @@ void xbox_A2hSlotWatchDisarm(void)
     fflush(stderr);
 }
 
+/* ── THE TERMINAL-VALUE COHERENCE GATE'S DECISION RULE, IN ONE PLACE ─────────────────────────────
+ *
+ * ⚠ THIS IS THE ONLY PLACE THE VERDICT IS DECIDED, AND IT IS A FUNCTION SO THE FIXTURE CAN DRIVE IT
+ * RATHER THAN REIMPLEMENT IT. A fixture that restated this rule would prove that the fixture and the
+ * handler agree about a rule neither of them had tested -- which is the same class of error as the
+ * void encoding classifier: a test asserting a property of an input the production path never sees.
+ * Extracting the rule makes the fixture's arms assertions about PRODUCTION behaviour.
+ *
+ * The three-way outcome is the whole gate:
+ *
+ *   no terminal read at all          -> NO_TERMINAL     (nothing to compare; never a claim)
+ *   no RECORDED slot write (seq==0)  -> NOT_COMPARABLE  (the terminal stands ALONE; never a claim)
+ *   values DIFFER                    -> MISMATCH        (=> UNKNOWN, fail closed; latch set)
+ *   values MATCH                     -> COHERENT        (removes the mismatch objection from a
+ *                                                        RECORDED positive ONLY -- never an
+ *                                                        absence proof, because a same-value
+ *                                                        racing write in an open window would be
+ *                                                        invisible and a match cannot exclude it)
+ *
+ * ⚠ `coherence_mismatch` IS A CUMULATIVE LATCH, NOT A CURRENT-STATE FLAG. It is never cleared, so a
+ * run that mismatched once and later matched cannot be read as coherent throughout. */
+static void a2h_slotw_decide_coherence(XboxA2hSlotwLedger *L)
+{
+    if (!L->terminal_seen) {
+        L->coherence_verdict = XBOX_A2H_SLOTW_COH_NO_TERMINAL;
+    } else if (L->coherence_last_write_seq == 0) {
+        L->coherence_verdict = XBOX_A2H_SLOTW_COH_NOT_COMPARABLE;
+    } else if (L->coherence_last_write_value != L->coherence_terminal_value) {
+        L->coherence_verdict = XBOX_A2H_SLOTW_COH_MISMATCH;
+        A2H_SLOTW_INC64(&L->loss.coherence_mismatch);
+    } else {
+        L->coherence_verdict = XBOX_A2H_SLOTW_COH_COHERENT;
+    }
+}
+
 /* TERMINAL: re-derive the slot from a FRESH read of the pointer. A moved base is a RE-SCOPE -- the
  * terminal slot is reported, the difference is latched, and nothing compares the new VA against the
  * old one as though they were the same object. */
@@ -3460,11 +3750,99 @@ void xbox_A2hSlotWatchTerminal(uint32_t target)
         fflush(stderr);
     }
 
+    /* ── THE TERMINAL-VALUE COHERENCE GATE (REQUIRED) ─────────────────────────────────────────────
+     *
+     * ⚠ THIS IS THE GATE THAT MAKES THE ACCEPTED SHAPE SOUND, AND IT IS NOT OPTIONAL.
+     *
+     * `VirtualProtect` is PAGE-GRANULAR and the slot sits at offset 0x62C of its page, so opening the
+     * page to single-step a NON-SLOT write also makes the SLOT writable for that one instruction.
+     * A racing write inside such a window would be invisible to this facility. Nothing in scope can
+     * close that window -- which is exactly why the accepted shape is "re-arm after EVERY write and
+     * accept the window as a stated limit" rather than the leave-RW narrowing that would blind the
+     * instrument after the first traffic write.
+     *
+     * SO THE WINDOW IS MADE TO FAIL CLOSED:
+     *
+     *     LAST-RECORDED slot write value   vs   TERMINAL slot read
+     *     MISMATCH  =>  UNKNOWN.   Never a claim.
+     *
+     * "Windows threaten only unrecorded writes; recorded positives stand; coherence converts the
+     * residual same-value race to fail-closed."
+     *
+     * ⚠ THE WORKED EXAMPLE IS ON-3'S OWN NUMBERS: last-recorded `0x0015F9D0` against terminal
+     * `0x001D5078` MISMATCHES, so that run is `UNKNOWN`. The mismatch is the GATE WORKING -- it is
+     * not a defect in the instrument and it must not be "repaired".
+     *
+     * ⚠ AND THE GATE IS ONE-DIRECTIONAL, WHICH IS THE HALF THAT IS EASY TO GET WRONG. A MATCH
+     * removes the mismatch objection from a RECORDED positive, and NOTHING MORE: it cannot prove
+     * the absence of an unrecorded same-value racing write, so a coherent pair never yields an
+     * absence or exclusivity row. `coherence_verdict` says COHERENT, never "clean".
+     *
+     * ⚠ AND "NO RECORDED WRITE" IS NOT COHERENCE EITHER. With `coherence_last_write_seq == 0` there
+     * is nothing to compare, so the verdict is NOT_COMPARABLE and the terminal read stands alone --
+     * which is precisely the state in which the packet forbids attributing anything from the
+     * terminal. */
+    L->coherence_terminal_value = L->terminal_guest_value;
+    a2h_slotw_decide_coherence(L);
+    fprintf(stderr, "  [A2HSLOTW] coherence verdict=%u last_write=%08X(seq=%u) terminal=%08X"
+                    " %s\n", L->coherence_verdict, L->coherence_last_write_value,
+            L->coherence_last_write_seq, L->coherence_terminal_value,
+            L->coherence_verdict == XBOX_A2H_SLOTW_COH_MISMATCH
+                ? "MISMATCH => UNKNOWN (the gate working, never a claim)"
+                : (L->coherence_verdict == XBOX_A2H_SLOTW_COH_COHERENT
+                       ? "match (removes the mismatch objection from a RECORDED positive only;"
+                         " NOT an absence proof)"
+                       : "not comparable: no recorded slot write to compare"));
+    fflush(stderr);
+
     fprintf(stderr, "  [A2HSLOTW] terminal base=%08X base_ok=%u slot=%08X target=%08X stable=%u"
                     " reads=%u fourth=%u(%08X)\n",
             base, base_ok, slot, target, L->slot_stable, L->read_count, L->fourth_reached,
             L->fourth_value);
+    fprintf(stderr, "  [A2HSLOTW] ranges recomp=%016llX..%016llX(valid=%u probes=%u)"
+                    " image=%016llX..%016llX game=%llu host=%llu unknown=%llu unavailable=%llu\n",
+            (unsigned long long)L->recomp_lo, (unsigned long long)L->recomp_hi,
+            L->recomp_bound_valid, L->recomp_bound_probes,
+            (unsigned long long)L->image_lo, (unsigned long long)L->image_hi,
+            (unsigned long long)L->loss.range_game, (unsigned long long)L->loss.range_host,
+            (unsigned long long)L->loss.range_unknown,
+            (unsigned long long)L->loss.range_unavailable);
     fflush(stderr);
+}
+
+/* ── THE PUBLIC RANGE / COHERENCE SEAMS ──────────────────────────────────────────────────────────
+ *
+ * These exist so Exp0 can be run OFFLINE against the REAL loaded modules rather than only from
+ * inside a live fault. Exp0 requires known RIPs to be classified against real image bounds; a proof
+ * that could only run during a fault would not be offline, and a proof run against a synthetic range
+ * would prove nothing about the ranges the classifier actually uses. */
+uint32_t xbox_A2hSlotWatchClassifyRip(uint64_t rip)
+{
+    return a2h_slotw_classify_rip(rip);
+}
+
+void xbox_A2hSlotWatchRangeBounds(uint64_t *recomp_lo, uint64_t *recomp_hi, uint32_t *valid,
+                                  uint64_t *image_lo, uint64_t *image_hi)
+{
+    a2h_slotw_read_image_bounds();
+    if (recomp_lo) *recomp_lo = s_a2h_slotw_recomp_lo;
+    if (recomp_hi) *recomp_hi = s_a2h_slotw_recomp_hi;
+    if (valid) *valid = s_a2h_slotw_recomp_valid;
+    if (image_lo) *image_lo = s_a2h_slotw_image_lo;
+    if (image_hi) *image_hi = s_a2h_slotw_image_hi;
+}
+
+int xbox_A2hSlotWatchCoherence(uint32_t *verdict, uint32_t *last_write_value,
+                               uint32_t *last_write_seq, uint32_t *terminal_value)
+{
+    XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+    if (!L->magic || !L->terminal_seen)
+        return 0;
+    if (verdict) *verdict = L->coherence_verdict;
+    if (last_write_value) *last_write_value = L->coherence_last_write_value;
+    if (last_write_seq) *last_write_seq = L->coherence_last_write_seq;
+    if (terminal_value) *terminal_value = L->coherence_terminal_value;
+    return 1;
 }
 
 /* THE FOURTH READ. `0x00193E62 mov eax,[esi+0x1C4]` produces the value that `0x00193EB5 call eax`
@@ -3489,7 +3867,8 @@ void xbox_A2hSlotWatchNoteFourthRead(uint32_t value, uint32_t read_index)
      * distinguish "one read was instrumented" from "the path was never reached". */
     A2H_SLOTW_INC64(&L->loss.read_samples);
     seq = a2h_slotw_next_seq();
-    a2h_slotw_publish(A2H_SLOTW_EV_READ, 0, 0, 0, value, 0, 0, XBOX_A2H_SLOTW_ENC_UNKNOWN);
+    a2h_slotw_publish(A2H_SLOTW_EV_READ, 0, 0, 0, value, 0, 0,
+                      XBOX_A2H_SLOTW_RANGE_UNKNOWN, XBOX_A2H_SLOTW_FORM_UNKNOWN);
     if (L->read_count != 4 || L->fourth_reached)
         return;
 
@@ -3501,7 +3880,7 @@ void xbox_A2hSlotWatchNoteFourthRead(uint32_t value, uint32_t read_index)
         if (L->events[i].seq > best) {
             best = L->events[i].seq;
             L->last_write_seq = L->events[i].seq;
-            L->last_write_enc = L->events[i].enc;
+            L->last_write_range = L->events[i].range_class;
             L->last_write_alias = L->events[i].alias_index;
             L->last_write_rip = L->events[i].rip;
             L->last_write_ticks = L->events[i].ticks;
@@ -3512,9 +3891,9 @@ void xbox_A2hSlotWatchNoteFourthRead(uint32_t value, uint32_t read_index)
     L->fourth_seq = seq;
     L->fourth_reached = 1;
     L->loss.read_samples++;
-    fprintf(stderr, "  [A2HSLOTW] fourth-read value=%08X index=%u seq=%u last_write_seq=%u enc=%u"
-                    " alias=%u\n", value, L->read_count, seq, L->last_write_seq, L->last_write_enc,
-            L->last_write_alias);
+    fprintf(stderr, "  [A2HSLOTW] fourth-read value=%08X index=%u seq=%u last_write_seq=%u"
+                    " range=%u alias=%u\n", value, L->read_count, seq, L->last_write_seq,
+            L->last_write_range, L->last_write_alias);
     fflush(stderr);
 }
 
@@ -3686,13 +4065,15 @@ void xbox_A2hSlotWatchFixtureNoteRead(uint32_t value, uint32_t read_index)
 }
 
 /* Publish a synthetic SLOT-HIT write record through the REAL publisher, so a fixture can prove the
- * fourth-read latch's ORDERED-EVENT-ID tie without waiting for a live store. `slot_hit` and `enc`
- * are the caller's, so the fixture can drive both the installer's class and an unrelated one. */
-int xbox_A2hSlotWatchFixturePublishWrite(uint32_t slot_hit, uint32_t enc, uint32_t pre_value)
+ * fourth-read latch's ORDERED-EVENT-ID tie without waiting for a live store. `slot_hit` and
+ * `range_class` are the caller's, so the fixture can drive both the installer's class and an
+ * unrelated one. */
+int xbox_A2hSlotWatchFixturePublishWrite(uint32_t slot_hit, uint32_t range_class, uint32_t pre_value)
 {
     if (!g_a2h_slotw_armed)
         return 0;
-    return a2h_slotw_publish(A2H_SLOTW_EV_WRITE, 1u, slot_hit, 0u, pre_value, 0u, 0u, enc);
+    return a2h_slotw_publish(A2H_SLOTW_EV_WRITE, 1u, slot_hit, 0u, pre_value, 0u, 0u,
+                             range_class, XBOX_A2H_SLOTW_FORM_UNKNOWN);
 }
 
 /* Deliver one exception to the REAL slot-watch handler. Returns its return value verbatim. */
@@ -3778,19 +4159,54 @@ uint32_t xbox_A2hSlotWatchFixtureSavedTf(void)
     return s_a2h_slotw_saved_tf;
 }
 
+/* Clear the coherence gate's two operands so a fixture can construct the NO-RECORDED-WRITE state.
+ * That state is a real one -- it is what an arm whose slot was never written looks like -- but a
+ * single live sequence cannot produce it once any slot write has happened, and the fixture must be
+ * able to assert the NOT_COMPARABLE verdict rather than only the two that a written slot can reach.
+ * This is the same kind of seam as xbox_A2hSlotWatchFixtureSetPending: it constructs a state the
+ * live path cannot, so the handler's behaviour in that state is PROVEN rather than assumed. */
+void xbox_A2hSlotWatchFixtureResetCoherence(void)
+{
+    g_xbox_a2h_slotw.coherence_last_write_value = 0;
+    g_xbox_a2h_slotw.coherence_last_write_seq = 0;
+}
+
+/* Set the gate's two operands and run the REAL decision rule over them, returning the verdict. The
+ * fixture must drive PRODUCTION code, not a restatement of its rule: a fixture that reimplemented
+ * the comparison would only prove that the fixture and the handler agree about an untested rule,
+ * which is the same defect class as the void encoding classifier. */
+uint32_t xbox_A2hSlotWatchFixtureDecideCoherence(uint32_t last_write_value, uint32_t last_write_seq,
+                                                 uint32_t terminal_value, uint32_t terminal_seen)
+{
+    XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
+    L->coherence_last_write_value = last_write_value;
+    L->coherence_last_write_seq = last_write_seq;
+    L->coherence_terminal_value = terminal_value;
+    L->terminal_seen = terminal_seen;
+    a2h_slotw_decide_coherence(L);
+    return L->coherence_verdict;
+}
+
 XboxA2hSlotwLedger *xbox_A2hSlotWatchFixtureLedger(void)
 {
     return &g_xbox_a2h_slotw;
 }
 
-/* Classify an arbitrary address's bytes with the REAL classifier, so a fixture can point it at the
- * ACTUAL bytes of the two store instructions in the loaded image. The control's validity rests
- * entirely on this function separating the installer's encoding from the candidate's, and a
- * classifier tested only against synthetic bytes would prove nothing about the image it will
- * actually run against. */
+/* ⚠ THE CLASSIFIER SEAM, IN THE NATIVE DOMAIN. The old seam classified the BYTES at an address and
+ * is gone with the paradigm it belonged to: there is nothing left to classify from bytes. This
+ * exposes the RANGE classifier instead, so a fixture can point it at the ACTUAL addresses of the
+ * loaded image -- its own functions, the recompiled module's published bound, and an address outside
+ * both -- and prove the classification against the real modules rather than a synthetic range. */
 uint32_t xbox_A2hSlotWatchFixtureClassify(uint64_t rip)
 {
-    return a2h_slotw_classify_store(rip);
+    return a2h_slotw_classify_rip(rip);
+}
+
+/* The optional native-disasm corroboration, exposed for the same reason: Exp0 must show it agrees
+ * with the range class on real code and that it never overrides it. */
+uint32_t xbox_A2hSlotWatchFixtureForm(uint64_t rip)
+{
+    return a2h_slotw_corroborate_form(rip);
 }
 
 /* ── THE ALL-THREAD CENSUS, AND WHY IT IS A POLLING THREAD RATHER THAN A THREAD CALLBACK ────────

@@ -94,8 +94,20 @@ extern uint32_t xbox_A2hSlotWatchFixturePending(void);
 extern uint32_t xbox_A2hSlotWatchFixtureSavedTf(void);
 extern XboxA2hSlotwLedger *xbox_A2hSlotWatchFixtureLedger(void);
 extern uint32_t xbox_A2hSlotWatchFixtureClassify(uint64_t rip);
+extern uint32_t xbox_A2hSlotWatchFixtureForm(uint64_t rip);
+extern void xbox_A2hSlotWatchSetRecompBounds(uint64_t lo, uint64_t hi, uint32_t probes,
+                                             uint32_t valid);
+extern void xbox_A2hSlotWatchRangeBounds(uint64_t *recomp_lo, uint64_t *recomp_hi, uint32_t *valid,
+                                         uint64_t *image_lo, uint64_t *image_hi);
+extern int  xbox_A2hSlotWatchCoherence(uint32_t *verdict, uint32_t *last_write_value,
+                                       uint32_t *last_write_seq, uint32_t *terminal_value);
+extern uint32_t xbox_A2hSlotWatchFixtureDecideCoherence(uint32_t last_write_value,
+                                                        uint32_t last_write_seq,
+                                                        uint32_t terminal_value,
+                                                        uint32_t terminal_seen);
+extern void xbox_A2hSlotWatchFixtureResetCoherence(void);
 extern void xbox_A2hSlotWatchFixtureNoteRead(uint32_t value, uint32_t read_index);
-extern int  xbox_A2hSlotWatchFixturePublishWrite(uint32_t slot_hit, uint32_t enc,
+extern int  xbox_A2hSlotWatchFixturePublishWrite(uint32_t slot_hit, uint32_t range_class,
                                                  uint32_t pre_value);
 
 static unsigned checks_run, checks_failed;
@@ -111,79 +123,250 @@ static const char *current_fixture = "?";
         }                                                                            \
     } while (0)
 
-/* ── 6. THE ENCODING CLASSIFIER, AGAINST THE REAL INSTRUCTIONS ────────────────────────────────────
+/* ── 6. THE RANGE CLASSIFIER, AGAINST THE REAL LOADED MODULES ─────────────────────────────────────
  *
- * THE CONTROL'S VALIDITY RESTS ENTIRELY ON THIS. The installer trap is "a store with the installer's
- * encoding landed on the derived slot"; the discriminator is that the installer's `mov [ecx+0x242c],
- * eax` is a ModRM-disp32 store carrying 0x242C while the candidate's `mov [esi+ebp*4+0x3ec], eax` is
- * a SIB store carrying 0x3EC. If the classifier cannot separate those two, the control fires on the
- * wrong instruction -- or never fires at all -- and the packet's fail-closed rule would then be
- * applied to a run in which the control was fine.
+ * ⚠⚠ THE PREVIOUS VERSION OF THIS FIXTURE IS DELETED, NOT REPAIRED, AND THE REASON IS THE POINT.
  *
- * So this reads the ACTUAL bytes out of the loaded image, at the ACTUAL guest VAs the packet names,
- * and runs the REAL classifier over them. Bytes come from the XBE the loader mapped, so this is the
- * instruction the title will execute and not a reconstruction of it.
+ * It read the GUEST bytes of `0x0018CE3A` and `0x00199F45` through `g_xbox_mem_offset` and asserted
+ * that the classifier returned MODRM for the first and SIB for the second. That proved the classifier
+ * could tell two GUEST ENCODINGS apart -- which is not a property the live classifier ever needed or
+ * could have used. At run time the classifier is handed a NATIVE RIP, and the bytes there are
+ * GENERATED C compiled by the host toolchain, never the guest's `89 81 2C 24 00 00`. The fixture was
+ * therefore proving something about an input the instrument never sees, and its passing is exactly
+ * why the void paradigm survived this long. The `0x7B3` residual is NOT repaired here either: it died
+ * with the paradigm and its arithmetic is not to be re-derived.
  *
- * The native RIP the classifier is handed at run time is a host address, so the fixture reaches the
- * guest bytes by translating the guest VA through g_xbox_mem_offset -- which is exactly the
- * relationship the classifier relies on when it reads memory at a recorded native RIP. */
+ * WHAT IS PROVEN INSTEAD, AND IT IS PROVEN ON THE REAL MODULES RATHER THAN A SYNTHETIC RANGE:
+ *
+ *   1. a RIP inside the RECOMPILED MODULE resolves to GAME_MODULE -- and the address used is a REAL
+ *      generated function's address, taken from the dispatch the game itself resolves through;
+ *   2. a RIP inside the TOOLKIT/HOST image resolves to TOOLKIT_HOST -- and the address used is a REAL
+ *      function in this test binary;
+ *   3. a RIP outside both resolves to UNKNOWN;
+ *   4. the boundary cases: the module's own start and end, checked INCLUSIVE at `lo` and EXCLUSIVE at
+ *      `hi`, because an off-by-one at a bound is the whole classification;
+ *   5. native-disasm corroboration where available, and an explicit check that it NEVER OVERRIDES the
+ *      range class.
+ *
+ * ⚠ AND THE BOUND IS PUBLISHED THE SAME WAY THE GAME PUBLISHES IT -- by probing the real dispatch.
+ * `recomp_lookup` is not available to this fixture (it links no generated code), so the fixture
+ * derives its bound from REAL function ADDRESSES it can name, and the production path is exercised by
+ * the game's own `a2h_publish_recomp_bounds()`. What this fixture proves is the CLASSIFIER's
+ * behaviour on real addresses and real bounds; what it cannot prove is that the game's probe loop
+ * finds the right bound, and that limitation is stated rather than papered over.
+ */
 #define FIX_INSTALLER_VA 0x0018CE3Au   /* mov [ecx+0x242c], eax  -- the required control */
 #define FIX_CANDIDATE_VA 0x00199F45u   /* mov [esi+ebp*4+0x3ec], eax -- the candidate */
 
-static void fixture_encoding_classifier(void)
+/* Real functions in THIS image, used as the TOOLKIT_HOST witnesses. Their addresses are the linker's
+ * and are read here, never assumed. */
+extern uint32_t xbox_A2hSlotWatchFixtureClassify(uint64_t rip);
+extern uint32_t xbox_A2hSlotWatchFixtureForm(uint64_t rip);
+
+static void fixture_range_classifier(void)
 {
-    const uint8_t *installer = (const uint8_t *)(uintptr_t)(FIX_INSTALLER_VA + g_xbox_mem_offset);
-    const uint8_t *candidate = (const uint8_t *)(uintptr_t)(FIX_CANDIDATE_VA + g_xbox_mem_offset);
-    uint32_t enc_i, enc_c;
+    uint64_t rlo = 0, rhi = 0, ilo = 0, ihi = 0;
+    uint32_t valid = 0;
+    uint32_t cls;
+    /* TWO REAL ADDRESSES FROM THIS IMAGE: one inside the generated recompiled module as the game
+     * publishes it, one inside the toolkit/host half. The first is supplied by the fixture's own
+     * publication below; the second is this function's own address, which is by construction in the
+     * image and NOT in the generated translation units. */
+    uint64_t host_witness = (uint64_t)(uintptr_t)&fixture_range_classifier;
 
-    current_fixture = "encoding-classifier";
+    current_fixture = "range-classifier";
 
-    /* The bytes the packet names, verified here rather than trusted: `89 81 2C 24 00 00` and
-     * `89 84 AE EC 03 00 00`. A wrong address would make every conclusion below vacuous. */
-    CHECK(installer[0] == 0x89 && installer[1] == 0x81
-          && installer[2] == 0x2C && installer[3] == 0x24
-          && installer[4] == 0x00 && installer[5] == 0x00,
-          "the installer's bytes at %08X are %02X %02X %02X %02X %02X %02X, expected 89 81 2C 24 00 00",
-          FIX_INSTALLER_VA, installer[0], installer[1], installer[2], installer[3], installer[4],
-          installer[5]);
-    CHECK(candidate[0] == 0x89 && candidate[1] == 0x84 && candidate[2] == 0xAE
-          && candidate[3] == 0xEC && candidate[4] == 0x03
-          && candidate[5] == 0x00 && candidate[6] == 0x00,
-          "the candidate's bytes at %08X are %02X %02X %02X %02X %02X %02X %02X, expected"
-          " 89 84 AE EC 03 00 00",
-          FIX_CANDIDATE_VA, candidate[0], candidate[1], candidate[2], candidate[3], candidate[4],
-          candidate[5], candidate[6]);
+    xbox_A2hSlotWatchRangeBounds(&rlo, &rhi, &valid, &ilo, &ihi);
+    printf("  [fixture] range-classifier: published recomp=%016llX..%016llX valid=%u"
+           " image=%016llX..%016llX\n",
+           (unsigned long long)rlo, (unsigned long long)rhi, valid,
+           (unsigned long long)ilo, (unsigned long long)ihi);
 
-    enc_i = xbox_A2hSlotWatchFixtureClassify((uint64_t)(uintptr_t)installer);
-    enc_c = xbox_A2hSlotWatchFixtureClassify((uint64_t)(uintptr_t)candidate);
+    /* THE IMAGE BOUND MUST BE REAL. It is read from this module's own PE headers, so a zero here
+     * means the header read failed and EVERY classification below would be vacuous. */
+    CHECK(ihi > ilo, "the image bound is degenerate (%016llX..%016llX): the PE header read failed"
+                     " and every classification below would be vacuous",
+          (unsigned long long)ilo, (unsigned long long)ihi);
+    /* ...and it must actually contain this function, which is the property that makes it THIS
+     * module's bound rather than some other range. */
+    CHECK(host_witness >= ilo && host_witness < ihi,
+          "this fixture's own address %016llX is OUTSIDE the image bound %016llX..%016llX: the bound"
+          " does not describe the module the RIPs live in",
+          (unsigned long long)host_witness, (unsigned long long)ilo, (unsigned long long)ihi);
 
-    CHECK(enc_i == XBOX_A2H_SLOTW_ENC_MODRM,
-          "the installer's own instruction classified as enc=%u, expected MODRM(%u) -- the required"
-          " control would never fire", enc_i, XBOX_A2H_SLOTW_ENC_MODRM);
-    CHECK(enc_c == XBOX_A2H_SLOTW_ENC_SIB,
-          "the candidate's instruction classified as enc=%u, expected SIB(%u) -- it would be"
-          " attributed to the control", enc_c, XBOX_A2H_SLOTW_ENC_SIB);
-    /* THE DISCRIMINATION ITSELF: distinct classes, which is what makes the two signatures
-     * unmistakable in both RIP and VALUE. */
-    CHECK(enc_i != enc_c, "the control and the candidate classified IDENTICALLY (enc=%u)", enc_i);
-    printf("  [fixture] encoding-classifier: installer(%08X)=MODRM candidate(%08X)=SIB distinct=1\n",
-           FIX_INSTALLER_VA, FIX_CANDIDATE_VA);
+    /* ── (2) TOOLKIT/HOST: A REAL ADDRESS IN THIS IMAGE THAT IS NOT RECOMPILED CODE ───────────── */
+    cls = xbox_A2hSlotWatchFixtureClassify(host_witness);
+    CHECK(cls == XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST,
+          "a real toolkit/host function at %016llX classified as %u, expected TOOLKIT_HOST(%u)",
+          (unsigned long long)host_witness, cls, XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST);
+    printf("  [fixture] range-classifier: host witness %016llX -> TOOLKIT_HOST(%u)\n",
+           (unsigned long long)host_witness, cls);
 
-    /* A store with neither displacement must fall to OTHER, so an unrelated page writer can never
-     * satisfy the control by accident. */
+    /* ── (3) UNKNOWN: OUTSIDE BOTH REAL RANGES ────────────────────────────────────────────────── */
     {
-        static uint8_t other[8] = { 0x89, 0x81, 0x00, 0x10, 0x00, 0x00, 0, 0 };
-        uint32_t enc_o = xbox_A2hSlotWatchFixtureClassify((uint64_t)(uintptr_t)other);
-        CHECK(enc_o == XBOX_A2H_SLOTW_ENC_OTHER,
-              "an unrelated ModRM store classified as enc=%u, expected OTHER(%u)", enc_o,
-              XBOX_A2H_SLOTW_ENC_OTHER);
-        /* ...and a NON-STORE first byte must not be mistaken for one either. */
-        other[0] = 0x8B;   /* mov r32, r/m32 -- a LOAD, not a store */
-        CHECK(xbox_A2hSlotWatchFixtureClassify((uint64_t)(uintptr_t)other)
-              == XBOX_A2H_SLOTW_ENC_OTHER,
-              "a LOAD was classified as a store: a read could be attributed to the control");
+        /* An address that is inside NO module of this process: far above the image, and not a
+         * canonical user-mode mapping. Chosen as `image_hi + 0x100000000` so it cannot accidentally
+         * land in a neighbouring DLL, and asserted to be outside both bounds before use so the arm
+         * cannot be vacuous if the bounds ever move. */
+        uint64_t outside = ihi + 0x100000000ull;
+        CHECK(outside >= ihi && (outside < rlo || outside >= rhi),
+              "the UNKNOWN witness %016llX is INSIDE a known range: the arm would be vacuous",
+              (unsigned long long)outside);
+        cls = xbox_A2hSlotWatchFixtureClassify(outside);
+        CHECK(cls == XBOX_A2H_SLOTW_RANGE_UNKNOWN,
+              "an address outside every real range (%016llX) classified as %u, expected UNKNOWN(%u)",
+              (unsigned long long)outside, cls, XBOX_A2H_SLOTW_RANGE_UNKNOWN);
+        printf("  [fixture] range-classifier: outside %016llX -> UNKNOWN(%u)\n",
+               (unsigned long long)outside, cls);
     }
-    printf("  [fixture] encoding-classifier: unrelated stores and loads fall to OTHER\n");
+
+    /* ── (4) THE BOUNDARY CASES, ON THE MODULE'S OWN START AND END ────────────────────────────────
+     *
+     * ⚠ THIS IS WHERE AN OFF-BY-ONE WOULD LIVE, AND IT IS TESTED ON BOTH SIDES OF BOTH BOUNDS.
+     * `lo` is INCLUSIVE and `hi` is EXCLUSIVE by construction: a function's own address is inside the
+     * module, and the first address past the last function's end is not. An implementation that used
+     * `>` at `lo` or `>=` at `hi` would misplace exactly one instruction at each end -- and the
+     * installer control is a SINGLE instruction, so "one instruction at the end" is the difference
+     * between the control firing and the packet reporting INFRA FAILURE. */
+    if (valid) {
+        CHECK(xbox_A2hSlotWatchFixtureClassify(rlo) == XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
+              "the module's OWN START %016llX did not classify as GAME_MODULE: `lo` is not inclusive",
+              (unsigned long long)rlo);
+        CHECK(xbox_A2hSlotWatchFixtureClassify(rhi - 1u) == XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
+              "the module's LAST address %016llX did not classify as GAME_MODULE: `hi` is not"
+              " exclusive as documented", (unsigned long long)(rhi - 1u));
+        CHECK(xbox_A2hSlotWatchFixtureClassify(rhi) != XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
+              "the FIRST address PAST the module %016llX classified as GAME_MODULE: the upper bound"
+              " is inclusive and the range is one byte too wide", (unsigned long long)rhi);
+        if (rlo > 0) {
+            CHECK(xbox_A2hSlotWatchFixtureClassify(rlo - 1u) != XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
+                  "the address just BELOW the module %016llX classified as GAME_MODULE: the lower"
+                  " bound is exclusive and the range is one byte too wide",
+                  (unsigned long long)(rlo - 1u));
+        }
+        /* AND THE MIDDLE OF THE RANGE, so the arms above are not the only ones that ran. */
+        CHECK(xbox_A2hSlotWatchFixtureClassify(rlo + (rhi - rlo) / 2u)
+              == XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
+              "an address in the MIDDLE of the recompiled bound did not classify as GAME_MODULE");
+        printf("  [fixture] range-classifier: boundaries lo=%016llX INCLUSIVE, hi=%016llX EXCLUSIVE,"
+               " both just-outside arms not GAME_MODULE\n",
+               (unsigned long long)rlo, (unsigned long long)rhi);
+    } else {
+        printf("  [fixture] range-classifier: NO recompiled bound published -- the boundary arms"
+               " cannot run, and the classifier must refuse (checked below)\n");
+    }
+
+    /* ── (5) NATIVE-DISASM CORROBORATION, AND THE PROOF THAT IT NEVER GATES ─────────────────────
+     *
+     * The corroboration decodes NATIVE x86-64 at the RIP. It is recorded BESIDE the range class and
+     * must never change it, so the arms below check both halves: that it produces a verdict on real
+     * code, and that the RANGE CLASS is identical with and without it. */
+    {
+        uint32_t form_self = xbox_A2hSlotWatchFixtureForm(host_witness);
+        uint32_t form_outside = xbox_A2hSlotWatchFixtureForm(ihi + 0x100000000ull);
+        CHECK(form_self == XBOX_A2H_SLOTW_FORM_STORE
+              || form_self == XBOX_A2H_SLOTW_FORM_NOT_STORE
+              || form_self == XBOX_A2H_SLOTW_FORM_UNDECODED,
+              "the corroboration returned an out-of-range form %u", form_self);
+        /* ⚠ A RIP OUTSIDE THE IMAGE IS NOT READABLE AND MUST REPORT UNDECODED, NOT A GUESS. Reading
+         * it would fault inside the fault handler; classifying it from unreadable bytes would be the
+         * old paradigm's error in a new place. */
+        CHECK(form_outside == XBOX_A2H_SLOTW_FORM_UNDECODED,
+              "the corroboration DECODED an address outside the image (%016llX -> %u): it must"
+              " refuse rather than read unreadable memory",
+              (unsigned long long)(ihi + 0x100000000ull), form_outside);
+        /* THE NON-GATING PROPERTY, STATED AS AN ASSERTION. The range class is a function of the
+         * BOUNDS alone; the corroboration cannot move it. If it ever could, a partial hand-written
+         * decoder would be able to fail a run the range classifier placed correctly. */
+        CHECK(xbox_A2hSlotWatchFixtureClassify(host_witness)
+              == XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST,
+              "the range class MOVED after corroboration ran: the corroboration is gating, and it"
+              " must never gate");
+        printf("  [fixture] range-classifier: corroboration self=%u outside=%u(UNDECODED expected)"
+               " and the range class is unmoved by it\n", form_self, form_outside);
+    }
+
+    /* ── (1) GAME_MODULE: A REAL RECOMPILED FUNCTION ADDRESS ────────────────────────────────────
+     *
+     * ⚠ THE WITNESS MUST BE A REAL ADDRESS, SO THE FIXTURE CANNOT INVENT ONE. This binary links no
+     * generated translation units, so the only honest way to place a RIP inside the recompiled
+     * module is to PUBLISH a bound around a real address and check that the address classifies into
+     * it. `host_witness` is a real function; wrapping a bound tightly around it exercises exactly the
+     * code path the game uses, with a range whose endpoints are real. The PUBLICATION path the game
+     * uses (`recomp_lookup` probing) is exercised in the game, not here, and that is stated in the
+     * block comment above rather than implied. */
+    {
+        uint64_t wlo = host_witness & ~(uint64_t)0xFFFu;
+        uint64_t whi = wlo + 0x1000u;
+        CHECK(wlo <= host_witness && host_witness < whi,
+              "the GAME_MODULE witness bound %016llX..%016llX does not contain the witness %016llX",
+              (unsigned long long)wlo, (unsigned long long)whi,
+              (unsigned long long)host_witness);
+        xbox_A2hSlotWatchSetRecompBounds(wlo, whi, 1u, 1u);
+        cls = xbox_A2hSlotWatchFixtureClassify(host_witness);
+        CHECK(cls == XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
+              "a RIP inside a published recompiled bound (%016llX in %016llX..%016llX) classified as"
+              " %u, expected GAME_MODULE(%u)", (unsigned long long)host_witness,
+              (unsigned long long)wlo, (unsigned long long)whi, cls,
+              XBOX_A2H_SLOTW_RANGE_GAME_MODULE);
+        /* THE ORDERING, WHICH IS THE WHOLE CLASSIFICATION: the recompiled module is LINKED INTO this
+         * image, so the witness is inside the IMAGE bound too. Testing the image bound first would
+         * classify every recompiled RIP as TOOLKIT_HOST and the installer control could never fire.
+         * That is asserted here rather than left to the reader. */
+        CHECK(host_witness >= ilo && host_witness < ihi,
+              "the witness is not also inside the image bound, so this arm does NOT prove the"
+              " recompiled-before-image ordering");
+        printf("  [fixture] range-classifier: witness %016llX inside published recompiled bound ->"
+               " GAME_MODULE(%u) even though it is ALSO inside the image bound (ordering proven)\n",
+               (unsigned long long)host_witness, cls);
+    }
+
+    /* ── (6) A DEGENERATE PUBLICATION MUST CLEAR THE BOUND, NOT WIDEN IT ─────────────────────────
+     *
+     * ⚠ THIS IS THE FAIL-CLOSED ARM. If an embedder published a degenerate or inverted range, an
+     * accepting classifier would call every RIP "recompiled" and hand the installer control to an
+     * unrelated writer. The publication is required to REFUSE such a bound, after which the
+     * classifier must report UNKNOWN for the very address it just accepted. */
+    {
+        xbox_A2hSlotWatchSetRecompBounds(host_witness, host_witness, 1u, 1u);   /* hi == lo */
+        CHECK(xbox_A2hSlotWatchFixtureClassify(host_witness) == XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST,
+              "a DEGENERATE bound (hi == lo) was accepted: the witness still classified GAME_MODULE,"
+              " so an unrelated writer could satisfy the installer control");
+        xbox_A2hSlotWatchSetRecompBounds(host_witness, host_witness - 1u, 1u, 1u); /* inverted */
+        CHECK(xbox_A2hSlotWatchFixtureClassify(host_witness) == XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST,
+              "an INVERTED bound (hi < lo) was accepted: the witness still classified GAME_MODULE");
+        xbox_A2hSlotWatchSetRecompBounds(0u, 0xFFFFFFFFFFFFFFFFull, 1u, 0u);    /* valid == 0 */
+        CHECK(xbox_A2hSlotWatchFixtureClassify(host_witness) == XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST,
+              "a bound published with valid == 0 was ACCEPTED: the classifier must refuse a bound"
+              " the embedder did not stand behind");
+        printf("  [fixture] range-classifier: degenerate/inverted/unvalidated publications all"
+               " CLEARED the bound and the classifier refused\n");
+    }
+
+    /* RESTORE a bound so later fixtures classify the way the live run would. */
+    {
+        uint64_t wlo = host_witness & ~(uint64_t)0xFFFu;
+        xbox_A2hSlotWatchSetRecompBounds(wlo, wlo + 0x1000u, 1u, 1u);
+    }
+    /* ⚠ AND THE GUEST VAs THE PACKET NAMES ARE STILL CHECKED -- but ONLY as guest VAs, which is what
+     * they are. There is no encoding expectation attached to them any more, and none may be added:
+     * the fixture asserts the bytes are there in the XBE image, which is a fact about the ORIGINAL
+     * guest program, and asserts NOTHING about what the classifier should say about them. */
+    {
+        const uint8_t *installer = (const uint8_t *)(uintptr_t)(FIX_INSTALLER_VA + g_xbox_mem_offset);
+        const uint8_t *candidate = (const uint8_t *)(uintptr_t)(FIX_CANDIDATE_VA + g_xbox_mem_offset);
+        CHECK(installer[0] == 0x89 && installer[1] == 0x81
+              && installer[2] == 0x2C && installer[3] == 0x24,
+              "the guest bytes at %08X are %02X %02X %02X %02X, expected 89 81 2C 24 (the GUEST"
+              " encoding -- a fact about the XBE, and NOT an expectation for any native RIP)",
+              FIX_INSTALLER_VA, installer[0], installer[1], installer[2], installer[3]);
+        CHECK(candidate[0] == 0x89 && candidate[1] == 0x84 && candidate[2] == 0xAE
+              && candidate[3] == 0xEC,
+              "the guest bytes at %08X are %02X %02X %02X %02X, expected 89 84 AE EC",
+              FIX_CANDIDATE_VA, candidate[0], candidate[1], candidate[2], candidate[3]);
+        printf("  [fixture] range-classifier: the packet's guest VAs still hold their GUEST bytes"
+               " (89 81 2C 24 / 89 84 AE EC); NO native-RIP encoding expectation is made of them\n");
+    }
 }
 
 
@@ -392,19 +575,18 @@ static void fixture_slot_vs_page(void)
                *(volatile uint32_t *)mirror_slot, canonical_before);
     }
 
-    /* (c) THE INSTALLER CONTROL'S ENCODING CLASSIFICATION, on the real slot. The positive control is
-     *     the store at 0x0018CE3A whose encoding is `89 81 2C 24 00 00`; the fixture cannot execute
-     *     guest code, but it CAN prove the classifier separates that encoding from the candidate's
-     *     SIB form, which is what makes the control distinguishable from the target. */
+    /* (c) THE INSTALLER CONTROL'S SPECIFICITY, IN THE NATIVE DOMAIN. The control is "a store landed
+     *     on the derived slot AND the faulting RIP is inside the recompiled module". A store made
+     *     from THIS fixture cannot satisfy the second half: the fixture is host code in the test
+     *     binary, not a recompiled guest function, so its RIP classifies TOOLKIT_HOST -- unless the
+     *     recompiled bound happens to cover it, which the fixture never publishes that way. */
     {
         uint64_t ctl_before = L->loss.installer_control_hits;
-        /* A real ModRM-disp32 store to the slot with the installer's displacement cannot be
-         * synthesised here; what is asserted instead is that a plain store is NOT misclassified as
-         * the installer's encoding, so the control can never be satisfied by an unrelated writer. */
         *(volatile uint32_t *)slot_ptr = 0x0015F9D0u;
         CHECK(L->loss.installer_control_hits == ctl_before,
-              "an unrelated store was counted as the INSTALLER CONTROL: the control is not specific");
-        printf("  [fixture] control-specificity: unrelated store did NOT satisfy the installer"
+              "a store from HOST code was counted as the INSTALLER CONTROL: the control does not"
+              " require the RIP to be in the recompiled module");
+        printf("  [fixture] control-specificity: a host-code store did NOT satisfy the installer"
                " control (hits=%llu)\n",
                (unsigned long long)L->loss.installer_control_hits);
     }
@@ -579,10 +761,10 @@ static void fixture_fourth_read_latch(void)
 
     /* Two writes: the FIRST is a slot hit (the installer's class), the SECOND is page traffic. Only
      * the first may be named as the last reaching write. */
-    CHECK(xbox_A2hSlotWatchFixturePublishWrite(1u, XBOX_A2H_SLOTW_ENC_MODRM, 0x11111111u),
+    CHECK(xbox_A2hSlotWatchFixturePublishWrite(1u, XBOX_A2H_SLOTW_RANGE_GAME_MODULE, 0x11111111u),
           "a slot-hit write record could not be published");
     hit_seq_before = L->events[L->event_count - 1].seq;
-    CHECK(xbox_A2hSlotWatchFixturePublishWrite(0u, XBOX_A2H_SLOTW_ENC_OTHER, 0x22222222u),
+    CHECK(xbox_A2hSlotWatchFixturePublishWrite(0u, XBOX_A2H_SLOTW_RANGE_TOOLKIT_HOST, 0x22222222u),
           "a non-slot write record could not be published");
     nonslot_seq = L->events[L->event_count - 1].seq;
     CHECK(nonslot_seq > hit_seq_before, "the event ids are not monotonic");
@@ -606,19 +788,19 @@ static void fixture_fourth_read_latch(void)
           "the latch tied to seq %u, but the last SLOT-HIT write before the read was seq %u"
           " (the non-slot write was seq %u) -- the tie is not slot-filtered",
           L->last_write_seq, hit_seq_before, nonslot_seq);
-    CHECK(L->last_write_enc == XBOX_A2H_SLOTW_ENC_MODRM,
-          "the latch recorded enc=%u, expected the installer's MODRM(%u)", L->last_write_enc,
-          XBOX_A2H_SLOTW_ENC_MODRM);
+    CHECK(L->last_write_range == XBOX_A2H_SLOTW_RANGE_GAME_MODULE,
+          "the latch recorded range=%u, expected the installer's GAME_MODULE(%u)",
+          L->last_write_range, XBOX_A2H_SLOTW_RANGE_GAME_MODULE);
     CHECK(L->fourth_seq > L->last_write_seq,
           "the read's own seq (%u) does not follow the write it latched (%u): the ordering key is"
           " not monotonic across the read", L->fourth_seq, L->last_write_seq);
-    printf("  [fixture] fourth-read-latch: value=%08X seq=%u tied to write seq=%u (enc=MODRM)"
+    printf("  [fixture] fourth-read-latch: value=%08X seq=%u tied to write seq=%u (range=GAME_MODULE)"
            " not the later non-slot seq=%u\n",
            L->fourth_value, L->fourth_seq, L->last_write_seq, nonslot_seq);
 
     /* A WRITE AFTER THE READ MUST NOT RETROACTIVELY BECOME THE TIE. This is the property that makes
      * the tie an ordering claim rather than a "last write we happened to see" claim. */
-    CHECK(xbox_A2hSlotWatchFixturePublishWrite(1u, XBOX_A2H_SLOTW_ENC_SIB, 0x33333333u),
+    CHECK(xbox_A2hSlotWatchFixturePublishWrite(1u, XBOX_A2H_SLOTW_RANGE_GAME_MODULE, 0x33333333u),
           "a post-read write record could not be published");
     later_seq = L->events[L->event_count - 1].seq;
     CHECK(later_seq > L->fourth_seq, "the post-read write did not get a later event id");
@@ -1020,6 +1202,91 @@ static void *load_xbe(const char *path, size_t *out_size)
     return data;
 }
 
+/* ── 9. FIX 2: THE TERMINAL-VALUE COHERENCE GATE, AND THE WORKED MISMATCH ─────────────────────────
+ *
+ * ⚠ THIS IS THE GATE THE ADVISOR'S RULING MAKES REQUIRED, AND IT IS WHAT MAKES THE ACCEPTED SHAPE
+ * SOUND RATHER THAN MERELY DOCUMENTED.
+ *
+ * `VirtualProtect` is PAGE-GRANULAR and the slot sits at offset 0x62C of its page, so opening the page
+ * to single-step a NON-SLOT write ALSO makes the SLOT writable for that one instruction. A racing
+ * write inside such a window is invisible to this facility. Nothing in scope closes the window, so the
+ * gate makes it FAIL CLOSED: LAST-RECORDED slot write value vs TERMINAL slot read, MISMATCH => UNKNOWN.
+ *
+ * ⚠ AND THE WORKED EXAMPLE IS ON-3'S OWN NUMBERS: last-recorded `0x0015F9D0` against terminal
+ * `0x001D5078`. That MISMATCH is the gate WORKING -- it is why ON-3 is `UNKNOWN` instead of a
+ * misattribution -- and the fixture drives exactly that pair through the REAL gate so the behaviour
+ * is asserted rather than described.
+ *
+ * ⚠ THE GATE IS ONE-DIRECTIONAL AND THE FIXTURE PROVES THAT TOO. A MATCH removes the mismatch
+ * objection from a RECORDED positive and NOTHING MORE: it cannot prove the absence of an unrecorded
+ * same-value racing write, so a coherent verdict never yields an absence or exclusivity row. */
+static void fixture_coherence_gate(void)
+{
+    XboxA2hSlotwLedger *L = xbox_A2hSlotWatchFixtureLedger();
+    uint32_t verdict = 0xFFFFFFFFu, lwv = 0, lws = 0, tv = 0;
+    uint32_t v;
+
+    current_fixture = "coherence-gate";
+
+    /* (a) THE WORKED MISMATCH, DRIVEN THROUGH THE REAL DECISION RULE. ON-3's own pair: a
+     *     last-recorded slot write of 0x0015F9D0 against a terminal read of 0x001D5078. */
+    v = xbox_A2hSlotWatchFixtureDecideCoherence(0x0015F9D0u, 1u, 0x001D5078u, 1u);
+    CHECK(v == XBOX_A2H_SLOTW_COH_MISMATCH,
+          "ON-3's own pair (last-recorded %08X vs terminal %08X) produced verdict %u, expected"
+          " MISMATCH(%u): the gate would have promoted a mismatched run to a claim",
+          0x0015F9D0u, 0x001D5078u, v, XBOX_A2H_SLOTW_COH_MISMATCH);
+    CHECK(L->loss.coherence_mismatch == 1,
+          "the mismatch did not latch (coherence_mismatch=%llu)",
+          (unsigned long long)L->loss.coherence_mismatch);
+    /* THE PUBLIC SEAM MUST REPORT THE SAME OPERANDS, so a reader sees the comparison rather than
+     * being told its result. */
+    CHECK(xbox_A2hSlotWatchCoherence(&verdict, &lwv, &lws, &tv) == 1,
+          "the coherence seam reported NOTHING for a ledger with a terminal read");
+    CHECK(verdict == XBOX_A2H_SLOTW_COH_MISMATCH && lwv == 0x0015F9D0u && tv == 0x001D5078u,
+          "the seam reported verdict=%u last_write=%08X terminal=%08X, expected MISMATCH with"
+          " %08X/%08X -- a reader must SEE the two operands, not just the verdict",
+          verdict, lwv, tv, 0x0015F9D0u, 0x001D5078u);
+    printf("  [fixture] coherence-gate: ON-3's pair last_recorded=%08X terminal=%08X ->"
+           " MISMATCH(%u) => UNKNOWN (the gate working)\n", lwv, tv, verdict);
+
+    /* (b) A COHERENT PAIR, through the same real rule. */
+    v = xbox_A2hSlotWatchFixtureDecideCoherence(0x001D5078u, 7u, 0x001D5078u, 1u);
+    CHECK(v == XBOX_A2H_SLOTW_COH_COHERENT,
+          "a MATCHING pair produced verdict %u, expected COHERENT(%u)", v,
+          XBOX_A2H_SLOTW_COH_COHERENT);
+    /* ⚠ THE ONE-DIRECTIONALITY, AS AN ASSERTION ABOUT THE LATCH. A coherent verdict must NOT clear
+     * the earlier mismatch, so a run that mismatched once and later matched cannot be read as
+     * coherent throughout -- and a match can never be read as evidence about the windows. */
+    CHECK(L->loss.coherence_mismatch == 1,
+          "the coherent arm CHANGED the mismatch latch (%llu): coherence would then be readable as"
+          " evidence about the windows rather than only about the recorded pair",
+          (unsigned long long)L->loss.coherence_mismatch);
+    printf("  [fixture] coherence-gate: matching pair -> COHERENT(%u); mismatch latch still %llu"
+           " (coherent is NOT an absence proof)\n", v,
+           (unsigned long long)L->loss.coherence_mismatch);
+
+    /* (c) NO RECORDED SLOT WRITE IS NOT COHERENCE. seq 0 means there is nothing to compare, so the
+     *     verdict is NOT_COMPARABLE -- the state in which nothing may be attributed from the
+     *     terminal alone, even when the two values happen to be equal. */
+    v = xbox_A2hSlotWatchFixtureDecideCoherence(0x001D5078u, 0u, 0x001D5078u, 1u);
+    CHECK(v == XBOX_A2H_SLOTW_COH_NOT_COMPARABLE,
+          "with NO recorded slot write (seq 0) and EQUAL values the verdict is %u, expected"
+          " NOT_COMPARABLE(%u): the terminal read would otherwise stand alone as a claim", v,
+          XBOX_A2H_SLOTW_COH_NOT_COMPARABLE);
+
+    /* (d) NO TERMINAL AT ALL. Nothing was ever compared, so no verdict may be inferred. */
+    v = xbox_A2hSlotWatchFixtureDecideCoherence(0x0015F9D0u, 1u, 0u, 0u);
+    CHECK(v == XBOX_A2H_SLOTW_COH_NO_TERMINAL,
+          "with terminal_seen == 0 the verdict is %u, expected NO_TERMINAL(%u)", v,
+          XBOX_A2H_SLOTW_COH_NO_TERMINAL);
+    printf("  [fixture] coherence-gate: seq==0 -> NOT_COMPARABLE(%u); no terminal ->"
+           " NO_TERMINAL(%u)\n", XBOX_A2H_SLOTW_COH_NOT_COMPARABLE, v);
+
+    /* Restore a terminal-seen state so later arms and the disarm path see a coherent ledger. */
+    xbox_A2hSlotWatchFixtureResetCoherence();
+    (void)lws;
+}
+
 int main(int argc, char **argv)
 {
     const char *gate = getenv(XBOX_A2H_SLOTW_GATE);
@@ -1106,12 +1373,13 @@ int main(int argc, char **argv)
     fixture_ro_write_av();
     fixture_info0_filter();
     fixture_slot_vs_page();
-    fixture_encoding_classifier();
+    fixture_range_classifier();    /* FIX 1: range-based native-domain classification, real bounds */
     fixture_address_identity();     /* Q3(c): instrument and guest read the SAME dword */
     fixture_value_fidelity();       /* Q3(b): pre/post are the TRUE before/after values */
     fixture_traffic_capacity();     /* TASK 1: traffic costs no records; slot still gets two */
     fixture_db_ownership();
     fixture_fourth_read_latch();
+    fixture_coherence_gate();       /* FIX 2: last-recorded vs terminal; mismatch => UNKNOWN */
 
     xbox_A2hSlotWatchFixtureDisarmAc97();
     xbox_A2hSlotWatchDisarm();
