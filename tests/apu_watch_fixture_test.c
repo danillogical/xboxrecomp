@@ -59,6 +59,15 @@ void recomp_diag_thread_start(uint32_t start, uint32_t low, uint32_t high)
 void recomp_diag_thread_end(void) {}
 void recomp_diag_record(uint32_t kind, uint32_t target, uint32_t site, uint32_t value)
 { (void)kind; (void)target; (void)site; (void)value; }
+/* The A2h NULL-slot latch lives in the GAME (src/diagnostics.c), which this standalone fixture
+ * does not link. The bridge calls these unconditionally when its gate is armed, so the fixture
+ * supplies inert stubs -- the same treatment recomp_diag_record gets above. They observe
+ * nothing and change nothing, which is exactly what a fixture needs. */
+void jsrf_slot_latch_install(uint32_t raw_value, uint32_t installed_value)
+{ (void)raw_value; (void)installed_value; }
+void jsrf_slot_latch_sample(uint32_t tid, uint32_t call_index, uint32_t ordinal,
+                            uint32_t before, uint32_t after)
+{ (void)tid; (void)call_index; (void)ordinal; (void)before; (void)after; }
 
 /* ============================================================
  * Geometry the fixture arranges

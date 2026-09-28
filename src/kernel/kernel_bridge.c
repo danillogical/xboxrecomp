@@ -8915,6 +8915,27 @@ static uint8_t g_slot_arg_unknown[XBOX_KERNEL_THUNK_TABLE_SIZE];
 /* Xbox VA to sample around each bridge call; 0 = off. See dispatch. */
 uint32_t g_kernel_watch_va = 0;
 
+/* A2h NULL-slot latch: the guest VA of the kernel thunk slot under investigation, and the
+ * gate that arms it. Off by default; absent means the latch is never written and the toolkit
+ * behaves exactly as before. See jsrf_slot_latch_sample() in the game's src/diagnostics.c.
+ *
+ * The slot is a fixed property of THIS title's import table, not a tunable: the packet pins it
+ * to 0x001C4064 (index 65 of the table based at 0x001C3F60, whose image content is the
+ * ordinal-277 marker 0x80000115). It is recorded here so the install control and the dispatch
+ * sampler provably refer to the SAME live slot. */
+#define A2H_SLOT_VA            0x001C4064u
+#define A2H_SLOT_INDEX         65u
+#define A2H_SLOT_IMAGE_VALUE   0x80000115u   /* 0x80000000 | 277, the ordinal marker */
+
+static int g_a2h_slot_trace = -1;   /* -1 = unread, 0 = off, 1 = on */
+
+static int a2h_slot_trace_on(void)
+{
+    if (g_a2h_slot_trace < 0)
+        g_a2h_slot_trace = getenv("JSRF_TRACE_A2H_SLOT") ? 1 : 0;
+    return g_a2h_slot_trace;
+}
+
 /* Arm the watch from the environment.
  *
  * The facility existed but nothing set it, so it was unreachable.
@@ -8965,11 +8986,16 @@ static void kernel_thunk_dispatch(void)
         /* The guest return address sits at the top of the guest stack: the
          * caller pushed it before dispatching here. Logging it turns "some
          * function is calling this" into "this call site is", which is the
-         * difference between guessing and knowing when a title recurses. */
+         * difference between guessing and knowing when a title recurses.
+         *
+         * tid is appended LAST so the existing prefix stays byte-identical for readers that
+         * match it. It is needed because g_kernel_call_count is RECOMP_TLS -- a PER-THREAD
+         * counter -- so `#N` restarts per thread and an unattributed series cannot support
+         * per-thread windows or negatives. */
         fprintf(stderr,
-                "  [KERNEL] #%d: ordinal %u (slot %d) esp=0x%08X ret=0x%08X\n",
+                "  [KERNEL] #%d: ordinal %u (slot %d) esp=0x%08X ret=0x%08X tid=%lu\n",
                 g_kernel_call_count, ordinal, slot, g_esp,
-                g_esp ? BRIDGE_MEM32(g_esp) : 0);
+                g_esp ? BRIDGE_MEM32(g_esp) : 0, GetCurrentThreadId());
         fflush(stderr);
     }
 
@@ -9027,6 +9053,7 @@ static void kernel_thunk_dispatch(void)
      *
      * Set g_kernel_watch_va to arm; zero (the default) costs one compare. */
     uint32_t _watch_before = 0;
+    uint32_t _a2h_before = 0;
     kernel_watch_arm_once();
     if (g_kernel_watch_va) {
         _watch_before = BRIDGE_MEM32(g_kernel_watch_va);
@@ -9038,13 +9065,31 @@ static void kernel_thunk_dispatch(void)
             static uint32_t seen = 0xDEADBEEFu;
             if (_watch_before != seen) {
                 seen = _watch_before;
-                fprintf(stderr, "  [KWATCH] 0x%08X = %08X before ordinal %u"
+                /* tid is printed because the dispatch counter is RECOMP_TLS, i.e. per-thread:
+                 * an unattributed series cannot support per-thread windows or negatives. */
+                fprintf(stderr, "  [KWATCH] tid=%lu 0x%08X = %08X before ordinal %u"
                                 " (call #%d)\n",
-                        g_kernel_watch_va, _watch_before, ordinal,
+                        GetCurrentThreadId(), g_kernel_watch_va, _watch_before, ordinal,
                         g_kernel_call_count);
                 fflush(stderr);
             }
         }
+    }
+
+    /* A2h NULL-slot latch: sample the SAME live slot immediately before the bridge runs.
+     *
+     * This is a read-only observation of guest memory the bridge is about to be handed anyway.
+     * It does not alter the bridge, the arguments, the allocation, the cleanup or any device
+     * state, and it is compiled in but inert unless JSRF_TRACE_A2H_SLOT is set.
+     *
+     * The latch itself is per-thread and write-once, and it is the AUTHORITATIVE record --
+     * KWATCH lines above are capped, sampled and change-gated, so no decision row may rest on
+     * the presence OR absence of one. See src/diagnostics.c for why the storage lives there. */
+    if (a2h_slot_trace_on()) {
+        _a2h_before = BRIDGE_MEM32(A2H_SLOT_VA);
+        fprintf(stderr, "  [A2HSLOT] tid=%lu call=#%d ordinal=%u slot=%08X value=%08X phase=before\n",
+                GetCurrentThreadId(), g_kernel_call_count, ordinal, A2H_SLOT_VA, _a2h_before);
+        fflush(stderr);
     }
 
     if (bridge) {
@@ -9086,12 +9131,31 @@ static void kernel_thunk_dispatch(void)
     if (g_kernel_watch_va) {
         uint32_t _after = BRIDGE_MEM32(g_kernel_watch_va);
         if (_after != _watch_before) {
+            /* tid and call index are printed here too: this is the line that names a bridge as
+             * the changer, and without attribution it cannot support a per-thread row. */
             fprintf(stderr,
-                    "  [KWATCH] ordinal %u changed Xbox VA 0x%08X: "
+                    "  [KWATCH] tid=%lu call=#%d ordinal %u changed Xbox VA 0x%08X: "
                     "%08X -> %08X\n",
-                    ordinal, g_kernel_watch_va, _watch_before, _after);
+                    GetCurrentThreadId(), g_kernel_call_count, ordinal, g_kernel_watch_va,
+                    _watch_before, _after);
             fflush(stderr);
         }
+    }
+
+    /* A2h NULL-slot latch: complete the intra-bridge pair and hand it to the game's latch.
+     *
+     * The latch decides whether this is a first nonzero->zero transition for THIS thread and, if
+     * so, claims a write-once slot. The toolkit does not filter beyond that: it reports what it
+     * sampled and lets the latch's own rules (write-once, per-thread, never recycled, overflow
+     * means UNKNOWN) decide admissibility, so the decision input is produced by the code that
+     * performs the observation. */
+    if (a2h_slot_trace_on()) {
+        uint32_t _a2h_after = BRIDGE_MEM32(A2H_SLOT_VA);
+        fprintf(stderr, "  [A2HSLOT] tid=%lu call=#%d ordinal=%u slot=%08X value=%08X phase=after\n",
+                GetCurrentThreadId(), g_kernel_call_count, ordinal, A2H_SLOT_VA, _a2h_after);
+        fflush(stderr);
+        jsrf_slot_latch_sample(GetCurrentThreadId(), (uint32_t)g_kernel_call_count,
+                               ordinal, _a2h_before, _a2h_after);
     }
 
     if (KERNEL_LOG_ON()) {
@@ -9251,6 +9315,20 @@ void xbox_kernel_bridge_init(void)
 
             /* Replace Xbox memory entry with synthetic VA */
             uint32_t synthetic = KERNEL_VA_BASE + i * 4;
+            /* A2h install positive control: capture the raw image value and the value being
+             * installed for the ONE slot under investigation, at the moment of installation.
+             * This is a POSITIVE CONTROL, not an observation -- the image holds the ordinal
+             * marker 0x80000115 at index 65 and this loop rewrites it to the synthetic dispatch
+             * VA, so the pair must match that prediction. If it does not, the control FAILED and
+             * every downstream attribution is unsafe, which is why the game records the
+             * comparison result rather than assuming it. */
+            if (va == A2H_SLOT_VA && a2h_slot_trace_on()) {
+                jsrf_slot_latch_install(current, synthetic);
+                fprintf(stderr, "  [A2HSLOT] install tid=%lu slot=%08X raw=%08X installed=%08X "
+                                "index=%u\n",
+                        GetCurrentThreadId(), A2H_SLOT_VA, current, synthetic, i);
+                fflush(stderr);
+            }
             BRIDGE_MEM32(va) = synthetic;
             resolved++;
         }
