@@ -487,7 +487,7 @@ void xbox_A2hAliasCensusDisarm(void);
 #define XBOX_A2H_SLOTW_PAGES_MAX   (1 + XBOX_NUM_MIRRORS)
 #define XBOX_A2H_SLOTW_EVENTS_MAX  256
 #define XBOX_A2H_SLOTW_THREADS_MAX 64
-#define XBOX_A2H_SLOTW_VERSION     1u
+#define XBOX_A2H_SLOTW_VERSION     2u
 
 /* The required positive control, as an ENCODING signature rather than a guessed native address.
  *
@@ -582,6 +582,15 @@ typedef struct {
     uint32_t terminal_seen;
     uint32_t terminal_target;   /* the raw value the fourth read produced, re-read at TERMINAL */
     uint32_t arm_reason;        /* why ARM refused, when armed == 0 */
+    /* ⚠ THE TERMINAL BASE CAN FAIL TO BE A POINTER AT ALL, AND THAT IS NOT THE SAME FINDING AS A
+     * MOVED ONE. MEASURED on an archived run: at the terminal point MEM32(0x19DCE0) held
+     * 0x30766A64 -- ASCII "djv0", string data from the 0x001D5078 region -- rather than a device
+     * pointer. 0x19DCE0 and the slot 0x19D62C are on the SAME PAGE (0x0019D000), so the global is
+     * itself inside the watched page and is written by the same data traffic the watch exists to
+     * sort from the slot. `term_base_ok` separates "the base is still a plausible guest pointer but
+     * different (RE-SCOPE)" from "the base is no longer a pointer (the global was overwritten)",
+     * because a reader must not treat the second as a device move. */
+    uint32_t term_base_ok;
     uint32_t reserved;
     uint64_t arm_ticks;
     uint64_t terminal_ticks;

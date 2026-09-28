@@ -3186,24 +3186,33 @@ void xbox_A2hSlotWatchDisarm(void)
 void xbox_A2hSlotWatchTerminal(uint32_t target)
 {
     XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
-    uint32_t base, slot;
+    uint32_t base, slot, base_ok;
+    size_t ram = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
 
     if (!L->magic)
         return;
     base = *(volatile uint32_t *)((uintptr_t)XBOX_A2H_SLOTW_DEVICE_PTR + g_xbox_mem_offset);
-    slot = (base >= 0x10000u) ? base + XBOX_A2H_SLOTW_SLOT_OFFSET : 0;
+    /* IS THE BASE STILL A PLAUSIBLE GUEST POINTER? The same checked test ARM applies, so a base
+     * that is no longer a pointer is reported as such instead of being run through the addition and
+     * compared as though it named an object. */
+    base_ok = (base >= XBOX_BASE_ADDRESS && (size_t)base < ram) ? 1u : 0u;
+    slot = base_ok ? base + XBOX_A2H_SLOTW_SLOT_OFFSET : 0;
 
     L->term_base = base;
+    L->term_base_ok = base_ok;
     L->term_slot = slot;
-    L->slot_stable = (slot == L->arm_slot) ? 1u : 0u;
+    L->slot_stable = (base_ok && slot == L->arm_slot) ? 1u : 0u;
+    /* A base that MOVED and a base that STOPPED BEING A POINTER are both re-scope conditions -- the
+     * old VA is not compared against the new one either way -- but only the first is a device move,
+     * and `base_changed` is set for both so a reader cannot read the second as a clean comparison. */
     if (!L->slot_stable)
-        L->loss.base_changed = 1;
+        A2H_SLOTW_SET64(&L->loss.base_changed, 1);
     L->terminal_target = target;
     L->terminal_seen = 1;
     L->terminal_ticks = (uint64_t)GetTickCount64();
-    fprintf(stderr, "  [A2HSLOTW] terminal base=%08X slot=%08X target=%08X stable=%u"
+    fprintf(stderr, "  [A2HSLOTW] terminal base=%08X base_ok=%u slot=%08X target=%08X stable=%u"
                     " reads=%u fourth=%u(%08X)\n",
-            base, slot, target, L->slot_stable, L->read_count, L->fourth_reached,
+            base, base_ok, slot, target, L->slot_stable, L->read_count, L->fourth_reached,
             L->fourth_value);
     fflush(stderr);
 }
