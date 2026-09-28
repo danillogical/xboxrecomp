@@ -926,6 +926,12 @@ void xbox_A2hSlotWatchDisarm(void);
  * which is the correct behaviour for a build whose dispatch the embedder could not read: an
  * invented bound is exactly the arithmetic this packet removes. */
 void xbox_A2hSlotWatchSetRecompBounds(uint64_t lo, uint64_t hi, uint32_t probes, uint32_t valid);
+/* The GAME sets this when its own probe loop hit JSRF_RECOMP_STARTS_MAX and had to refuse. It is a
+ * SEPARATE report from the set itself because the refusal happens BEFORE the set reaches the toolkit,
+ * so the toolkit would otherwise record a clean refusal with no reason attached -- and a reader must
+ * be able to tell "the embedder could not enumerate the module" from "the toolkit rejected what it
+ * was given". */
+void xbox_A2hSlotWatchNoteRecompOverflow(void);
 /* ⚠ THE PUBLICATION THE GAME ACTUALLY USES: EVERY RECOMPILED FUNCTION START, not one interval.
  *
  * `starts` are the native addresses the generated dispatch returned for real guest VAs. They are

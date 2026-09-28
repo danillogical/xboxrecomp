@@ -2919,6 +2919,10 @@ static uint32_t s_a2h_slotw_recomp_probes = 0;
  * can binary-search it without a lock and without ever observing a half-written set. */
 static uint64_t s_a2h_slotw_recomp_starts[XBOX_A2H_SLOTW_RECOMP_MAX];
 static uint32_t s_a2h_slotw_recomp_count = 0;
+/* The embedder's own overflow report. Latched, never cleared, and published into the ledger at ARM
+ * so the archive distinguishes "the embedder could not enumerate the module" from "the toolkit
+ * rejected what it was given" -- both are INFRA FAILURE, but they are different defects. */
+static uint32_t s_a2h_slotw_recomp_overflow = 0;
 
 /* This process's OWN image bounds, from its PE headers. Read once and cached: the loader does not
  * move a module after it is mapped, so a per-fault read would buy nothing and cost an exception
@@ -3581,7 +3585,7 @@ uint32_t xbox_A2hSlotWatchArm(void)
     L->recomp_bound_valid = s_a2h_slotw_recomp_valid;
     L->recomp_bound_probes = s_a2h_slotw_recomp_probes;
     L->recomp_start_count = s_a2h_slotw_recomp_count;
-    L->recomp_start_overflow = 0;
+    L->recomp_start_overflow = s_a2h_slotw_recomp_overflow;
     L->image_lo = s_a2h_slotw_image_lo;
     L->image_hi = s_a2h_slotw_image_hi;
     /* ⚠ THE SET ITSELF GOES INTO THE LEDGER, so the archive carries the classifier's ACTUAL input and
@@ -3960,6 +3964,12 @@ void xbox_A2hSlotWatchRangeBounds(uint64_t *recomp_lo, uint64_t *recomp_hi, uint
 uint32_t xbox_A2hSlotWatchRecompStartCount(void)
 {
     return s_a2h_slotw_recomp_count;
+}
+
+/* The embedder's own overflow report. See the declaration above for why it is a separate latch. */
+void xbox_A2hSlotWatchNoteRecompOverflow(void)
+{
+    s_a2h_slotw_recomp_overflow = 1;
 }
 
 int xbox_A2hSlotWatchCoherence(uint32_t *verdict, uint32_t *last_write_value,
