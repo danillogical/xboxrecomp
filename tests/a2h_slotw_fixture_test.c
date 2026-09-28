@@ -94,6 +94,9 @@ extern uint32_t xbox_A2hSlotWatchFixturePending(void);
 extern uint32_t xbox_A2hSlotWatchFixtureSavedTf(void);
 extern XboxA2hSlotwLedger *xbox_A2hSlotWatchFixtureLedger(void);
 extern uint32_t xbox_A2hSlotWatchFixtureClassify(uint64_t rip);
+extern void xbox_A2hSlotWatchFixtureNoteRead(uint32_t value, uint32_t read_index);
+extern int  xbox_A2hSlotWatchFixturePublishWrite(uint32_t slot_hit, uint32_t enc,
+                                                 uint32_t pre_value);
 
 static unsigned checks_run, checks_failed;
 static const char *current_fixture = "?";
@@ -554,6 +557,83 @@ static void fixture_db_ownership(void)
     }
 }
 
+/* ── 7. THE FOURTH-READ LATCH AND ITS ORDERED-EVENT-ID TIE ────────────────────────────────────────
+ *
+ * The packet requires the fourth `0x00193E62` read to be instrumented with a sequence/value latch
+ * "tied to the installer and all slot writes by ORDERED EVENT IDs -- not sampled log chronology".
+ * This drives the REAL latch through the REAL publisher and asserts exactly that:
+ *
+ *   * reads 1..3 latch nothing; read 4 latches;
+ *   * the latch records the seq of the LAST SLOT-HIT write at or before it, NOT a later write and
+ *     NOT a non-slot write;
+ *   * a write arriving AFTER the read is excluded by event id, which is the property a timestamp
+ *     comparison could not guarantee under log truncation or interleaving;
+ *   * the value latched is the value the read produced, and the latch is write-once.
+ */
+static void fixture_fourth_read_latch(void)
+{
+    XboxA2hSlotwLedger *L = xbox_A2hSlotWatchFixtureLedger();
+    uint32_t hit_seq_before, later_seq, nonslot_seq;
+
+    current_fixture = "fourth-read-latch";
+
+    /* Two writes: the FIRST is a slot hit (the installer's class), the SECOND is page traffic. Only
+     * the first may be named as the last reaching write. */
+    CHECK(xbox_A2hSlotWatchFixturePublishWrite(1u, XBOX_A2H_SLOTW_ENC_MODRM, 0x11111111u),
+          "a slot-hit write record could not be published");
+    hit_seq_before = L->events[L->event_count - 1].seq;
+    CHECK(xbox_A2hSlotWatchFixturePublishWrite(0u, XBOX_A2H_SLOTW_ENC_OTHER, 0x22222222u),
+          "a non-slot write record could not be published");
+    nonslot_seq = L->events[L->event_count - 1].seq;
+    CHECK(nonslot_seq > hit_seq_before, "the event ids are not monotonic");
+
+    /* Reads 1..3 must latch nothing. */
+    xbox_A2hSlotWatchFixtureNoteRead(0xAAAAAAAAu, 1u);
+    xbox_A2hSlotWatchFixtureNoteRead(0xBBBBBBBBu, 2u);
+    xbox_A2hSlotWatchFixtureNoteRead(0xCCCCCCCCu, 3u);
+    CHECK(L->fourth_reached == 0, "the latch fired before the FOURTH read (reached=%u)",
+          L->fourth_reached);
+    CHECK(L->read_count == 3, "read_count=%u after three instrumented reads", L->read_count);
+
+    /* READ 4. */
+    xbox_A2hSlotWatchFixtureNoteRead(0x001D5078u, 4u);
+    CHECK(L->fourth_reached == 1, "the fourth read did NOT latch");
+    CHECK(L->fourth_value == 0x001D5078u,
+          "the latch recorded value %08X, not the value the fourth read produced (%08X)",
+          L->fourth_value, 0x001D5078u);
+    /* THE ORDERED-EVENT-ID TIE. The last SLOT-HIT write before the read, named by seq. */
+    CHECK(L->last_write_seq == hit_seq_before,
+          "the latch tied to seq %u, but the last SLOT-HIT write before the read was seq %u"
+          " (the non-slot write was seq %u) -- the tie is not slot-filtered",
+          L->last_write_seq, hit_seq_before, nonslot_seq);
+    CHECK(L->last_write_enc == XBOX_A2H_SLOTW_ENC_MODRM,
+          "the latch recorded enc=%u, expected the installer's MODRM(%u)", L->last_write_enc,
+          XBOX_A2H_SLOTW_ENC_MODRM);
+    CHECK(L->fourth_seq > L->last_write_seq,
+          "the read's own seq (%u) does not follow the write it latched (%u): the ordering key is"
+          " not monotonic across the read", L->fourth_seq, L->last_write_seq);
+    printf("  [fixture] fourth-read-latch: value=%08X seq=%u tied to write seq=%u (enc=MODRM)"
+           " not the later non-slot seq=%u\n",
+           L->fourth_value, L->fourth_seq, L->last_write_seq, nonslot_seq);
+
+    /* A WRITE AFTER THE READ MUST NOT RETROACTIVELY BECOME THE TIE. This is the property that makes
+     * the tie an ordering claim rather than a "last write we happened to see" claim. */
+    CHECK(xbox_A2hSlotWatchFixturePublishWrite(1u, XBOX_A2H_SLOTW_ENC_SIB, 0x33333333u),
+          "a post-read write record could not be published");
+    later_seq = L->events[L->event_count - 1].seq;
+    CHECK(later_seq > L->fourth_seq, "the post-read write did not get a later event id");
+    CHECK(L->last_write_seq == hit_seq_before,
+          "a write published AFTER the read moved the latch's tie to seq %u (the read's seq is %u)",
+          L->last_write_seq, L->fourth_seq);
+    /* ...and the latch is write-once, so re-noting read 4 cannot overwrite the decision input. */
+    xbox_A2hSlotWatchFixtureNoteRead(0xDEADBEEFu, 4u);
+    CHECK(L->fourth_value == 0x001D5078u,
+          "the write-once latch was overwritten by a second read-4 notification (now %08X)",
+          L->fourth_value);
+    printf("  [fixture] fourth-read-latch: post-read write seq=%u did NOT move the tie; latch"
+           " write-once\n", later_seq);
+}
+
 /* ── THE GATE-OFF CONTROL ────────────────────────────────────────────────────────────────────── */
 static void fixture_gate_off(void)
 {
@@ -710,6 +790,7 @@ int main(int argc, char **argv)
     fixture_slot_vs_page();
     fixture_encoding_classifier();
     fixture_db_ownership();
+    fixture_fourth_read_latch();
 
     xbox_A2hSlotWatchFixtureDisarmAc97();
     xbox_A2hSlotWatchDisarm();

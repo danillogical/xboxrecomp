@@ -3234,6 +3234,10 @@ void xbox_A2hSlotWatchNoteFourthRead(uint32_t value, uint32_t read_index)
      * handler's own count is a cross-check, not the source, because the read site is reached from a
      * poll loop whose iterations this side cannot bound. */
     L->read_count = read_index ? read_index : (L->read_count + 1);
+    /* EVERY instrumented read is counted, not only the fourth: `read_samples` is the read-side
+     * coverage denominator, and a counter that only moved on the one read it latched could not
+     * distinguish "one read was instrumented" from "the path was never reached". */
+    A2H_SLOTW_INC64(&L->loss.read_samples);
     seq = a2h_slotw_next_seq();
     a2h_slotw_publish(A2H_SLOTW_EV_READ, 0, 0, 0, value, 0, 0, XBOX_A2H_SLOTW_ENC_UNKNOWN);
     if (L->read_count != 4 || L->fourth_reached)
@@ -3315,6 +3319,24 @@ int xbox_A2hSlotWatchFixtureArm(uint32_t device_va, XboxA2hSlotwFixtureState *ou
         out->mirror0 = g_a2h_slotw_pages[1];
     }
     return (int)rc;
+}
+
+/* Instrument the fourth-read latch for a fixture, with a controlled read index, so the read-side
+ * latch can be exercised without a live guest poll loop. It calls the REAL xbox_A2hSlotWatchNoteFourthRead
+ * and therefore exercises the real event-id tie, not a reimplementation of it. */
+void xbox_A2hSlotWatchFixtureNoteRead(uint32_t value, uint32_t read_index)
+{
+    xbox_A2hSlotWatchNoteFourthRead(value, read_index);
+}
+
+/* Publish a synthetic SLOT-HIT write record through the REAL publisher, so a fixture can prove the
+ * fourth-read latch's ORDERED-EVENT-ID tie without waiting for a live store. `slot_hit` and `enc`
+ * are the caller's, so the fixture can drive both the installer's class and an unrelated one. */
+int xbox_A2hSlotWatchFixturePublishWrite(uint32_t slot_hit, uint32_t enc, uint32_t pre_value)
+{
+    if (!g_a2h_slotw_armed)
+        return 0;
+    return a2h_slotw_publish(A2H_SLOTW_EV_WRITE, 1u, slot_hit, 0u, pre_value, 0u, 0u, enc);
 }
 
 /* Deliver one exception to the REAL slot-watch handler. Returns its return value verbatim. */
