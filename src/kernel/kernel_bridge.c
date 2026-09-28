@@ -8969,6 +8969,83 @@ static int a2h_watch_on(void)
     return g_a2h_watch;
 }
 
+/* ── C1: the install-STORE witness (A2h-dr0-delivery-gate) ───────────────────────────────────
+ *
+ * WHY THIS EXISTS, and why the existing [A2HSLOT] install line could not serve.
+ *
+ * The packet's Phase-1 question is whether a #DB reaches the debugger for a write that is KNOWN to
+ * have happened. That question is only decidable if the write side is recorded losslessly and AT THE
+ * STORE: the pre-existing callback at :9462 runs BEFORE the store, so a reader who saw only that line
+ * could not tell "the store executed and no #DB arrived" (NON-FIRING) from "the store never executed"
+ * (no observation at all). Those are different worlds and the packet refuses to conflate them.
+ *
+ * So the store itself moves inside a2h_install_witness(): the witness performs the store, reads the
+ * location back, and only then sets the write-once latch. The latch therefore cannot be set by a
+ * store that did not execute, and it cannot be set by a print.
+ *
+ *   install_executed=1 AND a complete raw single-step count of 0  ->  NON-FIRING (the watch did not
+ *                                                                   fire for a write that happened)
+ *   latch absent or the collector's accounting incomplete        ->  NOT-RECORDED / UNKNOWN
+ *
+ * OBSERVATION ONLY. The value stored, the target address and the ordering are exactly what the
+ * previous statement performed; the witness adds one readback of the same dword and nothing else. No
+ * guest register, allocation, device or error-handling state is touched. WITH THE GATE OFF the caller
+ * takes the original `BRIDGE_MEM32(va) = synthetic;` statement unchanged, so this whole facility is
+ * unreachable and the toolkit behaves exactly as before. */
+#define A2H_INSTALL_SITE "kernel_bridge.c:xbox_kernel_bridge_init:install_store"
+
+static volatile LONG g_a2h_install_latch_used = 0;    /* write-once guard for the latch below */
+static volatile LONG g_a2h_install_exec_count = 0;    /* UNCAPPED: every witness execution counts */
+static volatile LONG g_a2h_install_published = 0;     /* latch fully populated */
+static uint32_t g_a2h_install_raw;                    /* loop's read of the slot at :9412 */
+static uint32_t g_a2h_install_installed;              /* value being installed */
+static uint32_t g_a2h_install_before;                 /* dword read back IMMEDIATELY before the store */
+static uint32_t g_a2h_install_after;                  /* dword read back IMMEDIATELY after the store */
+static uint32_t g_a2h_install_va;                     /* guest VA of the store */
+static uint32_t g_a2h_install_index;                  /* thunk-table index */
+static uint64_t g_a2h_install_host;                   /* native address the store targeted */
+static unsigned long g_a2h_install_tid;
+
+static void a2h_install_witness(const char *site, uint32_t va, uint32_t value, uint32_t raw,
+                                unsigned index)
+{
+    uintptr_t host = (uintptr_t)va + (uintptr_t)g_xbox_mem_offset;
+    unsigned long tid = GetCurrentThreadId();
+    uint32_t before, after;
+
+    /* The counter is incremented BEFORE the store, so an execution that somehow failed to complete
+     * is still counted as an execution rather than vanishing. It is never capped: a capped counter
+     * could read 1 while two stores happened, which is the same absent-record error class. */
+    InterlockedIncrement(&g_a2h_install_exec_count);
+
+    before = *(volatile uint32_t *)host;      /* the actual pre-state of the target dword */
+    *(volatile uint32_t *)host = value;       /* THE INSTALL STORE, verbatim, same value/target */
+    after = *(volatile uint32_t *)host;       /* the actual post-state */
+
+    if (InterlockedCompareExchange(&g_a2h_install_latch_used, 1, 0) == 0) {
+        g_a2h_install_raw = raw;
+        g_a2h_install_installed = value;
+        g_a2h_install_before = before;
+        g_a2h_install_after = after;
+        g_a2h_install_va = va;
+        g_a2h_install_index = index;
+        g_a2h_install_host = (uint64_t)host;
+        g_a2h_install_tid = tid;
+        InterlockedExchange(&g_a2h_install_published, 1);   /* LAST: a reader never sees a partial latch */
+    }
+
+    /* TRANSPORT, NOT EVIDENCE. This line is how the latch reaches the archive (the child's stderr is
+     * redirected into jsrf_run.log); the latch and the counter above are the decision inputs, and the
+     * line is written only after both are set. `host=` is published so a reader can compare it
+     * directly against the collector's own `canonical=` readback -- if those two differ, the watch was
+     * never pointed at the address this store wrote, which is a different cause from a silent watch. */
+    fprintf(stderr, "  [A2HSLOT] install_exec site=%s tid=%lu va=%08X host=%016llX index=%u "
+                    "raw=%08X before=%08X installed=%08X after=%08X exec_count=%ld latch=%ld\n",
+            site, tid, va, (unsigned long long)host, index, raw, before, value, after,
+            (long)g_a2h_install_exec_count, (long)g_a2h_install_published);
+    fflush(stderr);
+}
+
 /* The acknowledgement half of the handshake.
  *
  * WITHOUT THIS THE HANDSHAKE IS FATAL. The collector receives the exception, arms, and returns
@@ -9465,7 +9542,14 @@ void xbox_kernel_bridge_init(void)
                         GetCurrentThreadId(), A2H_SLOT_VA, current, synthetic, i);
                 fflush(stderr);
             }
-            BRIDGE_MEM32(va) = synthetic;
+            /* C1: THE STORE, and the witness that is tied to it. When the gate is on the store is
+             * performed BY the witness, so `install_executed` cannot be set for a store that did not
+             * happen; when the gate is off this is byte-for-byte the original assignment. */
+            if (va == A2H_SLOT_VA && a2h_watch_on()) {
+                a2h_install_witness(A2H_INSTALL_SITE, va, synthetic, current, (unsigned)i);
+            } else {
+                BRIDGE_MEM32(va) = synthetic;
+            }
             resolved++;
         }
     }
