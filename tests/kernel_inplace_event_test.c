@@ -26,6 +26,17 @@ void jsrf_slot_latch_install(uint32_t raw_value, uint32_t installed_value)
 void jsrf_slot_latch_sample(uint32_t tid, uint32_t call_index, uint32_t ordinal,
                             uint32_t before, uint32_t after)
 { (void)tid; (void)call_index; (void)ordinal; (void)before; (void)after; }
+/* A2h slot-WRITE watch stubs (registry version 3), same treatment. Unreachable here because the
+ * fixture never sets JSRF_TRACE_A2H_DR, but the linked toolkit objects reference them. */
+void jsrf_slot_watch_handshake(uint32_t slot_va) { (void)slot_va; }
+void jsrf_slot_watch_alias_armed(uint32_t mapped_mask, uint32_t protect_mask, uint32_t alias_count)
+{ (void)mapped_mask; (void)protect_mask; (void)alias_count; }
+int jsrf_slot_watch_alias_touch(uint32_t alias_index, uint32_t fault_va, uint64_t rip,
+                                uint32_t value, uint32_t published)
+{ (void)alias_index; (void)fault_va; (void)rip; (void)value; (void)published; return 0; }
+void jsrf_slot_watch_write(uint32_t provenance, uint32_t before, uint32_t after,
+                           uint64_t rip, uint32_t ordinal)
+{ (void)provenance; (void)before; (void)after; (void)rip; (void)ordinal; }
 
 extern ptrdiff_t g_xbox_mem_offset;
 

@@ -2384,8 +2384,189 @@ void xbox_ProtectMirrorsForDebug(void)
             n, XBOX_NUM_MIRRORS);
 }
 
+/* ── A2h alias first-touch census (gated, observation only) ──────────────────────────────────
+ *
+ * WHY THIS EXISTS. The kernel thunk slot at guest VA 0x001C4064 is reachable at 29 linear host
+ * addresses: the canonical mapping plus 28 mirror views that alias the SAME file region. A native
+ * DR0 watch matches a LINEAR address, so it watches the canonical one and is structurally blind to
+ * the other 28 -- a store through a mirror changes the memory the slot reads without ever touching
+ * the watched address. The packet is explicit that this is not hypothetical: it is the mechanism
+ * that hid Halo's fs:[4] corruption (see the comment above xbox_ProtectMirrorsForDebug).
+ *
+ * THIS IS A FIRST-TOUCH CENSUS, NOT A WRITE HISTORY. A page can only absorb one first write before
+ * this handler sees it; after that the page is reopened and further writes to it escape. That is
+ * sufficient for the question actually being asked -- whether ANY alias was written at all -- and
+ * it is deliberately not more: a per-write history is unbounded, and the packet forbids sizing any
+ * decision record by run length. One touch disqualifies every absence/attribution row.
+ *
+ * RECORD-BEFORE-OPEN. The AC'97 handler above opens the page first and records nothing at fault
+ * time, so it is a functional precedent but NOT a forensic one and its ordering is deliberately
+ * not copied. Here the touch record is published BEFORE VirtualProtect opens the page, because a
+ * concurrent writer landing in an unprotected interval would otherwise be neither recorded nor the
+ * first touch -- and an unrecorded write is exactly the error this census exists to prevent. If
+ * the record cannot be published, the page is NOT opened: the fault is left to propagate rather
+ * than converted into a silent hole in the census.
+ *
+ * OFF BY DEFAULT. JSRF_TRACE_A2H_DR is read once and cached; with it unset no handler is
+ * registered, no page is protected and nothing is printed. */
+#define A2H_ALIAS_SLOT_VA   0x001C4064u
+#define A2H_ALIAS_PAGE_SIZE 4096u
+#define A2H_ALIAS_GATE      "JSRF_TRACE_A2H_DR"
+
+static void *g_a2h_alias_veh = NULL;
+static void *g_a2h_alias_pages[XBOX_NUM_MIRRORS] = {0};
+static uint32_t g_a2h_alias_mapped_mask = 0;
+static uint32_t g_a2h_alias_protect_mask = 0;
+static uint32_t g_a2h_alias_armed = 0;
+static int g_a2h_alias_gate = -1;
+static RECOMP_TLS int s_a2h_alias_stepping = 0;   /* 1-based index of the page this thread opened */
+
+static int a2h_alias_on(void)
+{
+    if (g_a2h_alias_gate < 0)
+        g_a2h_alias_gate = getenv(A2H_ALIAS_GATE) ? 1 : 0;
+    return g_a2h_alias_gate;
+}
+
+static LONG CALLBACK a2h_alias_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    DWORD old;
+
+    /* Second half: the faulting write has executed. Close the page again and stop stepping.
+     * Thread-local, exactly as AC'97 does it and for the same reason -- another thread must not
+     * mistake its own single-step for this one, and re-protecting from the wrong thread would
+     * strand this one mid-step. */
+    if (code == EXCEPTION_SINGLE_STEP && s_a2h_alias_stepping) {
+        int index = s_a2h_alias_stepping - 1;
+        s_a2h_alias_stepping = 0;
+        if (index >= 0 && index < XBOX_NUM_MIRRORS && g_a2h_alias_pages[index])
+            VirtualProtect(g_a2h_alias_pages[index], A2H_ALIAS_PAGE_SIZE, PAGE_READONLY, &old);
+        ep->ContextRecord->EFlags &= ~0x100u;   /* clear TF */
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if (code == EXCEPTION_ACCESS_VIOLATION
+            && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
+
+        /* ONLY OUR EXACT PAGES. Everything else is somebody else's fault: the game's own VEH
+         * (src/main.c:212) handles the NV2A and APU apertures and this must not shadow it. */
+        for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
+            uintptr_t base = (uintptr_t)g_a2h_alias_pages[m];
+            uint32_t live;
+            if (!base || fault < base || fault >= base + A2H_ALIAS_PAGE_SIZE)
+                continue;
+
+            /* PUBLISH FIRST. Read the live slot through this alias and hand the record over
+             * BEFORE the page is opened; only a confirmed publication may open it. */
+            live = *(volatile uint32_t *)(base + (A2H_ALIAS_SLOT_VA & (A2H_ALIAS_PAGE_SIZE - 1)));
+            if (!jsrf_slot_watch_alias_touch((uint32_t)m, (uint32_t)fault,
+                                             (uint64_t)ep->ContextRecord->Rip, live, 1)) {
+                /* Publication failed. Do NOT open: a page that is open without a record is a hole
+                 * in the census, and an unrecorded write is the one outcome that would make a
+                 * zero-touch conclusion false. The failure is recorded inside the game's registry
+                 * (publish_failed) and the fault is left to propagate rather than being converted
+                 * into a silent absence. */
+                fprintf(stderr, "  [A2HSLOT] alias touch NOT published mirror=%d fault=%p --"
+                                " leaving the page closed (coverage failure)\n",
+                        m + 1, (void *)fault);
+                fflush(stderr);
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            if (!VirtualProtect((LPVOID)base, A2H_ALIAS_PAGE_SIZE, PAGE_READWRITE, &old))
+                return EXCEPTION_CONTINUE_SEARCH;
+            s_a2h_alias_stepping = m + 1;
+            ep->ContextRecord->EFlags |= 0x100u;   /* TF: step the write, then close again */
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Arm the census. Called before the toolkit installs its thunk table, so every mirror page is
+ * read-only before the install store can execute. Returns 1 when EVERY mapped view is protected.
+ *
+ * A MAPPED VIEW THAT CANNOT BE PROTECTED IS A COVERAGE FAILURE, NOT A WARNING: an unwatched page
+ * can absorb a write that the census would then report as absent. The masks are handed to the game
+ * so the archive carries the distinction rather than an inference. */
+uint32_t xbox_A2hAliasCensusArm(void)
+{
+    int mapped = 0, protected_ = 0;
+
+    if (!a2h_alias_on() || g_a2h_alias_armed) return g_a2h_alias_armed;
+    g_a2h_alias_mapped_mask = 0;
+    g_a2h_alias_protect_mask = 0;
+
+    /* Registered at the same priority as the game's own VEH and AC'97's (both 1). This handler
+     * claims only its own pages and returns EXCEPTION_CONTINUE_SEARCH for everything else, so it
+     * neither shadows nor reorders their handling. */
+    g_a2h_alias_veh = AddVectoredExceptionHandler(1, a2h_alias_veh);
+    if (!g_a2h_alias_veh) {
+        fprintf(stderr, "  [A2HSLOT] alias census FAILED: no VEH\n");
+        fflush(stderr);
+        return 0;
+    }
+
+    for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
+        DWORD old;
+        uintptr_t base;
+        if (!g_mirror_views[m]) continue;      /* not mapped: accounted for, not assumed */
+        base = (uintptr_t)g_mirror_views[m] + (A2H_ALIAS_SLOT_VA & ~(A2H_ALIAS_PAGE_SIZE - 1));
+        g_a2h_alias_pages[m] = (void *)base;
+        g_a2h_alias_mapped_mask |= (1u << m);
+        mapped++;
+        if (VirtualProtect((LPVOID)base, A2H_ALIAS_PAGE_SIZE, PAGE_READONLY, &old)) {
+            g_a2h_alias_protect_mask |= (1u << m);
+            protected_++;
+        } else {
+            fprintf(stderr, "  [A2HSLOT] alias census: mirror %d page at %p NOT protected"
+                            " (error %lu) -- coverage failure\n", m + 1, (void *)base, GetLastError());
+            g_a2h_alias_pages[m] = NULL;
+        }
+    }
+    g_a2h_alias_armed = (mapped > 0 && mapped == protected_) ? 1u : 0u;
+    jsrf_slot_watch_alias_armed(g_a2h_alias_mapped_mask, g_a2h_alias_protect_mask,
+                                (uint32_t)protected_);
+    fprintf(stderr, "  [A2HSLOT] alias census armed=%u mapped=%d protected=%d mask=%08X/%08X"
+                    " slot_page=%08X\n",
+            g_a2h_alias_armed, mapped, protected_, g_a2h_alias_mapped_mask,
+            g_a2h_alias_protect_mask, A2H_ALIAS_SLOT_VA & ~(A2H_ALIAS_PAGE_SIZE - 1));
+    fflush(stderr);
+    return g_a2h_alias_armed;
+}
+
+/* Restore the original protections and drop the handler. The packet's closure rule requires the
+ * mirror-page protections to be restored, not merely reported. */
+void xbox_A2hAliasCensusDisarm(void)
+{
+    int restored = 0;
+    if (!g_a2h_alias_armed && !g_a2h_alias_veh) return;
+    for (int m = 0; m < XBOX_NUM_MIRRORS; m++) {
+        DWORD old;
+        if (!g_a2h_alias_pages[m]) continue;
+        if (VirtualProtect(g_a2h_alias_pages[m], A2H_ALIAS_PAGE_SIZE, PAGE_READWRITE, &old)) {
+            restored++;
+        } else {
+            fprintf(stderr, "  [A2HSLOT] alias census: mirror %d page NOT restored (error %lu)\n",
+                    m + 1, GetLastError());
+        }
+        g_a2h_alias_pages[m] = NULL;
+    }
+    if (g_a2h_alias_veh) {
+        RemoveVectoredExceptionHandler(g_a2h_alias_veh);
+        g_a2h_alias_veh = NULL;
+    }
+    fprintf(stderr, "  [A2HSLOT] alias census disarmed restored=%d\n", restored);
+    fflush(stderr);
+    g_a2h_alias_armed = 0;
+}
+
 void xbox_MemoryLayoutShutdown(void)
 {
+    /* Restore mirror-page protections and drop the census handler before the views go away.
+     * With the gate unset this is a no-op: no page was protected and no handler was registered. */
+    xbox_A2hAliasCensusDisarm();
     if (g_kernel_memory) {
         VirtualFree(g_kernel_memory, 0, MEM_RELEASE);
         g_kernel_memory = NULL;

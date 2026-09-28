@@ -8936,6 +8936,91 @@ static int a2h_slot_trace_on(void)
     return g_a2h_slot_trace;
 }
 
+/* ── A2h install handshake ───────────────────────────────────────────────────────────────────
+ *
+ * The collector (tools/harness/collect.c) is the debugger and is the only party that can program
+ * DR0: a debug register is per-thread state, set with SetThreadContext on a debug handle. The
+ * toolkit cannot arm itself, and the collector does not link the toolkit -- so the two must
+ * rendezvous at a defined point.
+ *
+ * This is that point, and it is placed so that arming PROVABLY precedes the install store: the
+ * collector receives a first-chance exception BEFORE any vectored handler runs and before the
+ * faulting instruction resumes, so while this call is outstanding the install thread is stopped
+ * and the slot still holds its image value. Only after the collector has armed every live thread
+ * and acknowledged does RaiseException return and the store at the end of the loop body execute.
+ *
+ * WHY A DISTINCT CODE: 0xE0424750 (GPU), 0xE0424243 (fixture), 0xE0424943 (invalid call) and
+ * 0xE0424845 already have owners. Reusing one would make the collector's arm-before-install
+ * ordering depend on somebody else's dispatch, and would make the ON run indistinguishable from a
+ * run in which the GPU or fixture path fired.
+ *
+ * WITH THE GATE OFF NOTHING IS RAISED. The environment is read once and cached, so an unarmed run
+ * executes exactly the instructions it executed before this existed -- no exception, no
+ * perturbation, no timing change. The packet requires an ON/OFF comparison, which is only
+ * meaningful if OFF is genuinely inert. */
+#define A2H_DR_HANDSHAKE_CODE  0xE0424452u
+
+static int g_a2h_watch = -1;        /* -1 = unread, 0 = off, 1 = on */
+
+static int a2h_watch_on(void)
+{
+    if (g_a2h_watch < 0)
+        g_a2h_watch = getenv("JSRF_TRACE_A2H_DR") ? 1 : 0;
+    return g_a2h_watch;
+}
+
+static void a2h_install_handshake(void)
+{
+    fprintf(stderr, "  [A2HSLOT] handshake tid=%lu slot=%08X state=raise\n",
+            GetCurrentThreadId(), A2H_SLOT_VA);
+    fflush(stderr);
+    /* First-chance, continuable: the collector sees this, arms, and acknowledges. If no collector
+     * is attached this returns immediately through the normal VEH chain, so a run without the
+     * debugger is not blocked by a diagnostic -- it is simply unarmed, and the toolkit's own
+     * arming summary is what reports that. */
+    RaiseException(A2H_DR_HANDSHAKE_CODE, 0, 0, NULL);
+    fprintf(stderr, "  [A2HSLOT] handshake tid=%lu slot=%08X state=ack\n",
+            GetCurrentThreadId(), A2H_SLOT_VA);
+    fflush(stderr);
+    jsrf_slot_watch_handshake(A2H_SLOT_VA);
+}
+
+/* Per-thread last observed value of the canonical slot, for the write witness below.
+ *
+ * The DR0 watch in the collector is the authoritative SITE record: it reports the native RIP that
+ * performed the store, which this sampler cannot see. But the collector is a SEPARATE PROCESS and
+ * cannot call into the game, so the class-keyed witness that must survive in the archived registry
+ * is fed from here -- from the same live slot, at the same dispatch boundary the latch already
+ * samples. The two are reconciled offline: the collector's RIP names the site, this names the
+ * value transition and the guest thread.
+ *
+ * PROVENANCE IS UNKNOWN, DELIBERATELY. This runs in host bridge code, but the write it observes
+ * happened somewhere between the previous boundary and this one, and a native RIP would be needed
+ * to say who did it. The packet's rule is explicit that an unknown class is never blamed on guest
+ * or host, so it is recorded as UNKNOWN rather than guessed from the fact that the sampler itself
+ * is host code. */
+static RECOMP_TLS uint32_t s_a2h_last_slot = 0;
+static RECOMP_TLS int s_a2h_last_valid = 0;
+
+static void a2h_watch_sample_slot(uint32_t ordinal)
+{
+    uint32_t now = BRIDGE_MEM32(A2H_SLOT_VA);
+    if (!s_a2h_last_valid) {
+        /* The first sample only establishes a baseline: without a previous value there is no
+         * transition to report, and reporting one would invent a write that was never observed. */
+        s_a2h_last_slot = now;
+        s_a2h_last_valid = 1;
+        return;
+    }
+    if (now != s_a2h_last_slot) {
+        jsrf_slot_watch_write(JSRF_PROV_UNKNOWN, s_a2h_last_slot, now, 0, ordinal);
+        fprintf(stderr, "  [A2HSLOT] write tid=%lu slot=%08X before=%08X after=%08X phase=boundary\n",
+                GetCurrentThreadId(), A2H_SLOT_VA, s_a2h_last_slot, now);
+        fflush(stderr);
+        s_a2h_last_slot = now;
+    }
+}
+
 /* Arm the watch from the environment.
  *
  * The facility existed but nothing set it, so it was unreachable.
@@ -9157,6 +9242,10 @@ static void kernel_thunk_dispatch(void)
         jsrf_slot_latch_sample(GetCurrentThreadId(), (uint32_t)g_kernel_call_count,
                                ordinal, _a2h_before, _a2h_after);
     }
+    /* The class-keyed write witness, fed from the same live slot at the same boundary. Kept
+     * separate from the latch call above so that the v2 latch's meaning is unchanged and the two
+     * records can disagree visibly rather than one silently overwriting the other. */
+    if (a2h_watch_on()) a2h_watch_sample_slot(ordinal);
 
     if (KERNEL_LOG_ON()) {
         fprintf(stderr, "  [KERNEL] → returned 0x%08X\n", g_eax);
@@ -9258,6 +9347,20 @@ void xbox_kernel_bridge_init(void)
 
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
             g_thunk_table_count, g_thunk_table_base);
+
+    /* A2h: arm the alias census and rendezvous with the collector BEFORE the install store below.
+     *
+     * ORDER IS THE WHOLE POINT. The census must be in place before the install store executes, or
+     * the install store itself would be the first touch of a page nobody was watching. And the
+     * handshake must complete before that same store, or the collector's DR0 would be programmed
+     * after the write it exists to trap -- leaving the install control unproven.
+     *
+     * Both are behind JSRF_TRACE_A2H_DR, read once and cached, so with the gate off this block
+     * executes nothing and raises nothing. */
+    if (a2h_watch_on()) {
+        xbox_A2hAliasCensusArm();
+        a2h_install_handshake();
+    }
 
     /* The thunk table lives in .rdata which is marked PAGE_READONLY.
      * Temporarily make it writable so we can patch the ordinals. */

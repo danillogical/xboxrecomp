@@ -450,6 +450,15 @@ extern RECOMP_TLS uint32_t g_fs_base;
  */
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 
+/* A2h alias first-touch census (gated by JSRF_TRACE_A2H_DR, observation only).
+ *
+ * Read-only-protects the 4 KiB page holding guest VA 0x001C4064 in every MAPPED mirror view and
+ * records the first write fault to each. Returns 1 only when every mapped view was protected --
+ * a mapped view that could not be protected is a coverage failure, not a warning. Disarm restores
+ * the original protections. Both are no-ops with the gate unset. */
+uint32_t xbox_A2hAliasCensusArm(void);
+void xbox_A2hAliasCensusDisarm(void);
+
 /**
  * Free a block from the Xbox heap. Currently a no-op (bump allocator).
  */

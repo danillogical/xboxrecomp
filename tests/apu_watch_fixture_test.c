@@ -68,6 +68,20 @@ void jsrf_slot_latch_install(uint32_t raw_value, uint32_t installed_value)
 void jsrf_slot_latch_sample(uint32_t tid, uint32_t call_index, uint32_t ordinal,
                             uint32_t before, uint32_t after)
 { (void)tid; (void)call_index; (void)ordinal; (void)before; (void)after; }
+/* Same treatment for the A2h slot-WRITE watch (registry version 3). The census and the install
+ * handshake are both behind JSRF_TRACE_A2H_DR, which this fixture never sets, so these are
+ * unreachable in every registered arm -- but the toolkit object that calls them is linked in
+ * regardless, so the symbols must exist. The touch stub returns 0 (publication refused), which is
+ * the fail-closed direction: a caller that ignored the result could not open a page on it. */
+void jsrf_slot_watch_handshake(uint32_t slot_va) { (void)slot_va; }
+void jsrf_slot_watch_alias_armed(uint32_t mapped_mask, uint32_t protect_mask, uint32_t alias_count)
+{ (void)mapped_mask; (void)protect_mask; (void)alias_count; }
+int jsrf_slot_watch_alias_touch(uint32_t alias_index, uint32_t fault_va, uint64_t rip,
+                                uint32_t value, uint32_t published)
+{ (void)alias_index; (void)fault_va; (void)rip; (void)value; (void)published; return 0; }
+void jsrf_slot_watch_write(uint32_t provenance, uint32_t before, uint32_t after,
+                           uint64_t rip, uint32_t ordinal)
+{ (void)provenance; (void)before; (void)after; (void)rip; (void)ordinal; }
 
 /* ============================================================
  * Geometry the fixture arranges
