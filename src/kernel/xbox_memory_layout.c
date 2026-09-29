@@ -945,8 +945,12 @@ static void fence_mirrors_tick(void)
             uint32_t value =
                 *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].src_off)
                                        + g_memory_offset);
-            if (*fence != value)
+            if (*fence != value) {
+                /* The NV2A semaphore release may own this word; it logs the overlap. */
+                extern void nv2a_note_fence_mirror_write(const volatile void *, uint32_t);
+                nv2a_note_fence_mirror_write(fence, value);
                 *fence = value;
+            }
         }
     }
 }

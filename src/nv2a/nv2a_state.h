@@ -62,6 +62,10 @@ struct PGRAPHState {
     uint32_t pending_interrupts;
     uint32_t enabled_interrupts;
     uint32_t regs[0x2000];
+    /* Instance of the DMA object SET_CONTEXT_DMA_SEMAPHORE bound (action
+     * methods only; see nv2a_actions_enabled). */
+    uint32_t dma_semaphore;
+    bool dma_semaphore_valid;
     /* Phase 3-4: Full PGRAPH state will go here */
 };
 
@@ -151,6 +155,8 @@ typedef struct NV2AState {
         uint32_t fixture_object[8];
         bool fixture_execution;
         uint32_t sink_count;
+        /* Semaphore releases written to guest memory (action methods only). */
+        uint32_t semaphore_releases;
         /* class_id is recorded because the same method number means different
          * things in different classes -- 0x2FC is NV09F_SET_OPERATION and an
          * NV097 surface method, and both appear in JSRF's stream. */
@@ -331,6 +337,17 @@ bool nv2a_set_fixture_binding(NV2AState *d, uint32_t subchannel,
 bool nv2a_set_fixture_execution(NV2AState *d, bool enabled);
 bool nv2a_submit_pending(NV2AState *d);
 const char *nv2a_submit_diagnostic(uint32_t code);
+
+/* NV097 action methods: the semaphore release, and the software-method trap
+ * and FLIP_STALL hold. Modelled but not admitted as hardware causes, so they
+ * run only when RECOMP_NV2A_ACTIONS is exactly "1" (read once). */
+bool nv2a_actions_enabled(void);
+/* Test seam: 1 or 0 forces the switch, -1 re-reads the environment. */
+void nv2a_actions_override_for_test(int enabled);
+/* Called by the fence mirror before it writes a guest word; logs when that
+ * word is the one the last semaphore release wrote. */
+void nv2a_note_fence_mirror_write(const volatile void *host, uint32_t value);
+uint32_t nv2a_fence_mirror_overlaps(void);
 
 /* Get the global NV2A state instance */
 NV2AState *nv2a_get_state(void);

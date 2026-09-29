@@ -927,6 +927,7 @@ enum {
     NV2A_SUBMIT_BAD_POINTER = 10,
     NV2A_SUBMIT_UNSUPPORTED_METHOD = 11,
     NV2A_SUBMIT_INVALID_HANDLE = 12,
+    NV2A_SUBMIT_SEMAPHORE_FAULT = 13,
 };
 
 /* NV01_SUBC_SET_OBJECT binds a RAMHT handle.  Production lookup uses the
@@ -964,6 +965,7 @@ const char *nv2a_submit_diagnostic(uint32_t code)
     case NV2A_SUBMIT_BAD_POINTER: return "invalid_get_put";
     case NV2A_SUBMIT_UNSUPPORTED_METHOD: return "unsupported_method";
     case NV2A_SUBMIT_INVALID_HANDLE: return "invalid_handle";
+    case NV2A_SUBMIT_SEMAPHORE_FAULT: return "semaphore_fault";
     default: return "unknown";
     }
 }
@@ -1047,12 +1049,13 @@ static uint32_t ramht_hash(uint32_t handle, unsigned bits)
     return hash;
 }
 
-static bool ramht_lookup_class(NV2AState *d, uint32_t handle, uint32_t *class_id)
+/* The instance address RAMHT gives for a handle: the object SET_OBJECT binds,
+ * or the DMA object a context-DMA method (0x180..0x1FC) names. */
+static bool ramht_lookup_instance(NV2AState *d, uint32_t handle, uint32_t *instance_out)
 {
     uint32_t ramht, size_code, ramht_size, ramht_base, bits, hash, slot;
     uint32_t entry_handle, entry_context, instance;
-    uint32_t object[4];
-    if (!d || !class_id || !handle || !d->ramin_ptr || d->ramin.size < 16)
+    if (!d || !instance_out || !handle || !d->ramin_ptr || d->ramin.size < 16)
         return false;
     ramht = d->pfifo.regs[NV_PFIFO_RAMHT];
     size_code = GET_MASK(ramht, NV_PFIFO_RAMHT_SIZE);
@@ -1072,8 +1075,17 @@ static bool ramht_lookup_class(NV2AState *d, uint32_t handle, uint32_t *class_id
         return false;
     instance = (entry_context & NV_RAMHT_INSTANCE) << 4;
     if (instance > d->ramin.size - 16) return false;
-    memcpy(object, d->ramin_ptr + instance, 16);
-    *class_id = object[0] & 0xFFu;
+    *instance_out = instance;
+    return true;
+}
+
+static bool ramht_lookup_class(NV2AState *d, uint32_t handle, uint32_t *class_id)
+{
+    uint32_t instance, object0;
+    if (!class_id || !ramht_lookup_instance(d, handle, &instance))
+        return false;
+    memcpy(&object0, d->ramin_ptr + instance, 4);
+    *class_id = object0 & 0xFFu;
     return *class_id != 0;
 }
 
@@ -1103,6 +1115,176 @@ static void pfifo_trace(const char *site, uint32_t reg, uint32_t value)
     pfifo_trace_lines++;
 }
 
+/* ── Action methods (RECOMP_NV2A_ACTIONS=1) ────────────────────────────────
+ *
+ * The walk records methods as register state and executes nothing with a
+ * side effect. The behaviours below are the NV097 ones the guest waits on,
+ * modelled from xemu and envytools (docs/technical/nv2a-action-methods.md).
+ * They are not admitted as unconditional hardware causes, so they stay
+ * dormant unless RECOMP_NV2A_ACTIONS is exactly "1", and a run that sets it
+ * is exploratory. With it unset the walk is unchanged.
+ *
+ * Every effect is staged while the walk runs and applied only when it
+ * commits, so a rejected stream leaves guest memory and PGRAPH untouched. */
+
+static int g_actions_enabled = -1;
+
+bool nv2a_actions_enabled(void)
+{
+    if (g_actions_enabled < 0) {
+        const char *v = getenv("RECOMP_NV2A_ACTIONS");
+        g_actions_enabled = v != NULL && strcmp(v, "1") == 0;
+        if (g_actions_enabled)
+            fprintf(stderr, "[NV2A] RECOMP_NV2A_ACTIONS=1: NV097 action methods are"
+                    " modelled (not admitted; the run is exploratory)\n");
+    }
+    return g_actions_enabled != 0;
+}
+
+void nv2a_actions_override_for_test(int enabled)
+{
+    g_actions_enabled = enabled < 0 ? -1 : enabled != 0;
+}
+
+#define NV2A_MAX_STAGED_RELEASES 64
+
+typedef struct {
+    uint32_t sem_dma;           /* instance of the semaphore DMA object */
+    bool sem_dma_valid;
+    uint32_t sem_offset;
+    uint32_t releases;
+    struct { uint32_t phys, value; } release[NV2A_MAX_STAGED_RELEASES];
+} ActionStage;
+
+/* Host address and value of the last semaphore release, for the fence-mirror
+ * overlap check below. Written by the walk, read by the mirror's thread. */
+static volatile uintptr_t g_semaphore_last_host;
+static volatile uint32_t g_semaphore_last_value;
+static volatile LONG g_fence_mirror_overlaps;
+
+static void action_stage_begin(NV2AState *d, ActionStage *st)
+{
+    st->sem_dma = d->pgraph.dma_semaphore;
+    st->sem_dma_valid = d->pgraph.dma_semaphore_valid;
+    st->sem_offset = d->pgraph.regs[NV_PGRAPH_SEMAPHOREOFFSET];
+    st->releases = 0;
+}
+
+/* A semaphore lands in the physical window the pushbuffer is read from: a
+ * guest physical address, never aliased into canonical RAM. */
+static bool window_word_writable(NV2AState *d, uint32_t phys)
+{
+    if (!d->pfifo.pushbuffer || (phys & 3u) || phys < d->pfifo.pushbuffer_base ||
+        phys - d->pfifo.pushbuffer_base > d->pfifo.pushbuffer_size - 4u)
+        return false;
+#if defined(_WIN32)
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        uint8_t *host = d->pfifo.pushbuffer + (phys - d->pfifo.pushbuffer_base);
+        DWORD protect;
+        if (VirtualQuery(host, &mbi, sizeof(mbi)) != sizeof(mbi) ||
+            mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            return false;
+        protect = mbi.Protect & 0xffu;
+        if (protect != PAGE_READWRITE && protect != PAGE_WRITECOPY &&
+            protect != PAGE_EXECUTE_READWRITE && protect != PAGE_EXECUTE_WRITECOPY)
+            return false;
+        if (host + 4 > (uint8_t *)mbi.BaseAddress + mbi.RegionSize)
+            return false;
+    }
+#endif
+    return true;
+}
+
+/* BACK_END_WRITE_SEMAPHORE_RELEASE writes its parameter at the semaphore DMA
+ * object's base plus SET_SEMAPHORE_OFFSET. The object's limit is the last byte
+ * it covers, so the whole dword has to fit under it. */
+static bool semaphore_target(NV2AState *d, const ActionStage *st, uint32_t *phys)
+{
+    DMAObject dma;
+    if (!st->sem_dma_valid || !d->ramin_ptr || d->ramin.size < 16 ||
+        st->sem_dma > d->ramin.size - 16)
+        return false;
+    dma = nv_dma_load(d, st->sem_dma);
+    if ((st->sem_offset & 3u) || dma.limit < 3 || st->sem_offset > dma.limit - 3 ||
+        dma.address > UINT32_MAX - st->sem_offset)
+        return false;
+    *phys = (uint32_t)dma.address + st->sem_offset;
+    return window_word_writable(d, *phys);
+}
+
+/* Stage one NV097 method's effect. Returns NV2A_SUBMIT_OK, or the diagnostic
+ * that rejects the whole stream. */
+static uint32_t action_method(NV2AState *d, ActionStage *st,
+                              uint32_t method, uint32_t param)
+{
+    uint32_t phys;
+    switch (method) {
+    case NV097_SET_CONTEXT_DMA_SEMAPHORE:
+        /* Methods 0x180..0x1FC take a handle; the puller resolves it through
+         * RAMHT and PGRAPH receives the instance. */
+        if (!ramht_lookup_instance(d, param, &st->sem_dma))
+            return NV2A_SUBMIT_INVALID_HANDLE;
+        st->sem_dma_valid = true;
+        break;
+    case NV097_SET_SEMAPHORE_OFFSET:
+        st->sem_offset = param;
+        break;
+    case NV097_BACK_END_WRITE_SEMAPHORE_RELEASE:
+        if (st->releases >= NV2A_MAX_STAGED_RELEASES || !semaphore_target(d, st, &phys))
+            return NV2A_SUBMIT_SEMAPHORE_FAULT;
+        st->release[st->releases].phys = phys;
+        st->release[st->releases].value = param;
+        ++st->releases;
+        break;
+    default:
+        break;
+    }
+    return NV2A_SUBMIT_OK;
+}
+
+static void action_commit(NV2AState *d, const ActionStage *st)
+{
+    static unsigned logged;
+    d->pgraph.dma_semaphore = st->sem_dma;
+    d->pgraph.dma_semaphore_valid = st->sem_dma_valid;
+    d->pgraph.regs[NV_PGRAPH_SEMAPHOREOFFSET] = st->sem_offset;
+    for (uint32_t i = 0; i < st->releases; ++i) {
+        uint8_t *host = d->pfifo.pushbuffer +
+                        (st->release[i].phys - d->pfifo.pushbuffer_base);
+        memcpy(host, &st->release[i].value, 4);
+        g_semaphore_last_host = (uintptr_t)host;
+        g_semaphore_last_value = st->release[i].value;
+        ++d->pfifo.semaphore_releases;
+        if (logged < 8) {
+            ++logged;
+            fprintf(stderr, "  [NV2A] semaphore release %08X -> phys %08X\n",
+                    st->release[i].value, st->release[i].phys);
+        }
+    }
+}
+
+/* The fence mirror (xbox_memory_layout.c) writes the word D3D's fence wait
+ * polls, which in JSRF is the word the semaphore release targets. Two writers
+ * of one word would fight without either noticing, so the mirror reports each
+ * write it makes and an overlap with the last release is logged. */
+void nv2a_note_fence_mirror_write(const volatile void *host, uint32_t value)
+{
+    LONG n;
+    if (!host || !nv2a_actions_enabled() || (uintptr_t)host != g_semaphore_last_host)
+        return;
+    n = InterlockedIncrement(&g_fence_mirror_overlaps);
+    if (n <= 16 || n % 1000 == 0)
+        fprintf(stderr, "  [NV2A] fence mirror writes %08X over the semaphore word"
+                " at %p (last release %08X; overlap %ld)\n",
+                value, (const void *)host, g_semaphore_last_value, (long)n);
+}
+
+uint32_t nv2a_fence_mirror_overlaps(void)
+{
+    return (uint32_t)g_fence_mirror_overlaps;
+}
+
 bool nv2a_submit_pending(NV2AState *d)
 {
     uint32_t get, put, pc, ret = 0, words = 0, packets = 0;
@@ -1112,8 +1294,11 @@ bool nv2a_submit_pending(NV2AState *d)
     uint32_t staged_count = 0;
     uint32_t staged_class[8], staged_object[8];
     bool ok = true;
+    bool actions = nv2a_actions_enabled();
+    ActionStage st;
     if (!d) return false;
     qemu_mutex_lock(&d->pfifo.lock);
+    if (actions) action_stage_begin(d, &st);
     /* The sink is a per-submission record of the methods just walked. Nothing
      * reads it and nothing used to clear it, so it ratcheted to its 256 cap and
      * then rejected every later submission for the rest of the run -- which is
@@ -1223,6 +1408,18 @@ bool nv2a_submit_pending(NV2AState *d)
                     ok = false;
                     goto done;
                 }
+                if (actions && staged_class[subchannel] == NV097_CLASS) {
+                    uint32_t code = action_method(d, &st, method, param);
+                    if (code != NV2A_SUBMIT_OK) {
+                        d->pfifo.submit_diag = code;
+                        d->pfifo.submit_diag_get = address;
+                        d->pfifo.submit_diag_subchannel = subchannel;
+                        d->pfifo.submit_diag_method = method;
+                        d->pfifo.submit_diag_param = param;
+                        ok = false;
+                        goto done;
+                    }
+                }
                 staged[staged_count].subchannel = subchannel;
                 staged[staged_count].method = method;
                 staged[staged_count].param = param;
@@ -1257,6 +1454,7 @@ bool nv2a_submit_pending(NV2AState *d)
         }
         memcpy(d->pfifo.binding_class, staged_class, sizeof(staged_class));
         memcpy(d->pfifo.binding_object, staged_object, sizeof(staged_object));
+        if (actions) action_commit(d, &st);
         if (staged_count) {
             d->pfifo.submit_last_method = staged[staged_count - 1].method;
             d->pfifo.submit_last_param = staged[staged_count - 1].param;
