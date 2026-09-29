@@ -368,6 +368,15 @@ void recomp_icall_not_code_log(uint32_t va);
  * to the console's rate instead. */
 uint64_t xbox_ReadTimeStampCounter(void);
 
+/* Port I/O, emitted for in/out (kernel_hal.c). Without these the calls were
+ * implicit declarations; SET_LO8/SET_LO16 masked the int return, but only by luck. */
+void     xbox_outb(uint16_t port, uint8_t value);
+void     xbox_outw(uint16_t port, uint16_t value);
+void     xbox_outl(uint16_t port, uint32_t value);
+uint8_t  xbox_inb(uint16_t port);
+uint16_t xbox_inw(uint16_t port);
+uint32_t xbox_inl(uint16_t port);
+
 void recomp_trace_enter(const char *name, uint32_t va);
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
 void recomp_trace_exit(const char *name, uint32_t va);
