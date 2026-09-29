@@ -5472,6 +5472,29 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     return result;
 }
 
+/* Reserve exactly [base, base+size) in the heap, for a MEM_RESERVE that names
+ * its address: the caller compares what comes back with what it asked for, so
+ * this answers with that range or nothing. Free means untouched tail, one free
+ * block, or a free last block running into the tail (kmem_heap_carve). Returns
+ * 1 with the range zeroed and recorded as a live block, 0 when some of it is
+ * not free, KMEM_TABLE_FULL when the block table cannot record it. */
+int xbox_HeapReserveAt(uint32_t base, uint32_t size)
+{
+    int r = kmem_heap_carve(g_heap_blocks, &g_heap_block_count,
+                            XBOX_HEAP_MAX_BLOCKS, &g_heap_next,
+                            XBOX_HEAP_BASE, XBOX_HEAP_TOP, base, size);
+
+    if (r > 0) {
+        g_kmem_alloc.heap_carve_ok++;
+        memset((void *)((uintptr_t)base + g_memory_offset), 0, size);
+    } else if (r == 0) {
+        g_kmem_alloc.heap_carve_busy++;
+    } else {
+        g_kmem_alloc.heap_carve_full++;
+    }
+    return r;
+}
+
 /* How big is the block at this guest address?
  *
  * MmQueryAllocationSize and ExQueryPoolBlockSize both ask this, and both used

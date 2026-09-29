@@ -1062,6 +1062,19 @@ void xbox_HeapFree(uint32_t xbox_va);
  * arena that never frees, and the old NtAllocate/NtFreeVirtualMemory. */
 int xbox_KmemLegacy(void);
 
+/* Reserve exactly [base, base+size) in the heap: 1 carved and zeroed, 0 not
+ * free, -1 block table full. */
+int xbox_HeapReserveAt(uint32_t base, uint32_t size);
+
+/* NtAllocateVirtualMemory / NtFreeVirtualMemory on the 32-bit values the
+ * guest's BaseAddress and RegionSize point at (kernel_vm.c). Return an
+ * NTSTATUS; on success *base and *size hold what the guest gets back. */
+uint32_t xbox_VmAllocate(uint32_t *base, uint32_t *size, uint32_t type);
+uint32_t xbox_VmFree(uint32_t *base, uint32_t *size, uint32_t type);
+
+/* One "[KMEM] summary" line with every kernel-memory counter. */
+void xbox_KmemLogSummary(void);
+
 /* Snapshot of the allocator counters kept beside the heap and arena. */
 struct kmem_alloc_counters;
 void xbox_KmemAllocCounters(struct kmem_alloc_counters *out);

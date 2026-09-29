@@ -912,6 +912,31 @@ static void bridge_NtAllocateVirtualMemory(void)
         return;
     }
 
+    /* Reservations are recorded as regions, so a base hint is honoured or
+     * refused and a commit must land inside something reserved (kernel_vm.c).
+     * Everything below is the pre-registry path, kept for RECOMP_KMEM_LEGACY. */
+    if (!xbox_KmemLegacy()) {
+        uint32_t b = base_hint, s = size;
+
+        (void)zero_bits;
+        (void)protect;
+        if (!base_ptr) {
+            g_eax = STATUS_INVALID_PARAMETER;
+            return;
+        }
+        g_eax = xbox_VmAllocate(&b, &s, alloc_type);
+        if (g_eax == STATUS_SUCCESS) {
+            BRIDGE_MEM32(base_ptr) = b;
+            BRIDGE_MEM32(size_ptr) = s;
+        }
+        if (KERNEL_LOG_ON()) {
+            fprintf(stderr, "  [KERNEL] -> status=0x%08X base=0x%08X size=%u\n",
+                    g_eax, b, s);
+            fflush(stderr);
+        }
+        return;
+    }
+
     /*
      * Xbox NtAllocateVirtualMemory supports two modes:
      * - MEM_RESERVE (0x2000): Reserve virtual address space
@@ -1114,6 +1139,32 @@ static void bridge_NtFreeVirtualMemory(void)
     uint32_t base_ptr = STACK_ARG(0);
     uint32_t size_ptr = STACK_ARG(1);
     uint32_t free_type = STACK_ARG(2);
+
+    /* BaseAddress and RegionSize point at 32-bit guest values. The host
+     * xbox_NtFreeVirtualMemory reads them as 64-bit host values and calls
+     * VirtualFree on a guest address, so it failed every call; it is kept only
+     * for RECOMP_KMEM_LEGACY. */
+    if (!xbox_KmemLegacy()) {
+        uint32_t b, s;
+
+        if (!base_ptr || !size_ptr) {
+            g_eax = STATUS_INVALID_PARAMETER;
+            return;
+        }
+        b = BRIDGE_MEM32(base_ptr);
+        s = BRIDGE_MEM32(size_ptr);
+        if (KERNEL_LOG_ON()) {
+            fprintf(stderr, "  [KERNEL] NtFreeVirtualMemory: base=0x%08X size=%u"
+                            " type=0x%X\n", b, s, free_type);
+            fflush(stderr);
+        }
+        g_eax = xbox_VmFree(&b, &s, free_type);
+        if (g_eax == STATUS_SUCCESS) {
+            BRIDGE_MEM32(base_ptr) = b;
+            BRIDGE_MEM32(size_ptr) = s;
+        }
+        return;
+    }
 
     g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
         XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
@@ -9394,6 +9445,7 @@ static void kernel_thunk_dispatch(void)
                             (unsigned long long)g_ordinal_calls[best]);
                 }
             }
+            xbox_KmemLogSummary();
             fflush(stderr);
             xbox_GuestMeterSummary();
             last_summary_tick = now;

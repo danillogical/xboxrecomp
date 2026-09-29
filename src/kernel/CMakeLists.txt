@@ -22,6 +22,7 @@ set(KERNEL_SOURCES
     guest_meter.c
     xbox_memory_layout.c
     kmem.c
+    kernel_vm.c
     icall_feedback.c
     recomp_trace.c
     nv2a_pb_scan.c
