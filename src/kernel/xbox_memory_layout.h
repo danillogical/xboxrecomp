@@ -285,6 +285,18 @@ void xbox_WatchInit(void);
  * it to work out the running image's path. The struct was declared without
  * anything to point at, so Buffer held whatever was in that page. */
 #define KDATA_XE_IMAGE_BUF      0x4B0  /* image path text (up to 64 bytes) */
+/* The remaining DATA exports, sized to the kernel's own layouts (nxdk
+ * xboxkrnl.h), above the IDE channel's 512-byte region. */
+#define KDATA_KD_DEBUGGER_ENABLED     0x700  /* KdDebuggerEnabled (BOOLEAN) */
+#define KDATA_KD_DEBUGGER_NOT_PRESENT 0x710  /* KdDebuggerNotPresent (BOOLEAN) */
+#define KDATA_MMGLOBAL          0x720  /* MMGLOBALDATA (8 pointers, 32 bytes) */
+#define KDATA_INTERRUPT_TIME    0x740  /* KeInterruptTime (KSYSTEM_TIME, 12 bytes) */
+#define KDATA_SYSTEM_TIME       0x750  /* KeSystemTime (KSYSTEM_TIME, 12 bytes) */
+#define KDATA_BUGCHECK_DATA     0x760  /* KiBugCheckData (ULONG[5], 20 bytes) */
+#define KDATA_OBJ_DIR_TYPE      0x780  /* ObDirectoryObjectType (OBJECT_TYPE, 28 bytes) */
+#define KDATA_OBJ_HANDLE_TABLE  0x7A0  /* ObpObjectHandleTable (OBJECT_HANDLE_TABLE, 48 bytes) */
+#define KDATA_OBJ_SYM_LINK_TYPE 0x7D0  /* ObSymbolicLinkObjectType (OBJECT_TYPE, 28 bytes) */
+#define KDATA_EEPROM_KEY        0x7F0  /* XboxEEPROMKey (16 bytes) */
 
 /** Size of the simulated Xbox stack (8 MB).
  *  Increased from 1 MB because failed RECOMP_ICALL indirect calls

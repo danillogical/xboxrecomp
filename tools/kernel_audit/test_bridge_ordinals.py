@@ -213,6 +213,59 @@ KDATA_OWNER = {
     "KDATA_XE_PUBLIC_KEY": "XePublicKeyData",
     "KDATA_BOOT_SMC_VIDEO": "HalBootSMCVideoMode",
     "KDATA_IDEX_CHANNEL": "IdexChannelObject",
+    "KDATA_KD_DEBUGGER_ENABLED": "KdDebuggerEnabled",
+    "KDATA_KD_DEBUGGER_NOT_PRESENT": "KdDebuggerNotPresent",
+    "KDATA_MMGLOBAL": "MmGlobalData",
+    "KDATA_INTERRUPT_TIME": "KeInterruptTime",
+    "KDATA_SYSTEM_TIME": "KeSystemTime",
+    "KDATA_BUGCHECK_DATA": "KiBugCheckData",
+    "KDATA_OBJ_DIR_TYPE": "ObDirectoryObjectType",
+    "KDATA_OBJ_HANDLE_TABLE": "ObpObjectHandleTable",
+    "KDATA_OBJ_SYM_LINK_TYPE": "ObSymbolicLinkObjectType",
+    "KDATA_EEPROM_KEY": "XboxEEPROMKey",
+}
+
+# Every DATA export of the retail kernel. nxdk's lib/xboxkrnl/xboxkrnl.exe.def
+# marks exactly these 34 ordinals DATA, and Cxbx-Reloaded's KernelThunk.cpp
+# wraps exactly the same 34 in VARIABLE(); the names are also checked against
+# KERNEL_EXPORTS below. A title reads each through its thunk slot, so the slot
+# must hold the variable's address -- a synthetic function VA there is
+# dereferenced as data and faults.
+KNOWN_DATA_EXPORTS = {
+    16: "ExEventObjectType",
+    22: "ExMutantObjectType",
+    30: "ExSemaphoreObjectType",
+    31: "ExTimerObjectType",
+    40: "HalDiskCachePartitionCount",
+    41: "HalDiskModelNumber",
+    42: "HalDiskSerialNumber",
+    64: "IoCompletionObjectType",
+    70: "IoDeviceObjectType",
+    71: "IoFileObjectType",
+    88: "KdDebuggerEnabled",
+    89: "KdDebuggerNotPresent",
+    102: "MmGlobalData",
+    120: "KeInterruptTime",
+    154: "KeSystemTime",
+    156: "KeTickCount",
+    157: "KeTimeIncrement",
+    162: "KiBugCheckData",
+    164: "LaunchDataPage",
+    240: "ObDirectoryObjectType",
+    245: "ObpObjectHandleTable",
+    249: "ObSymbolicLinkObjectType",
+    259: "PsThreadObjectType",
+    321: "XboxEEPROMKey",
+    322: "XboxHardwareInfo",
+    323: "XboxHDKey",
+    324: "XboxKrnlVersion",
+    325: "XboxSignatureKey",
+    326: "XeImageFileName",
+    353: "XboxLANKey",
+    354: "XboxAlternateSignatureKeys",
+    355: "XePublicKeyData",
+    356: "HalBootSMCVideoMode",
+    357: "IdexChannelObject",
 }
 
 
@@ -248,6 +301,40 @@ def test_no_data_export_ordinal_is_also_a_function_route():
     both = sorted(data & {o for o, _ in load_routes()})
     assert not both, ("ordinals routed as BOTH data and function: %s" % both)
     print("ok  no_data_export_ordinal_is_also_a_function_route")
+
+def test_known_data_exports_are_named_as_in_the_export_table():
+    exports = load_exports()
+    bad = [f"ordinal {o} is listed as data export {n}, but is "
+           f"{exports.get(o)}" for o, n in KNOWN_DATA_EXPORTS.items()
+           if exports.get(o) != n]
+    assert not bad, "\n  ".join(bad)
+    print(f"ok  known_data_exports_are_named_as_in_the_export_table "
+          f"({len(KNOWN_DATA_EXPORTS)} exports)")
+
+
+def test_no_data_export_is_routed_to_a_function_bridge():
+    """A data export in bridge_for_ordinal and not in the data table gets a
+    synthetic function VA in its thunk slot. The title does not call it; it
+    loads the slot and dereferences it, which reads unmapped memory at
+    0xFE000000 + 4*slot. 88, 89, 102, 120, 154, 162, 240, 245, 249 and 321
+    were routed that way."""
+    routed = [f"ordinal {o} ({KNOWN_DATA_EXPORTS[o]}) -> bridge_{n}"
+              for o, n in load_routes() if o in KNOWN_DATA_EXPORTS]
+    assert not routed, ("data exports routed to function bridges:\n  "
+                        + "\n  ".join(routed))
+    print("ok  no_data_export_is_routed_to_a_function_bridge")
+
+
+def test_every_data_export_is_backed_by_data_and_nothing_else_is():
+    table = {o for o, _ in load_data_exports()}
+    missing = sorted(set(KNOWN_DATA_EXPORTS) - table)
+    extra = sorted(table - set(KNOWN_DATA_EXPORTS))
+    assert not missing, ("data exports with no kernel_data_va_for_ordinal "
+                         "entry: %s" % missing)
+    assert not extra, ("kernel_data_va_for_ordinal lists ordinals that are "
+                       "not data exports: %s" % extra)
+    print("ok  every_data_export_is_backed_by_data_and_nothing_else_is")
+
 
 if __name__ == "__main__":
     # Discovered rather than listed: this file has been appended to before, and
