@@ -1153,10 +1153,12 @@ class FunctionTranslator:
 
         backward = scan(-1, 1)
         forward = scan(1, 0)
-        if not forward:
+        if not forward and not backward:
             # Some MSVC tables use the alignment remainder directly as the
             # index. Slot zero is unreachable on this path and overlaps the
             # preceding instruction, while slots one onward are real targets.
+            # Pointers before slot zero mean it splits two clusters, not one
+            # table, so the retry is not taken then.
             forward = scan(1, 1)
         if len(backward) + len(forward) < 2:
             return []

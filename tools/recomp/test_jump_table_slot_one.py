@@ -28,6 +28,21 @@ class JumpTableSlotOneTest(unittest.TestCase):
         translator = FunctionTranslator(bytes(image), {})
         self.assertEqual(translator._read_local_jump_table(TABLE, LOWER, UPPER), entries[1:])
 
+    def test_slot_zero_between_two_clusters_is_not_skipped(self):
+        # Pointers before and after a garbage slot zero are two clusters; the
+        # retry must not join them into one table.
+        image = bytearray(b"\xCC" * 0x200)
+        before = [LOWER + 0x40, LOWER + 0x50]
+        after = [0xCCCCCCCC, LOWER + 0x10, LOWER + 0x20]
+        offset = va_to_file_offset(TABLE)
+        for index, target in enumerate(before):
+            at = offset - (len(before) - index) * 4
+            image[at:at + 4] = target.to_bytes(4, "little")
+        for index, target in enumerate(after):
+            image[offset + index * 4:offset + index * 4 + 4] = target.to_bytes(4, "little")
+        translator = FunctionTranslator(bytes(image), {})
+        self.assertEqual(translator._read_local_jump_table(TABLE, LOWER, UPPER), before)
+
 
 if __name__ == "__main__":
     unittest.main()
