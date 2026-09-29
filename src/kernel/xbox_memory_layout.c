@@ -15,6 +15,7 @@
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "recomp_diagnostics.h"   /* jsrf_slot_watch_alias_* prototypes (A2h alias census) */
+#include "kmem.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5126,9 +5127,28 @@ static int g_heap_alloc_count = 0;
  * in bump order, so index order is address order and coalescing is a
  * neighbour check. */
 #define XBOX_HEAP_MAX_BLOCKS 65536
-static struct { uint32_t addr; uint32_t size; uint8_t free; }
-    g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
+static struct kmem_block g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
 static int g_heap_block_count = 0;
+
+static struct kmem_alloc_counters g_kmem_alloc;
+
+/* RECOMP_KMEM_LEGACY=1 puts back the allocator and kernel memory behaviour
+ * that preceded the region registry, for A/B runs. Read once. */
+int xbox_KmemLegacy(void)
+{
+    static int legacy = -1;
+
+    if (legacy < 0) {
+        const char *v = getenv("RECOMP_KMEM_LEGACY");
+        legacy = (v && v[0] == '1') ? 1 : 0;
+    }
+    return legacy;
+}
+
+void xbox_KmemAllocCounters(struct kmem_alloc_counters *out)
+{
+    *out = g_kmem_alloc;
+}
 
 /*
  * Simulated stacks for spawned threads.
@@ -5317,18 +5337,24 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
      * debug build allocates and releases heavily through init, exhausted all
      * 48 MB in 4,726 allocations, and its second D3D CreateDevice then failed
      * with E_OUTOFMEMORY -- which the title reports by clearing
-     * global_d3d_device, so the rasterizer asserts and startup stops. */
-    for (int i = 0; i < g_heap_block_count; i++) {
-        if (!g_heap_blocks[i].free || g_heap_blocks[i].size < size) {
-            continue;
+     * global_d3d_device, so the rasterizer asserts and startup stops.
+     *
+     * A block larger than the request is split and the rest stays free, so a
+     * small request cannot pin memory that a later large one needs. */
+    {
+        int split_result;
+
+        result = kmem_heap_reuse(g_heap_blocks, &g_heap_block_count,
+                                 XBOX_HEAP_MAX_BLOCKS, size, alignment,
+                                 !xbox_KmemLegacy(), &split_result);
+        if (split_result > 0)
+            g_kmem_alloc.heap_split++;
+        else if (split_result == KMEM_TABLE_FULL)
+            g_kmem_alloc.heap_split_full++;
+        if (result) {
+            memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
+            return result;
         }
-        if (g_heap_blocks[i].addr & (alignment - 1)) {
-            continue;   /* wrong alignment for this request */
-        }
-        g_heap_blocks[i].free = 0;
-        result = g_heap_blocks[i].addr;
-        memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
-        return result;
     }
 
     /* Align the next pointer */

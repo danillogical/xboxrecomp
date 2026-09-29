@@ -1053,6 +1053,15 @@ uint32_t xbox_A2hSlotWatchSlotHits(void);
  */
 void xbox_HeapFree(uint32_t xbox_va);
 
+/* RECOMP_KMEM_LEGACY=1 (read once): the allocator and kernel memory behaviour
+ * that preceded the region registry -- whole-block heap reuse, a contiguous
+ * arena that never frees, and the old NtAllocate/NtFreeVirtualMemory. */
+int xbox_KmemLegacy(void);
+
+/* Snapshot of the allocator counters kept beside the heap and arena. */
+struct kmem_alloc_counters;
+void xbox_KmemAllocCounters(struct kmem_alloc_counters *out);
+
 /**
  * Bytes remaining in the heap block containing this guest address, or 0 if the
  * heap never handed it out. Backs MmQueryAllocationSize and

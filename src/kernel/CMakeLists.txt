@@ -21,6 +21,7 @@ set(KERNEL_SOURCES
     kernel_bridge.c
     guest_meter.c
     xbox_memory_layout.c
+    kmem.c
     icall_feedback.c
     recomp_trace.c
     nv2a_pb_scan.c
@@ -85,4 +86,16 @@ if(BUILD_TESTING AND WIN32)
     target_link_libraries(xbox_guest_meter_test PRIVATE platform kernel32)
     add_test(NAME xbox_guest_meter COMMAND xbox_guest_meter_test)
     set_tests_properties(xbox_guest_meter PROPERTIES TIMEOUT 60)
+endif()
+
+# The allocator and kernel-memory decisions in kmem.c have no host dependency,
+# so their regression runs on every host, not only on Windows.
+if(BUILD_TESTING)
+    add_executable(xbox_kmem_test
+        kmem.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/kmem_test.c
+    )
+    target_include_directories(xbox_kmem_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME xbox_kmem COMMAND xbox_kmem_test)
+    set_tests_properties(xbox_kmem PROPERTIES TIMEOUT 20)
 endif()
