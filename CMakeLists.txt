@@ -24,6 +24,14 @@ add_compile_definitions(
     NOMINMAX
 )
 
+# A call with no prototype in scope is an error, not a warning: C then assumes an
+# int return, which silently truncates a 64-bit pointer on this host.
+if(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:/we4013>)
+else()
+    add_compile_options($<$<COMPILE_LANGUAGE:C>:-Werror=implicit-function-declaration>)
+endif()
+
 # Option to build examples
 
 # ── Runtime Libraries ─────────────────────────────────────────

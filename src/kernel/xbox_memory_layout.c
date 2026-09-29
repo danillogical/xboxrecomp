@@ -14,6 +14,7 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "recomp_diagnostics.h"   /* jsrf_slot_watch_alias_* prototypes (A2h alias census) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -492,6 +492,9 @@ void dsp56k_b9_epoch_begin(void);
  * by write_memory_raw(). */
 void dsp56k_pwrite_watch(dsp_core_t *dsp, uint32_t address, uint32_t value);
 void dsp56k_pwrite_terminal(const char *why);
+/* The bulk-load notes call this before its definition; without the declaration
+ * C99 has no prototype in scope and MSVC only warns (C4013, then C4211). */
+static int pwrite_watch_enabled(void);
 
 /* A4b2-NR: set by dsp56k_request_decode() and serviced on the next executed
  * instruction. The request takes no argument because dsp_core_t is opaque
