@@ -126,6 +126,116 @@ static void test_heap_reuse_alignment_and_legacy(void)
     CHECK(sr == 0 && count == 2 && b[1].size == 0x10000u);
 }
 
+/* ── Contiguous arena ────────────────────────────────────── */
+
+#define ARENA_BASE 0x80000000u
+
+static void arena_init(struct kmem_arena *a, struct kmem_block *b, int cap,
+                       uint32_t window)
+{
+    memset(a, 0, sizeof *a);
+    a->b = b;
+    a->cap = cap;
+    a->next = ARENA_BASE;
+    a->limit = (uint64_t)ARENA_BASE + window;
+}
+
+static void test_arena_free_then_reuse(void)
+{
+    static struct kmem_block b[64];
+    struct kmem_arena a;
+    uint32_t p1, p2, p3, hw;
+
+    arena_init(&a, b, 64, 0x100000);
+    p1 = kmem_arena_alloc(&a, 0x3000, 0, g_legacy);
+    p2 = kmem_arena_alloc(&a, 0x1000, 0, g_legacy);
+    CHECK(p1 == ARENA_BASE && p2 == ARENA_BASE + 0x3000);
+    hw = a.next;
+
+    CHECK(kmem_arena_free(&a, p1) == 1);
+    CHECK(a.next == hw);                     /* a free never lowers the mark */
+    CHECK(kmem_arena_block_size(&a, p1) == 0);
+
+    /* The freed block comes back instead of the window growing. */
+    p3 = kmem_arena_alloc(&a, 0x2000, 0, g_legacy);
+    CHECK(p3 == p1);
+    CHECK(a.next == hw);
+    CHECK(kmem_arena_block_size(&a, p3) == 0x2000);
+    CHECK(kmem_arena_block_size(&a, p3 + 0x800) == 0x1800);
+    CHECK(blocks_ordered(b, a.count));
+    CHECK(a.frees_ok == 1 && a.frees_unknown == 0);
+}
+
+static void test_arena_merges_neighbours(void)
+{
+    static struct kmem_block b[64];
+    struct kmem_arena a;
+    uint32_t p1, p2, p3;
+
+    arena_init(&a, b, 64, 0x100000);
+    p1 = kmem_arena_alloc(&a, 0x1000, 0, g_legacy);
+    p2 = kmem_arena_alloc(&a, 0x1000, 0, g_legacy);
+    p3 = kmem_arena_alloc(&a, 0x1000, 0, g_legacy);
+    CHECK(kmem_arena_free(&a, p1) == 1);
+    CHECK(kmem_arena_free(&a, p2) == 1);
+    CHECK(kmem_arena_free(&a, p2) == 0);     /* double free is not ours */
+    CHECK(a.frees_unknown == 1);
+    /* Two freed neighbours serve one request the size of both. */
+    CHECK(kmem_arena_alloc(&a, 0x2000, 0, g_legacy) == p1);
+    CHECK(kmem_arena_block_size(&a, p3) == 0x1000);
+}
+
+static void test_arena_aligned_carve(void)
+{
+    static struct kmem_block b[64];
+    struct kmem_arena a;
+    uint32_t p0, p1, p2;
+
+    arena_init(&a, b, 64, 0x100000);
+    p0 = kmem_arena_alloc(&a, 0x1000, 0, g_legacy);
+    p1 = kmem_arena_alloc(&a, 0x20000, 0, g_legacy);   /* at +0x1000 */
+    kmem_arena_alloc(&a, 0x1000, 0, g_legacy);
+    CHECK(p0 == ARENA_BASE && p1 == ARENA_BASE + 0x1000);
+    CHECK(kmem_arena_free(&a, p1) == 1);
+
+    /* A 64 KB-aligned piece from the middle, both sides kept free. */
+    p2 = kmem_arena_alloc(&a, 0x1000, 0x10000, g_legacy);
+    CHECK(p2 == ARENA_BASE + 0x10000);
+    CHECK(blocks_ordered(b, a.count));
+    CHECK(kmem_arena_alloc(&a, 0xF000, 0, g_legacy) == ARENA_BASE + 0x1000);
+    CHECK(kmem_arena_alloc(&a, 0x10000, 0, g_legacy) == ARENA_BASE + 0x11000);
+}
+
+static void test_arena_bump_arithmetic_unchanged(void)
+{
+    static struct kmem_block b[8];
+    struct kmem_arena a;
+
+    /* The high-water mark advances by the exact size, as it always did. */
+    arena_init(&a, b, 8, 0x10000);
+    CHECK(kmem_arena_alloc(&a, 100, 0, g_legacy) == ARENA_BASE);
+    CHECK(a.next == ARENA_BASE + 100);
+    CHECK(kmem_arena_alloc(&a, 100, 0, g_legacy) == ARENA_BASE + 0x1000);
+    CHECK(kmem_arena_alloc(&a, 0xF000, 0, g_legacy) == 0);   /* past the limit */
+    CHECK(a.next == ARENA_BASE + 0x1000 + 100);
+}
+
+static void test_arena_table_full_is_counted(void)
+{
+    static struct kmem_block b[2];
+    struct kmem_arena a;
+    uint32_t p3;
+
+    arena_init(&a, b, 2, 0x100000);
+    kmem_arena_alloc(&a, 0x1000, 0, 0);
+    kmem_arena_alloc(&a, 0x1000, 0, 0);
+    p3 = kmem_arena_alloc(&a, 0x1000, 0, 0);
+    CHECK(p3 == ARENA_BASE + 0x2000);        /* still allocated... */
+    CHECK(a.untracked == 1);                 /* ...and counted as unrecorded */
+    CHECK(kmem_arena_free(&a, p3) == 0);
+    CHECK(a.frees_unknown == 1);
+}
+
 int main(void)
 {
     const char *v = getenv("KMEM_TEST_AS_LEGACY");
@@ -138,6 +248,11 @@ int main(void)
     test_heap_reuse_table_full_hands_out_whole_block();
     test_heap_reuse_small_tail_stays();
     test_heap_reuse_alignment_and_legacy();
+    test_arena_free_then_reuse();
+    test_arena_merges_neighbours();
+    test_arena_aligned_carve();
+    test_arena_bump_arithmetic_unchanged();
+    test_arena_table_full_is_counted();
 
     printf("kmem_test: %d checks, %d failed%s\n", g_checks, g_failures,
            g_legacy ? " (legacy behaviour)" : "");

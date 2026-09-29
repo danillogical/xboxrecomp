@@ -196,6 +196,10 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
  * below 256 MB, or 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 uint32_t xbox_ContiguousAllocatedBytes(void);
+/* Give back a block xbox_ContiguousAlloc returned: 1 if freed, 0 if addr is not
+ * the start of a live block. Bytes from va to the end of its live block, or 0. */
+int xbox_ContiguousFree(uint32_t addr);
+uint32_t xbox_ContiguousBlockSize(uint32_t va);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t src_off, uint32_t ptr_off);

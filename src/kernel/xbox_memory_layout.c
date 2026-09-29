@@ -5145,10 +5145,6 @@ int xbox_KmemLegacy(void)
     return legacy;
 }
 
-void xbox_KmemAllocCounters(struct kmem_alloc_counters *out)
-{
-    *out = g_kmem_alloc;
-}
 
 /*
  * Simulated stacks for spawned threads.
@@ -5267,7 +5263,7 @@ void xbox_FreeThreadStack(uint32_t stack_top)
         g_thread_stacks_used--;
 }
 
-/* Bump allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
+/* Allocator over the contiguous window mapped at XBOX_CONTIG_BASE.
  *
  * MmAllocateContiguousMemory hands back physical memory, and on Xbox physical
  * page P is visible at 0x80000000 + P. Drivers rely on that being an exact
@@ -5281,31 +5277,86 @@ void xbox_FreeThreadStack(uint32_t stack_top)
  *
  * Grows up from the base; XBOX_GPU_INSTANCE_DEFAULT is carved off the top by
  * the GPU-instance bridge, so the two do not meet until the window is full.
- * Never freed: contiguous blocks are framebuffers and pushbuffers, which a
- * title allocates once. */
-static uint32_t g_contig_next = XBOX_CONTIG_BASE;
+ *
+ * MmFreeContiguousMemory gives a block back and later requests reuse it
+ * first-fit (kmem_arena_alloc). The bump pointer stays the high-water mark and
+ * is never lowered by a free, because the GP DSP and pushbuffer translations
+ * (apu_guest_dma_ptr, dma_resolve) treat a physical offset below it as window
+ * memory: every block, live or reused, lies below it. Under RECOMP_KMEM_LEGACY
+ * this is the original bump allocator that never frees. */
+#define XBOX_CONTIG_MAX_BLOCKS 16384
+static struct kmem_block g_contig_blocks[XBOX_CONTIG_MAX_BLOCKS];
+static struct kmem_arena g_contig = {
+    g_contig_blocks, 0, XBOX_CONTIG_MAX_BLOCKS, XBOX_CONTIG_BASE,
+    /* Leave the top of the window for GPU instance memory. */
+    (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE - XBOX_GPU_INSTANCE_DEFAULT,
+    0, 0, 0, 0
+};
+static SRWLOCK g_contig_lock = SRWLOCK_INIT;
 
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
-    if (alignment < 4096) alignment = 4096;
-    result = (g_contig_next + alignment - 1) & ~(alignment - 1);
+    AcquireSRWLockExclusive(&g_contig_lock);
+    result = kmem_arena_alloc(&g_contig, size, alignment, xbox_KmemLegacy());
+    ReleaseSRWLockExclusive(&g_contig_lock);
 
-    /* Leave the top of the window for GPU instance memory. */
-    if ((uint64_t)result + size >
-            (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE
-                - XBOX_GPU_INSTANCE_DEFAULT) {
+    if (!result) {
         fprintf(stderr, "  [CONTIG] arena exhausted (%u requested, %u of %u used)\n",
-                size, g_contig_next - XBOX_CONTIG_BASE,
+                size, g_contig.next - XBOX_CONTIG_BASE,
                 (unsigned)XBOX_CONTIG_SIZE);
         fflush(stderr);
         return 0;
     }
 
-    g_contig_next = result + size;
     memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
     return result;
+}
+
+/* MmFreeContiguousMemory. Returns 0, and frees nothing, for an address that is
+ * not the start of a live block: a pinned MmAllocateContiguousMemoryEx range,
+ * a heap pointer, or a double free. The first few are logged. */
+int xbox_ContiguousFree(uint32_t addr)
+{
+    int ok;
+
+    AcquireSRWLockExclusive(&g_contig_lock);
+    ok = kmem_arena_free(&g_contig, addr);
+    ReleaseSRWLockExclusive(&g_contig_lock);
+
+    if (!ok) {
+        static int logged;
+        if (logged < 8) {
+            logged++;
+            fprintf(stderr, "  [KMEM] reject kind=contig_free_unknown base=0x%08X\n",
+                    addr);
+            fflush(stderr);
+        }
+    }
+    return ok;
+}
+
+/* Bytes from va to the end of the live contiguous block holding it, or 0. */
+uint32_t xbox_ContiguousBlockSize(uint32_t va)
+{
+    uint32_t n;
+
+    AcquireSRWLockShared(&g_contig_lock);
+    n = kmem_arena_block_size(&g_contig, va);
+    ReleaseSRWLockShared(&g_contig_lock);
+    return n;
+}
+
+void xbox_KmemAllocCounters(struct kmem_alloc_counters *out)
+{
+    *out = g_kmem_alloc;
+    AcquireSRWLockShared(&g_contig_lock);
+    out->contig_free_ok       = g_contig.frees_ok;
+    out->contig_free_unknown  = g_contig.frees_unknown;
+    out->contig_untracked     = g_contig.untracked;
+    out->contig_split_skipped = g_contig.split_skipped;
+    ReleaseSRWLockShared(&g_contig_lock);
 }
 
 /* How much of the window has been handed out.
@@ -5315,7 +5366,7 @@ uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment)
  * a surface offset is physical, and only the window makes it addressable. */
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
-    return g_contig_next - XBOX_CONTIG_BASE;
+    return g_contig.next - XBOX_CONTIG_BASE;
 }
 
 

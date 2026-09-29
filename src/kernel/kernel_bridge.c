@@ -874,7 +874,13 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
 static void bridge_MmFreeContiguousMemory(void)
 {
     uint32_t addr = STACK_ARG(0);
-    xbox_HeapFree(addr);
+
+    /* The block came from the contiguous arena, which the heap does not own:
+     * xbox_HeapFree found nothing and the window only ever filled up. */
+    if (xbox_KmemLegacy())
+        xbox_HeapFree(addr);
+    else
+        xbox_ContiguousFree(addr);
     g_eax = 0;
 }
 
@@ -4198,7 +4204,11 @@ static void bridge_MmLockUnlockBufferPages(void)
  */
 static void bridge_MmQueryAllocationSize(void)
 {
-    g_eax = xbox_HeapBlockSize(STACK_ARG(0));
+    uint32_t va = STACK_ARG(0);
+    uint32_t n = xbox_KmemLegacy() ? 0 : xbox_ContiguousBlockSize(va);
+
+    /* Contiguous blocks first: XPhysicalSize asks this about them. */
+    g_eax = n ? n : xbox_HeapBlockSize(va);
 }
 
 /* ── NtCreateMutant (ordinal 192, 3 args) */
