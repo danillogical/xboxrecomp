@@ -72,6 +72,7 @@ struct PGRAPHState {
 enum {
     NV2A_HOLD_NONE = 0,
     NV2A_HOLD_SOFTWARE_METHOD = 1,
+    NV2A_HOLD_FLIP_STALL = 2,
 };
 
 /* ============================================================
@@ -162,7 +163,8 @@ typedef struct NV2AState {
         uint32_t sink_count;
         /* Semaphore releases written to guest memory (action methods only). */
         uint32_t semaphore_releases;
-        /* A walk held by a software-method trap (action methods only), and the rest of the packet it stopped in, which the walk
+        /* A walk held by a software-method trap or FLIP_STALL (action methods
+         * only), and the rest of the packet it stopped in, which the walk
          * that resumes after the hold continues from. */
         uint32_t hold;
         uint32_t carry_count, carry_method, carry_subchannel, carry_ret;

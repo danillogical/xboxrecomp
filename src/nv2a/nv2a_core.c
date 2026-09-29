@@ -791,6 +791,8 @@ void pvideo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
  * PGRAPH - graphics engine (stub for Phase 1)
  * ============================================================ */
 
+static uint32_t flip_counter_next(uint32_t value, uint32_t modulo);
+
 uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
@@ -828,6 +830,17 @@ void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
             d->pgraph.regs[addr] = val;
             d->pgraph.enabled_interrupts = (uint32_t)val;
             nv2a_update_irq(d);
+            return;
+        case NV_PGRAPH_INCREMENT:
+            /* A trigger, not storage: the display's vblank handler advances
+             * the read counter a FLIP_STALL waits on. */
+            if (val & NV_PGRAPH_INCREMENT_READ_3D) {
+                uint32_t *surface = &d->pgraph.regs[NV_PGRAPH_SURFACE];
+                uint32_t next = flip_counter_next(GET_MASK(*surface, NV_PGRAPH_SURFACE_READ_3D),
+                                                  GET_MASK(*surface, NV_PGRAPH_SURFACE_MODULO_3D));
+                SET_MASK(*surface, NV_PGRAPH_SURFACE_READ_3D, next);
+                pgraph_resume_walk(d);
+            }
             return;
         case NV_PGRAPH_FIFO:
             d->pgraph.regs[addr] = val;
@@ -958,8 +971,10 @@ enum {
     NV2A_SUBMIT_SEMAPHORE_FAULT = 13,
     /* The walk committed up to and including a method that holds it. */
     NV2A_SUBMIT_SOFTWARE_METHOD = 14,
+    NV2A_SUBMIT_FLIP_STALL = 15,
     /* A kick arrived while the walk was held; nothing was walked. */
     NV2A_SUBMIT_HELD_SOFTWARE_METHOD = 16,
+    NV2A_SUBMIT_HELD_FLIP_STALL = 17,
     /* A non-zero NOP with PGRAPH data checking off: the references disagree
      * on what happens, so the stream stops here instead of guessing. */
     NV2A_SUBMIT_NOP_UNCHECKED = 18,
@@ -1002,7 +1017,9 @@ const char *nv2a_submit_diagnostic(uint32_t code)
     case NV2A_SUBMIT_INVALID_HANDLE: return "invalid_handle";
     case NV2A_SUBMIT_SEMAPHORE_FAULT: return "semaphore_fault";
     case NV2A_SUBMIT_SOFTWARE_METHOD: return "software_method_trap";
+    case NV2A_SUBMIT_FLIP_STALL: return "flip_stall";
     case NV2A_SUBMIT_HELD_SOFTWARE_METHOD: return "held_software_method";
+    case NV2A_SUBMIT_HELD_FLIP_STALL: return "held_flip_stall";
     case NV2A_SUBMIT_NOP_UNCHECKED: return "software_method_unchecked";
     default: return "unknown";
     }
@@ -1192,6 +1209,7 @@ typedef struct {
     uint32_t sem_offset;
     uint32_t releases;
     struct { uint32_t phys, value; } release[NV2A_MAX_STAGED_RELEASES];
+    uint32_t surface;           /* NV_PGRAPH_SURFACE: the flip counters */
     uint32_t param_a, param_b;  /* the two registers a software method reads */
     uint32_t trap_subchannel, trap_param;
 } ActionStage;
@@ -1208,8 +1226,23 @@ static void action_stage_begin(NV2AState *d, ActionStage *st)
     st->sem_dma_valid = d->pgraph.dma_semaphore_valid;
     st->sem_offset = d->pgraph.regs[NV_PGRAPH_SEMAPHOREOFFSET];
     st->releases = 0;
+    st->surface = d->pgraph.regs[NV_PGRAPH_SURFACE];
     st->param_a = d->pgraph.regs[NV_PGRAPH_ZSTENCILCLEARVALUE];
     st->param_b = d->pgraph.regs[NV_PGRAPH_COLORCLEARVALUE];
+}
+
+/* One step of a 3-bit flip counter: wrap to 0 on reaching the modulo. */
+static uint32_t flip_counter_next(uint32_t value, uint32_t modulo)
+{
+    return value + 1u == modulo ? 0u : (value + 1u) & 7u;
+}
+
+/* FLIP_STALL holds the walk until the display has read past the buffer the
+ * walk is about to write: it may continue once READ_3D differs from WRITE_3D. */
+static bool flip_stall_complete(uint32_t surface)
+{
+    return GET_MASK(surface, NV_PGRAPH_SURFACE_READ_3D) !=
+           GET_MASK(surface, NV_PGRAPH_SURFACE_WRITE_3D);
 }
 
 /* A semaphore lands in the physical window the pushbuffer is read from: a
@@ -1256,8 +1289,8 @@ static bool semaphore_target(NV2AState *d, const ActionStage *st, uint32_t *phys
 }
 
 /* Stage one NV097 method's effect. Returns NV2A_SUBMIT_OK; the diagnostic
- * that rejects the whole stream; or NV2A_SUBMIT_SOFTWARE_METHOD, which
- * commits this method and holds the walk after it. */
+ * that rejects the whole stream; or NV2A_SUBMIT_SOFTWARE_METHOD /
+ * NV2A_SUBMIT_FLIP_STALL, which commit this method and hold the walk after it. */
 static uint32_t action_method(NV2AState *d, ActionStage *st, uint32_t subchannel,
                               uint32_t method, uint32_t param)
 {
@@ -1273,6 +1306,26 @@ static uint32_t action_method(NV2AState *d, ActionStage *st, uint32_t subchannel
         st->trap_subchannel = subchannel;
         st->trap_param = param;
         return NV2A_SUBMIT_SOFTWARE_METHOD;
+    case NV097_SET_FLIP_READ:
+        SET_MASK(st->surface, NV_PGRAPH_SURFACE_READ_3D, param);
+        break;
+    case NV097_SET_FLIP_WRITE:
+        SET_MASK(st->surface, NV_PGRAPH_SURFACE_WRITE_3D, param);
+        break;
+    case NV097_SET_FLIP_MODULO:
+        SET_MASK(st->surface, NV_PGRAPH_SURFACE_MODULO_3D, param);
+        break;
+    case NV097_FLIP_INCREMENT_WRITE: {
+        /* Computed first: SET_MASK clears the field before it reads `val`. */
+        uint32_t next = flip_counter_next(GET_MASK(st->surface, NV_PGRAPH_SURFACE_WRITE_3D),
+                                          GET_MASK(st->surface, NV_PGRAPH_SURFACE_MODULO_3D));
+        SET_MASK(st->surface, NV_PGRAPH_SURFACE_WRITE_3D, next);
+        break;
+    }
+    case NV097_FLIP_STALL:
+        if (!flip_stall_complete(st->surface))
+            return NV2A_SUBMIT_FLIP_STALL;
+        break;
     case NV097_SET_ZSTENCIL_CLEAR_VALUE:
         st->param_a = param;
         break;
@@ -1308,6 +1361,7 @@ static void action_commit(NV2AState *d, const ActionStage *st)
     d->pgraph.dma_semaphore = st->sem_dma;
     d->pgraph.dma_semaphore_valid = st->sem_dma_valid;
     d->pgraph.regs[NV_PGRAPH_SEMAPHOREOFFSET] = st->sem_offset;
+    d->pgraph.regs[NV_PGRAPH_SURFACE] = st->surface;
     d->pgraph.regs[NV_PGRAPH_ZSTENCILCLEARVALUE] = st->param_a;
     d->pgraph.regs[NV_PGRAPH_COLORCLEARVALUE] = st->param_b;
     for (uint32_t i = 0; i < st->releases; ++i) {
@@ -1352,6 +1406,8 @@ static bool walk_hold_released(NV2AState *d)
     case NV2A_HOLD_SOFTWARE_METHOD:
         return !(d->pgraph.pending_interrupts & NV_PGRAPH_INTR_ERROR) &&
                (d->pgraph.regs[NV_PGRAPH_FIFO] & NV_PGRAPH_FIFO_ACCESS);
+    case NV2A_HOLD_FLIP_STALL:
+        return flip_stall_complete(d->pgraph.regs[NV_PGRAPH_SURFACE]);
     default:
         return true;
     }
@@ -1394,7 +1450,8 @@ bool nv2a_submit_pending(NV2AState *d)
     qemu_mutex_lock(&d->pfifo.lock);
     if (actions) {
         if (!walk_hold_released(d)) {
-            d->pfifo.submit_diag = NV2A_SUBMIT_HELD_SOFTWARE_METHOD;
+            d->pfifo.submit_diag = d->pfifo.hold == NV2A_HOLD_FLIP_STALL ?
+                NV2A_SUBMIT_HELD_FLIP_STALL : NV2A_SUBMIT_HELD_SOFTWARE_METHOD;
             qemu_mutex_unlock(&d->pfifo.lock);
             return false;
         }
@@ -1486,7 +1543,7 @@ bool nv2a_submit_pending(NV2AState *d)
             }
             if (actions && staged_class[subchannel] == NV097_CLASS) {
                 uint32_t code = action_method(d, &st, subchannel, method, param);
-                if (code == NV2A_SUBMIT_SOFTWARE_METHOD) {
+                if (code == NV2A_SUBMIT_SOFTWARE_METHOD || code == NV2A_SUBMIT_FLIP_STALL) {
                     stop = code;
                 } else if (code != NV2A_SUBMIT_OK) {
                     d->pfifo.submit_diag = code;
@@ -1596,6 +1653,8 @@ bool nv2a_submit_pending(NV2AState *d)
             if (stop == NV2A_SUBMIT_SOFTWARE_METHOD) {
                 action_raise_trap(d, &st);
                 d->pfifo.hold = NV2A_HOLD_SOFTWARE_METHOD;
+            } else if (stop == NV2A_SUBMIT_FLIP_STALL) {
+                d->pfifo.hold = NV2A_HOLD_FLIP_STALL;
             }
             if (held) {
                 d->pfifo.submit_diag = stop;

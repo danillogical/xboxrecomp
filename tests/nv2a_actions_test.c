@@ -518,11 +518,63 @@ static void test_nop_dormant_when_unset(void)
     pb_begin(&pb, PB_BASE);
     pb_method(&pb, 0, 0x0000, H_KELVIN);
     pb_method(&pb, 0, NV097_NO_OPERATION, 0x300);
+    pb_method(&pb, 0, NV097_FLIP_STALL, 0);
     kick(d, pb.start, pb.at);
     CHECK(strcmp(diag(d), "ok") == 0 && get_ptr(d) == pb.at, "stream held (%s)", diag(d));
     CHECK(g_line == 0 && g_line_edges == 0, "interrupt raised with the switch unset");
     CHECK(mmio_r(d, PGRAPH(NV_PGRAPH_FIFO)) == NV_PGRAPH_FIFO_ACCESS, "FIFO access changed");
     CHECK(mmio_r(d, PGRAPH(NV_PGRAPH_TRAPPED_ADDR)) == 0, "trap latched");
+}
+
+/* FLIP_STALL holds while READ_3D equals WRITE_3D and continues once the
+ * vblank handler's INCREMENT write moves READ_3D. */
+static void test_flip_stall(void)
+{
+    NV2AState *d = fresh_with(1);
+    Pb pb;
+    uint32_t after_stall, surface;
+    guest_setup(d, 1);
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    pb_method(&pb, 0, NV097_SET_FLIP_READ, 0);     /* JSRF's values */
+    pb_method(&pb, 0, NV097_SET_FLIP_WRITE, 1);
+    pb_method(&pb, 0, NV097_SET_FLIP_MODULO, 3);
+    pb_method(&pb, 0, NV097_FLIP_INCREMENT_WRITE, 0);   /* write 2 */
+    pb_method(&pb, 0, NV097_FLIP_STALL, 0);             /* 0 != 2: passes */
+    kick(d, pb.start, pb.at);
+    surface = mmio_r(d, PGRAPH(NV_PGRAPH_SURFACE));
+    CHECK(get_ptr(d) == pb.at, "first FLIP_STALL held (%s)", diag(d));
+    CHECK(GET_MASK(surface, NV_PGRAPH_SURFACE_READ_3D) == 0 &&
+          GET_MASK(surface, NV_PGRAPH_SURFACE_WRITE_3D) == 2 &&
+          GET_MASK(surface, NV_PGRAPH_SURFACE_MODULO_3D) == 3, "SURFACE %08X", surface);
+
+    pb_method(&pb, 0, NV097_FLIP_INCREMENT_WRITE, 0);   /* write wraps to 0 */
+    pb_method(&pb, 0, NV097_FLIP_STALL, 0);             /* 0 == 0: holds */
+    after_stall = pb.at;
+    pb_semaphore(&pb, H_SEMAPHORE, 0, 9);
+    kick_put(d, pb.at);
+    CHECK(strcmp(diag(d), "flip_stall") == 0, "diag %s", diag(d));
+    CHECK(get_ptr(d) == after_stall, "GET %08X, want just past FLIP_STALL %08X",
+          get_ptr(d), after_stall);
+    CHECK(sema() == SENTINEL, "release after FLIP_STALL ran early");
+    CHECK(g_line == 0, "FLIP_STALL raised an interrupt");
+
+    kick_put(d, pb.at);
+    CHECK(strcmp(diag(d), "held_flip_stall") == 0 && get_ptr(d) == after_stall,
+          "held walk moved (%s)", diag(d));
+    mmio_w(d, PGRAPH(NV_PGRAPH_INCREMENT), NV_PGRAPH_INCREMENT_READ_BLIT);
+    CHECK(get_ptr(d) == after_stall, "released by the blit read counter");
+    mmio_w(d, PGRAPH(NV_PGRAPH_INCREMENT), NV_PGRAPH_INCREMENT_READ_3D);
+    surface = mmio_r(d, PGRAPH(NV_PGRAPH_SURFACE));
+    CHECK(GET_MASK(surface, NV_PGRAPH_SURFACE_READ_3D) == 1, "READ_3D %u",
+          GET_MASK(surface, NV_PGRAPH_SURFACE_READ_3D));
+    CHECK(get_ptr(d) == pb.at && sema() == 9, "not released (GET %08X, %s)", get_ptr(d), diag(d));
+
+    /* The read counter wraps at the modulo too. */
+    mmio_w(d, PGRAPH(NV_PGRAPH_INCREMENT), NV_PGRAPH_INCREMENT_READ_3D);
+    mmio_w(d, PGRAPH(NV_PGRAPH_INCREMENT), NV_PGRAPH_INCREMENT_READ_3D);
+    CHECK(GET_MASK(mmio_r(d, PGRAPH(NV_PGRAPH_SURFACE)), NV_PGRAPH_SURFACE_READ_3D) == 0,
+          "READ_3D did not wrap");
 }
 
 int main(void)
@@ -538,6 +590,7 @@ int main(void)
     test_trap_inside_subroutine();
     test_nop_unchecked_blocks();
     test_nop_dormant_when_unset();
+    test_flip_stall();
 
     if (g_failures) {
         fprintf(stderr, "nv2a_actions_test: %d failure(s)\n", g_failures);
