@@ -2131,8 +2131,9 @@ class Lifter:
                     f"  SET_HI8(eax, (uint8_t)((int8_t)(_dividend % (int8_t){src}))); }}"
                 ]
             elif w == 2:
+                # Assembled unsigned: a left shift of a negative int is undefined in C.
                 return [
-                    f"{{ int32_t _dividend = ((int32_t)(int16_t)LO16(edx) << 16) | LO16(eax);",
+                    f"{{ int32_t _dividend = (int32_t)(((uint32_t)LO16(edx) << 16) | LO16(eax));",
                     f"  SET_LO16(eax, (uint16_t)((int16_t)(_dividend / (int16_t){src})));",
                     f"  SET_LO16(edx, (uint16_t)((int16_t)(_dividend % (int16_t){src}))); }}"
                 ]
