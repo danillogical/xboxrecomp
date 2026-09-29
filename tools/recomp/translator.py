@@ -25,7 +25,9 @@ from . import config as _config
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
-                     detect_setjmp_helpers, _func_ident, _operand_width)
+                     detect_setjmp_helpers, _func_ident, _operand_width,
+                     CC_KEYS, MATERIALISED, flag_condition_read,
+                     _make_condition, _track_flag_state)
 
 
 def _merge_flag_states(states):
@@ -94,6 +96,104 @@ def _incoming_flag_state(sources, known, is_entry):
     if not all(p in known for p in sources):
         return None
     return _merge_flag_states([known[p] for p in sources])
+
+
+def _answers(state, key):
+    """True when a flag state yields the condition named by `key`."""
+    return bool(state) and _make_condition(
+        "j" + key, state[0], state[1]) is not None
+
+
+_NO_STATE = object()
+
+
+def _block_flag_use(instructions):
+    """(conditions read before any flag write, whether the block writes flags).
+
+    Conditions are CC_KEYS keys. The write test runs the lifter's own state
+    tracker from a sentinel, so both agree on which instructions write EFLAGS.
+    """
+    used = set()
+    for insn in instructions:
+        read = flag_condition_read(insn)
+        if read in CC_KEYS:
+            used.add(CC_KEYS[read][0])
+        after = _track_flag_state(insn, _NO_STATE, ())
+        if after[0] is not _NO_STATE:
+            return used, True
+    return used, False
+
+
+def _flag_liveness(blocks, preds):
+    """Condition keys live on entry to each block.
+
+    A block's own reads before its first flag write, plus, when it writes no
+    flags, whatever its successors read.
+    """
+    succs = {bb.start: set() for bb in blocks}
+    for target, sources in preds.items():
+        for source in sources:
+            if source in succs:
+                succs[source].add(target)
+    uses, writes = {}, {}
+    for bb in blocks:
+        uses[bb.start], writes[bb.start] = _block_flag_use(bb.instructions)
+    live = {start: set(keys) for start, keys in uses.items()}
+    changed = True
+    while changed:
+        changed = False
+        for bb in reversed(blocks):
+            if writes[bb.start]:
+                continue
+            for succ in succs[bb.start]:
+                if not live[succ] <= live[bb.start]:
+                    live[bb.start] |= live[succ]
+                    changed = True
+    return live
+
+
+def _join_flag_state(merged, sources, known, live, is_entry):
+    """The state a join uses when a plain merge cannot answer its readers.
+
+    When predecessors set the flags differently -- `test ah, 1` on one edge,
+    `cmp [ebx+0x10], 7` on another -- no expression over the shared _fa/_fb
+    snapshot serves both. Each predecessor can still compute the condition
+    from its own state, so the join takes a MATERIALISED state naming the
+    conditions every predecessor can compute; the translator then has each
+    predecessor write them to _fc_<key> before its edge. A condition some
+    predecessor cannot compute is left out, and its reader keeps the
+    recorded `_flags` fallback rather than a guess.
+
+    Returns `merged` unchanged when it already answers every live condition,
+    or when materialising would not answer more of them.
+    """
+    if is_entry or not sources or not live:
+        return merged
+    answered = {key for key in live if _answers(merged, key)}
+    if answered == live:
+        return merged
+    states = [known.get(source) for source in sources]
+    if not all(states):
+        return merged
+    keys = {key for key in live
+            if all(_answers(state, key) for state in states)}
+    if keys > answered:
+        return (MATERIALISED, tuple(sorted(keys)))
+    return merged
+
+
+def flag_gaps(lifter):
+    """Every emitted conditional that reads a `_flags` nothing assigned.
+
+    Sorted (function start, address, form, flag setter or None) tuples. The
+    branch, SETcc, CMOVcc or LOOPcc at each one reads the initial 0, so it
+    answers a condition the guest never computed. A setter of None means no
+    single state reached it: flags live into the function, left undefined by
+    mul/div/popfd, or a join where some predecessor cannot compute the
+    condition. A named setter means that state cannot produce it.
+    """
+    return sorted((func, addr, form, setter)
+                  for (addr, form), (func, setter) in lifter.flag_gaps.items())
 
 
 def write_if_changed(path, text):
@@ -2112,6 +2212,8 @@ class FunctionTranslator:
             for insn in instructions)
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")
+        # Join condition variables are declared here once the joins are known.
+        join_decl_index = len(lines)
 
         # Flag snapshot temporaries: a cmp/test records its operands here,
         # zero- and sign-extended to the compare's own width, so the branch
@@ -2268,17 +2370,34 @@ class FunctionTranslator:
         # settled_state onto the dict that pass fills is what makes the two
         # cases one loop: it then reads exactly the states it has computed
         # itself, which is what this function did before the probe existed.
+        #
+        # A join whose predecessors set the flags differently needs its
+        # predecessors to compute the conditions it reads (_join_flag_state),
+        # and a predecessor is emitted before the join is reached in address
+        # order, so those joins also need every state up front.
+        live_flags = _flag_liveness(blocks, preds)
+
+        def incoming_state(bb, known):
+            merged = _incoming_flag_state(
+                preds[bb.start], known, bb.start == start)
+            return _join_flag_state(merged, preds[bb.start], known,
+                                    live_flags[bb.start], bb.start == start)
+
         out_state = {}
         settled_state = out_state
-        if any(p >= bb.start for bb in blocks for p in preds[bb.start]):
+        back_edge = any(p >= bb.start for bb in blocks for p in preds[bb.start])
+        live_join = any(len(preds[bb.start]) > 1 and live_flags[bb.start]
+                        for bb in blocks)
+        if back_edge or live_join:
             saved_unimplemented = {
                 k: list(v) for k, v in self.lifter.unimplemented.items()
             }
-            for _ in range(3):
+            saved_flag_gaps = dict(self.lifter.flag_gaps)
+            # Without a back edge one pass in address order is already final.
+            for _ in range(3 if back_edge else 1):
                 changed = False
                 for bb in blocks:
-                    incoming = _incoming_flag_state(
-                        preds[bb.start], out_state, bb.start == start)
+                    incoming = incoming_state(bb, out_state)
                     _, new_out = lift_basic_block(
                         self.lifter, bb, flag_state=incoming)
                     if out_state.get(bb.start) != new_out:
@@ -2288,8 +2407,23 @@ class FunctionTranslator:
                     break
             self.lifter.unimplemented.clear()
             self.lifter.unimplemented.update(saved_unimplemented)
+            self.lifter.flag_gaps.clear()
+            self.lifter.flag_gaps.update(saved_flag_gaps)
             settled_state = out_state
             out_state = {}
+
+        # Which conditions each predecessor writes for a join it reaches.
+        materialise = {}
+        if live_join:
+            for bb in blocks:
+                incoming = incoming_state(bb, settled_state)
+                if incoming and incoming[0] == MATERIALISED:
+                    for pred in preds[bb.start]:
+                        materialise.setdefault(pred, set()).update(incoming[1])
+        join_keys = sorted(set().union(*materialise.values()))
+        if join_keys:
+            lines.insert(join_decl_index, "    int %s; /* join conditions */"
+                         % ", ".join(f"_fc_{key} = 0" for key in join_keys))
 
         for bb in blocks:
             # Emit label if this block is a branch target
@@ -2306,11 +2440,11 @@ class FunctionTranslator:
             # states come from the pre-pass above, so a back edge's
             # predecessor is known here even though it sits later in address
             # order.
-            incoming = _incoming_flag_state(preds[bb.start], settled_state,
-                                            bb.start == start)
+            incoming = incoming_state(bb, settled_state)
 
             stmts, out_state[bb.start] = lift_basic_block(
-                self.lifter, bb, flag_state=incoming)
+                self.lifter, bb, flag_state=incoming,
+                materialise=sorted(materialise.get(bb.start, ())))
             for stmt in stmts:
                 lines.append(f"    {stmt}")
             bypass = debug_slide_bypasses.get(bb.last_insn.address)
@@ -2671,6 +2805,7 @@ class BatchTranslator:
 
         stats["output_file"] = output_file
         stats["output_size"] = len(output_text)
+        stats["flag_gaps"] = flag_gaps(self.translator.lifter)
 
         return stats
 
@@ -2984,6 +3119,7 @@ class BatchTranslator:
             m: list(addrs)
             for m, addrs in self.translator.lifter.unimplemented.items()
         }
+        stats["flag_gaps"] = flag_gaps(self.translator.lifter)
 
         # Generate header with all forward declarations
         header_path = os.path.join(output_dir, header_name)

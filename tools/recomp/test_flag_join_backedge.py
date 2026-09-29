@@ -25,8 +25,10 @@ until it left mapped memory, taking the process with it. Settling the flag
 state to a fixed point before emitting gives the jcc its comparison back.
 
 The second property matters as much: when the predecessors genuinely
-disagree, the fallback must stay. Inheriting the wrong flags is worse than
-inheriting none, because the branch then looks right and goes the wrong way.
+disagree, the join must not inherit either one's flags. Inheriting the wrong
+flags is worse than inheriting none, because the branch then looks right and
+goes the wrong way. Each predecessor computes the condition from its own
+flags instead (see test_flag_join_materialise.py).
 """
 
 import os
@@ -67,9 +69,10 @@ def test_loop_head_inherits_flags_from_both_predecessors():
     assert "CMP_EQ" in code or "== 0" in code, code
 
 
-def test_disagreeing_predecessors_keep_the_fallback():
+def test_disagreeing_predecessors_each_compute_the_condition():
     # Two predecessors reach the jz: one after `sub`, one after `inc`, whose
-    # flags come from a different operand. The join must refuse.
+    # flags come from a different operand. The join must not merge them;
+    # each predecessor writes its own ZF for the jz instead.
     #   +0  sub eax, ecx
     #   +2  jmp +3            -> the jz at +5
     #   +4  inc edx           (falls through to the jz, different flag source)
@@ -81,10 +84,12 @@ def test_disagreeing_predecessors_keep_the_fallback():
              b"\x74\x00"          # jz +0 -> +7
              b"\xC3")             # ret
     code = _translate(image)
-    assert "_flags /*" in code, code
+    assert "_flags /*" not in code, code
+    assert code.count("_fc_e = ((_fa == 0)) ? 1 : 0;") == 2, code
+    assert "if (_fc_e) goto loc_00010007;" in code, code
 
 
 if __name__ == "__main__":
     test_loop_head_inherits_flags_from_both_predecessors()
-    test_disagreeing_predecessors_keep_the_fallback()
+    test_disagreeing_predecessors_each_compute_the_condition()
     print("ok")

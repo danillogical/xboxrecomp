@@ -25,7 +25,7 @@ import sys
 import time
 
 from . import config
-from .translator import BatchTranslator
+from .translator import BatchTranslator, flag_gaps
 from .output import write_summary, print_stats, generate_header
 
 
@@ -172,6 +172,37 @@ def _report_unimplemented(stats):
         print(f"    ... and {len(ranked) - 20} more", file=sys.stderr)
 
 
+def _report_flag_gaps(stats):
+    """List the conditionals that read a `_flags` nothing assigned.
+
+    Each one answers with the variable's initial 0: a branch never taken, a
+    SETcc that writes 0, a CMOVcc that never moves. That is a guess at a
+    condition the guest computed, so it is reported every run, and
+    --strict-flags turns it into a failed generation.
+    """
+    gaps = stats.get("flag_gaps") or []
+    if not gaps:
+        return 0
+    by_cause = {}
+    for _, _, form, setter in gaps:
+        cause = ("join edge" if form.startswith("join ")
+                 else "no single flag state" if setter is None
+                 else f"{setter} cannot answer")
+        by_cause[cause] = by_cause.get(cause, 0) + 1
+    functions = len({func for func, _, _, _ in gaps})
+    print(f"FLAGS: {len(gaps)} conditional(s) in {functions} function(s) "
+          f"read `_flags` that nothing assigned (each answers 0):",
+          file=sys.stderr)
+    for cause, count in sorted(by_cause.items(), key=lambda kv: -kv[1]):
+        print(f"    {count:6d}  {cause}", file=sys.stderr)
+    for func, addr, form, setter in gaps[:40]:
+        print(f"    sub_{func:08X}  0x{addr:08X}  {form:<24} "
+              f"state: {setter or 'none'}", file=sys.stderr)
+    if len(gaps) > 40:
+        print(f"    ... and {len(gaps) - 40} more", file=sys.stderr)
+    return len(gaps)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Xbox x86 -> C Static Recompiler")
@@ -257,6 +288,9 @@ def main():
                         help="Address of __SEH_prolog (hex). Auto-detected if omitted")
     parser.add_argument("--seh-epilog", metavar="ADDR",
                         help="Address of __SEH_epilog (hex). Auto-detected if omitted")
+    parser.add_argument("--strict-flags", action="store_true",
+                        help="Exit non-zero when any emitted conditional "
+                             "reads a _flags nothing assigned")
 
     args = parser.parse_args()
 
@@ -347,6 +381,10 @@ def main():
         else:
             print(f"ERROR: Could not translate function at 0x{addr:08X}",
                   file=sys.stderr)
+            sys.exit(1)
+        gaps = _report_flag_gaps(
+            {"flag_gaps": flag_gaps(translator.translator.lifter)})
+        if args.strict_flags and gaps:
             sys.exit(1)
         return
 
@@ -495,6 +533,7 @@ def main():
                   f"(addresses called but not detected as functions)",
                   file=sys.stderr)
         _report_unimplemented(stats)
+        flag_gap_count = _report_flag_gaps(stats)
         for f_path in stats.get("files", []):
             print(f"  {f_path}", file=sys.stderr)
     else:
@@ -509,12 +548,17 @@ def main():
         print(f"\n=== Translation Complete ({t_translate:.1f}s) ===",
               file=sys.stderr)
         print_stats(stats)
+        flag_gap_count = _report_flag_gaps(stats)
 
     # Write summary
     output_dir = args.output_dir or os.path.join(
         os.path.dirname(__file__), "output")
     summary_path = write_summary(stats, output_dir)
     print(f"\nSummary: {summary_path}", file=sys.stderr)
+    if args.strict_flags and flag_gap_count:
+        print(f"--strict-flags: {flag_gap_count} conditional(s) read an "
+              f"unassigned _flags; failing", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

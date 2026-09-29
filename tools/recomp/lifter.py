@@ -490,11 +490,71 @@ def _has_xmm_operand(ops):
                for op in (ops or ()))
 
 
+# Condition code -> (key, negated). A key names one condition a join can have
+# its predecessors compute into _fc_<key>; the negated codes read it inverted.
+CC_KEYS = {
+    "je": ("e", False), "jz": ("e", False),
+    "jne": ("e", True), "jnz": ("e", True),
+    "jb": ("b", False), "jc": ("b", False), "jnae": ("b", False),
+    "jae": ("b", True), "jnb": ("b", True), "jnc": ("b", True),
+    "jbe": ("be", False), "jna": ("be", False),
+    "ja": ("be", True), "jnbe": ("be", True),
+    "jl": ("l", False), "jnge": ("l", False),
+    "jge": ("l", True), "jnl": ("l", True),
+    "jle": ("le", False), "jng": ("le", False),
+    "jg": ("le", True), "jnle": ("le", True),
+    "js": ("s", False), "jns": ("s", True),
+    "jo": ("o", False), "jno": ("o", True),
+    "jp": ("p", False), "jpe": ("p", False),
+    "jnp": ("p", True), "jpo": ("p", True),
+}
+
+# Flag state of a join whose predecessors each computed the conditions its
+# consumers need; the operands are the keys that were computed.
+MATERIALISED = "__materialised"
+
+# The SETcc and CMOVcc forms the lifter implements.
+_SETCC_FORMS = frozenset({
+    "sete", "setne", "setb", "setae", "setbe", "seta",
+    "setl", "setge", "setle", "setg", "sets", "setns",
+})
+_CMOVCC_FORMS = frozenset({
+    "cmove", "cmovne", "cmovb", "cmovae", "cmovbe", "cmova",
+    "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns",
+})
+
+
+def flag_condition_read(insn):
+    """The jcc-equivalent condition an instruction reads from EFLAGS, or None.
+
+    A REPE/REPNE compare counts as reading ZF, because a zero count leaves
+    the incoming ZF for whatever consumes it next.
+    """
+    m = insn.mnemonic
+    if m == "loope":
+        return "je"
+    if m == "loopne":
+        return "jne"
+    if m in ("loop", "jecxz", "jcxz"):
+        return None
+    if insn.is_cond_jump:
+        return m
+    if m in _SETCC_FORMS:
+        return "j" + m[3:]
+    if m in _CMOVCC_FORMS:
+        return "j" + m[4:]
+    if _is_rep_compare(insn):
+        return "je"
+    return None
+
+
 def _make_condition(jcc, flag_setter, flag_ops):
     """
     Generate a C condition expression for a jcc based on what set the flags.
     Returns (cond_expr, description) or None.
     """
+    if not flag_setter:
+        return None
     # LOCK affects atomicity, not the arithmetic condition codes.
     if flag_setter.startswith("lock "):
         flag_setter = flag_setter[5:]
@@ -502,6 +562,13 @@ def _make_condition(jcc, flag_setter, flag_ops):
     if not cond_info:
         return None
     cmp_macro, test_macro, desc = cond_info
+
+    # Every predecessor of this join wrote the condition into _fc_<key>.
+    if flag_setter == MATERIALISED:
+        key, negated = CC_KEYS.get(jcc, (None, False))
+        if key not in flag_ops:
+            return None
+        return (f"!_fc_{key}" if negated else f"_fc_{key}"), desc
 
     # A join whose predecessors disagree on which instruction set the flags,
     # but agree that the zero flag came from the same destination register.
@@ -1292,6 +1359,15 @@ class Lifter:
         # The translator reports this at the end of a run, so the next one
         # costs a line of output instead of an afternoon.
         self.unimplemented = {}
+        # Conditionals that read `_flags` without anything having assigned it,
+        # as {(addr, form): (function start, flag setter in force or None)}.
+        # Keyed so re-lifting a block records a site once. The translator
+        # reports these; see _record_flag_gap.
+        self.flag_gaps = {}
+        # The tracked flag setter while lift_basic_block lifts an instruction,
+        # so a recorded gap can say whether the state was unknown or merely
+        # unable to answer that condition.
+        self.current_flag_setter = None
 
         # Detect if either is missing, so overriding one does not silently
         # leave the other unset -- that is the bug this whole path fixes.
@@ -1593,11 +1669,9 @@ class Lifter:
             else:
                 address = "ebx + LO8(eax)"
             return [f"SET_LO8(eax, MEM8({address})); /* xlatb */"]
-        if m in ("sete", "setne", "setb", "setae", "setbe", "seta",
-                 "setl", "setge", "setle", "setg", "sets", "setns"):
+        if m in _SETCC_FORMS:
             return self._lift_setcc(insn, ops, m)
-        if m in ("cmove", "cmovne", "cmovb", "cmovae", "cmovbe", "cmova",
-                 "cmovl", "cmovge", "cmovle", "cmovg", "cmovs", "cmovns"):
+        if m in _CMOVCC_FORMS:
             return self._lift_cmovcc(insn, ops, m)
 
         # ── SSE (scalar float) ──
@@ -2756,6 +2830,11 @@ class Lifter:
                 f" /* indirect tail jmp */")]
         return ["/* jmp: no target */"]
 
+    def _record_flag_gap(self, address, form):
+        """Note a conditional whose flags nothing in this function computed."""
+        self.flag_gaps[(address, form)] = (self.func_start,
+                                           self.current_flag_setter)
+
     def _lift_jcc(self, insn):
         """Standalone conditional jump (no flag-setter tracked)."""
         target = insn.jump_target
@@ -2791,6 +2870,8 @@ class Lifter:
                 cond = "!_cf"
 
         if target:
+            if cond == "_flags":
+                self._record_flag_gap(insn.address, jcc)
             if self._is_external_target(target):
                 name = self._call_target_name(target)
                 return [f"if ({cond} /* {jcc}: {desc} */) {{ g_seh_ebp = ebp; {name}(); return; }}"]
@@ -2823,17 +2904,21 @@ class Lifter:
         if target is None:
             stmts.append(f"/* {jcc}: {desc} - no target */")
             return stmts
+        if jcc != "loop" and not zf_expr:
+            self._record_flag_gap(insn.address, jcc)
         stmts.append(_emit_cond_goto(cond, jcc, desc, target, self))
         return stmts
 
     def _lift_setcc(self, insn, ops, m):
         if len(ops) < 1:
             return [f"/* {m}: no operand */"]
+        self._record_flag_gap(insn.address, m)
         return [_fmt_operand_write(ops[0], f"_flags /* {m} */")]
 
     def _lift_cmovcc(self, insn, ops, m):
         if len(ops) < 2:
             return [f"/* {m}: bad operands */"]
+        self._record_flag_gap(insn.address, m)
         src = _fmt_operand_read(ops[1])
         return [f"if (_flags /* {m} */) {_fmt_operand_write(ops[0], src)}"]
 
@@ -3898,7 +3983,67 @@ def _is_rep_compare(insn):
                                    "scasb", "scasw", "scasd"))
 
 
-def lift_basic_block(lifter, bb, flag_state=None):
+def _track_flag_state(curr, last_flag_setter, last_flag_ops):
+    """The flag state after `curr`, given the state before it.
+
+    Shared by lift_basic_block and the translator's flag liveness, so both
+    agree on which instructions write EFLAGS.
+    """
+    if curr.mnemonic in FLAG_SETTERS:
+        last_flag_setter, last_flag_ops = normalise_zero_test(
+            curr.mnemonic, list(curr.operands))
+    elif curr.mnemonic in _FLAGS_UNDEFINED:
+        # Flags are undefined after these - clear tracking
+        last_flag_setter = None
+        last_flag_ops = []
+    elif curr.mnemonic in _EFLAGS_SETTERS:
+        # Additional flag-setting instructions
+        last_flag_setter, last_flag_ops = normalise_zero_test(
+            curr.mnemonic, list(curr.operands))
+    elif curr.mnemonic in _EFLAGS_PRESERVE:
+        pass  # These don't affect EFLAGS
+    elif curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",
+                            "fucomip", "fcomi"):
+        # FPU compare-to-EFLAGS: sets CF, ZF, PF directly
+        last_flag_setter = curr.mnemonic
+        last_flag_ops = list(curr.operands)
+    elif curr.mnemonic == "sahf":
+        # sahf loads AH into flags - typically after fnstsw ax
+        # in the fcomp/fnstsw/sahf pattern for FPU comparisons
+        last_flag_setter = "sahf"
+        last_flag_ops = list(curr.operands)
+    elif curr.mnemonic.startswith("f") or curr.mnemonic.startswith("cmov"):
+        pass  # FPU and already-handled CMOVcc
+    elif curr.mnemonic.startswith("j"):
+        pass  # Jumps don't set flags
+    elif curr.mnemonic.startswith("set"):
+        pass  # SETcc doesn't set flags
+    elif curr.mnemonic.startswith("rep"):
+        # rep movsb/movsd = data copy, preserves flags
+        # repe cmpsb/repne scasb = comparison, sets flags
+        rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
+        raw_m = curr.mnemonic
+        # Every width sets flags, not just the byte forms: a
+        # `repe cmpsd` left the xor before it as the tracked setter, so
+        # the sbb that follows read the xor's CF instead of the compare's.
+        _cmp_forms = ("cmpsb", "cmpsw", "cmpsd",
+                      "scasb", "scasw", "scasd")
+        if any(f in raw_m for f in _cmp_forms):
+            last_flag_setter = raw_m
+            last_flag_ops = list(curr.operands)
+        elif any(f in rest for f in _cmp_forms):
+            last_flag_setter = raw_m
+            last_flag_ops = list(curr.operands)
+        else:
+            pass  # rep movs/stos = data movement, flags preserved
+    else:
+        # Unknown instruction - conservatively clear flag state
+        last_flag_setter = None
+        last_flag_ops = []
+    return last_flag_setter, last_flag_ops
+
+
+def lift_basic_block(lifter, bb, flag_state=None, materialise=None):
     """
     Lift a basic block to C statements.
     Tracks flags to generate proper conditions for jcc/setcc/cmovcc.
@@ -3908,6 +4053,9 @@ def lift_basic_block(lifter, bb, flag_state=None):
         bb: BasicBlock with instructions
         flag_state: tuple of (flag_setter_mnemonic, flag_operands) from
                     a preceding block, or None
+        materialise: condition keys (see CC_KEYS) a successor join reads from
+                    _fc_<key>; each is computed from this block's final flag
+                    state, before the branch that leaves the block
 
     Returns:
         (stmts, flag_state) where stmts is a list of C statement strings
@@ -3916,6 +4064,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
     stmts = []
     insns = bb.instructions
     i = 0
+    pending = list(materialise or ())
 
     # Track the last instruction that set flags
     if flag_state:
@@ -3924,8 +4073,28 @@ def lift_basic_block(lifter, bb, flag_state=None):
         last_flag_setter = None
         last_flag_ops = []
 
+    def emit_materialised():
+        for key in pending:
+            if last_flag_setter == MATERIALISED and key in last_flag_ops:
+                continue  # already in _fc_<key> from this block's own join
+            cond = _make_condition("j" + key, last_flag_setter, last_flag_ops)
+            if cond is None:
+                lifter.current_flag_setter = last_flag_setter
+                lifter._record_flag_gap(insns[-1].address, f"join j{key}")
+                stmts.append(f"/* _fc_{key}: flags unknown on this edge */")
+            else:
+                stmts.append(f"_fc_{key} = ({cond[0]}) ? 1 : 0;"
+                             f" /* j{key}, for a join */")
+        pending.clear()
+
     while i < len(insns):
         curr = insns[i]
+        lifter.current_flag_setter = last_flag_setter
+
+        # A join's conditions are written before the branch leaves the block,
+        # or the taken edge would skip them.
+        if pending and i == len(insns) - 1 and curr.is_branch:
+            emit_materialised()
 
         # Try cmp/test + jcc pattern first (2-instruction match)
         match = try_match_cmp_jcc(insns, i, lifter=lifter)
@@ -3943,6 +4112,8 @@ def lift_basic_block(lifter, bb, flag_state=None):
             if flag_insn.mnemonic in ("cmp", "test") and len(flag_insn.operands) >= 2:
                 stmts.extend(lifter._snapshot_flags(
                     flag_insn, last_flag_ops, last_flag_setter))
+            if pending and i + consumed == len(insns):
+                emit_materialised()
             stmts.append(stmt)
             i += consumed
             continue
@@ -3982,9 +4153,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
-        if (curr.mnemonic in ("sete", "setne", "setb", "setae", "setbe",
-                              "seta", "setl", "setge", "setle", "setg",
-                              "sets", "setns")
+        if (curr.mnemonic in _SETCC_FORMS
                 and last_flag_setter and len(curr.operands) >= 1):
             cond = _make_setcc_value(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
@@ -3996,9 +4165,7 @@ def lift_basic_block(lifter, bb, flag_state=None):
                 i += 1
                 continue
 
-        if (curr.mnemonic in ("cmove", "cmovne", "cmovb", "cmovae",
-                              "cmovbe", "cmova", "cmovl", "cmovge",
-                              "cmovle", "cmovg", "cmovs", "cmovns")
+        if (curr.mnemonic in _CMOVCC_FORMS
                 and last_flag_setter and len(curr.operands) >= 2):
             cond = _make_cmovcc_cond(
                 curr.mnemonic, last_flag_setter, last_flag_ops)
@@ -4048,67 +4215,25 @@ def lift_basic_block(lifter, bb, flag_state=None):
             # is `xor eax, eax; repe cmpsb; je` with the count = the shorter
             # length, so comparing against an empty string took the wrong
             # arm. Load the incoming ZF first, when a tracked setter has one.
-            if _is_rep_compare(curr) and last_flag_setter:
+            if _is_rep_compare(curr):
                 zf = _make_condition("je", last_flag_setter, last_flag_ops)
                 if zf:
                     stmts.append(f"_flags = ({zf[0]}) ? 1 : 0;"
                                  " /* ZF in: a zero count keeps it */")
+                else:
+                    # A zero count would leave `_flags` holding nothing.
+                    lifter._record_flag_gap(curr.address,
+                                            f"{curr.mnemonic} zero-count ZF")
         stmts.extend(results)
 
         # Track flag-setting instructions
-        if curr.mnemonic in FLAG_SETTERS:
-            last_flag_setter, last_flag_ops = normalise_zero_test(
-                curr.mnemonic, list(curr.operands))
-        elif curr.mnemonic in _FLAGS_UNDEFINED:
-            # Flags are undefined after these - clear tracking
-            last_flag_setter = None
-            last_flag_ops = []
-        elif curr.mnemonic in _EFLAGS_SETTERS:
-            # Additional flag-setting instructions
-            last_flag_setter, last_flag_ops = normalise_zero_test(
-                curr.mnemonic, list(curr.operands))
-        elif curr.mnemonic in _EFLAGS_PRESERVE:
-            pass  # These don't affect EFLAGS
-        elif curr.mnemonic in ("fcompi", "fcomip", "fucomi", "fucompi",
-                                "fucomip", "fcomi"):
-            # FPU compare-to-EFLAGS: sets CF, ZF, PF directly
-            last_flag_setter = curr.mnemonic
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic == "sahf":
-            # sahf loads AH into flags - typically after fnstsw ax
-            # in the fcomp/fnstsw/sahf pattern for FPU comparisons
-            last_flag_setter = "sahf"
-            last_flag_ops = list(curr.operands)
-        elif curr.mnemonic.startswith("f") or curr.mnemonic.startswith("cmov"):
-            pass  # FPU and already-handled CMOVcc
-        elif curr.mnemonic.startswith("j"):
-            pass  # Jumps don't set flags
-        elif curr.mnemonic.startswith("set"):
-            pass  # SETcc doesn't set flags
-        elif curr.mnemonic.startswith("rep"):
-            # rep movsb/movsd = data copy, preserves flags
-            # repe cmpsb/repne scasb = comparison, sets flags
-            rest = curr.op_str.strip() if hasattr(curr, 'op_str') else ""
-            raw_m = curr.mnemonic
-            # Every width sets flags, not just the byte forms: a
-            # `repe cmpsd` left the xor before it as the tracked setter, so
-            # the sbb that follows read the xor's CF instead of the compare's.
-            _cmp_forms = ("cmpsb", "cmpsw", "cmpsd",
-                          "scasb", "scasw", "scasd")
-            if any(f in raw_m for f in _cmp_forms):
-                last_flag_setter = raw_m
-                last_flag_ops = list(curr.operands)
-            elif any(f in rest for f in _cmp_forms):
-                last_flag_setter = raw_m
-                last_flag_ops = list(curr.operands)
-            else:
-                pass  # rep movs/stos = data movement, flags preserved
-        else:
-            # Unknown instruction - conservatively clear flag state
-            last_flag_setter = None
-            last_flag_ops = []
+        last_flag_setter, last_flag_ops = _track_flag_state(
+            curr, last_flag_setter, last_flag_ops)
 
         i += 1
 
+    if pending:
+        emit_materialised()
+    lifter.current_flag_setter = None
     out_flag_state = (last_flag_setter, last_flag_ops) if last_flag_setter else None
     return stmts, out_flag_state
