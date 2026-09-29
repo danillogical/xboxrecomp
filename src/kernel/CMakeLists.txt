@@ -19,6 +19,7 @@ set(KERNEL_SOURCES
     kernel_crypto.c
     kernel_thunks.c
     kernel_bridge.c
+    guest_meter.c
     xbox_memory_layout.c
     icall_feedback.c
     recomp_trace.c
@@ -70,4 +71,18 @@ if(BUILD_TESTING AND WIN32)
     target_link_libraries(xbox_timestamp_test PRIVATE platform kernel32)
     add_test(NAME xbox_timestamp_publication COMMAND xbox_timestamp_test)
     set_tests_properties(xbox_timestamp_publication PROPERTIES TIMEOUT 20)
+
+    add_executable(xbox_guest_meter_test
+        guest_meter.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/guest_meter_test.c
+    )
+    target_compile_definitions(xbox_guest_meter_test PRIVATE
+        XBOXRECOMP_GMETER_TEST_BUILD)
+    target_include_directories(xbox_guest_meter_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${XBOXRECOMP_SRC_DIR}
+    )
+    target_link_libraries(xbox_guest_meter_test PRIVATE platform kernel32)
+    add_test(NAME xbox_guest_meter COMMAND xbox_guest_meter_test)
+    set_tests_properties(xbox_guest_meter PROPERTIES TIMEOUT 60)
 endif()

@@ -19,6 +19,7 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "guest_meter.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -475,6 +476,7 @@ void xbox_kernel_shutdown(void)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
         "=== Xbox Kernel Replacement Layer shutting down ===");
+    xbox_GuestMeterSummary();
 
     /* Close log file */
     if (g_log_file) {

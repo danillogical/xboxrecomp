@@ -10,6 +10,7 @@
 #include "../platform/mmio_decode.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
+#include "../kernel/guest_meter.h"
 #include "usb_gamepad.h"
 
 #include <stdio.h>
@@ -761,7 +762,11 @@ static int ohci_call_isr(OhciController *hc)
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
 
-    fn();
+    {
+        int gm = xbox_GuestMeterEnter(XBOX_GM_USB_ISR);
+        fn();
+        xbox_GuestMeterRestore(gm, XBOX_GM_USB_ISR);
+    }
 
     xbox_worker_stack_free(slot);
     return (int)(g_eax & 1u);

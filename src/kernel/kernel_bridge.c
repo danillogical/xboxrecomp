@@ -31,6 +31,7 @@
 #include "nv2a_state.h"
 #include "nv2a_mmio_hook.h"
 #include "recomp_icall_feedback.h"
+#include "guest_meter.h"
 #include <stdio.h>
 /* stdlib.h is load-bearing, not tidiness. Without it C89 implicit declaration
  * makes malloc return `int`, so bridge_spawn_thread truncated its heap pointer
@@ -513,13 +514,17 @@ struct bridge_thread_start {
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
 
 static void bridge_run_thread_inline(recomp_func_t fn, uint32_t ctx1,
-                                     uint32_t ctx2)
+                                     uint32_t ctx2, int gm_source)
 {
+    int gm;
+
     g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx2;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = ctx1;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     g_seh_ebp = g_esp;
+    gm = xbox_GuestMeterEnter(gm_source);
     fn();
+    xbox_GuestMeterRestore(gm, gm_source);
     g_esp += 12;
 }
 
@@ -551,7 +556,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     recomp_diag_thread_start(ctx1, g_thread_stack_top + 16 - 512 * 1024,
                              g_thread_stack_top + 16);
 
-    bridge_run_thread_inline(fn, ctx1, ctx2);
+    bridge_run_thread_inline(fn, ctx1, ctx2, XBOX_GM_THREAD);
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
@@ -636,7 +641,11 @@ static void bridge_PsCreateSystemThreadEx(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-                fn();
+                {
+                    int gm = xbox_GuestMeterEnter(XBOX_GM_THREAD_INLINE);
+                    fn();
+                    xbox_GuestMeterRestore(gm, XBOX_GM_THREAD_INLINE);
+                }
                 g_esp += 12;
                 fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: main thread returned (g_eax=0x%08X)\n", g_eax);
                 fflush(stderr);
@@ -668,7 +677,8 @@ static void bridge_PsCreateSystemThreadEx(void)
                     fprintf(stderr, "  [KERNEL] RECOMP_WORKERS=inline: running "
                             "worker 0x%08X on this thread\n", start_routine);
                     fflush(stderr);
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    bridge_run_thread_inline(fn, start_context1, start_context2,
+                                             XBOX_GM_THREAD_INLINE);
                     return;
                 }
 
@@ -679,7 +689,8 @@ static void bridge_PsCreateSystemThreadEx(void)
                             "thread stacks, running worker 0x%08X inline\n",
                             start_routine);
                     fflush(stderr);
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    bridge_run_thread_inline(fn, start_context1, start_context2,
+                                             XBOX_GM_THREAD_INLINE);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top);
@@ -1791,7 +1802,11 @@ static void bridge_NtUserIoApcDispatcher(void)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = information;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = (status == 0) ? 0 : status;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    {
+        int gm = xbox_GuestMeterEnter(XBOX_GM_IO_APC_DISPATCH);
+        fn();
+        xbox_GuestMeterRestore(gm, XBOX_GM_IO_APC_DISPATCH);
+    }
 
     g_eax = 0;
 }
@@ -2001,10 +2016,12 @@ static void bridge_HalReadSMCTrayState(void)
  *
  * Returns 1 if the routine was found and called.
  */
-static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
+static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2,
+                          int gm_source)
 {
     uint32_t routine, context;
     recomp_func_t fn;
+    int gm;
 
     if (!dpc_va)
         return 0;
@@ -2030,7 +2047,9 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+    gm = xbox_GuestMeterEnter(gm_source);
     fn();
+    xbox_GuestMeterRestore(gm, gm_source);
     return 1;
 }
 
@@ -2070,7 +2089,11 @@ static void bridge_KeSynchronizeExecution(void)
      * the dummy return address and the argument, so g_esp needs no fixup. */
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    {
+        int gm = xbox_GuestMeterEnter(XBOX_GM_SYNC_EXEC);
+        fn();
+        xbox_GuestMeterRestore(gm, XBOX_GM_SYNC_EXEC);
+    }
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
@@ -2165,7 +2188,11 @@ static int kernel_raise_interrupt(uint32_t vector)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-    fn();
+    {
+        int gm = xbox_GuestMeterEnter(XBOX_GM_ISR);
+        fn();
+        xbox_GuestMeterRestore(gm, XBOX_GM_ISR);
+    }
     return (int)(g_eax & 1u);
 }
 
@@ -2257,7 +2284,7 @@ static void kernel_drain_dpcs(void)
         LONG head = g_dpc_head;
         PendingDpc d = g_dpc_queue[head];
         g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
-        kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+        kernel_run_dpc(d.dpc, d.arg1, d.arg2, XBOX_GM_DPC);
     }
 }
 
@@ -2565,7 +2592,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 
             /* Outside the lock: the routine can set or cancel timers. */
             if (dpc)
-                kernel_run_dpc(dpc, 0, 0);
+                kernel_run_dpc(dpc, 0, 0, XBOX_GM_TIMER_DPC);
 
             /* Wake anyone parked on the timer's shadow event; a timer with no
              * DPC is just a kernel sleep. */
@@ -3130,6 +3157,7 @@ static void bridge_NtOpenFile(void)
  * dropped rather than risk changing this shared path for the other titles.
  */
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
+static void kernel_thunk_dispatch(void);
 
 static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
                             uint32_t iostatus)
@@ -3147,7 +3175,13 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
         g_esp -= 4; BRIDGE_MEM32(g_esp) = iostatus;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = apc_context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;   /* dummy return address */
-        fn();
+        {
+            /* A kernel-export APC runs no guest code; the dispatch meters it. */
+            int gm = (fn != kernel_thunk_dispatch)
+                   ? xbox_GuestMeterEnter(XBOX_GM_IO_APC) : 0;
+            fn();
+            xbox_GuestMeterRestore(gm, XBOX_GM_IO_APC);
+        }
         g_esp += 12;
     } else {
         uint32_t ord = 0;
@@ -3293,7 +3327,12 @@ static void bridge_RtlUnwind(void)
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = reg;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = exc_record;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;  /* return address */
-                fn();
+                {
+                    int gm = (fn != kernel_thunk_dispatch)
+                           ? xbox_GuestMeterEnter(XBOX_GM_SEH_UNWIND) : 0;
+                    fn();
+                    xbox_GuestMeterRestore(gm, XBOX_GM_SEH_UNWIND);
+                }
                 /* 16, not 20: the handler's own `ret` has already taken the
                  * return address off, leaving just the four arguments for the
                  * caller to drop. Cleaning 20 leaves esp four bytes high, and
@@ -7549,23 +7588,28 @@ static void bridge_PsCreateSystemThread(void)
             fn = recomp_lookup_manual(start_routine);
         if (fn) {
             if (is_first_call) {
+                int gm;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
+                gm = xbox_GuestMeterEnter(XBOX_GM_THREAD_INLINE);
                 fn();
+                xbox_GuestMeterRestore(gm, XBOX_GM_THREAD_INLINE);
                 g_esp += 12;
             } else {
                 const char *inline_workers = getenv("RECOMP_WORKERS");
                 uint32_t stack_top;
 
                 if (inline_workers && !strcmp(inline_workers, "inline")) {
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    bridge_run_thread_inline(fn, start_context1, start_context2,
+                                             XBOX_GM_THREAD_INLINE);
                     g_eax = 0;
                     return;
                 }
                 stack_top = xbox_AllocThreadStack();
                 if (!stack_top) {
-                    bridge_run_thread_inline(fn, start_context1, start_context2);
+                    bridge_run_thread_inline(fn, start_context1, start_context2,
+                                             XBOX_GM_THREAD_INLINE);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top);
@@ -9276,11 +9320,14 @@ static void kernel_thunk_dispatch(void)
     int slot = g_kernel_dispatch_slot;
     bridge_func_t bridge;
     ULONG ordinal;
+    /* The calling thread leaves guest code here and re-enters on return. */
+    int gm = xbox_GuestMeterLeave();
 
     if (slot < 0 || slot >= XBOX_KERNEL_THUNK_TABLE_SIZE) {
         fprintf(stderr, "  [KERNEL] bad slot %d\n", slot);
         g_eax = 0;
         g_esp += 4;  /* pop dummy return address */
+        xbox_GuestMeterRestore(gm, XBOX_GM_KERNEL);
         return;
     }
 
@@ -9338,6 +9385,7 @@ static void kernel_thunk_dispatch(void)
                 }
             }
             fflush(stderr);
+            xbox_GuestMeterSummary();
             last_summary_tick = now;
         }
     }
@@ -9475,6 +9523,7 @@ static void kernel_thunk_dispatch(void)
         fprintf(stderr, "  [KERNEL] → returned 0x%08X\n", g_eax);
         fflush(stderr);
     }
+    xbox_GuestMeterRestore(gm, XBOX_GM_KERNEL);
 }
 
 /* ── Dispatch lookup ────────────────────────────────────── */
