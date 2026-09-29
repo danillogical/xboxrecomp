@@ -5129,6 +5129,9 @@ static int g_heap_alloc_count = 0;
 #define XBOX_HEAP_MAX_BLOCKS 65536
 static struct kmem_block g_heap_blocks[XBOX_HEAP_MAX_BLOCKS];
 static int g_heap_block_count = 0;
+/* Guest threads, DPCs and bridges allocate and free concurrently; every heap
+ * entry point takes this, and none calls another while holding it. */
+static SRWLOCK g_heap_lock = SRWLOCK_INIT;
 
 static struct kmem_alloc_counters g_kmem_alloc;
 
@@ -5370,7 +5373,7 @@ uint32_t xbox_ContiguousAllocatedBytes(void)
 }
 
 
-uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
@@ -5472,13 +5475,23 @@ uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
     return result;
 }
 
+uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
+{
+    uint32_t r;
+
+    AcquireSRWLockExclusive(&g_heap_lock);
+    r = heap_alloc_locked(size, alignment);
+    ReleaseSRWLockExclusive(&g_heap_lock);
+    return r;
+}
+
 /* Reserve exactly [base, base+size) in the heap, for a MEM_RESERVE that names
  * its address: the caller compares what comes back with what it asked for, so
  * this answers with that range or nothing. Free means untouched tail, one free
  * block, or a free last block running into the tail (kmem_heap_carve). Returns
  * 1 with the range zeroed and recorded as a live block, 0 when some of it is
  * not free, KMEM_TABLE_FULL when the block table cannot record it. */
-int xbox_HeapReserveAt(uint32_t base, uint32_t size)
+static int heap_reserve_at_locked(uint32_t base, uint32_t size)
 {
     int r = kmem_heap_carve(g_heap_blocks, &g_heap_block_count,
                             XBOX_HEAP_MAX_BLOCKS, &g_heap_next,
@@ -5495,6 +5508,16 @@ int xbox_HeapReserveAt(uint32_t base, uint32_t size)
     return r;
 }
 
+int xbox_HeapReserveAt(uint32_t base, uint32_t size)
+{
+    int r;
+
+    AcquireSRWLockExclusive(&g_heap_lock);
+    r = heap_reserve_at_locked(base, size);
+    ReleaseSRWLockExclusive(&g_heap_lock);
+    return r;
+}
+
 /* How big is the block at this guest address?
  *
  * MmQueryAllocationSize and ExQueryPoolBlockSize both ask this, and both used
@@ -5508,7 +5531,7 @@ int xbox_HeapReserveAt(uint32_t base, uint32_t size)
  * forward is asking about the block that contains it. Returns 0 for an address
  * this heap never handed out, which is what "not one of mine" has to look like.
  */
-uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+static uint32_t heap_block_size_locked(uint32_t xbox_va)
 {
     int i;
 
@@ -5524,7 +5547,17 @@ uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
     return 0;
 }
 
-void xbox_HeapFree(uint32_t xbox_va)
+uint32_t xbox_HeapBlockSize(uint32_t xbox_va)
+{
+    uint32_t r;
+
+    AcquireSRWLockShared(&g_heap_lock);
+    r = heap_block_size_locked(xbox_va);
+    ReleaseSRWLockShared(&g_heap_lock);
+    return r;
+}
+
+static void heap_free_locked(uint32_t xbox_va)
 {
     static int frees = 0, matched = 0;
 
@@ -5566,6 +5599,13 @@ void xbox_HeapFree(uint32_t xbox_va)
         }
         return;
     }
+}
+
+void xbox_HeapFree(uint32_t xbox_va)
+{
+    AcquireSRWLockExclusive(&g_heap_lock);
+    heap_free_locked(xbox_va);
+    ReleaseSRWLockExclusive(&g_heap_lock);
 }
 
 HANDLE xbox_GetMappingHandle(void)
