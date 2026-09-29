@@ -825,27 +825,33 @@ static uint32_t g_pgraph_flip_count = 0;
 static uint32_t g_pgraph_inline_verts = 0;
 static int g_pgraph_in_begin = 0;
 
-/* NV097 method constants for dispatch */
-#define M_NO_OPERATION          0x0100
-#define M_SET_SURFACE_FORMAT    0x0208
-#define M_SET_SURFACE_PITCH     0x020C
-#define M_SET_SURFACE_COLOR_OFF 0x0210
-#define M_SET_SURFACE_ZETA_OFF  0x0214
-#define M_SET_SURFACE_CLIP_H    0x0200
-#define M_SET_SURFACE_CLIP_V    0x0204
-#define M_CLEAR_SURFACE         0x01D0
-#define M_SET_COLOR_CLEAR_VALUE 0x01D4
-#define M_SET_BEGIN_END         0x17FC
-#define M_INLINE_ARRAY          0x1818
-#define M_FLIP_INCREMENT_WRITE  NV097_FLIP_INCREMENT_WRITE
-#define M_FLIP_STALL            NV097_FLIP_STALL
-#define M_SET_VIEWPORT_OFFSET   0x0A20
-#define M_SET_VIEWPORT_SCALE    0x0AF0
+/* Class ids JSRF binds. Whether a method may be executed, and what it means,
+ * is a per-class decision: 0x2FC is NV09F_SET_OPERATION and an NV097 surface
+ * method, and both appear in JSRF's stream. */
+#define NV097_CLASS         0x97u
+#define NV_MEMCPY_CLASS     0x39u   /* NV_MEMORY_TO_MEMORY_FORMAT */
+#define NV_SURFACES2D_CLASS 0x62u   /* NV_CONTEXT_SURFACES_2D */
+#define NV_IMAGEBLIT_CLASS  0x9Fu   /* NV_IMAGE_BLIT */
 
 void pgraph_method(NV2AState *d, uint32_t subchannel,
                    uint32_t method, uint32_t param)
 {
+    /* The translator and the counters below read NV097 method numbers. A
+     * subchannel bound to another class would be misread as Kelvin, so its
+     * methods only count as unhandled. Class 0 is a subchannel no SET_OBJECT
+     * bound (the replay and test generators), which keeps the Kelvin reading
+     * those generators were written for. */
+    uint32_t class_id = subchannel < 8 ? d->pfifo.binding_class[subchannel] : 0;
+
     g_pgraph_method_count++;
+
+    if (class_id != 0 && class_id != NV097_CLASS) {
+        if (g_pgraph_method_count <= 20 || (g_pgraph_method_count % 5000) == 0) {
+            fprintf(stderr, "[PGRAPH] #%u UNHANDLED sub=%u class=0x%02X 0x%04X = 0x%08X\n",
+                    g_pgraph_method_count, subchannel, class_id, method, param);
+        }
+        return;
+    }
 
     /* Route through D3D11 translator first */
     if (pgraph_d3d11_method(subchannel, method, param)) {
@@ -869,11 +875,11 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
 
     /* Track high-level operations (legacy counters) */
     switch (method) {
-    case M_CLEAR_SURFACE:
+    case NV097_CLEAR_SURFACE:
         g_pgraph_clear_count++;
         break;
 
-    case M_SET_BEGIN_END:
+    case NV097_SET_BEGIN_END:
         if (param != 0) {
             g_pgraph_in_begin = 1;
             g_pgraph_draw_count++;
@@ -882,13 +888,13 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
         }
         break;
 
-    case M_INLINE_ARRAY:
+    case NV097_INLINE_ARRAY:
         if (g_pgraph_in_begin) {
             g_pgraph_inline_verts++;
         }
         break;
 
-    case M_FLIP_INCREMENT_WRITE:
+    case NV097_FLIP_INCREMENT_WRITE:
         g_pgraph_flip_count++;
         if (g_pgraph_flip_count <= 5 || (g_pgraph_flip_count % 300) == 0) {
             fprintf(stderr, "[PGRAPH] Frame %u: %u methods, %u draws, %u clears, %u inline verts\n",
@@ -927,14 +933,6 @@ enum {
  * original 0x001945D6 hash into the claimed PRAMIN table; the fixture seam
  * remains test-only. */
 #define M_SET_OBJECT 0x0000u
-#define NV097_CLASS  0x97u
-/* The other classes JSRF binds, named here because whether a method may be
- * executed is a per-class decision. nv2a_regs.h carries all four; the walk
- * previously knew only NV097, so a subchannel bound to the blit engine could
- * never be accepted no matter what it submitted. */
-#define NV_MEMCPY_CLASS     0x39u   /* NV_MEMORY_TO_MEMORY_FORMAT */
-#define NV_SURFACES2D_CLASS 0x62u   /* NV_CONTEXT_SURFACES_2D */
-#define NV_IMAGEBLIT_CLASS  0x9Fu   /* NV_IMAGE_BLIT */
 
 /* Is this a method this model can execute on a subchannel bound to class_id?
  *

@@ -34,3 +34,23 @@ target_link_libraries(xbox_nv2a PRIVATE platform)
 if(WIN32)
     target_link_libraries(xbox_nv2a PRIVATE kernel32)
 endif()
+
+if(BUILD_TESTING)
+    # The walk and the PGRAPH interrupt registers, driven through the real MMIO
+    # entry points. The D3D11 translator is replaced by a recorder in the test.
+    add_executable(nv2a_actions_test
+        nv2a_core.c
+        nv2a_method_table.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/nv2a_actions_test.c
+    )
+    target_include_directories(nv2a_actions_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(NOT MSVC)
+        target_compile_options(nv2a_actions_test PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+    target_link_libraries(nv2a_actions_test PRIVATE platform)
+    if(WIN32)
+        target_link_libraries(nv2a_actions_test PRIVATE kernel32)
+    endif()
+    add_test(NAME nv2a_actions COMMAND nv2a_actions_test)
+    set_tests_properties(nv2a_actions PROPERTIES TIMEOUT 20)
+endif()

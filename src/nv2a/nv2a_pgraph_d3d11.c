@@ -69,33 +69,13 @@ static IDirect3DTexture8 *create_dxt5_texture(IDirect3DDevice8 *dev,
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- * NV2A method constants (from nv2a_regs.h, subset for translator)
+ * NV2A method numbers come from nv2a_regs.h, included above.
+ *
+ * Do not add local copies here: a local #define of an NV097_* name is a
+ * redefinition of the header's, the later one wins, and a wrong value makes
+ * its handler key on a method the hardware never sends. Every per-stage
+ * texture method below repeats at a 0x40 stride.
  * ══════════════════════════════════════════════════════════════════════ */
-
-#define NV097_SET_BEGIN_END             0x17FC
-#define NV097_INLINE_ARRAY              0x1818
-#define NV097_CLEAR_SURFACE             0x01D0
-#define NV097_SET_COLOR_CLEAR_VALUE     0x01D4
-#define NV097_SET_CLEAR_RECT_HORIZONTAL 0x01D8
-#define NV097_SET_CLEAR_RECT_VERTICAL   0x01DC
-
-#define NV097_SET_DEPTH_TEST_ENABLE     0x0354
-#define NV097_SET_BLEND_ENABLE          0x0304
-#define NV097_SET_BLEND_FUNC_SFACTOR    0x0344
-#define NV097_SET_BLEND_FUNC_DFACTOR    0x0348
-#define NV097_SET_CULL_FACE_ENABLE      0x039C
-#define NV097_SET_ALPHA_TEST_ENABLE     0x0300
-#define NV097_SET_COLOR_MASK            0x0358
-#define NV097_SET_SHADE_MODE            0x0368
-
-#define NV097_SET_VIEWPORT_OFFSET       0x0A20
-#define NV097_SET_VIEWPORT_SCALE        0x0AF0
-#define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
-#define NV097_SET_SURFACE_CLIP_VERTICAL 0x0204
-
-#define NV097_SET_TEXTURE_OFFSET        0x1B00  /* +0x40 per stage */
-#define NV097_SET_TEXTURE_FORMAT        0x1B04  /* +0x40 per stage */
-#define NV097_SET_TEXTURE_CONTROL0      0x1B08  /* +0x40 per stage */
 
 /* NV2A draw modes → D3D primitive types */
 static int nv2a_draw_mode_to_d3d(uint32_t mode) {
@@ -171,9 +151,9 @@ static struct {
 
     /* Texture state per stage (4 stages) */
     struct {
-        uint32_t offset;     /* NV2A VRAM offset (method 0x1B00) */
-        uint32_t format;     /* Format register (method 0x1B04) */
-        uint32_t control0;   /* Control0 register (method 0x1B08) */
+        uint32_t offset;     /* NV097_SET_TEXTURE_OFFSET */
+        uint32_t format;     /* NV097_SET_TEXTURE_FORMAT */
+        uint32_t control0;   /* NV097_SET_TEXTURE_CONTROL0 */
         int enabled;         /* Decoded from control0 bit 30 */
     } tex[4];
 
@@ -607,18 +587,20 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
     }
 
     default:
-        /* Check if it's in a known range we can safely ignore */
-        if ((method >= 0x0B80 && method < 0x0C00) ||  /* Transform program */
-            (method >= 0x0E00 && method < 0x1000) ||  /* Transform constants */
-            (method >= 0x1680 && method < 0x1780) ||  /* Vertex array format/offset */
-            (method >= 0x1B00 && method < 0x1C00) ||  /* Texture registers */
-            (method >= 0x1D60 && method < 0x1EA0) ||  /* Combiners */
-            method == 0x0100 ||                        /* NOP */
-            method == 0x0180 ||                        /* SET_OBJECT */
-            method == 0x0394 ||                        /* TRANSFORM_EXECUTION_MODE */
-            method == 0x0398 ||                        /* TRANSFORM_PROGRAM_CXT_WRITE_EN */
-            method == 0x039C ||                        /* TRANSFORM_PROGRAM_LOAD */
-            method == 0x01E0 ||                        /* SHADER_STAGE_PROGRAM */
+        /* Known ranges acknowledged without an effect. The explicit cases
+         * above take precedence, which is what keeps the clear family out of
+         * the 0x1D60 range. */
+        if ((method >= 0x0B80 && method < 0x0C00) ||  /* transform constants */
+            (method >= 0x0E00 && method < 0x1000) ||
+            (method >= 0x1680 && method < 0x1780) ||  /* vertex attributes */
+            (method >= 0x1B00 && method < 0x1C00) ||  /* texture stages */
+            (method >= 0x1D60 && method < 0x1EA0) ||  /* semaphore, clear, combiner, transform control */
+            method == NV097_NO_OPERATION ||
+            method == NV097_SET_CONTEXT_DMA_NOTIFIES ||
+            method == NV097_SET_CLIP_MIN ||
+            method == NV097_SET_CLIP_MAX ||
+            method == NV097_SET_CULL_FACE ||
+            method == 0x01E0 ||                        /* no NV097 name in nv2a_regs.h */
             method == NV097_SET_FLIP_READ ||           /* 0x0120 */
             method == NV097_SET_FLIP_WRITE ||          /* 0x0124 */
             method == NV097_SET_FLIP_MODULO ||         /* 0x0128 */
