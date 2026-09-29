@@ -215,6 +215,9 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             case ERROR_FILE_NOT_FOUND: return STATUS_OBJECT_NAME_NOT_FOUND;
             case ERROR_PATH_NOT_FOUND: return STATUS_OBJECT_PATH_NOT_FOUND;
             case ERROR_ACCESS_DENIED:  return STATUS_ACCESS_DENIED;
+            /* CREATE_NEW on an existing file fails with ERROR_FILE_EXISTS;
+             * ERROR_ALREADY_EXISTS is what an existing directory gives. */
+            case ERROR_FILE_EXISTS:
             case ERROR_ALREADY_EXISTS: return STATUS_OBJECT_NAME_COLLISION;
             default:                   return STATUS_UNSUCCESSFUL;
         }
