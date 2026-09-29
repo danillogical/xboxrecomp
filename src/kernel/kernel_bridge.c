@@ -371,7 +371,12 @@ static ULONG g_slot_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE];
 /* Calls per ordinal, for the ranking in the periodic summary. 378 counters
  * is smaller than one of the strings this file prints. */
 static RECOMP_TLS unsigned long long g_ordinal_calls[XBOX_KERNEL_THUNK_TABLE_SIZE];
-static RECOMP_TLS int g_kernel_call_count = 0;
+/* 64-bit: a title that polls the clock through the kernel passes 2^31 calls
+ * within minutes (X-Men Legends does). As a 32-bit int it wrapped negative,
+ * "count <= log budget" turned true, and every kernel call then wrote two log
+ * lines through the shared stderr lock -- the frame rate fell to ~1 FPS.
+ * Per-thread (RECOMP_TLS) as before: the A2h series are per-thread windows. */
+static RECOMP_TLS long long g_kernel_call_count = 0;
 
 /* How many kernel calls get logged before the log goes quiet.
  *
@@ -2646,6 +2651,9 @@ static void bridge_RtlNtStatusToDosError(void)
     case 0xC0000023: g_eax = 122; break;        /* STATUS_BUFFER_TOO_SMALL → ERROR_INSUFFICIENT_BUFFER */
     case 0xC0000035: g_eax = 183; break;        /* STATUS_OBJECT_NAME_COLLISION → ERROR_ALREADY_EXISTS */
     case 0xC00000BB: g_eax = 50; break;         /* STATUS_NOT_SUPPORTED → ERROR_NOT_SUPPORTED */
+    /* The CRT heap-grow path retries at a new address only on
+     * ERROR_INVALID_ADDRESS; any other answer makes it give up. */
+    case 0xC0000018: g_eax = 487; break;        /* STATUS_CONFLICTING_ADDRESSES → ERROR_INVALID_ADDRESS */
 
     default:         g_eax = 317; break;         /* ERROR_MR_MID_NOT_FOUND (generic) */
     }
@@ -2773,6 +2781,12 @@ static HANDLE bridge_resolve_handle(uint32_t token)
         uint32_t i = token & BRIDGE_HANDLE_MASK;
         return (i > 0 && i < BRIDGE_HANDLE_MAX) ? s_handle_table[i] : NULL;
     }
+    /* Pseudo-handles (NtCurrentProcess() = -1, NtCurrentThread() = -2) are
+     * negative. Zero-extending them on a 64-bit host yields 0x00000000FFFFFFFE,
+     * which Win32 rejects: X-Men Legends' CRT duplicates NtCurrentThread()
+     * and spun forever on the STATUS_UNSUCCESSFUL that came back. */
+    if (token >= 0xFFFFFFF0u)
+        return (HANDLE)(intptr_t)(int32_t)token;
     /* Untagged: synthetic/dummy handle -- pass through unchanged. */
     return (HANDLE)(uintptr_t)token;
 }
@@ -5019,6 +5033,13 @@ static void bridge_NtDuplicateObject(void)
 
     if (!DuplicateHandle(GetCurrentProcess(), src, GetCurrentProcess(),
                          &dup, 0, FALSE, opts)) {
+        static int logged = 0;
+        if (logged++ < 8) {
+            fprintf(stderr, "  [KERNEL] NtDuplicateObject: token=0x%08X "
+                    "handle=%p failed (error %lu)\n",
+                    STACK_ARG(0), src, (unsigned long)GetLastError());
+            fflush(stderr);
+        }
         g_eax = 0xC0000001u;   /* STATUS_UNSUCCESSFUL */
         return;
     }
@@ -9377,7 +9398,7 @@ static void kernel_thunk_dispatch(void)
          * counter -- so `#N` restarts per thread and an unattributed series cannot support
          * per-thread windows or negatives. */
         fprintf(stderr,
-                "  [KERNEL] #%d: ordinal %u (slot %d) esp=0x%08X ret=0x%08X tid=%lu\n",
+                "  [KERNEL] #%lld: ordinal %u (slot %d) esp=0x%08X ret=0x%08X tid=%lu\n",
                 g_kernel_call_count, ordinal, slot, g_esp,
                 g_esp ? BRIDGE_MEM32(g_esp) : 0, GetCurrentThreadId());
         fflush(stderr);
@@ -9388,7 +9409,7 @@ static void kernel_thunk_dispatch(void)
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
-            fprintf(stderr, "  [KERNEL] summary: %d total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
+            fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
                     g_kernel_call_count, ordinal, slot, g_esp);
             /* And which ones, ranked. "Latest" names whatever the sample
              * happened to land on; the question behind this line is what a
@@ -9452,7 +9473,7 @@ static void kernel_thunk_dispatch(void)
                 /* tid is printed because the dispatch counter is RECOMP_TLS, i.e. per-thread:
                  * an unattributed series cannot support per-thread windows or negatives. */
                 fprintf(stderr, "  [KWATCH] tid=%lu 0x%08X = %08X before ordinal %u"
-                                " (call #%d)\n",
+                                " (call #%lld)\n",
                         GetCurrentThreadId(), g_kernel_watch_va, _watch_before, ordinal,
                         g_kernel_call_count);
                 fflush(stderr);
@@ -9471,7 +9492,7 @@ static void kernel_thunk_dispatch(void)
      * the presence OR absence of one. See src/diagnostics.c for why the storage lives there. */
     if (a2h_slot_trace_on()) {
         _a2h_before = BRIDGE_MEM32(A2H_SLOT_VA);
-        fprintf(stderr, "  [A2HSLOT] tid=%lu call=#%d ordinal=%u slot=%08X value=%08X phase=before\n",
+        fprintf(stderr, "  [A2HSLOT] tid=%lu call=#%lld ordinal=%u slot=%08X value=%08X phase=before\n",
                 GetCurrentThreadId(), g_kernel_call_count, ordinal, A2H_SLOT_VA, _a2h_before);
         fflush(stderr);
     }
@@ -9518,7 +9539,7 @@ static void kernel_thunk_dispatch(void)
             /* tid and call index are printed here too: this is the line that names a bridge as
              * the changer, and without attribution it cannot support a per-thread row. */
             fprintf(stderr,
-                    "  [KWATCH] tid=%lu call=#%d ordinal %u changed Xbox VA 0x%08X: "
+                    "  [KWATCH] tid=%lu call=#%lld ordinal %u changed Xbox VA 0x%08X: "
                     "%08X -> %08X\n",
                     GetCurrentThreadId(), g_kernel_call_count, ordinal, g_kernel_watch_va,
                     _watch_before, _after);
@@ -9535,7 +9556,7 @@ static void kernel_thunk_dispatch(void)
      * performs the observation. */
     if (a2h_slot_trace_on()) {
         uint32_t _a2h_after = BRIDGE_MEM32(A2H_SLOT_VA);
-        fprintf(stderr, "  [A2HSLOT] tid=%lu call=#%d ordinal=%u slot=%08X value=%08X phase=after\n",
+        fprintf(stderr, "  [A2HSLOT] tid=%lu call=#%lld ordinal=%u slot=%08X value=%08X phase=after\n",
                 GetCurrentThreadId(), g_kernel_call_count, ordinal, A2H_SLOT_VA, _a2h_after);
         fflush(stderr);
         jsrf_slot_latch_sample(GetCurrentThreadId(), (uint32_t)g_kernel_call_count,
