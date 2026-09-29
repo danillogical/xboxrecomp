@@ -2815,6 +2815,8 @@ class BatchTranslator:
         # Kept separate from alias_parent so the dispatch writer can rewrite the
         # pointer without re-deriving the parent from the address.
         _alias_dispatch = {}
+        # alias VA -> the owner's VA, for the dispatch writer's alias observer.
+        _alias_owner = {}
         # The parent's *name* is needed for the dispatch tuple, and func_list is
         # consumed as an iterator below, so index it first.
         func_list_by_addr = {a: i for a, i in func_list}
@@ -2928,6 +2930,7 @@ class BatchTranslator:
                     _parent_info = func_list_by_addr.get(_owner, {})
                     _alias_dispatch[addr] = _parent_info.get(
                         "name", f"sub_{_owner:08X}")
+                    _alias_owner[addr] = _owner
                 manual_decls[addr] = name
                 stats["alias_entries"] = stats.get("alias_entries", 0) + 1
                 continue
@@ -3185,7 +3188,8 @@ class BatchTranslator:
             key=lambda e: e[0])
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")
         self._write_dispatch_table(dispatch_entries, dispatch_path, header_name,
-                                   alias_redirect=_alias_dispatch)
+                                   alias_redirect=_alias_dispatch,
+                                   alias_owner=_alias_owner)
         generated_files.append(dispatch_path)
 
         stats["files"] = generated_files
@@ -3193,8 +3197,78 @@ class BatchTranslator:
         stats["chunk_size"] = chunk_size
         return stats
 
+    @staticmethod
+    def _alias_observer_lines(observed):
+        """C for the alias-entry observer in the dispatch unit.
+
+        An alias VA is dispatched to its owner's symbol, so an indirect call to
+        it runs the owner from its start rather than from the alias. Nothing
+        here changes that; it makes it visible. Each alias entry is routed
+        through a wrapper that bumps g_recomp_alias_icall_count (a lossless
+        64-bit total, always defined so a debugger can read it by name) and
+        that alias's slot in g_recomp_alias_icall_hits, prints the first eight
+        distinct aliases reached as `[ALIAS-ICALL] target=... owner=...`, and
+        then calls the owner exactly as the plain entry did. The wrapper runs
+        on a call, not on a lookup, so address probes of recomp_lookup are
+        not counted. `observed` is a list of (alias VA, owner VA, owner symbol).
+        """
+        out = [
+            "/* ----------------------------------------------------------------",
+            " * Alias-entry observer.",
+            " *",
+            " * An alias VA (a secondary entry inside another function's body) is",
+            " * dispatched to its owner's symbol, so a call to it runs the owner",
+            " * from its START. These wrappers count such calls and print the first",
+            " * eight distinct ones; the behaviour is otherwise unchanged.",
+            " * ---------------------------------------------------------------- */",
+            "#include <stdio.h>",
+            "volatile uint64_t g_recomp_alias_icall_count = 0;",
+            f"const uint32_t g_recomp_alias_icall_entries = {len(observed)}u;",
+        ]
+        if not observed:
+            return out + [""]
+        out += [
+            "#if defined(__GNUC__) || defined(__clang__)",
+            "#define RECOMP_ALIAS_INC64(p) __atomic_add_fetch((p), 1, __ATOMIC_RELAXED)",
+            "#define RECOMP_ALIAS_FIRST(p) (__atomic_exchange_n((p), 1, __ATOMIC_RELAXED) == 0)",
+            "#elif defined(_MSC_VER)",
+            "#include <intrin.h>",
+            "#define RECOMP_ALIAS_INC64(p) ((uint64_t)_InterlockedIncrement64((volatile __int64 *)(p)))",
+            "#define RECOMP_ALIAS_FIRST(p) (_InterlockedExchange8((volatile char *)(p), 1) == 0)",
+            "#else",
+            "#define RECOMP_ALIAS_INC64(p) (++*(p))",
+            "#define RECOMP_ALIAS_FIRST(p) (*(p) ? 0 : (*(p) = 1))",
+            "#endif",
+            "/* {alias VA, owner VA}, in the order of g_recomp_alias_icall_hits. */",
+            "const uint32_t g_recomp_alias_icall_map[][2] = {",
+        ]
+        out += [f"    {{ 0x{addr:08X}u, 0x{owner:08X}u }},"
+                for addr, owner, _ in observed]
+        out += [
+            "};",
+            f"volatile uint64_t g_recomp_alias_icall_hits[{len(observed)}];",
+            f"static volatile char g_recomp_alias_seen[{len(observed)}];",
+            "static volatile uint64_t g_recomp_alias_printed;",
+            "",
+            "static void recomp_alias_observe(uint32_t i)",
+            "{",
+            "    RECOMP_ALIAS_INC64(&g_recomp_alias_icall_count);",
+            "    RECOMP_ALIAS_INC64(&g_recomp_alias_icall_hits[i]);",
+            "    if (RECOMP_ALIAS_FIRST(&g_recomp_alias_seen[i])",
+            "            && RECOMP_ALIAS_INC64(&g_recomp_alias_printed) <= 8)",
+            "        fprintf(stderr, \"[ALIAS-ICALL] target=0x%08X owner=0x%08X\\n\",",
+            "                (unsigned)g_recomp_alias_icall_map[i][0],",
+            "                (unsigned)g_recomp_alias_icall_map[i][1]);",
+            "}",
+            "",
+        ]
+        for i, (addr, owner, symbol) in enumerate(observed):
+            out.append(f"static void recomp_alias_{addr:08X}(void) "
+                       f"{{ recomp_alias_observe({i}u); {symbol}(); }}")
+        return out + [""]
+
     def _write_dispatch_table(self, translations, output_path, header_name,
-                              alias_redirect=None):
+                              alias_redirect=None, alias_owner=None):
         """
         Generate a dispatch table mapping Xbox VA -> function pointer.
 
@@ -3205,8 +3279,19 @@ class BatchTranslator:
         never emitted, so its own name has no address; naming the parent is what
         keeps the entry linkable. The VA is left alone, so an indirect branch to
         the alias address still resolves.
+
+        alias_owner maps the same alias VAs to their owner's VA. Each such
+        alias is dispatched through a small generated wrapper that counts the
+        call and then runs the owner from its start, which is what an alias
+        entry does today; see _alias_observer_lines.
         """
         alias_redirect = alias_redirect or {}
+        alias_owner = alias_owner or {}
+        observed = [(addr, alias_owner[addr], alias_redirect[addr])
+                    for addr, _, _ in translations
+                    if addr in alias_redirect and addr in alias_owner
+                    and alias_owner[addr] != addr]
+        observed_index = {addr: i for i, (addr, _, _) in enumerate(observed)}
         lines = [
             "/**",
             # getattr: the dispatch writer is exercised directly by tests
@@ -3231,14 +3316,17 @@ class BatchTranslator:
             "    recomp_func_t func;",
             "} recomp_entry_t;",
             "",
-            f"static const recomp_entry_t g_recomp_table[] = {{",
         ]
+        lines.extend(self._alias_observer_lines(observed))
+        lines.append(f"static const recomp_entry_t g_recomp_table[] = {{")
 
         for addr, name, _ in translations:
             # A tail_jump_alias has no body of its own; its dispatch entry must
             # name the parent that does. The VA stays the alias address so an
             # indirect branch to the alias still lands on a real function.
             dispatch_name = alias_redirect.get(addr, name)
+            if addr in observed_index:
+                dispatch_name = f"recomp_alias_{addr:08X}"
             lines.append(f"    {{ 0x{addr:08X}u, (recomp_func_t){dispatch_name} }},")
 
         addrs = [addr for addr, _, _ in translations]
