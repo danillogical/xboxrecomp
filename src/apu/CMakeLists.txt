@@ -8,7 +8,7 @@
 
 # The pinned xemu DSP56300 core, vendored byte-for-byte from
 # 67cc79e663038d1f55448c0f566b37dde016adf6 under src/apu/dsp/. Per-file
-# provenance, SHA-256 and licence are in docs/reviews/a4b-xemu-pin.md.
+# provenance, SHA-256 and licence are in src/apu/dsp/PROVENANCE.md.
 #
 # dsp_jit.* is deliberately ABSENT: the JIT backend is an A4b1 non-goal, and
 # dsp.c/dsp_internal.h carry marked local modifications that remove the

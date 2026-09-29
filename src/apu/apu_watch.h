@@ -7,8 +7,8 @@
  * log line: the ledger is a small device-side struct updated at the event by
  * the code that performs the event, so it cannot lose the deciding event.
  *
- * Design authority: docs/reviews/a4b-watch-ledger-ruling.md (Device semantics
- * 5, 6, 7) and docs/reviews/a4b-gpin-accounting-ruling.md (the finite-universe
+ * Design authority: src/apu/GP-INTEGRATION.md (Device semantics
+ * 5, 6, 7, and its ledger and finite-universe
  * input accounting). The retired r3 mechanism -- the 256-entry table, the
  * GPIN_OVERFLOW latch, per-key [GPIN] lines and the cut-off -- does not appear
  * here or in apu_watch.c, by ruling.

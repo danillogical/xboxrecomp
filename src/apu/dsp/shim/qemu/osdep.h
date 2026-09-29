@@ -9,7 +9,7 @@
  * path onto the toolkit's existing QEMU shim (src/nv2a/qemu_shim.h, reached
  * through src/apu/apu_shim.h) and defines nothing of its own that could invent
  * device behaviour. The surface was inventoried rather than assumed -- see
- * docs/reviews/a4b1-execution-evidence.md, "Step 2 prerequisite".
+ * src/apu/dsp/PROVENANCE.md, "QEMU shim surface".
  */
 
 #ifndef XBOXRECOMP_SHIM_QEMU_OSDEP_H

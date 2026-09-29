@@ -1,5 +1,5 @@
 /*
- * AC-FIX fixture -- A4b1 step 8 (docs/packets/a4b1-gp-core-port.md, A4b1-r4).
+ * AC-FIX fixture -- JSRF packet A4b1-r4, step 8; the contract it checks is src/apu/GP-INTEGRATION.md.
  *
  * Positive control for the ported GP core's bootstrap, the ONE translation
  * function (Device semantics 3), the ONE DMA write choke point (Device

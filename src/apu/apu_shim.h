@@ -31,7 +31,7 @@
  * header, rather than by editing a vendored file.
  *
  * The surface was inventoried, not guessed: see
- * docs/reviews/a4b1-execution-evidence.md, "Step 2 prerequisite". Everything
+ * src/apu/dsp/PROVENANCE.md, "QEMU shim surface". Everything
  * below is a NO-OP or a PASS-THROUGH. Nothing here invents device behaviour.
  * ============================================================ */
 

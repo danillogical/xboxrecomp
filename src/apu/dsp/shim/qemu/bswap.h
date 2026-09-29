@@ -4,7 +4,7 @@
  * The pinned interp/dsp_cpu.c includes this header but does not call anything
  * from it: the only byte-order helpers it actually uses are ldl_le_p/stl_le_p,
  * which the toolkit's QEMU shim provides (little-endian host). Measured, not
- * assumed: see docs/reviews/a4b1-execution-evidence.md, "Step 2 prerequisite",
+ * assumed: see src/apu/dsp/PROVENANCE.md, "QEMU shim surface",
  * which lists `bswap` as part of the surface; a grep of the vendored tree shows
  * the sole occurrence is the #include itself.
  *

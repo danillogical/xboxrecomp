@@ -439,7 +439,7 @@ static void proc_rst_write(DSPState *dsp, uint32_t oldval, uint32_t val)
  * intact. Nothing about which offset reaches which arm changes.
  *
  * This is a build-portability modification only; it is recorded in
- * docs/reviews/a4b-xemu-pin.md's local-modification list.
+ * src/apu/dsp/PROVENANCE.md's local-modification list.
  *
  * Global Processor - programmable DSP */
 static uint64_t gp_read(void *opaque, hwaddr addr, unsigned int size)
