@@ -194,6 +194,7 @@
 
 #define NV_PGRAPH_DEBUG_3                                0x0000008C
 #   define NV_PGRAPH_DEBUG_3_HW_CONTEXT_SWITCH                (1 << 2)
+#   define NV_PGRAPH_DEBUG_3_DATA_CHECK                       (1 << 20)
 #define NV_PGRAPH_INTR                                   0x00000100
 #   define NV_PGRAPH_INTR_NOTIFY                              (1 << 0)
 #   define NV_PGRAPH_INTR_MISSING_HW                          (1 << 4)
@@ -209,6 +210,7 @@
 #   define NV_PGRAPH_INTR_SINGLE_STEP                        (1 << 24)
 #define NV_PGRAPH_NSOURCE                                0x00000108
 #   define NV_PGRAPH_NSOURCE_NOTIFICATION                     (1 << 0)
+#   define NV_PGRAPH_NSOURCE_DATA_ERROR                       (1 << 1)
 #define NV_PGRAPH_INTR_EN                                0x00000140
 #   define NV_PGRAPH_INTR_EN_NOTIFY                           (1 << 0)
 #   define NV_PGRAPH_INTR_EN_MISSING_HW                       (1 << 4)

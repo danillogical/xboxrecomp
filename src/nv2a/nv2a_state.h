@@ -69,6 +69,11 @@ struct PGRAPHState {
     /* Phase 3-4: Full PGRAPH state will go here */
 };
 
+enum {
+    NV2A_HOLD_NONE = 0,
+    NV2A_HOLD_SOFTWARE_METHOD = 1,
+};
+
 /* ============================================================
  * NV2AState - Main GPU state
  * Adapted from xemu's nv2a_int.h
@@ -157,6 +162,12 @@ typedef struct NV2AState {
         uint32_t sink_count;
         /* Semaphore releases written to guest memory (action methods only). */
         uint32_t semaphore_releases;
+        /* A walk held by a software-method trap (action methods only), and the rest of the packet it stopped in, which the walk
+         * that resumes after the hold continues from. */
+        uint32_t hold;
+        uint32_t carry_count, carry_method, carry_subchannel, carry_ret;
+        bool carry_non_inc;
+        uint32_t software_method_traps;
         /* class_id is recorded because the same method number means different
          * things in different classes -- 0x2FC is NV09F_SET_OPERATION and an
          * NV097 surface method, and both appear in JSRF's stream. */

@@ -799,15 +799,43 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
     return r;
 }
 
+/* The guest's acknowledgements of a held walk (action methods only): each may
+ * release it, and nv2a_submit_pending decides whether it has. */
+static void pgraph_resume_walk(NV2AState *d)
+{
+    if (d->pfifo.hold != NV2A_HOLD_NONE)
+        nv2a_submit_pending(d);
+}
+
 void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
+    bool actions = nv2a_actions_enabled();
     nv2a_reg_log_write(NV_PGRAPH, addr, size, val);
     if (addr == NV_PGRAPH_INTR) {
         d->pgraph.regs[addr] &= ~(uint32_t)val;
         d->pgraph.pending_interrupts &= ~(uint32_t)val;
+        /* NSOURCE clears with the interrupt it explains. */
+        if (actions && (val & NV_PGRAPH_INTR_ERROR))
+            d->pgraph.regs[NV_PGRAPH_NSOURCE] = 0;
         nv2a_update_irq(d);
+        if (actions) pgraph_resume_walk(d);
         return;
+    }
+    if (actions) {
+        switch (addr) {
+        case NV_PGRAPH_INTR_EN:
+            d->pgraph.regs[addr] = val;
+            d->pgraph.enabled_interrupts = (uint32_t)val;
+            nv2a_update_irq(d);
+            return;
+        case NV_PGRAPH_FIFO:
+            d->pgraph.regs[addr] = val;
+            pgraph_resume_walk(d);
+            return;
+        default:
+            break;
+        }
     }
     d->pgraph.regs[addr] = val;
 }
@@ -928,6 +956,13 @@ enum {
     NV2A_SUBMIT_UNSUPPORTED_METHOD = 11,
     NV2A_SUBMIT_INVALID_HANDLE = 12,
     NV2A_SUBMIT_SEMAPHORE_FAULT = 13,
+    /* The walk committed up to and including a method that holds it. */
+    NV2A_SUBMIT_SOFTWARE_METHOD = 14,
+    /* A kick arrived while the walk was held; nothing was walked. */
+    NV2A_SUBMIT_HELD_SOFTWARE_METHOD = 16,
+    /* A non-zero NOP with PGRAPH data checking off: the references disagree
+     * on what happens, so the stream stops here instead of guessing. */
+    NV2A_SUBMIT_NOP_UNCHECKED = 18,
 };
 
 /* NV01_SUBC_SET_OBJECT binds a RAMHT handle.  Production lookup uses the
@@ -966,6 +1001,9 @@ const char *nv2a_submit_diagnostic(uint32_t code)
     case NV2A_SUBMIT_UNSUPPORTED_METHOD: return "unsupported_method";
     case NV2A_SUBMIT_INVALID_HANDLE: return "invalid_handle";
     case NV2A_SUBMIT_SEMAPHORE_FAULT: return "semaphore_fault";
+    case NV2A_SUBMIT_SOFTWARE_METHOD: return "software_method_trap";
+    case NV2A_SUBMIT_HELD_SOFTWARE_METHOD: return "held_software_method";
+    case NV2A_SUBMIT_NOP_UNCHECKED: return "software_method_unchecked";
     default: return "unknown";
     }
 }
@@ -1154,6 +1192,8 @@ typedef struct {
     uint32_t sem_offset;
     uint32_t releases;
     struct { uint32_t phys, value; } release[NV2A_MAX_STAGED_RELEASES];
+    uint32_t param_a, param_b;  /* the two registers a software method reads */
+    uint32_t trap_subchannel, trap_param;
 } ActionStage;
 
 /* Host address and value of the last semaphore release, for the fence-mirror
@@ -1168,6 +1208,8 @@ static void action_stage_begin(NV2AState *d, ActionStage *st)
     st->sem_dma_valid = d->pgraph.dma_semaphore_valid;
     st->sem_offset = d->pgraph.regs[NV_PGRAPH_SEMAPHOREOFFSET];
     st->releases = 0;
+    st->param_a = d->pgraph.regs[NV_PGRAPH_ZSTENCILCLEARVALUE];
+    st->param_b = d->pgraph.regs[NV_PGRAPH_COLORCLEARVALUE];
 }
 
 /* A semaphore lands in the physical window the pushbuffer is read from: a
@@ -1213,13 +1255,30 @@ static bool semaphore_target(NV2AState *d, const ActionStage *st, uint32_t *phys
     return window_word_writable(d, *phys);
 }
 
-/* Stage one NV097 method's effect. Returns NV2A_SUBMIT_OK, or the diagnostic
- * that rejects the whole stream. */
-static uint32_t action_method(NV2AState *d, ActionStage *st,
+/* Stage one NV097 method's effect. Returns NV2A_SUBMIT_OK; the diagnostic
+ * that rejects the whole stream; or NV2A_SUBMIT_SOFTWARE_METHOD, which
+ * commits this method and holds the walk after it. */
+static uint32_t action_method(NV2AState *d, ActionStage *st, uint32_t subchannel,
                               uint32_t method, uint32_t param)
 {
     uint32_t phys;
     switch (method) {
+    case NV097_NO_OPERATION:
+        /* A non-zero NOP on Kelvin is a data error when PGRAPH data checking
+         * is on, which is how D3D calls its software methods. */
+        if (param == 0)
+            break;
+        if (!(d->pgraph.regs[NV_PGRAPH_DEBUG_3] & NV_PGRAPH_DEBUG_3_DATA_CHECK))
+            return NV2A_SUBMIT_NOP_UNCHECKED;
+        st->trap_subchannel = subchannel;
+        st->trap_param = param;
+        return NV2A_SUBMIT_SOFTWARE_METHOD;
+    case NV097_SET_ZSTENCIL_CLEAR_VALUE:
+        st->param_a = param;
+        break;
+    case NV097_SET_COLOR_CLEAR_VALUE:
+        st->param_b = param;
+        break;
     case NV097_SET_CONTEXT_DMA_SEMAPHORE:
         /* Methods 0x180..0x1FC take a handle; the puller resolves it through
          * RAMHT and PGRAPH receives the instance. */
@@ -1249,6 +1308,8 @@ static void action_commit(NV2AState *d, const ActionStage *st)
     d->pgraph.dma_semaphore = st->sem_dma;
     d->pgraph.dma_semaphore_valid = st->sem_dma_valid;
     d->pgraph.regs[NV_PGRAPH_SEMAPHOREOFFSET] = st->sem_offset;
+    d->pgraph.regs[NV_PGRAPH_ZSTENCILCLEARVALUE] = st->param_a;
+    d->pgraph.regs[NV_PGRAPH_COLORCLEARVALUE] = st->param_b;
     for (uint32_t i = 0; i < st->releases; ++i) {
         uint8_t *host = d->pfifo.pushbuffer +
                         (st->release[i].phys - d->pfifo.pushbuffer_base);
@@ -1261,6 +1322,38 @@ static void action_commit(NV2AState *d, const ActionStage *st)
             fprintf(stderr, "  [NV2A] semaphore release %08X -> phys %08X\n",
                     st->release[i].value, st->release[i].phys);
         }
+    }
+}
+
+/* The trap a non-zero NOP raises: TRAPPED_ADDR/DATA name the method, NSOURCE
+ * says why, the ERROR interrupt is raised and PGRAPH FIFO access is switched
+ * off. The guest's handler acknowledges by clearing the interrupt and turning
+ * access back on; the walk resumes after the NOP only when both are done. */
+static void action_raise_trap(NV2AState *d, const ActionStage *st)
+{
+    uint32_t chid = GET_MASK(d->pgraph.regs[NV_PGRAPH_CTX_USER], NV_PGRAPH_CTX_USER_CHID);
+    uint32_t addr = 0;
+    SET_MASK(addr, NV_PGRAPH_TRAPPED_ADDR_MTHD, NV097_NO_OPERATION);
+    SET_MASK(addr, NV_PGRAPH_TRAPPED_ADDR_SUBCH, st->trap_subchannel);
+    SET_MASK(addr, NV_PGRAPH_TRAPPED_ADDR_CHID, chid);
+    d->pgraph.regs[NV_PGRAPH_TRAPPED_ADDR] = addr;
+    d->pgraph.regs[NV_PGRAPH_TRAPPED_DATA_LOW] = st->trap_param;
+    d->pgraph.regs[NV_PGRAPH_NSOURCE] |= NV_PGRAPH_NSOURCE_DATA_ERROR;
+    d->pgraph.pending_interrupts |= NV_PGRAPH_INTR_ERROR;
+    d->pgraph.regs[NV_PGRAPH_INTR] |= NV_PGRAPH_INTR_ERROR;
+    d->pgraph.regs[NV_PGRAPH_FIFO] &= ~(uint32_t)NV_PGRAPH_FIFO_ACCESS;
+    ++d->pfifo.software_method_traps;
+}
+
+/* Whether a held walk may continue. Called with the pfifo lock held. */
+static bool walk_hold_released(NV2AState *d)
+{
+    switch (d->pfifo.hold) {
+    case NV2A_HOLD_SOFTWARE_METHOD:
+        return !(d->pgraph.pending_interrupts & NV_PGRAPH_INTR_ERROR) &&
+               (d->pgraph.regs[NV_PGRAPH_FIFO] & NV_PGRAPH_FIFO_ACCESS);
+    default:
+        return true;
     }
 }
 
@@ -1295,10 +1388,19 @@ bool nv2a_submit_pending(NV2AState *d)
     uint32_t staged_class[8], staged_object[8];
     bool ok = true;
     bool actions = nv2a_actions_enabled();
+    uint32_t stop = NV2A_SUBMIT_OK;
     ActionStage st;
     if (!d) return false;
     qemu_mutex_lock(&d->pfifo.lock);
-    if (actions) action_stage_begin(d, &st);
+    if (actions) {
+        if (!walk_hold_released(d)) {
+            d->pfifo.submit_diag = NV2A_SUBMIT_HELD_SOFTWARE_METHOD;
+            qemu_mutex_unlock(&d->pfifo.lock);
+            return false;
+        }
+        d->pfifo.hold = NV2A_HOLD_NONE;
+        action_stage_begin(d, &st);
+    }
     /* The sink is a per-submission record of the methods just walked. Nothing
      * reads it and nothing used to clear it, so it ratcheted to its 256 cap and
      * then rejected every later submission for the rest of the run -- which is
@@ -1323,8 +1425,89 @@ bool nv2a_submit_pending(NV2AState *d)
     if (get == end) get = begin;
     if (put == end) put = begin;
     pc = get;
-    while (pc != put) {
-        uint32_t h, address = pc;
+    /* The packet being walked. A walk normally starts at a header; after a
+     * hold it resumes inside the packet the hold interrupted. */
+    uint32_t count = 0, method = 0, subchannel = 0, address = pc;
+    bool non_inc = false;
+    if (actions && (d->pfifo.carry_count || d->pfifo.carry_ret)) {
+        count = d->pfifo.carry_count;
+        method = d->pfifo.carry_method;
+        subchannel = d->pfifo.carry_subchannel;
+        non_inc = d->pfifo.carry_non_inc;
+        ret = d->pfifo.carry_ret;
+        if (count > 1024) { d->pfifo.submit_diag = NV2A_SUBMIT_SINK_FULL; ok = false; goto done; }
+    }
+    while (pc != put || count) {
+        uint32_t h;
+        if (count) {
+            uint32_t param;
+            if (words >= 4096) { d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false; goto done; }
+            if (pc == put || !submit_read_word(d, pc, &param)) { d->pfifo.submit_diag = pc == put ? NV2A_SUBMIT_TRUNCATED : NV2A_SUBMIT_UNREADABLE; ok = false; goto done; }
+            pc = submit_advance(d, pc); ++words;
+            /* Production SET_OBJECT walks RAMHT in claimed PRAMIN.
+             * The fixture seam stays opt-in for isolated 11b4b2 tests. */
+            if (method == M_SET_OBJECT) {
+                uint32_t class_id = 0;
+                bool bound = false;
+                if (d->pfifo.fixture_execution) {
+                    if (param &&
+                        d->pfifo.fixture_object[subchannel] == param &&
+                        d->pfifo.fixture_class[subchannel] == NV097_CLASS) {
+                        class_id = NV097_CLASS;
+                        bound = true;
+                    }
+                    if (!bound) {
+                        d->pfifo.submit_diag = NV2A_SUBMIT_UNSUPPORTED_METHOD;
+                        d->pfifo.submit_diag_get = address;
+                        d->pfifo.submit_diag_subchannel = subchannel;
+                        d->pfifo.submit_diag_method = method;
+                        d->pfifo.submit_diag_param = param;
+                        ok = false; goto done;
+                    }
+                } else if (!ramht_lookup_class(d, param, &class_id)) {
+                    d->pfifo.submit_diag = NV2A_SUBMIT_INVALID_HANDLE;
+                    d->pfifo.submit_diag_get = address;
+                    d->pfifo.submit_diag_subchannel = subchannel;
+                    d->pfifo.submit_diag_method = method;
+                    d->pfifo.submit_diag_param = param;
+                    ok = false; goto done;
+                }
+                staged_class[subchannel] = class_id;
+                staged_object[subchannel] = param;
+            } else if (method != 0x0100u &&
+                       !nv2a_method_implemented(staged_class[subchannel], method)) {
+                d->pfifo.submit_diag = NV2A_SUBMIT_UNSUPPORTED_METHOD;
+                d->pfifo.submit_diag_get = address;
+                d->pfifo.submit_diag_subchannel = subchannel;
+                d->pfifo.submit_diag_method = method;
+                d->pfifo.submit_diag_param = param;
+                ok = false;
+                goto done;
+            }
+            if (actions && staged_class[subchannel] == NV097_CLASS) {
+                uint32_t code = action_method(d, &st, subchannel, method, param);
+                if (code == NV2A_SUBMIT_SOFTWARE_METHOD) {
+                    stop = code;
+                } else if (code != NV2A_SUBMIT_OK) {
+                    d->pfifo.submit_diag = code;
+                    d->pfifo.submit_diag_get = address;
+                    d->pfifo.submit_diag_subchannel = subchannel;
+                    d->pfifo.submit_diag_method = method;
+                    d->pfifo.submit_diag_param = param;
+                    ok = false;
+                    goto done;
+                }
+            }
+            staged[staged_count].subchannel = subchannel;
+            staged[staged_count].method = method;
+            staged[staged_count].param = param;
+            ++staged_count;
+            --count;
+            if (!non_inc) method += 4;
+            if (stop != NV2A_SUBMIT_OK) break;
+            continue;
+        }
+        address = pc;
         trace[words & 31u] = address;
         if (words >= 4096 || packets >= 1024) {
             d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false;
@@ -1360,72 +1543,10 @@ bool nv2a_submit_pending(NV2AState *d)
             continue;
         }
         if ((h & 0xe0030003u) == 0u || (h & 0xe0030003u) == 0x40000000u) {
-            uint32_t count = (h >> 18) & 0x7ffu, method = h & 0x1ffcu, subchannel = (h >> 13) & 7u;
-            if (!(h & 0x40000000u) && count && method + 4u * (count - 1u) > 0x1ffcu) { d->pfifo.submit_diag = NV2A_SUBMIT_METHOD_RANGE; ok = false; break; }
+            count = (h >> 18) & 0x7ffu; method = h & 0x1ffcu; subchannel = (h >> 13) & 7u;
+            non_inc = (h & 0x40000000u) != 0;
+            if (!non_inc && count && method + 4u * (count - 1u) > 0x1ffcu) { d->pfifo.submit_diag = NV2A_SUBMIT_METHOD_RANGE; ok = false; break; }
             if (d->pfifo.sink_count + staged_count + count > 1024) { d->pfifo.submit_diag = NV2A_SUBMIT_SINK_FULL; ok = false; break; }
-            for (uint32_t i = 0; i < count; ++i) {
-                uint32_t param;
-                if (words >= 4096) { d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false; goto done; }
-                if (pc == put || !submit_read_word(d, pc, &param)) { d->pfifo.submit_diag = pc == put ? NV2A_SUBMIT_TRUNCATED : NV2A_SUBMIT_UNREADABLE; ok = false; goto done; }
-                pc = submit_advance(d, pc); ++words;
-                /* Production SET_OBJECT walks RAMHT in claimed PRAMIN.
-                 * The fixture seam stays opt-in for isolated 11b4b2 tests. */
-                if (method == M_SET_OBJECT) {
-                    uint32_t class_id = 0;
-                    bool bound = false;
-                    if (d->pfifo.fixture_execution) {
-                        if (param &&
-                            d->pfifo.fixture_object[subchannel] == param &&
-                            d->pfifo.fixture_class[subchannel] == NV097_CLASS) {
-                            class_id = NV097_CLASS;
-                            bound = true;
-                        }
-                        if (!bound) {
-                            d->pfifo.submit_diag = NV2A_SUBMIT_UNSUPPORTED_METHOD;
-                            d->pfifo.submit_diag_get = address;
-                            d->pfifo.submit_diag_subchannel = subchannel;
-                            d->pfifo.submit_diag_method = method;
-                            d->pfifo.submit_diag_param = param;
-                            ok = false; goto done;
-                        }
-                    } else if (!ramht_lookup_class(d, param, &class_id)) {
-                        d->pfifo.submit_diag = NV2A_SUBMIT_INVALID_HANDLE;
-                        d->pfifo.submit_diag_get = address;
-                        d->pfifo.submit_diag_subchannel = subchannel;
-                        d->pfifo.submit_diag_method = method;
-                        d->pfifo.submit_diag_param = param;
-                        ok = false; goto done;
-                    }
-                    staged_class[subchannel] = class_id;
-                    staged_object[subchannel] = param;
-                } else if (method != 0x0100u &&
-                           !nv2a_method_implemented(staged_class[subchannel], method)) {
-                    d->pfifo.submit_diag = NV2A_SUBMIT_UNSUPPORTED_METHOD;
-                    d->pfifo.submit_diag_get = address;
-                    d->pfifo.submit_diag_subchannel = subchannel;
-                    d->pfifo.submit_diag_method = method;
-                    d->pfifo.submit_diag_param = param;
-                    ok = false;
-                    goto done;
-                }
-                if (actions && staged_class[subchannel] == NV097_CLASS) {
-                    uint32_t code = action_method(d, &st, method, param);
-                    if (code != NV2A_SUBMIT_OK) {
-                        d->pfifo.submit_diag = code;
-                        d->pfifo.submit_diag_get = address;
-                        d->pfifo.submit_diag_subchannel = subchannel;
-                        d->pfifo.submit_diag_method = method;
-                        d->pfifo.submit_diag_param = param;
-                        ok = false;
-                        goto done;
-                    }
-                }
-                staged[staged_count].subchannel = subchannel;
-                staged[staged_count].method = method;
-                staged[staged_count].param = param;
-                ++staged_count;
-                if (!(h & 0x40000000u)) method += 4;
-            }
             continue;
         }
         d->pfifo.submit_diag = NV2A_SUBMIT_RESERVED; d->pfifo.submit_diag_get = address; ok = false; break;
@@ -1463,12 +1584,34 @@ bool nv2a_submit_pending(NV2AState *d)
         pfifo_trace("submit_commit", NV_PFIFO_CACHE1_DMA_GET, pc);
         ++d->pfifo.submit_successes;
         d->pfifo.submit_diag = NV2A_SUBMIT_OK;
+        if (actions) {
+            /* A hold keeps the rest of the interrupted packet, and the
+             * subroutine return, for the walk that resumes after it. */
+            bool held = stop != NV2A_SUBMIT_OK;
+            d->pfifo.carry_count = held ? count : 0;
+            d->pfifo.carry_method = held ? method : 0;
+            d->pfifo.carry_subchannel = held ? subchannel : 0;
+            d->pfifo.carry_non_inc = held && non_inc;
+            d->pfifo.carry_ret = held ? ret : 0;
+            if (stop == NV2A_SUBMIT_SOFTWARE_METHOD) {
+                action_raise_trap(d, &st);
+                d->pfifo.hold = NV2A_HOLD_SOFTWARE_METHOD;
+            }
+            if (held) {
+                d->pfifo.submit_diag = stop;
+                d->pfifo.submit_diag_subchannel = staged[staged_count - 1].subchannel;
+                d->pfifo.submit_diag_method = staged[staged_count - 1].method;
+                d->pfifo.submit_diag_param = staged[staged_count - 1].param;
+            }
+        }
     }
 done:
     d->pfifo.submit_words += words;
     d->pfifo.submit_packets += packets;
     d->pfifo.submit_diag_get = (d->pfifo.submit_diag == NV2A_SUBMIT_OK) ? pc : d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
     qemu_mutex_unlock(&d->pfifo.lock);
+    if (ok && stop == NV2A_SUBMIT_SOFTWARE_METHOD)
+        nv2a_update_irq(d);
     return ok;
 }
 

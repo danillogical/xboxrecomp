@@ -140,6 +140,11 @@ static uint32_t hdr(uint32_t subchannel, uint32_t method, uint32_t count)
     return (count << 18) | (subchannel << 13) | method;
 }
 
+static uint32_t hdr_noninc(uint32_t subchannel, uint32_t method, uint32_t count)
+{
+    return 0x40000000u | hdr(subchannel, method, count);
+}
+
 static void pb_begin(Pb *pb, uint32_t at)
 {
     pb->start = pb->at = at;
@@ -168,6 +173,47 @@ static uint32_t mmio_r(NV2AState *d, uint32_t addr)
 }
 
 #define USER(r)   (0x800000u + (r))
+#define PGRAPH(r) (0x400000u + (r))
+#define PMC(r)    (0x000000u + (r))
+
+/* The card's interrupt line as the kernel would see it. */
+static int g_line;
+static unsigned g_line_edges;
+
+static void irq_sink(void *opaque, int asserted)
+{
+    (void)opaque;
+    g_line = asserted;
+    ++g_line_edges;
+}
+
+/* What JSRF's device setup (0x00194780) and D3D's debug-register setup leave
+ * behind: all PGRAPH sources enabled, the hardware master enable on, data
+ * checking on, and PGRAPH FIFO access on. */
+static void guest_setup(NV2AState *d, int data_check)
+{
+    g_line = 0;
+    g_line_edges = 0;
+    nv2a_set_irq_sink(d, irq_sink, NULL);
+    mmio_w(d, PGRAPH(NV_PGRAPH_DEBUG_3), data_check ? 0xF3DE0479u : 0xF3CE0479u);
+    mmio_w(d, PGRAPH(NV_PGRAPH_INTR), 0xFFFFFFFFu);
+    mmio_w(d, PGRAPH(NV_PGRAPH_INTR_EN), 0xFFFFFFFFu);
+    mmio_w(d, PMC(NV_PMC_INTR_EN_0), 1);
+    mmio_w(d, PGRAPH(NV_PGRAPH_FIFO), NV_PGRAPH_FIFO_ACCESS);
+}
+
+/* The acknowledgement half of JSRF's PGRAPH ISR (0x00194210): FIFO off on
+ * entry, write back the pending bits it read, FIFO on at exit. `between` runs
+ * where the ISR calls the software-method handler. */
+static void guest_isr(NV2AState *d, void (*between)(NV2AState *))
+{
+    uint32_t intr;
+    mmio_w(d, PGRAPH(NV_PGRAPH_FIFO), 0);
+    intr = mmio_r(d, PGRAPH(NV_PGRAPH_INTR));
+    mmio_w(d, PGRAPH(NV_PGRAPH_INTR), intr);
+    if (between) between(d);
+    mmio_w(d, PGRAPH(NV_PGRAPH_FIFO), NV_PGRAPH_FIFO_ACCESS);
+}
 
 static uint32_t get_ptr(NV2AState *d)
 {
@@ -319,6 +365,166 @@ static void test_fence_mirror_overlap_reported(void)
     CHECK(nv2a_fence_mirror_overlaps() == before + 1, "overlap not counted");
 }
 
+/* A non-zero NOP on Kelvin stops the walk after itself, raises the ERROR
+ * interrupt through PMC to the line, latches what the handler reads, holds
+ * every later kick, and resumes only after both acknowledgements. */
+static uint32_t g_get_seen_in_isr;
+static int g_line_seen_in_isr;
+
+static void observe_hold(NV2AState *d)
+{
+    /* Between the W1C and FIFO re-enable the walk must still be held. */
+    g_get_seen_in_isr = get_ptr(d);
+    g_line_seen_in_isr = g_line;
+}
+
+static void test_software_method_trap(void)
+{
+    NV2AState *d = fresh_with(1);
+    Pb pb;
+    uint32_t after_nop;
+    guest_setup(d, 1);
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    pb_method(&pb, 0, NV097_SET_ZSTENCIL_CLEAR_VALUE, 0x00400B80u);   /* D3D: register */
+    pb_method(&pb, 0, NV097_SET_COLOR_CLEAR_VALUE, 0x45EAD10Eu);      /* D3D: value */
+    pb_method(&pb, 0, NV097_NO_OPERATION, 0x324);
+    after_nop = pb.at;
+    pb_semaphore(&pb, H_SEMAPHORE, 0, 7);
+    kick(d, pb.start, pb.at);
+
+    CHECK(strcmp(diag(d), "software_method_trap") == 0, "diag %s", diag(d));
+    CHECK(get_ptr(d) == after_nop, "GET %08X, want just past the NOP %08X", get_ptr(d), after_nop);
+    CHECK(sema() == SENTINEL, "release after the trap ran early (%08X)", sema());
+    CHECK(mmio_r(d, PGRAPH(NV_PGRAPH_INTR)) & NV_PGRAPH_INTR_ERROR, "ERROR not pending");
+    CHECK(mmio_r(d, PGRAPH(NV_PGRAPH_NSOURCE)) == NV_PGRAPH_NSOURCE_DATA_ERROR,
+          "NSOURCE %08X", mmio_r(d, PGRAPH(NV_PGRAPH_NSOURCE)));
+    CHECK((mmio_r(d, PGRAPH(NV_PGRAPH_TRAPPED_ADDR)) & 0x1FFCu) == 0x100 &&
+          (mmio_r(d, PGRAPH(NV_PGRAPH_TRAPPED_ADDR)) >> 16) == 0,
+          "TRAPPED_ADDR %08X", mmio_r(d, PGRAPH(NV_PGRAPH_TRAPPED_ADDR)));
+    CHECK(mmio_r(d, PGRAPH(NV_PGRAPH_TRAPPED_DATA_LOW)) == 0x324, "TRAPPED_DATA %08X",
+          mmio_r(d, PGRAPH(NV_PGRAPH_TRAPPED_DATA_LOW)));
+    CHECK(mmio_r(d, PGRAPH(NV_PGRAPH_ZSTENCILCLEARVALUE)) == 0x00400B80u &&
+          mmio_r(d, PGRAPH(NV_PGRAPH_COLORCLEARVALUE)) == 0x45EAD10Eu,
+          "0x401A88/0x40186C not latched from 0x1D8C/0x1D90");
+    CHECK(!(mmio_r(d, PGRAPH(NV_PGRAPH_FIFO)) & NV_PGRAPH_FIFO_ACCESS), "FIFO access left on");
+    CHECK(mmio_r(d, PMC(NV_PMC_INTR_0)) & NV_PMC_INTR_0_PGRAPH, "PMC PGRAPH bit not set");
+    CHECK(g_line == 1, "interrupt line not asserted");
+
+    /* A kick while trapped walks nothing. */
+    kick_put(d, pb.at);
+    CHECK(strcmp(diag(d), "held_software_method") == 0, "diag %s", diag(d));
+    CHECK(get_ptr(d) == after_nop && sema() == SENTINEL, "held walk moved");
+
+    guest_isr(d, observe_hold);
+    CHECK(g_get_seen_in_isr == after_nop, "walk resumed on the W1C alone");
+    CHECK(g_line_seen_in_isr == 0, "line still asserted after the W1C");
+    CHECK(get_ptr(d) == pb.at, "walk did not resume after FIFO re-enable (GET %08X, %s)",
+          get_ptr(d), diag(d));
+    CHECK(sema() == 7, "release after the trap not written (%08X)", sema());
+    CHECK(mmio_r(d, PGRAPH(NV_PGRAPH_NSOURCE)) == 0, "NSOURCE not cleared with ERROR");
+    CHECK(d->pfifo.software_method_traps == 1, "trap count %u", d->pfifo.software_method_traps);
+}
+
+/* Enabling FIFO access first and clearing the interrupt second also resumes. */
+static void test_trap_acks_in_either_order(void)
+{
+    NV2AState *d = fresh_with(1);
+    Pb pb;
+    guest_setup(d, 1);
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    pb_method(&pb, 0, NV097_NO_OPERATION, 0x300);
+    pb_semaphore(&pb, H_SEMAPHORE, 0, 3);
+    kick(d, pb.start, pb.at);
+    mmio_w(d, PGRAPH(NV_PGRAPH_FIFO), NV_PGRAPH_FIFO_ACCESS);
+    CHECK(get_ptr(d) != pb.at, "resumed with ERROR still pending");
+    mmio_w(d, PGRAPH(NV_PGRAPH_INTR), NV_PGRAPH_INTR_ERROR);
+    CHECK(get_ptr(d) == pb.at && sema() == 3, "did not resume (%s)", diag(d));
+}
+
+/* A trap inside a packet resumes inside it: a non-incrementing NOP run with two
+ * non-zero parameters traps twice, and the zero between them does not. */
+static void test_trap_resumes_inside_packet(void)
+{
+    NV2AState *d = fresh_with(1);
+    Pb pb;
+    uint32_t first, third;
+    guest_setup(d, 1);
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    pb_word(&pb, hdr_noninc(0, NV097_NO_OPERATION, 3));
+    pb_word(&pb, 0x301);
+    first = pb.at;
+    pb_word(&pb, 0);
+    pb_word(&pb, 0x302);
+    third = pb.at;
+    pb_semaphore(&pb, H_SEMAPHORE, 0, 4);
+    kick(d, pb.start, pb.at);
+    CHECK(get_ptr(d) == first, "first trap GET %08X", get_ptr(d));
+    guest_isr(d, NULL);
+    CHECK(get_ptr(d) == third, "second trap GET %08X (%s)", get_ptr(d), diag(d));
+    CHECK(mmio_r(d, PGRAPH(NV_PGRAPH_TRAPPED_DATA_LOW)) == 0x302, "second trap data %08X",
+          mmio_r(d, PGRAPH(NV_PGRAPH_TRAPPED_DATA_LOW)));
+    CHECK(sema() == SENTINEL, "release ran before the second trap was handled");
+    guest_isr(d, NULL);
+    CHECK(get_ptr(d) == pb.at && sema() == 4, "did not finish (%s)", diag(d));
+    CHECK(d->pfifo.software_method_traps == 2, "trap count %u", d->pfifo.software_method_traps);
+}
+
+/* A trap inside a CALLed subroutine keeps its return address across the hold. */
+static void test_trap_inside_subroutine(void)
+{
+    NV2AState *d = fresh_with(1);
+    Pb pb, sub;
+    guest_setup(d, 1);
+    pb_begin(&sub, PB_BASE + 0x400);
+    pb_method(&sub, 0, NV097_NO_OPERATION, 0x310);
+    pb_word(&sub, 0x00020000u);                   /* return */
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    pb_word(&pb, sub.start | 2u);                  /* call */
+    pb_semaphore(&pb, H_SEMAPHORE, 0, 6);
+    kick(d, pb.start, pb.at);
+    CHECK(strcmp(diag(d), "software_method_trap") == 0, "diag %s", diag(d));
+    guest_isr(d, NULL);
+    CHECK(get_ptr(d) == pb.at && sema() == 6, "return lost across the hold (GET %08X, %s)",
+          get_ptr(d), diag(d));
+}
+
+/* With data checking off the references disagree (trap, or ignore), so the
+ * stream stops there, rolled back, with no interrupt. */
+static void test_nop_unchecked_blocks(void)
+{
+    NV2AState *d = fresh_with(1);
+    Pb pb;
+    guest_setup(d, 0);
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    pb_method(&pb, 0, NV097_NO_OPERATION, 0x300);
+    kick(d, pb.start, pb.at);
+    CHECK(strcmp(diag(d), "software_method_unchecked") == 0, "diag %s", diag(d));
+    CHECK(get_ptr(d) == pb.start, "GET moved to %08X", get_ptr(d));
+    CHECK(g_line == 0 && !(mmio_r(d, PGRAPH(NV_PGRAPH_INTR)) & NV_PGRAPH_INTR_ERROR),
+          "interrupt raised");
+}
+
+/* With the switch unset a non-zero NOP is the no-op it always was. */
+static void test_nop_dormant_when_unset(void)
+{
+    NV2AState *d = fresh_with(0);
+    Pb pb;
+    guest_setup(d, 1);
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    pb_method(&pb, 0, NV097_NO_OPERATION, 0x300);
+    kick(d, pb.start, pb.at);
+    CHECK(strcmp(diag(d), "ok") == 0 && get_ptr(d) == pb.at, "stream held (%s)", diag(d));
+    CHECK(g_line == 0 && g_line_edges == 0, "interrupt raised with the switch unset");
+    CHECK(mmio_r(d, PGRAPH(NV_PGRAPH_FIFO)) == NV_PGRAPH_FIFO_ACCESS, "FIFO access changed");
+    CHECK(mmio_r(d, PGRAPH(NV_PGRAPH_TRAPPED_ADDR)) == 0, "trap latched");
+}
+
 int main(void)
 {
     test_translator_reads_bound_class();
@@ -326,6 +532,12 @@ int main(void)
     test_semaphore_written_only_on_commit();
     test_semaphore_bounds();
     test_fence_mirror_overlap_reported();
+    test_software_method_trap();
+    test_trap_acks_in_either_order();
+    test_trap_resumes_inside_packet();
+    test_trap_inside_subroutine();
+    test_nop_unchecked_blocks();
+    test_nop_dormant_when_unset();
 
     if (g_failures) {
         fprintf(stderr, "nv2a_actions_test: %d failure(s)\n", g_failures);
