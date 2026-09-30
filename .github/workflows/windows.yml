@@ -59,12 +59,21 @@ jobs:
           python-version: '3.13'
 
       - name: Install Python test dependencies
-        # Measured on the primary Windows host: the `tools/` suite imports
-        # `pytest` (15 modules) and `pefile` (the fusion tests) in addition to
-        # `capstone`, and discovery fails at import without them.
+        # Measured, not guessed -- and measured on the RUNNER, not only on the
+        # primary Windows host, because the two environments differed.
+        #
+        #   pytest  -- imported directly by 15 test modules
+        #   pefile  -- the fusion tests
+        #   capstone -- the lifter/disassembly tests
+        #   numpy   -- via tools/fusion/module.py, which the fusion tests import
+        #
+        # The first version of this step installed only capstone, and the job
+        # failed at `ModuleNotFoundError: No module named 'pytest'`; after pytest
+        # and pefile were added the runner still failed, on `numpy`, which was
+        # already present on the primary host and therefore invisible there.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install capstone pytest pefile
+          python -m pip install capstone pytest pefile numpy
 
       - name: Translator and lifter unit tests
         # Discovered, not hand-listed: a hand-maintained list silently stops
