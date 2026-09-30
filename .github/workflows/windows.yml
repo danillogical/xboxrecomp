@@ -1,0 +1,84 @@
+name: windows
+
+# Plan T4: Windows CI for the toolkit fork.
+#
+# What this is for.  The fork's fixes (`db96e30..2a349c8`) change strict-path
+# behaviour -- kernel memory, data-export thunks -- and were **not built or run on
+# Windows** before they were merged.  A toolkit that does not compile on the host
+# the game actually runs on is a defect that costs a whole session to find, and
+# the fork has no other automated check.
+#
+# Two independent suites, because they fail for different reasons:
+#
+#   * `ctest` -- the C tests CMake registers in `src/*/CMakeLists.txt`
+#     (`xbox_kmem`, `xbox_guest_meter`, `nv2a_actions`, ...).  These are the
+#     behaviour the runtime links.
+#   * the Python translator/lifter unit tests under `tools/`, which do not need a
+#     compiler and cover the lifter semantics the generated code depends on.
+#
+# The checkout is standalone: the toolkit builds on its own, so CI does not need
+# the game repository (which carries nondistributable assets and is not public in
+# the same way).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (MSVC, x64)
+        # A plain MSVC generator, not `-A x64` on a multi-config generator that
+        # may not exist on the runner.  The runtime is x64-only.
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        # `/we4013` (implicit function declaration is an error) is set by the
+        # toolkit's own CMakeLists, so a missing prototype fails the build here
+        # rather than truncating a 64-bit pointer at run time.
+        run: cmake --build build --config Release --parallel 4
+
+      - name: CTest
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Python test dependencies
+        # Measured on the primary Windows host: the `tools/` suite imports
+        # `pytest` (15 modules) and `pefile` (the fusion tests) in addition to
+        # `capstone`, and discovery fails at import without them.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install capstone pytest pefile
+
+      - name: Translator and lifter unit tests
+        # Discovered, not hand-listed: a hand-maintained list silently stops
+        # covering a new test file, which is the failure mode this project has
+        # already paid for once with a build target list.
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m unittest discover -s tools -p 'test_*.py' -v
+
+      - name: Upload CTest log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-log
+          path: build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
