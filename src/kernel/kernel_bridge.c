@@ -3503,17 +3503,26 @@ static void bridge_NtReadFile(void)
          * file reads sector-aligned chunks, so the first bytes belong to
          * whatever precedes the file it actually wants, and a read that stops
          * early looks identical to one that never started -- until you can
-         * see where each one landed. */
+         * see where each one landed.
+         *
+         * `dst=` is the DESTINATION guest VA. Without it a reader cannot ask a
+         * trace whether this transfer appears as a write, which is the only way
+         * to test whether the recorder reports memory that a system call filled
+         * in. That question is W11's exclusion (d), it was listed as "uncertain;
+         * needs a control" for as long as this line omitted the address, and a
+         * control needs the address to exist. The value is guest-side and is
+         * printed as a guest VA like `from=`; the bytes follow it. */
         if (poff)
-            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X dst=0x%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
                     g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
+                    buffer_va,
                     (long long)off.QuadPart, length, got,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
         else
-            fprintf(stderr, "  [READ] from=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
-                    g_xbox_kernel_caller,
+            fprintf(stderr, "  [READ] from=0x%08X dst=0x%08X @seq want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+                    g_xbox_kernel_caller, buffer_va,
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
