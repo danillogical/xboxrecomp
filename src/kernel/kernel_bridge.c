@@ -41,6 +41,9 @@
  * but only as warnings, and this file is compiled with /W4 /WX-. */
 #include <stdlib.h>
 #include <float.h>
+#ifdef _WIN32
+#include <mmsystem.h>   /* timeBeginPeriod; WIN32_LEAN_AND_MEAN leaves it out */
+#endif
 /* Section B string helpers: wcslen helper, case folding.
  * ctype.h/wctype.h are not pulled in by the platform headers on either host. */
 #include <string.h>
@@ -9691,6 +9694,13 @@ void xbox_kernel_bridge_init(void)
 
     fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
             g_thunk_table_count, g_thunk_table_base);
+
+#ifdef _WIN32
+    /* A 1 ms host timer period, as xemu requests: at the default 15.6 ms the
+     * timer thread's 10 ms tick, guest waits and Sleep-paced workers all wake
+     * late. Windows restores the period when the process exits. */
+    timeBeginPeriod(1);
+#endif
 
     /* A2h: arm the alias census and rendezvous with the collector BEFORE the install store below.
      *
