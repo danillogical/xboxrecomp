@@ -157,38 +157,47 @@ static inline void qemu_thread_join(QemuThread *t) {
 #endif
 
 /* ============================================================
- * Physical memory access (direct RAM pointer)
- * We access Xbox RAM via a global pointer, same as NV2A.
+ * Physical memory access
+ * A physical address is translated the way the GP's DMA is (apu_watch.c):
+ * a window VA, a contiguous allocation's physical offset, or low RAM. An
+ * unmapped access reads zero and writes nothing.
  * ============================================================ */
 
 extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
+uint8_t *apu_phys_ptr(uint32_t addr, uint32_t len);   /* apu_watch.c */
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
+    const uint8_t *p = apu_phys_ptr((uint32_t)addr, 4);
     (void)as;
-    return *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return p ? *(const uint32_t *)p : 0;
 }
 static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
+    const uint8_t *p = apu_phys_ptr((uint32_t)addr, 2);
     (void)as;
-    return *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return p ? *(const uint16_t *)p : 0;
 }
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
+    const uint8_t *p = apu_phys_ptr((uint32_t)addr, 1);
     (void)as;
-    return *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF));
+    return p ? *p : 0;
 }
 
 /* Little-endian physical memory writes */
 static inline void stl_le_phys(void *as, hwaddr addr, uint32_t val) {
+    uint8_t *p = apu_phys_ptr((uint32_t)addr, 4);
     (void)as;
-    *(uint32_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    if (p) *(uint32_t *)p = val;
 }
 static inline void stw_le_phys(void *as, hwaddr addr, uint16_t val) {
+    uint8_t *p = apu_phys_ptr((uint32_t)addr, 2);
     (void)as;
-    *(uint16_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    if (p) *(uint16_t *)p = val;
 }
 static inline void stb_phys(void *as, hwaddr addr, uint8_t val) {
+    uint8_t *p = apu_phys_ptr((uint32_t)addr, 1);
     (void)as;
-    *(uint8_t *)(g_apu_ram_ptr + (addr & 0x03FFFFFF)) = val;
+    if (p) *p = val;
 }
 
 /* Stub address space - just passed to ldl_le_phys etc. (ignored) */

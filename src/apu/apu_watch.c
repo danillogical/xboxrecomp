@@ -458,9 +458,9 @@ static void note_unmapped(uint32_t addr, uint32_t len)
  * pinned xemu code does (it has one flat 64 MB physical space and no window),
  * and it is exactly the bug Device semantics 3 exists to fix: for the window VA
  * 0x803C0000 it would read low-RAM 0x003C0000 instead, which is a different
- * 4 KB in a machine that keeps the window as separate storage. (The
- * & 0x03FFFFFF sites in apu_shim.h and apu_vp.c are VP code, which Device
- * semantics 3 leaves untouched -- a recorded lead, not scope.)
+ * 4 KB in a machine that keeps the window as separate storage. The VP's
+ * accessors in apu_shim.h and apu_vp.c used the same mask and now share this
+ * translation through apu_phys_ptr.
  *
  * It returns a host pointer only when the whole range lies in a mapped guest
  * region. host(va) = g_apu_ram_ptr + va holds for BOTH low RAM and the window:
@@ -474,11 +474,44 @@ static void note_unmapped(uint32_t addr, uint32_t len)
  * exactly as dma_resolve would do. That case increments GPDMA_AMBIGUOUS, which
  * is observation plus this claim limit and nothing else -- no row reads it.
  */
+/* Cases 1-3 below, with no side effects: 1 and the translated VA in *t when the
+ * range is mapped, 0 for case 4. *ambiguous is set for a case-2 range that is
+ * also mapped low RAM. Shared by the GP path and the VP accessors. */
+static int apu_translate(uint32_t addr, uint32_t len, uint32_t *t, int *ambiguous)
+{
+    size_t mapped = xbox_GetMappedSize();
+    uint32_t high_water = xbox_ContiguousAllocatedBytes();
+
+    *ambiguous = 0;
+    /* Case 1: already a window VA. Used as is -- this is the 0d7929c form. */
+    if (addr >= XBOX_CONTIG_BASE &&
+        (uint64_t)addr + len <=
+            (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE) {
+        *t = addr;
+        return 1;
+    }
+    /* Case 2: a physical offset this runtime handed out as contiguous memory. */
+    if (high_water != 0 && addr < high_water &&
+        (uint64_t)addr + len <= (uint64_t)XBOX_CONTIG_SIZE) {
+        *t = XBOX_CONTIG_BASE + addr;
+        /* Ambiguous when the same range is also mapped low RAM: the two forms
+         * are indistinguishable here and this chose the window. */
+        *ambiguous = mapped != 0 && (uint64_t)addr + len <= (uint64_t)mapped;
+        return 1;
+    }
+    /* Case 3: a mapped low-RAM range is identity. */
+    if (mapped != 0 && (uint64_t)addr + len <= (uint64_t)mapped) {
+        *t = addr;
+        return 1;
+    }
+    /* Case 4: fail closed. */
+    return 0;
+}
+
 uint8_t *apu_guest_dma_ptr(uint32_t addr, uint32_t len, uint32_t *translated_va)
 {
     uint32_t t;
-    size_t mapped = xbox_GetMappedSize();
-    uint32_t high_water = xbox_ContiguousAllocatedBytes();
+    int ambiguous;
 
     if (translated_va) {
         *translated_va = addr;
@@ -486,35 +519,40 @@ uint8_t *apu_guest_dma_ptr(uint32_t addr, uint32_t len, uint32_t *translated_va)
     if (!g_apu_ram_ptr) {
         return NULL;
     }
-
-    /* Case 1: already a window VA. Used as is -- this is the 0d7929c form. */
-    if (addr >= XBOX_CONTIG_BASE &&
-        (uint64_t)addr + len <=
-            (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE) {
-        t = addr;
-    }
-    /* Case 2: a physical offset this runtime handed out as contiguous memory. */
-    else if (high_water != 0 && addr < high_water &&
-             (uint64_t)addr + len <= (uint64_t)XBOX_CONTIG_SIZE) {
-        t = XBOX_CONTIG_BASE + addr;
-        /* Ambiguous when the same range is also mapped low RAM: the two forms
-         * are indistinguishable here and this chose the window. */
-        if (mapped != 0 && (uint64_t)addr + len <= (uint64_t)mapped) {
-            InterlockedIncrement((volatile LONG *)&s.gpdma_ambiguous);
-        }
-    }
-    /* Case 3: a mapped low-RAM range is identity. */
-    else if (mapped != 0 && (uint64_t)addr + len <= (uint64_t)mapped) {
-        t = addr;
-    }
-    /* Case 4: fail closed. */
-    else {
+    if (!apu_translate(addr, len, &t, &ambiguous)) {
         note_unmapped(addr, len);
         return NULL;
     }
-
+    if (ambiguous) {
+        InterlockedIncrement((volatile LONG *)&s.gpdma_ambiguous);
+    }
     if (translated_va) {
         *translated_va = t;
+    }
+    return g_apu_ram_ptr + t;
+}
+
+/* The voice processor's physical accesses, through the same translation. VP
+ * code used to mask to 26 bits as xemu does, which reads and writes low RAM --
+ * the XBE image included -- for an address the title meant in the contiguous
+ * window. GP counters are left alone; an unmapped address is logged the first
+ * few times and the access dropped. */
+uint8_t *apu_phys_ptr(uint32_t addr, uint32_t len)
+{
+    static volatile LONG unmapped;
+    uint32_t t;
+    int ambiguous;
+
+    if (!g_apu_ram_ptr) {
+        return NULL;
+    }
+    if (!apu_translate(addr, len, &t, &ambiguous)) {
+        if (InterlockedIncrement(&unmapped) <= 8) {
+            fprintf(stderr, "[VPDMA] unmapped addr=%08X len=%X; access dropped\n",
+                    addr, len);
+            fflush(stderr);
+        }
+        return NULL;
     }
     return g_apu_ram_ptr + t;
 }

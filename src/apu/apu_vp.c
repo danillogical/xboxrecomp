@@ -843,8 +843,11 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, &d->ram_ptr[addr & 0x03FFFFFF],
-                           block_size);
+                    const uint8_t *src = apu_phys_ptr((uint32_t)addr, (uint32_t)block_size);
+                    if (src)
+                        memcpy(adpcm_block, src, block_size);
+                    else
+                        memset(adpcm_block, 0, block_size);
                 } else {
                     linear_addr += ba;
                     for (unsigned int word_index = 0;
