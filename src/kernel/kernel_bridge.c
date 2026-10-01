@@ -3470,6 +3470,18 @@ static int bridge_async_io_enabled(void)
     return on;
 }
 
+/* RECOMP_READ_DIRECT=1 reads straight into guest memory, as before the bounce
+ * buffer, so the two can be compared. */
+static int bridge_read_direct(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_READ_DIRECT");
+        on = (e && strcmp(e, "1") == 0) ? 1 : 0;
+    }
+    return on;
+}
+
 /* ── NtReadFile (ordinal 219, 8 args = 32 bytes) ──────── */
 static void bridge_NtReadFile(void)
 {
@@ -3481,6 +3493,7 @@ static void bridge_NtReadFile(void)
     XBOX_IO_STATUS_BLOCK ios;
     LARGE_INTEGER  off = {0};
     PLARGE_INTEGER poff = NULL;
+    uint8_t *bounce;
 
     memset(&ios, 0, sizeof(ios));
     if (!bridge_buf_ok(buffer_va, length, "NtReadFile")) {
@@ -3493,8 +3506,18 @@ static void bridge_NtReadFile(void)
         off.HighPart = (LONG)BRIDGE_MEM32(offset_va + 4);
         poff = &off;
     }
+    /* Read into a host buffer, then copy. ReadFile straight into guest memory
+     * stores from kernel mode, which neither a TTD trace nor a page-protection
+     * tripwire sees; the copy is an ordinary user-mode store that both do. A
+     * failed allocation falls back to the direct read. */
+    bounce = bridge_read_direct() ? NULL : (uint8_t *)malloc(length ? length : 1u);
     g_eax = (uint32_t)xbox_NtReadFile(handle, NULL, NULL, NULL, &ios,
-                XBOX_TO_NATIVE(buffer_va), length, poff);
+                bounce ? (void *)bounce : XBOX_TO_NATIVE(buffer_va), length, poff);
+    if (bounce) {
+        size_t got = ios.Information < length ? (size_t)ios.Information : length;
+        memcpy(XBOX_TO_NATIVE(buffer_va), bounce, got);
+        free(bounce);
+    }
 
     /* What a read actually delivered. A decoder that rejects its input cannot
      * say whether the bytes were wrong or the read was, and the two look
@@ -3529,6 +3552,15 @@ static void bridge_NtReadFile(void)
                     length, got, (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
+        /* A file read never belongs in a section the XBE leaves read-only. */
+        {
+            uint32_t lo, hi;
+            const char *name;
+            if (xbox_ReadOnlySectionOverlap(buffer_va, got, &lo, &hi, &name))
+                fprintf(stderr, "  [READ] WARNING dst=0x%08X+%u lands in read-only"
+                                " section %s 0x%08X-0x%08X\n",
+                        buffer_va, got, name, lo, hi);
+        }
         fflush(stderr);
     }
     bridge_write_iostatus(iostatus, ios.Status, (uint32_t)ios.Information);
@@ -9895,6 +9927,8 @@ void xbox_kernel_bridge_init(void)
     fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
             KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
 
+    /* The table is written; from here a store into it is a defect. */
+    xbox_RdataGuardArm();
 }
 
 #define JSRF_TEST_STACK_VA 0x0003F000u

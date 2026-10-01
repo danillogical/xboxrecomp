@@ -238,6 +238,15 @@ void xbox_WatchdogStart(void);
 void xbox_PeekSample(const char *label);
 void xbox_WatchInit(void);
 
+/* Report stores into the title's read-only sections (RECOMP_RDATA_GUARD=1).
+ * Call once the kernel thunk table is installed; see the implementation. */
+void xbox_RdataGuardArm(void);
+/* Nonzero when [va, va+len) overlaps a section the XBE leaves read-only; that
+ * section's bounds and name come back through the pointers, any of which may
+ * be NULL. */
+int  xbox_ReadOnlySectionOverlap(uint32_t va, uint32_t len,
+                                 uint32_t *lo, uint32_t *hi, const char **name);
+
 /* ================================================================
  * Xbox stack for recompiled code
  * ================================================================ */

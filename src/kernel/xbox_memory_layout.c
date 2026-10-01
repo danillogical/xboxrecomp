@@ -1733,6 +1733,296 @@ static int watch_arm(uint32_t va)
     return 1;
 }
 
+/* ---- RECOMP_RDATA_GUARD: report stores into the title's read-only sections --
+ *
+ * The XBE marks .rdata, and usually .text, not writable, but every section is
+ * mapped writable here: sections share host pages, and the kernel thunk table
+ * in .rdata is written at install. A stray store into a read-only section then
+ * corrupts it silently, and the first sign is a thunk slot or a constant
+ * holding something else much later.
+ *
+ * With RECOMP_RDATA_GUARD=1, xbox_RdataGuardArm makes every page that
+ * read-only sections wholly cover read-only in the canonical view and in all
+ * 28 mirrors, once the thunk table is installed. A store faults; the handler
+ * opens that page in that view, single-steps the store, closes the page again
+ * and prints the address, the dword before and after, the native RIP and the
+ * guest return chain. Each page reports RO_GUARD_PAGE_REPORTS stores and then
+ * stays open in the view that wrote it, so a legitimate writer costs a bounded
+ * number of faults.
+ *
+ * A host API writing from kernel mode does not fault here; the call fails
+ * instead (ReadFile returns ERROR_NOACCESS). NtReadFile bounces through a host
+ * buffer, so its copy into guest memory is an ordinary store that this handler,
+ * and a TTD trace, can see.
+ *
+ * Off unless RECOMP_RDATA_GUARD=1. Not armed with JSRF_TRACE_A2H_DR or
+ * JSRF_TRACE_A2H_SLOTW, which protect pages of the same table and would fight
+ * over them.
+ */
+#define RO_GUARD_MAX_SECTIONS  16
+#define RO_GUARD_PAGE_REPORTS  4
+#define RO_GUARD_TOTAL_REPORTS 256
+#define RO_GUARD_STEP_PAGES    4
+
+static struct { uint32_t lo, hi; char name[9]; } g_ro_sections[RO_GUARD_MAX_SECTIONS];
+static unsigned g_ro_section_count;
+static uint8_t       *g_ro_guard_armed;  /* per guest page: protected at arm */
+static volatile LONG *g_ro_guard_left;   /* per guest page: reports left */
+static volatile LONG  g_ro_guard_reports;
+static void          *g_ro_guard_veh;
+static uintptr_t      g_ro_guard_exe;    /* host image base, so RIPs print module-relative */
+
+static RECOMP_TLS int      s_ro_guard_stepping;
+static RECOMP_TLS int      s_ro_guard_report;
+static RECOMP_TLS void    *s_ro_guard_open[RO_GUARD_STEP_PAGES];
+static RECOMP_TLS int      s_ro_guard_open_count;
+static RECOMP_TLS uint32_t s_ro_guard_va;
+static RECOMP_TLS uint32_t s_ro_guard_old;
+static RECOMP_TLS int      s_ro_guard_view;
+static RECOMP_TLS uint64_t s_ro_guard_rip;
+
+static int a2h_alias_on(void);
+static int a2h_slotw_on(void);
+
+/* Called by the section loader for each section without the WRITABLE flag. */
+static void ro_section_note(uint32_t va, uint32_t vsize, const char *name)
+{
+    unsigned i, n = g_ro_section_count;
+
+    if (n >= RO_GUARD_MAX_SECTIONS || !vsize)
+        return;
+    g_ro_sections[n].lo = va;
+    g_ro_sections[n].hi = va + vsize;
+    for (i = 0; i < 8 && name && name[i]; i++)
+        g_ro_sections[n].name[i] = name[i];
+    g_ro_sections[n].name[i] = 0;
+    g_ro_section_count = n + 1;
+}
+
+int xbox_ReadOnlySectionOverlap(uint32_t va, uint32_t len,
+                                uint32_t *lo, uint32_t *hi, const char **name)
+{
+    uint64_t end = (uint64_t)va + len;
+    unsigned i;
+
+    if (!len)
+        return 0;
+    for (i = 0; i < g_ro_section_count; i++) {
+        if (va < g_ro_sections[i].hi && end > g_ro_sections[i].lo) {
+            if (lo)   *lo = g_ro_sections[i].lo;
+            if (hi)   *hi = g_ro_sections[i].hi;
+            if (name) *name = g_ro_sections[i].name;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Host address of guest XBOX_MAP_START in a view: 0 is canonical, m is mirror m. */
+static uint8_t *ro_guard_view_base(int view)
+{
+    return view == 0 ? (uint8_t *)g_memory_base : (uint8_t *)g_mirror_views[view - 1];
+}
+
+/* Which view and guest VA a faulting host address belongs to. The mirrors sit
+ * directly above the canonical view, one RAM size each. */
+static int ro_guard_locate(uintptr_t a, uint32_t *va, int *view)
+{
+    uintptr_t base = (uintptr_t)g_memory_base, off;
+
+    if (!base || a < base)
+        return 0;
+    off = a - base;
+    if (off >= (uintptr_t)g_memory_size * (uintptr_t)(1 + XBOX_NUM_MIRRORS))
+        return 0;
+    *view = (int)(off / g_memory_size);
+    if (*view > 0 && !g_mirror_views[*view - 1])
+        return 0;
+    *va = (uint32_t)(off % g_memory_size) + XBOX_MAP_START;
+    return 1;
+}
+
+static void ro_guard_report(void)
+{
+    const uint8_t *mem = (const uint8_t *)g_memory_offset;
+    uint32_t a = s_ro_guard_va & ~3u;
+    uint32_t now = *(const volatile uint32_t *)(mem + a);
+    uint32_t lo = 0, esp = g_esp, i, shown = 0;
+    const char *name = "?";
+
+    xbox_ReadOnlySectionOverlap(a, 4, &lo, NULL, &name);
+    fprintf(stderr, "[RDATA-GUARD] write va=0x%08X (%s+0x%X) view=%d %08X -> %08X"
+                    " rip=exe+0x%llX tid=%lu esp=%08X\n",
+            s_ro_guard_va, name, s_ro_guard_va - lo, s_ro_guard_view,
+            s_ro_guard_old, now,
+            (unsigned long long)(s_ro_guard_rip - g_ro_guard_exe),
+            (unsigned long)GetCurrentThreadId(), esp);
+    /* Guest return addresses on the stack, innermost first; a lead, as in
+     * watch_report, not an unwound chain. A host thread has no guest stack. */
+    for (i = 0; esp && i < 256u && shown < 8u; i++) {
+        uint32_t slot = esp + i * 4u, v;
+        if (!peek_readable(slot))
+            break;
+        v = *(const uint32_t *)(mem + slot);
+        if (watch_is_code(v)) {
+            fprintf(stderr, "         [esp+%-4u] %08X\n", i * 4u, v);
+            shown++;
+        }
+    }
+    fflush(stderr);
+}
+
+static LONG CALLBACK ro_guard_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    DWORD old;
+
+    if (!g_ro_guard_armed)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    /* Second half: the store has executed. Report it and close what it opened. */
+    if (code == EXCEPTION_SINGLE_STEP && s_ro_guard_stepping) {
+        int i;
+        s_ro_guard_stepping = 0;
+        if (s_ro_guard_report)
+            ro_guard_report();
+        for (i = 0; i < s_ro_guard_open_count; i++)
+            VirtualProtect(s_ro_guard_open[i], 4096, PAGE_READONLY, &old);
+        s_ro_guard_open_count = 0;
+        ep->ContextRecord->EFlags &= ~0x100u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if (code == EXCEPTION_ACCESS_VIOLATION
+            && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
+        uintptr_t fault = ep->ExceptionRecord->ExceptionInformation[1];
+        uint32_t va, idx;
+        int view;
+        void *page;
+
+        if (!ro_guard_locate(fault, &va, &view))
+            return EXCEPTION_CONTINUE_SEARCH;
+        idx = (va - XBOX_MAP_START) >> 12;
+        if (!g_ro_guard_armed[idx])
+            return EXCEPTION_CONTINUE_SEARCH;
+        page = ro_guard_view_base(view) + ((va - XBOX_MAP_START) & ~4095u);
+
+        /* A store that straddles into a second guarded page while stepping:
+         * open that one too and let the step finish. */
+        if (s_ro_guard_stepping) {
+            if (s_ro_guard_open_count >= RO_GUARD_STEP_PAGES
+                    || !VirtualProtect(page, 4096, PAGE_READWRITE, &old))
+                return EXCEPTION_CONTINUE_SEARCH;
+            s_ro_guard_open[s_ro_guard_open_count++] = page;
+            ep->ContextRecord->EFlags |= 0x100u;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        /* Reported enough: open the page in this view and say nothing. Still
+         * claimed later, since other views (or a step elsewhere) may close it. */
+        if (InterlockedDecrement(&g_ro_guard_left[idx]) < 0
+                || InterlockedIncrement(&g_ro_guard_reports) > RO_GUARD_TOTAL_REPORTS) {
+            if (!VirtualProtect(page, 4096, PAGE_READWRITE, &old))
+                return EXCEPTION_CONTINUE_SEARCH;
+            if (g_ro_guard_reports == RO_GUARD_TOTAL_REPORTS + 1)
+                fprintf(stderr, "[RDATA-GUARD] %d writes reported; further writes"
+                                " are not\n", RO_GUARD_TOTAL_REPORTS);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        s_ro_guard_va = va;
+        s_ro_guard_old = *(const volatile uint32_t *)((const uint8_t *)g_memory_offset
+                                                      + (va & ~3u));
+        s_ro_guard_view = view;
+        s_ro_guard_rip = (uint64_t)ep->ContextRecord->Rip;
+        s_ro_guard_report = 1;
+        if (!VirtualProtect(page, 4096, PAGE_READWRITE, &old))
+            return EXCEPTION_CONTINUE_SEARCH;
+        s_ro_guard_open[0] = page;
+        s_ro_guard_open_count = 1;
+        s_ro_guard_stepping = 1;
+        ep->ContextRecord->EFlags |= 0x100u;   /* TF: step the store, then close again */
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void xbox_RdataGuardArm(void)
+{
+    const char *e = getenv("RECOMP_RDATA_GUARD");
+    unsigned s, pages = 0, failed = 0;
+    uint32_t lo = 0xFFFFFFFFu, hi = 0, pva;
+    uint8_t *armed;
+    int views = 1, v;
+
+    if (!e || strcmp(e, "1") != 0 || g_ro_guard_armed || !g_memory_base)
+        return;
+    if (a2h_alias_on() || a2h_slotw_on()) {
+        fprintf(stderr, "  RDATA-GUARD: not armed; an A2h trace owns pages of"
+                        " the same table\n");
+        return;
+    }
+    for (v = 0; v < XBOX_NUM_MIRRORS; v++)
+        if (g_mirror_views[v])
+            views++;
+    g_ro_guard_exe = (uintptr_t)GetModuleHandleA(NULL);
+    armed = (uint8_t *)calloc(g_memory_size >> 12, 1);
+    g_ro_guard_left = (volatile LONG *)calloc(g_memory_size >> 12, sizeof(LONG));
+    if (!armed || !g_ro_guard_left)
+        return;
+    /* Published before the first page is protected, so the first fault is
+     * recognised. */
+    g_ro_guard_armed = armed;
+    g_ro_guard_veh = AddVectoredExceptionHandler(1, ro_guard_veh);
+    if (!g_ro_guard_veh) {
+        g_ro_guard_armed = NULL;
+        fprintf(stderr, "  RDATA-GUARD: not armed; no VEH\n");
+        return;
+    }
+
+    for (s = 0; s < g_ro_section_count; s++) {
+        fprintf(stderr, "  RDATA-GUARD: %-8s 0x%08X-0x%08X\n", g_ro_sections[s].name,
+                g_ro_sections[s].lo, g_ro_sections[s].hi);
+        if (g_ro_sections[s].lo < lo)
+            lo = g_ro_sections[s].lo;
+        if (g_ro_sections[s].hi > hi)
+            hi = g_ro_sections[s].hi;
+    }
+    /* A page is guarded when read-only sections cover all of it, so a page
+     * shared with a writable section stays open and adjacent read-only
+     * sections (a thunk table starting mid-page, say) are covered. */
+    for (pva = lo & ~4095u; pva < hi; pva += 4096u) {
+        uint32_t off = pva - XBOX_MAP_START, covered = 0;
+        if (off >= g_memory_size)
+            break;
+        for (s = 0; s < g_ro_section_count; s++) {
+            uint32_t a = g_ro_sections[s].lo > pva ? g_ro_sections[s].lo : pva;
+            uint32_t b = g_ro_sections[s].hi < pva + 4096u ? g_ro_sections[s].hi : pva + 4096u;
+            if (b > a)
+                covered += b - a;
+        }
+        if (covered < 4096u)
+            continue;
+        /* RECOMP_WATCH owns its page already. */
+        if (g_watch_page == (void *)(ro_guard_view_base(0) + off))
+            continue;
+        g_ro_guard_left[off >> 12] = RO_GUARD_PAGE_REPORTS;
+        armed[off >> 12] = 1;
+        for (v = 0; v <= XBOX_NUM_MIRRORS; v++) {
+            DWORD old;
+            if (v > 0 && !g_mirror_views[v - 1])
+                continue;
+            if (!VirtualProtect(ro_guard_view_base(v) + off, 4096, PAGE_READONLY, &old))
+                failed++;
+        }
+        pages++;
+    }
+    fprintf(stderr, "  RDATA-GUARD: %u page(s) in %u read-only section(s) protected"
+                    " in %d view(s); %u protection(s) failed\n",
+            pages, g_ro_section_count, views, failed);
+    fflush(stderr);
+}
+
 /* Print the RECOMP_PEEK globals. Shared, because the two moments worth
  * sampling are a hang and an early exit, and only the first had it: a title
  * whose main() returns during init never reaches the watchdog, so the one
@@ -2212,6 +2502,11 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 g_xbox_image_lo = sec_va;
             if (sec_va + sec_vsize > g_xbox_image_hi)
                 g_xbox_image_hi = sec_va + sec_vsize;
+
+            /* Sections the XBE leaves read-only (flag 0x01 is WRITABLE), for
+             * RECOMP_RDATA_GUARD and the NtReadFile destination check. */
+            if (!(*(const DWORD *)(sh + SECTHDR_FLAGS) & 0x00000001u))
+                ro_section_note(sec_va, sec_vsize, sec_name);
 
             /* Executable sections define the range indirect calls may target.
              * XBE section flag 0x04 is EXECUTABLE. */
