@@ -91,7 +91,10 @@ static DWORD xbox_access_to_win32(ACCESS_MASK Access)
     DWORD result = 0;
     if (Access & XBOX_GENERIC_READ)           result |= GENERIC_READ;
     if (Access & XBOX_GENERIC_WRITE)          result |= GENERIC_WRITE;
-    if (Access & XBOX_GENERIC_ALL)            result |= GENERIC_ALL;
+    /* Data and delete rights only: Win32 GENERIC_ALL also demands owner and
+     * security rights a title file never needs, and can fail where they are
+     * missing. */
+    if (Access & XBOX_GENERIC_ALL)            result |= GENERIC_READ | GENERIC_WRITE | DELETE;
     if (Access & XBOX_FILE_READ_DATA)         result |= FILE_READ_DATA;
     if (Access & XBOX_FILE_WRITE_DATA)        result |= FILE_WRITE_DATA;
     if (Access & XBOX_FILE_APPEND_DATA)       result |= FILE_APPEND_DATA;
@@ -185,8 +188,10 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             xbox_share_to_win32(ShareAccess), NULL, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS, NULL);
     } else {
-        if (CreateOptions & XBOX_FILE_NO_INTERMEDIATE_BUFFERING)
-            flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
+        /* XBOX_FILE_NO_INTERMEDIATE_BUFFERING is treated as a caching hint, not
+         * FILE_FLAG_NO_BUFFERING: that flag makes every ReadFile demand buffers,
+         * offsets and lengths aligned to the host volume's sector size, which
+         * guest buffers are not. */
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
