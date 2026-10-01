@@ -15,6 +15,7 @@ import bisect
 import json
 import glob
 import os
+import re
 import struct
 import sys
 
@@ -423,6 +424,30 @@ _FLAG_WRITERS = frozenset({
 })
 
 
+_GOTO_TARGET = re.compile(r"goto loc_([0-9A-F]{8});")
+
+
+def _mark_back_edges(stmts, func_start, jump_address):
+    """Put RECOMP_BACKEDGE() before each goto that jumps back in the function.
+
+    A block ends at its jump, so a goto from it to an address at or before
+    that jump, and not before the function, is a loop back-edge. Serial
+    guest mode lets one host thread run guest code at a time; a guest loop
+    that spins without calling the kernel would hold the lock until a
+    waiter's bounded wait ran out, and the back-edge is where it can offer
+    the lock instead. Switch-table dispatch lines are left alone. The hook
+    only reads a flag when serial mode is off (templates/runtime/recomp_types.h).
+    """
+    out = []
+    for stmt in stmts:
+        if not stmt.startswith("if (_jt =="):
+            targets = [int(t, 16) for t in _GOTO_TARGET.findall(stmt)]
+            if any(func_start <= t <= jump_address for t in targets):
+                out.append("RECOMP_BACKEDGE();")
+        out.append(stmt)
+    return out
+
+
 class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
@@ -438,9 +463,13 @@ class FunctionTranslator:
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
-                 trace_functions=None, force_returns=None, icall_sites=None):
+                 trace_functions=None, force_returns=None, icall_sites=None,
+                 backedge_yield=False):
         """
         xbe_data: bytes - raw XBE file contents
+        backedge_yield: emit RECOMP_BACKEDGE() before every jump back to an
+                     earlier address in the function (serial guest mode's
+                     preemption point; see _mark_back_edges)
         icall_sites: dict - call-site VA -> [target VAs] a recorded run saw
                      that site reach (tools.recomp.icall_feedback merge)
         func_db: dict - addr → function info from functions.json
@@ -457,6 +486,7 @@ class FunctionTranslator:
         self.abi_db = abi_db or {}
         self.trace_functions = set(trace_functions or ())
         self.force_returns = dict(force_returns or {})
+        self.backedge_yield = bool(backedge_yield)
         self.disasm = Disassembler()
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
@@ -2445,6 +2475,8 @@ class FunctionTranslator:
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming,
                 materialise=sorted(materialise.get(bb.start, ())))
+            if self.backedge_yield:
+                stmts = _mark_back_edges(stmts, start, bb.last_insn.address)
             for stmt in stmts:
                 lines.append(f"    {stmt}")
             bypass = debug_slide_bypasses.get(bb.last_insn.address)
@@ -2575,7 +2607,7 @@ class BatchTranslator:
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
-                 icall_sites_json_path=None):
+                 icall_sites_json_path=None, backedge_yield=False):
         self.xbe_path = xbe_path
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
@@ -2641,7 +2673,8 @@ class BatchTranslator:
             self.classification_db, self.abi_db,
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions,
-            force_returns=force_returns, icall_sites=self.icall_sites)
+            force_returns=force_returns, icall_sites=self.icall_sites,
+            backedge_yield=backedge_yield)
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
         for explicit_helper in (seh_prolog, seh_epilog):

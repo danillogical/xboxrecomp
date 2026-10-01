@@ -377,6 +377,18 @@ uint8_t  xbox_inb(uint16_t port);
 uint16_t xbox_inw(uint16_t port);
 uint32_t xbox_inl(uint16_t port);
 
+/* Loop back-edge hook, emitted before a jump back to an earlier address when
+ * the translator runs with --backedge-yield. Serial guest mode
+ * (RECOMP_GUEST_SERIAL=1, guest_meter.h) lets one host thread run guest code at
+ * a time; xbox_GuestSerialYield offers the lock to a waiting thread on every
+ * 4096th call, so a guest loop that never calls the kernel cannot hold it until
+ * the waiter's bounded wait runs out. Serial mode off, the hook reads one flag. */
+extern volatile int g_xbox_guest_serial_on;
+void xbox_GuestSerialYield(void);
+#define RECOMP_BACKEDGE() do { \
+    if (g_xbox_guest_serial_on) xbox_GuestSerialYield(); \
+} while (0)
+
 void recomp_trace_enter(const char *name, uint32_t va);
 #define RECOMP_TRACE_ENTER(name, va) recomp_trace_enter((name), (va))
 void recomp_trace_exit(const char *name, uint32_t va);

@@ -31,6 +31,9 @@ static volatile LONGLONG g_gm_exits[XBOX_GM_SOURCE_COUNT];
 #define GS_HANDOFF_GRACE_MS   2
 
 static volatile LONG g_gs_enabled = -1;   /* -1 until RECOMP_GUEST_SERIAL is read */
+/* What generated code's RECOMP_BACKEDGE reads: 1 once serial mode is on, so a
+ * loop pays one load, not a call, when it is off. */
+volatile int g_xbox_guest_serial_on = 0;
 static DWORD g_gs_timeout_ms = GS_DEFAULT_TIMEOUT_MS;
 static HANDLE volatile g_gs_wake;         /* one release wakes one waiter */
 static volatile LONG g_gs_owner;          /* host thread id holding the lock, 0 when free */
@@ -111,6 +114,7 @@ static LONG gs_init(void)
         }
     }
     InterlockedExchange(&g_gs_enabled, on);
+    g_xbox_guest_serial_on = (int)on;
     return on;
 }
 
@@ -401,6 +405,7 @@ void xbox_GuestMeterTestReset(int enabled)
 
     g_gm_enabled = enabled ? 1 : 0;
     g_gs_enabled = 0;
+    g_xbox_guest_serial_on = 0;
     g_gm_track = g_gm_enabled;
     g_gm_where = GM_UNSEEN;
     g_gs_held = 0;
@@ -418,6 +423,7 @@ void xbox_GuestSerialTestReset(int on, DWORD timeout_ms)
     if (!g_gs_wake)
         g_gs_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
     g_gs_enabled = on ? 1 : 0;
+    g_xbox_guest_serial_on = on ? 1 : 0;
     g_gm_track = (g_gm_enabled > 0 || g_gs_enabled) ? 1 : 0;
     g_gs_timeout_ms = timeout_ms ? timeout_ms : GS_DEFAULT_TIMEOUT_MS;
     g_gs_owner = g_gs_waiters = g_gs_handoff = g_gs_release_seq = 0;

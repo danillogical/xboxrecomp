@@ -281,6 +281,13 @@ def main():
                              "not implement yet: the body still runs, only "
                              "the answer changes, and the emitted code is "
                              "inert unless RECOMP_FORCE_RETURN is set")
+    parser.add_argument("--backedge-yield", action="store_true",
+                        help="Emit RECOMP_BACKEDGE() before every jump back to "
+                             "an earlier address in a function: the point where "
+                             "serial guest mode (RECOMP_GUEST_SERIAL=1) lets a "
+                             "spinning loop offer the guest lock. Reads one "
+                             "flag when that mode is off. Needs the matching "
+                             "recomp_types.h, which a full pass writes")
     parser.add_argument("--coalesce-functions", metavar="JSON", action="append",
                         help="Explicit owner bounds and false interior starts "
                              "to merge before translation; repeatable")
@@ -353,6 +360,7 @@ def main():
         force_returns=_parse_force_returns(args.force_return),
         coalesce_json_paths=args.coalesce_functions,
         protected_function_starts=protected_function_starts,
+        backedge_yield=args.backedge_yield,
         seh_prolog=int(args.seh_prolog, 16) if args.seh_prolog else None,
         seh_epilog=int(args.seh_epilog, 16) if args.seh_epilog else None,
         icall_sites_json_path=args.icall_sites or os.path.join(

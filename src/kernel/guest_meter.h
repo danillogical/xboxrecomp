@@ -48,10 +48,11 @@
  * xbox_GuestMeterEnter / xbox_GuestMeterRestore.
  *
  * xbox_GuestSerialYield lets a waiter in if there is one. It acts on every
- * 4096th call per thread, so a caller can put it on a hot path. Nothing calls
- * it from lifted code yet: generated indirect calls go through the title's own
- * lookup functions, not a runtime one, so the hook belongs in the translator,
- * on loop back-edges or in the indirect-call macro.
+ * 4096th call per thread, so a caller can put it on a hot path. Lifted code
+ * calls it from RECOMP_BACKEDGE (templates/runtime/recomp_types.h), which the
+ * translator emits before every loop back-edge when run with --backedge-yield;
+ * the macro tests g_xbox_guest_serial_on first, so serial mode off costs a
+ * loop one load.
  *
  * Serial mode off, every serial check returns at a cached flag test. The
  * [GMETER] line prints when either mode is on, so a serial run shows max=1
@@ -130,6 +131,8 @@ void xbox_GuestSerialEndAtomic(int token, int source);
 void xbox_GuestSerialNoteSkip(int which);
 /* Release and re-take the lock if another thread is waiting for it. */
 void xbox_GuestSerialYield(void);
+/* 1 while serial mode is on; read by RECOMP_BACKEDGE in generated code. */
+extern volatile int g_xbox_guest_serial_on;
 void xbox_GuestSerialSnapshot(xbox_gserial_record *out);
 
 #ifdef XBOXRECOMP_GMETER_TEST_BUILD
