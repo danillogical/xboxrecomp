@@ -56,6 +56,11 @@ enum {
 #define PASSIVE_LEVEL   0
 #define APC_LEVEL       1
 #define DISPATCH_LEVEL  2
+/* The Xbox kernel is uniprocessor, and on a uniprocessor NT kernel SYNCH_LEVEL
+ * is DISPATCH_LEVEL (wdm.h, NT_UP). */
+#ifndef SYNCH_LEVEL
+#define SYNCH_LEVEL     DISPATCH_LEVEL
+#endif
 
 /*
  * NTSTATUS codes - guard each against Windows SDK redefinition.
@@ -834,6 +839,9 @@ int     xbox_IrqlTransitions(void);
 void    xbox_IrqlDumpHolders(void);
 VOID    __fastcall xbox_KfLowerIrql(KIRQL NewIrql);
 KIRQL   __stdcall xbox_KeRaiseIrqlToDpcLevel(void);
+KIRQL   __stdcall xbox_KeRaiseIrqlToSynchLevel(void);
+/* This thread's IRQL, as the raise and lower calls above have left it. */
+KIRQL   xbox_KeGetCurrentIrql(void);
 
 VOID    __stdcall xbox_KeStallExecutionProcessor(ULONG MicroSeconds);
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void);

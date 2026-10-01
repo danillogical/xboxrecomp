@@ -385,6 +385,24 @@ KIRQL __stdcall xbox_KeRaiseIrqlToDpcLevel(void)
     return old;
 }
 
+/*
+ * KeRaiseIrqlToSynchLevel - Raises IRQL to SYNCH_LEVEL (DISPATCH_LEVEL here).
+ * Tracked like the other raises, so the interrupt gates see it.
+ */
+KIRQL __stdcall xbox_KeRaiseIrqlToSynchLevel(void)
+{
+    KIRQL old = g_current_irql;
+
+    irql_track(old, SYNCH_LEVEL, IRQL_CALLER());
+    g_current_irql = SYNCH_LEVEL;
+    return old;
+}
+
+KIRQL xbox_KeGetCurrentIrql(void)
+{
+    return g_current_irql;
+}
+
 /* ============================================================================
  * KeTickCount
  *

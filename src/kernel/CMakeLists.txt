@@ -87,6 +87,20 @@ if(BUILD_TESTING AND WIN32)
     target_link_libraries(xbox_guest_meter_test PRIVATE platform kernel32)
     add_test(NAME xbox_guest_meter COMMAND xbox_guest_meter_test)
     set_tests_properties(xbox_guest_meter PROPERTIES TIMEOUT 60)
+
+    add_executable(xbox_irql_tracking_test
+        kernel_hal.c
+        guest_meter.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/kernel_irql_tracking_test.c
+    )
+    target_include_directories(xbox_irql_tracking_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${XBOXRECOMP_SRC_DIR}
+    )
+    target_link_libraries(xbox_irql_tracking_test PRIVATE platform kernel32)
+    add_test(NAME xbox_irql_tracking COMMAND xbox_irql_tracking_test)
+    set_tests_properties(xbox_irql_tracking PROPERTIES TIMEOUT 20
+                         ENVIRONMENT "RECOMP_GUEST_SERIAL=1")
 endif()
 
 # The allocator and kernel-memory decisions in kmem.c have no host dependency,
