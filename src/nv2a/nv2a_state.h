@@ -87,6 +87,16 @@ enum {
  * Adapted from xemu's nv2a_int.h
  * ============================================================ */
 
+/* One submission's walk budget, in words, and the capacity of everything the
+ * walk stages or records for that submission.
+ *
+ * The walk commits a submission all-or-nothing: it stages every method before
+ * it commits any of them, so the staging array and the sink both have to hold
+ * a whole budget's worth. Each staged method consumes exactly one parameter
+ * word, so staged methods <= walked words <= NV2A_SUBMIT_MAX_WORDS. The walk
+ * separately bounds itself to 1024 packets, which is unchanged. */
+#define NV2A_SUBMIT_MAX_WORDS 4096
+
 typedef struct NV2AState {
     /*< private >*/
     PCIDevice parent_obj;
@@ -171,7 +181,13 @@ typedef struct NV2AState {
         /* class_id is recorded because the same method number means different
          * things in different classes -- 0x2FC is NV09F_SET_OPERATION and an
          * NV097 surface method, and both appear in JSRF's stream. */
-        struct { uint32_t subchannel, class_id, method, param; } sink[1024];
+        struct { uint32_t subchannel, class_id, method, param; } sink[NV2A_SUBMIT_MAX_WORDS];
+        /* The walk's staging area for the submission it is walking. It is
+         * PFIFO-owned rather than a local because a submission may stage a
+         * whole budget's worth, and 4096 entries is 48 KB -- too much for the
+         * submission thread's stack. Nothing is committed from it until the
+         * whole walk has succeeded. */
+        struct { uint32_t subchannel, method, param; } staged[NV2A_SUBMIT_MAX_WORDS];
     } pfifo;
 
     struct {

@@ -985,6 +985,21 @@ enum {
  * remains test-only. */
 #define M_SET_OBJECT 0x0000u
 
+/* Both capacities must hold a whole submission's word budget: a submission is
+ * staged in full before any of it is committed, and every staged method
+ * consumes exactly one parameter word, so a walk that stays inside its word
+ * budget can never overrun either array. The guards below the walk still check
+ * against capacity; with these assertions they are unreachable except by a
+ * carry/accounting bug, which must still reject rather than corrupt state. */
+_Static_assert(sizeof(((NV2AState *)0)->pfifo.staged) /
+                   sizeof(((NV2AState *)0)->pfifo.staged[0]) >=
+               NV2A_SUBMIT_MAX_WORDS,
+               "submit staging must hold a whole submission word budget");
+_Static_assert(sizeof(((NV2AState *)0)->pfifo.sink) /
+                   sizeof(((NV2AState *)0)->pfifo.sink[0]) >=
+               NV2A_SUBMIT_MAX_WORDS,
+               "submit sink must hold a whole submission word budget");
+
 /* Is this a method this model can execute on a subchannel bound to class_id?
  *
  * The table is GENERATED from the pushbuffer the title actually submits
@@ -1439,7 +1454,6 @@ bool nv2a_submit_pending(NV2AState *d)
     uint32_t get, put, pc, ret = 0, words = 0, packets = 0;
     uint32_t seen[1024]; unsigned seen_count = 0;
     uint32_t trace[32] = { 0 };   /* ring of recent walk addresses, for the budget dump */
-    struct { uint32_t subchannel, method, param; } staged[1024];
     uint32_t staged_count = 0;
     uint32_t staged_class[8], staged_object[8];
     bool ok = true;
@@ -1458,13 +1472,12 @@ bool nv2a_submit_pending(NV2AState *d)
         d->pfifo.hold = NV2A_HOLD_NONE;
         action_stage_begin(d, &st);
     }
-    /* The sink is a per-submission record of the methods just walked. Nothing
-     * reads it and nothing used to clear it, so it ratcheted to its 256 cap and
-     * then rejected every later submission for the rest of the run -- which is
-     * what strands PFIFO_DMA_GET. The test harness already treats it this way
-     * (submit_reset zeroes sink_count), so this is the model catching up with
-     * its own contract rather than a relaxation: the within-submission cap is
-     * unchanged and a 257-packet stream still rejects. */
+    /* sink_count is cleared per submission, because the sink records the methods
+     * this submission walked. Its payload is written for diagnostics and tests
+     * and has no production reader; sink_count is the diagnostic/test seam. The
+     * staging area and the sink both cover the walk's whole word budget
+     * (NV2A_SUBMIT_MAX_WORDS), and the submission is still committed
+     * all-or-nothing. */
     d->pfifo.sink_count = 0;
     memcpy(staged_class, d->pfifo.binding_class, sizeof(staged_class));
     memcpy(staged_object, d->pfifo.binding_object, sizeof(staged_object));
@@ -1492,13 +1505,13 @@ bool nv2a_submit_pending(NV2AState *d)
         subchannel = d->pfifo.carry_subchannel;
         non_inc = d->pfifo.carry_non_inc;
         ret = d->pfifo.carry_ret;
-        if (count > 1024) { d->pfifo.submit_diag = NV2A_SUBMIT_SINK_FULL; ok = false; goto done; }
+        if (count > NV2A_SUBMIT_MAX_WORDS) { d->pfifo.submit_diag = NV2A_SUBMIT_SINK_FULL; ok = false; goto done; }
     }
     while (pc != put || count) {
         uint32_t h;
         if (count) {
             uint32_t param;
-            if (words >= 4096) { d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false; goto done; }
+            if (words >= NV2A_SUBMIT_MAX_WORDS) { d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false; goto done; }
             if (pc == put || !submit_read_word(d, pc, &param)) { d->pfifo.submit_diag = pc == put ? NV2A_SUBMIT_TRUNCATED : NV2A_SUBMIT_UNREADABLE; ok = false; goto done; }
             pc = submit_advance(d, pc); ++words;
             /* Production SET_OBJECT walks RAMHT in claimed PRAMIN.
@@ -1555,9 +1568,9 @@ bool nv2a_submit_pending(NV2AState *d)
                     goto done;
                 }
             }
-            staged[staged_count].subchannel = subchannel;
-            staged[staged_count].method = method;
-            staged[staged_count].param = param;
+            d->pfifo.staged[staged_count].subchannel = subchannel;
+            d->pfifo.staged[staged_count].method = method;
+            d->pfifo.staged[staged_count].param = param;
             ++staged_count;
             --count;
             if (!non_inc) method += 4;
@@ -1566,12 +1579,14 @@ bool nv2a_submit_pending(NV2AState *d)
         }
         address = pc;
         trace[words & 31u] = address;
-        if (words >= 4096 || packets >= 1024) {
+        if (words >= NV2A_SUBMIT_MAX_WORDS || packets >= 1024) {
             d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false;
-            /* A straight-line walk cannot consume more than PUT-GET words, so
-             * reaching the budget means a jump or call target moved pc and the
-             * walk kept going. Without the path this is indistinguishable from
-             * "the ring is simply large", which it is not. */
+            /* A jump-free walk consumes at most PUT-GET words: it only ever
+             * advances, and a packet header's parameters are counted as they
+             * are consumed. So a jump-free walk that reaches the word budget
+             * was already longer than the budget, and reaching it with a cyclic
+             * jump or call trace means the walk never left the ring. The
+             * 32-address dump below is what tells those two apart. */
             fprintf(stderr, "  [PFIFO] budget_exhausted get=%08X put=%08X"
                     " begin=%08X end=%08X words=%u packets=%u pc=%08X\n",
                     get, put, begin, end, words, packets, pc);
@@ -1603,17 +1618,17 @@ bool nv2a_submit_pending(NV2AState *d)
             count = (h >> 18) & 0x7ffu; method = h & 0x1ffcu; subchannel = (h >> 13) & 7u;
             non_inc = (h & 0x40000000u) != 0;
             if (!non_inc && count && method + 4u * (count - 1u) > 0x1ffcu) { d->pfifo.submit_diag = NV2A_SUBMIT_METHOD_RANGE; ok = false; break; }
-            if (d->pfifo.sink_count + staged_count + count > 1024) { d->pfifo.submit_diag = NV2A_SUBMIT_SINK_FULL; ok = false; break; }
+            if (d->pfifo.sink_count + staged_count + count > NV2A_SUBMIT_MAX_WORDS) { d->pfifo.submit_diag = NV2A_SUBMIT_SINK_FULL; ok = false; break; }
             continue;
         }
         d->pfifo.submit_diag = NV2A_SUBMIT_RESERVED; d->pfifo.submit_diag_get = address; ok = false; break;
     }
     if (ok) {
         for (uint32_t i = 0; i < staged_count; ++i) {
-            d->pfifo.sink[d->pfifo.sink_count].subchannel = staged[i].subchannel;
-            d->pfifo.sink[d->pfifo.sink_count].class_id = staged_class[staged[i].subchannel];
-            d->pfifo.sink[d->pfifo.sink_count].method = staged[i].method;
-            d->pfifo.sink[d->pfifo.sink_count].param = staged[i].param;
+            d->pfifo.sink[d->pfifo.sink_count].subchannel = d->pfifo.staged[i].subchannel;
+            d->pfifo.sink[d->pfifo.sink_count].class_id = staged_class[d->pfifo.staged[i].subchannel];
+            d->pfifo.sink[d->pfifo.sink_count].method = d->pfifo.staged[i].method;
+            d->pfifo.sink[d->pfifo.sink_count].param = d->pfifo.staged[i].param;
             ++d->pfifo.sink_count;
             /* Capture the parameter as method state. For the register-setting
              * methods -- which is most of the NV097 pipeline, and all of the
@@ -1626,17 +1641,17 @@ bool nv2a_submit_pending(NV2AState *d)
              * Only NV097 has method state in this model, so only NV097 is
              * captured this way; the other classes' parameters are recorded in
              * the sink, which now carries the class. */
-            if (staged_class[staged[i].subchannel] == NV097_CLASS
-                    && staged[i].method / 4 < NV2A_PGRAPH_METHOD_WORDS) {
-                d->pgraph.methods[staged[i].method / 4] = staged[i].param;
+            if (staged_class[d->pfifo.staged[i].subchannel] == NV097_CLASS
+                    && d->pfifo.staged[i].method / 4 < NV2A_PGRAPH_METHOD_WORDS) {
+                d->pgraph.methods[d->pfifo.staged[i].method / 4] = d->pfifo.staged[i].param;
             }
         }
         memcpy(d->pfifo.binding_class, staged_class, sizeof(staged_class));
         memcpy(d->pfifo.binding_object, staged_object, sizeof(staged_object));
         if (actions) action_commit(d, &st);
         if (staged_count) {
-            d->pfifo.submit_last_method = staged[staged_count - 1].method;
-            d->pfifo.submit_last_param = staged[staged_count - 1].param;
+            d->pfifo.submit_last_method = d->pfifo.staged[staged_count - 1].method;
+            d->pfifo.submit_last_param = d->pfifo.staged[staged_count - 1].param;
         }
         d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = pc;
         pfifo_trace("submit_commit", NV_PFIFO_CACHE1_DMA_GET, pc);
@@ -1659,9 +1674,9 @@ bool nv2a_submit_pending(NV2AState *d)
             }
             if (held) {
                 d->pfifo.submit_diag = stop;
-                d->pfifo.submit_diag_subchannel = staged[staged_count - 1].subchannel;
-                d->pfifo.submit_diag_method = staged[staged_count - 1].method;
-                d->pfifo.submit_diag_param = staged[staged_count - 1].param;
+                d->pfifo.submit_diag_subchannel = d->pfifo.staged[staged_count - 1].subchannel;
+                d->pfifo.submit_diag_method = d->pfifo.staged[staged_count - 1].method;
+                d->pfifo.submit_diag_param = d->pfifo.staged[staged_count - 1].param;
             }
         }
     }
