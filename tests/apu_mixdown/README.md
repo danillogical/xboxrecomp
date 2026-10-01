@@ -21,7 +21,10 @@ audible while no effect ever was.
     cmake --build build/apu-mixdown
     ctest --test-dir build/apu-mixdown
 
-Two tests, and both matter. `apu_mixdown_all` puts a signal only in bins 6..10
-and requires it to reach the frame buffer. `apu_mixdown_two_bins` requires the
-same signal to be *lost* with the switch off — without that arm, a mixdown
-that ignored its own switch would pass.
+Three tests. `apu_mixdown_all` (the default 5.1 fold-down) puts a signal only
+in bins 6..10 and requires it to reach the frame buffer on both channels, then
+requires a centre-only signal to reach both channels equally.
+`apu_mixdown_even_odd` checks the first wide mixdown (`RECOMP_APU_MIXDOWN_ALL=2`,
+even bins left, odd bins right). `apu_mixdown_two_bins` requires the same
+signal to be *lost* with the switch off — without that arm, a mixdown that
+ignored its own switch would pass.

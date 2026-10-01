@@ -49,15 +49,22 @@
  * Gating the HRTF submix override was tried first and did not fix it, so the
  * defect is the width of this mixdown and nothing else.
  *
- * Even bins left, odd bins right, which preserves the stereo pairing the guest
- * set up -- bins 6/7 and 8/9 arrive with matched counts. This is not what a real
- * EP does; it is the cheapest mixdown that stops discarding audio. */
+ * The wide arm is a 5.1 fold-down of the DirectSound speaker buses, the one
+ * Mercenaries-Recompiled uses when its EP does not run: front L/R as they are,
+ * centre and rear at -3 dB into both sides, LFE at -6 dB, the 3D front pair
+ * (6/7) as they are and the 3D rear pair (8/9) at -3 dB. Bins from 10 up are
+ * effect sends (I3DL2 reverb first) that the EP would process; they are not
+ * dry signal and are left out. This is not what a real EP does either; it is
+ * the cheapest mixdown that keeps every authored speaker route.
+ *
+ * RECOMP_APU_MIXDOWN_ALL=2 restores the first wide mixdown, every even bin
+ * left and every odd bin right, which put the centre on the left only. */
 int mcpx_apu_mixdown_all(void)
 {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("RECOMP_APU_MIXDOWN_ALL");
-        on = (e && *e) ? (atoi(e) != 0) : 1;
+        on = (e && *e) ? atoi(e) : 1;
     }
     return on;
 }
@@ -72,7 +79,7 @@ int mcpx_apu_mixdown_all(void)
  *   Mixbin 4-5 = Rear L/R
  *
  * For stereo output, bins 0 and 1 are what the two-bin arm wants; the wide arm
- * sums every bin the guest routed to. */
+ * folds every speaker bus the guest routed to. */
 void mcpx_apu_monitor_mixdown(MCPXAPUState *d,
                               float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -84,13 +91,20 @@ void mcpx_apu_monitor_mixdown(MCPXAPUState *d,
 
     for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
         float left, right;
-        if (mcpx_apu_mixdown_all()) {
+        if (mcpx_apu_mixdown_all() == 2) {
             left = 0.0f;
             right = 0.0f;
             for (int b = 0; b < NUM_MIXBINS; ++b) {
                 if (b & 1) right += mixbins[b][i];
                 else       left  += mixbins[b][i];
             }
+        } else if (mcpx_apu_mixdown_all()) {
+            left  = mixbins[0][i] + 0.70710678f * mixbins[2][i]
+                  + 0.5f * mixbins[3][i] + 0.70710678f * mixbins[4][i]
+                  + mixbins[6][i] + 0.70710678f * mixbins[8][i];
+            right = mixbins[1][i] + 0.70710678f * mixbins[2][i]
+                  + 0.5f * mixbins[3][i] + 0.70710678f * mixbins[5][i]
+                  + mixbins[7][i] + 0.70710678f * mixbins[9][i];
         } else {
             left = mixbins[0][i];
             right = mixbins[1][i];

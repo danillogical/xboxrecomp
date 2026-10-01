@@ -9,8 +9,9 @@
 #include <string.h>
 
 /* The bins a title's 3D positional voices actually land in, from JSRF's own
- * V0BIN..V3BIN. 6 and 8 are even (left), 7 and 9 odd (right), so a mixdown
- * that preserves the guest's stereo pairing puts signal on both channels. */
+ * V0BIN..V3BIN: the 3D front pair 6/7, the rear pair 8/9 and the reverb send
+ * 10. A mixdown that preserves the guest's stereo pairing puts signal on both
+ * channels. */
 #define EFFECT_BIN_LO 6
 #define EFFECT_BIN_HI 10
 
@@ -52,6 +53,27 @@ int main(void)
             return 1;
         }
         puts("PASS: bins above 1 reach the output on both channels.");
+
+        /* The 5.1 fold (the default arm) puts the centre on both channels
+         * equally; the even/odd arm put it on the left only. */
+        if (atoi(getenv("RECOMP_APU_MIXDOWN_ALL") ? getenv("RECOMP_APU_MIXDOWN_ALL") : "1") == 1) {
+            int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+            memset(mixbins, 0, sizeof(mixbins));
+            for (i = 0; i < NUM_SAMPLES_PER_FRAME; ++i)
+                mixbins[2][i] = 0.5f;
+            mcpx_apu_monitor_mixdown(d, mixbins);
+            for (i = 0; i < NUM_SAMPLES_PER_FRAME; ++i) {
+                if (!d->monitor.frame_buf[off + i][0]
+                        || d->monitor.frame_buf[off + i][0] != d->monitor.frame_buf[off + i][1]) {
+                    fprintf(stderr, "FAIL: centre bin folded unevenly (left=%d right=%d)\n",
+                            d->monitor.frame_buf[off + i][0],
+                            d->monitor.frame_buf[off + i][1]);
+                    free(d);
+                    return 1;
+                }
+            }
+            puts("PASS: the centre bin reaches both channels equally.");
+        }
     } else {
         /* The negative control. Without it, a mixdown that ignored its own
          * switch would pass the arm above and silently reintroduce nothing. */

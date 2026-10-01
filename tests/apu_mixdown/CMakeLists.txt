@@ -14,6 +14,9 @@ enable_testing()
 add_test(NAME apu_mixdown_all COMMAND apu_mixdown_test)
 set_tests_properties(apu_mixdown_all PROPERTIES
                      ENVIRONMENT "RECOMP_APU_MIXDOWN_ALL=1;APU_MIXDOWN_EXPECT=1")
+add_test(NAME apu_mixdown_even_odd COMMAND apu_mixdown_test)
+set_tests_properties(apu_mixdown_even_odd PROPERTIES
+                     ENVIRONMENT "RECOMP_APU_MIXDOWN_ALL=2;APU_MIXDOWN_EXPECT=1")
 add_test(NAME apu_mixdown_two_bins COMMAND apu_mixdown_test)
 set_tests_properties(apu_mixdown_two_bins PROPERTIES
                      ENVIRONMENT "RECOMP_APU_MIXDOWN_ALL=0;APU_MIXDOWN_EXPECT=0")
