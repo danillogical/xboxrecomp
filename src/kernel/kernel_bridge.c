@@ -745,8 +745,13 @@ static void bridge_NtClose(void)
     /* Close real handles but skip fake/synthetic ones */
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
-        if (h && h != INVALID_HANDLE_VALUE)
+        if (h && h != INVALID_HANDLE_VALUE) {
+            /* Release the enumeration context BEFORE the host handle goes away:
+             * the context is keyed on the handle value, and a freed value can be
+             * handed straight back out by the allocator. */
+            xbox_dir_context_release(h);
             CloseHandle(h);
+        }
     }
     g_eax = 0; /* STATUS_SUCCESS */
 }
@@ -10177,6 +10182,48 @@ NTSTATUS xbox_test_bridge_NtPulseEvent(uint32_t EventVa)
     uint32_t args[1] = { EventVa };
     jsrf_test_write_stack(args, 1);
     bridge_NtPulseEvent();
+    return (NTSTATUS)g_eax;
+}
+
+/*
+ * Directory-enumeration seam for the D2 context-release fixture.
+ *
+ * These call the REAL bridge handlers through the guest stack, so the fixture
+ * exercises the actual guest path -- real tokens resolved through the real
+ * handle table, results read back from guest memory -- rather than a direct
+ * call that would bypass the ABI it is meant to test.
+ *
+ * NtOpenFile is used rather than NtCreateFile because that is the call the
+ * title actually makes to open a directory for enumeration.
+ */
+NTSTATUS xbox_test_bridge_NtOpenFile(uint32_t handle_va, uint32_t access,
+                                     uint32_t obj_attrs_va, uint32_t ios_va,
+                                     uint32_t share, uint32_t options)
+{
+    uint32_t args[6] = { handle_va, access, obj_attrs_va, ios_va, share, options };
+    jsrf_test_write_stack(args, 6);
+    bridge_NtOpenFile();
+    return (NTSTATUS)g_eax;
+}
+
+NTSTATUS xbox_test_bridge_NtQueryDirectoryFile(uint32_t handle, uint32_t event,
+                                               uint32_t apc, uint32_t apc_ctx,
+                                               uint32_t ios_va, uint32_t info_va,
+                                               uint32_t length, uint32_t info_class,
+                                               uint32_t filename_va, uint32_t restart)
+{
+    uint32_t args[10] = { handle, event, apc, apc_ctx, ios_va, info_va,
+                          length, info_class, filename_va, restart };
+    jsrf_test_write_stack(args, 10);
+    bridge_NtQueryDirectoryFile();
+    return (NTSTATUS)g_eax;
+}
+
+NTSTATUS xbox_test_bridge_NtClose(uint32_t token)
+{
+    uint32_t args[1] = { token };
+    jsrf_test_write_stack(args, 1);
+    bridge_NtClose();
     return (NTSTATUS)g_eax;
 }
 

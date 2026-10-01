@@ -101,6 +101,32 @@ if(BUILD_TESTING AND WIN32)
     add_test(NAME xbox_irql_tracking COMMAND xbox_irql_tracking_test)
     set_tests_properties(xbox_irql_tracking PROPERTIES TIMEOUT 20
                          ENVIRONMENT "RECOMP_GUEST_SERIAL=1")
+
+    # D2: a closed directory handle must not leak its enumeration context.
+    #
+    # Unlike the fixtures above, this one drives the REAL bridge handlers
+    # (xbox_test_bridge_NtOpenFile / _NtQueryDirectoryFile / _NtClose), so it
+    # needs the whole kernel rather than one or two sources; the sibling
+    # bridge-driving fixture, kernel_dpc_queue_test.c, is registered by the game
+    # project for the same reason.
+    add_executable(xbox_dir_context_release_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/dir_context_release_test.c
+    )
+    target_include_directories(xbox_dir_context_release_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${XBOXRECOMP_SRC_DIR}
+    )
+    target_link_libraries(xbox_dir_context_release_test PRIVATE
+        xbox_kernel platform kernel32)
+    # Registered TWICE on purpose: the direct HLE path and the bridge seam are
+    # different code paths and must run as SEPARATE PROCESSES, so a leaked slot
+    # or a crash in one cannot influence the other.
+    add_test(NAME xbox_dir_context_release_direct
+             COMMAND xbox_dir_context_release_test direct)
+    set_tests_properties(xbox_dir_context_release_direct PROPERTIES TIMEOUT 60)
+    add_test(NAME xbox_dir_context_release_bridge
+             COMMAND xbox_dir_context_release_test bridge)
+    set_tests_properties(xbox_dir_context_release_bridge PROPERTIES TIMEOUT 60)
 endif()
 
 # The allocator and kernel-memory decisions in kmem.c have no host dependency,

@@ -679,6 +679,11 @@ NTSTATUS __stdcall xbox_NtWriteFile(
 
 NTSTATUS __stdcall xbox_NtClose(HANDLE Handle);
 
+/* Release the directory-enumeration context owned by a closing handle, so a
+ * closed handle cannot keep one of the MAX_DIR_CONTEXTS slots occupied.
+ * NULL/INVALID_HANDLE_VALUE and handles with no context are no-ops. */
+void xbox_dir_context_release(HANDLE Handle);
+
 NTSTATUS __stdcall xbox_NtDeleteFile(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes);
 
 NTSTATUS __stdcall xbox_NtQueryInformationFile(
@@ -795,6 +800,17 @@ NTSTATUS xbox_test_bridge_NtClearEvent(uint32_t EventVa);
 NTSTATUS xbox_test_bridge_NtSetEvent(uint32_t EventVa);
 NTSTATUS xbox_test_bridge_NtPulseEvent(uint32_t EventVa);
 NTSTATUS xbox_test_bridge_NtWaitForSingleObject(uint32_t EventVa, BOOLEAN Alertable, int TimeoutMs);
+/* Directory-enumeration seam (D2 context-release fixture): real bridge handlers
+ * driven through the guest stack, using NtOpenFile as the title does. */
+NTSTATUS xbox_test_bridge_NtOpenFile(uint32_t handle_va, uint32_t access,
+                                     uint32_t obj_attrs_va, uint32_t ios_va,
+                                     uint32_t share, uint32_t options);
+NTSTATUS xbox_test_bridge_NtQueryDirectoryFile(uint32_t handle, uint32_t event,
+                                               uint32_t apc, uint32_t apc_ctx,
+                                               uint32_t ios_va, uint32_t info_va,
+                                               uint32_t length, uint32_t info_class,
+                                               uint32_t filename_va, uint32_t restart);
+NTSTATUS xbox_test_bridge_NtClose(uint32_t token);
 NTSTATUS __stdcall xbox_KeWaitForSingleObject(PVOID Object, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout);
 NTSTATUS __stdcall xbox_KeWaitForMultipleObjects(ULONG Count, PVOID Objects[], ULONG WaitType, ULONG WaitReason, KPROCESSOR_MODE WaitMode, BOOLEAN Alertable, PLARGE_INTEGER Timeout, PVOID WaitBlockArray);
 

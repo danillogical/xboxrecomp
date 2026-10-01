@@ -317,6 +317,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        xbox_dir_context_release(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -598,6 +599,38 @@ typedef struct {
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
+
+/*
+ * Release any directory-enumeration context owned by a closing handle.
+ *
+ * NtQueryDirectoryFile keys its per-handle enumeration state on the directory's
+ * Nt handle (s_dir_contexts). A context is normally released only when a query
+ * runs out of files, so a title that opens directories, queries them, and closes
+ * them -- without ever draining a query to STATUS_NO_MORE_FILES -- leaks slots
+ * until all MAX_DIR_CONTEXTS are gone and a later directory can no longer be
+ * enumerated. Closing the handle must therefore release its context.
+ *
+ * NULL/INVALID_HANDLE_VALUE and any handle with no context are no-ops.
+ */
+void xbox_dir_context_release(HANDLE Handle)
+{
+    if (!Handle || Handle == INVALID_HANDLE_VALUE)
+        return;
+
+    if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].file_handle == Handle) {
+            if (s_dir_contexts[i].find_handle &&
+                s_dir_contexts[i].find_handle != INVALID_HANDLE_VALUE)
+                FindClose(s_dir_contexts[i].find_handle);
+            s_dir_contexts[i].find_handle = NULL;
+            s_dir_contexts[i].file_handle = NULL;
+            s_dir_contexts[i].first_done  = FALSE;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
 
 static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
 {
@@ -908,6 +941,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
 {
     XBOX_TRACE(XBOX_LOG_FILE, "NtClose(handle=%p)", Handle);
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
+        xbox_dir_context_release(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
@@ -1136,6 +1170,26 @@ typedef struct {
 static DIR_CONTEXT s_dir_contexts[MAX_DIR_CONTEXTS];
 static CRITICAL_SECTION s_dir_cs;
 static BOOL s_dir_cs_init = FALSE;
+
+/* POSIX counterpart of the Windows xbox_dir_context_release above. The POSIX
+ * DIR_CONTEXT keys on `handle` and holds a DIR* rather than a find handle. */
+void xbox_dir_context_release(HANDLE Handle)
+{
+    if (!Handle || Handle == INVALID_HANDLE_VALUE)
+        return;
+
+    if (!s_dir_cs_init) { InitializeCriticalSection(&s_dir_cs); s_dir_cs_init = TRUE; }
+    EnterCriticalSection(&s_dir_cs);
+    for (int i = 0; i < MAX_DIR_CONTEXTS; i++) {
+        if (s_dir_contexts[i].handle == Handle) {
+            if (s_dir_contexts[i].dir)
+                closedir(s_dir_contexts[i].dir);
+            s_dir_contexts[i].dir = NULL;
+            s_dir_contexts[i].handle = NULL;
+        }
+    }
+    LeaveCriticalSection(&s_dir_cs);
+}
 
 NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
