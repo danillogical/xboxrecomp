@@ -120,7 +120,7 @@ def step_native(work: Path) -> tuple[int, list[str]]:
             continue
         for label, env in runs:
             result = run([str(exe)], cwd=str(work), env=child_env(env), timeout=300)
-            last = (result.stdout.strip().splitlines() or [''])[-1]
+            last = ((result.stdout.strip() or result.stderr.strip()).splitlines() or [''])[-1]
             if result.returncode == 0:
                 print(f'  PASS       {label}: {last[:90]}')
             else:
