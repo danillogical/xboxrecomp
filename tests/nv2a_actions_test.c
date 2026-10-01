@@ -36,8 +36,7 @@ int pgraph_d3d11_method(int subchannel, uint32_t method, uint32_t param)
 
 /* ── fixture ─────────────────────────────────────────────────────────── */
 
-/* Guest physical 0.. as the contiguous window; pushbuffers sit below 64 KiB
- * so no offset carries the kick bit. */
+/* Guest physical 0.. as the contiguous window; pushbuffers sit below 64 KiB. */
 static uint8_t g_window[1u << 20];
 static uint8_t g_ramin[64u << 10];
 static uint8_t g_vram[4096];
@@ -273,6 +272,28 @@ static void test_translator_reads_bound_class(void)
     CHECK(g_translator_calls == 1, "Kelvin method did not reach the translator");
     pgraph_method(d, 5, NV097_CLEAR_SURFACE, 0xF0);
     CHECK(g_translator_calls == 2, "unbound subchannel lost the Kelvin reading");
+}
+
+/* Method parameters are method state, not PGRAPH registers: by register
+ * offset, method 0x500 is NV_PGRAPH_INTR_EN and 0x520 NV_PGRAPH_CTX_USER. */
+static void test_method_state_is_not_register_state(void)
+{
+    NV2AState *d = fresh();
+    uint32_t intr_en = d->pgraph.regs[NV_PGRAPH_INTR_EN];
+    uint32_t ctx_user = d->pgraph.regs[NV_PGRAPH_CTX_USER];
+
+    g_translator_calls = 0;
+    pgraph_method(d, 0, 0x0500, 0x12345678u);
+    pgraph_method(d, 0, 0x0520, 0x9ABCDEF0u);
+    CHECK(g_translator_calls == 2, "Kelvin methods did not reach the translator");
+    CHECK(d->pgraph.methods[0x0500 / 4] == 0x12345678u, "method 0x500 state %08X",
+          d->pgraph.methods[0x0500 / 4]);
+    CHECK(d->pgraph.methods[0x0520 / 4] == 0x9ABCDEF0u, "method 0x520 state %08X",
+          d->pgraph.methods[0x0520 / 4]);
+    CHECK(d->pgraph.regs[NV_PGRAPH_INTR_EN] == intr_en,
+          "method 0x500 overwrote NV_PGRAPH_INTR_EN (%08X)", d->pgraph.regs[NV_PGRAPH_INTR_EN]);
+    CHECK(d->pgraph.regs[NV_PGRAPH_CTX_USER] == ctx_user,
+          "method 0x520 overwrote NV_PGRAPH_CTX_USER (%08X)", d->pgraph.regs[NV_PGRAPH_CTX_USER]);
 }
 
 /* With the switch unset the release is register capture only: the stream
@@ -580,6 +601,7 @@ static void test_flip_stall(void)
 int main(void)
 {
     test_translator_reads_bound_class();
+    test_method_state_is_not_register_state();
     test_semaphore_dormant_when_unset();
     test_semaphore_written_only_on_commit();
     test_semaphore_bounds();

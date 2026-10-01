@@ -58,10 +58,17 @@ typedef struct DMAObject {
  * Full struct will be added when PGRAPH is integrated.
  * ============================================================ */
 
+/* NV097 method numbers run to 0x1FFC, so their parameters fit 0x800 words. */
+#define NV2A_PGRAPH_METHOD_WORDS 0x800
+
 struct PGRAPHState {
     uint32_t pending_interrupts;
     uint32_t enabled_interrupts;
-    uint32_t regs[0x2000];
+    uint32_t regs[0x2000];          /* PGRAPH registers, by byte offset */
+    /* NV097 method parameters by method / 4: the state a renderer reads. Kept
+     * apart from regs, where method 0x500 would land on NV_PGRAPH_INTR_EN and
+     * 0x520 on the CTX_USER the trap path reads. */
+    uint32_t methods[NV2A_PGRAPH_METHOD_WORDS];
     /* Instance of the DMA object SET_CONTEXT_DMA_SEMAPHORE bound (action
      * methods only; see nv2a_actions_enabled). */
     uint32_t dma_semaphore;

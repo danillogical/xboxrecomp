@@ -896,9 +896,9 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
 
     /* Route through D3D11 translator first */
     if (pgraph_d3d11_method(subchannel, method, param)) {
-        /* Handled by D3D11 translator — still store in regs for state queries */
-        if (method < 0x2000 * 4) {
-            d->pgraph.regs[method / 4] = param;
+        /* Handled by D3D11 translator -- still store it for state queries */
+        if (method / 4 < NV2A_PGRAPH_METHOD_WORDS) {
+            d->pgraph.methods[method / 4] = param;
         }
         return;
     }
@@ -909,9 +909,9 @@ void pgraph_method(NV2AState *d, uint32_t subchannel,
                 g_pgraph_method_count, subchannel, method, param);
     }
 
-    /* Store method parameters in PGRAPH register space */
-    if (method < 0x2000 * 4) {
-        d->pgraph.regs[method / 4] = param;
+    /* Store the method parameter as method state */
+    if (method / 4 < NV2A_PGRAPH_METHOD_WORDS) {
+        d->pgraph.methods[method / 4] = param;
     }
 
     /* Track high-level operations (legacy counters) */
@@ -1615,7 +1615,7 @@ bool nv2a_submit_pending(NV2AState *d)
             d->pfifo.sink[d->pfifo.sink_count].method = staged[i].method;
             d->pfifo.sink[d->pfifo.sink_count].param = staged[i].param;
             ++d->pfifo.sink_count;
-            /* Capture the parameter as register state. For the register-setting
+            /* Capture the parameter as method state. For the register-setting
              * methods -- which is most of the NV097 pipeline, and all of the
              * surface, blit and memcpy state -- this IS the implementation: the
              * value is where a renderer reads it from. Methods that trigger an
@@ -1623,11 +1623,12 @@ bool nv2a_submit_pending(NV2AState *d)
              * too and need their own handling on top; the notify one is what
              * JSRF's ring-space wait at 0x001914F0 is waiting on.
              *
-             * Only NV097 has a register file in this model, so only NV097 is
+             * Only NV097 has method state in this model, so only NV097 is
              * captured this way; the other classes' parameters are recorded in
              * the sink, which now carries the class. */
-            if (staged_class[staged[i].subchannel] == NV097_CLASS) {
-                d->pgraph.regs[staged[i].method / 4] = staged[i].param;
+            if (staged_class[staged[i].subchannel] == NV097_CLASS
+                    && staged[i].method / 4 < NV2A_PGRAPH_METHOD_WORDS) {
+                d->pgraph.methods[staged[i].method / 4] = staged[i].param;
             }
         }
         memcpy(d->pfifo.binding_class, staged_class, sizeof(staged_class));
