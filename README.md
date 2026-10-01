@@ -470,6 +470,25 @@ XBE need the real MSVC where snippets do not, and why it takes two images.
 
 If you fix a lift, add the case.
 
+### Checking runtime changes on macOS or Linux
+
+The conformance suite covers the lifter. For runtime changes (kernel, NV2A, APU)
+on a host without Windows:
+
+```bash
+python3 tools/posix_check.py               # all three steps
+python3 tools/posix_check.py native cross  # a subset
+```
+
+`native` builds and runs, with the host compiler, the tests whose code is
+portable through the platform layer (kmem, the NV2A walk, the guest meter and
+serial mode, IRQL tracking, ADPCM decode, the mixdown arms). `cross` builds the
+whole tree for Windows with MinGW-w64 from zig's toolchain (fetched by `uv`),
+so a change is known to compile and link for the real target. `python` runs
+`pytest tools`. Each step lists its known failures and fails on anything else.
+Nothing Windows-only runs here, so a change that needs a guest run still needs
+the Windows host.
+
 The runtime libraries (C) use:
 - MSVC (Visual Studio 2022) or MinGW-w64
 - Windows SDK (D3D11, DXGI, XInput, waveOut)
