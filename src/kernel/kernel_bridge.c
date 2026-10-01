@@ -2157,19 +2157,6 @@ static void bridge_KeSynchronizeExecution(void)
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
 
-/* -- KeRemoveQueueDpc (ordinal 137) ------------------------
- * BOOLEAN KeRemoveQueueDpc(PKDPC Dpc)
- *
- * Cancels a queued DPC, returning whether it was still in the queue. DPCs run
- * inline here (see KeInsertQueueDpc), so by the time anyone can call this the
- * routine has already run and there is nothing to cancel. FALSE is both the
- * honest answer and the one that keeps a caller's bookkeeping right.
- */
-static void bridge_KeRemoveQueueDpc(void)
-{
-    g_eax = 0;
-}
-
 /* The pending DPC queue.
  *
  * These used to run inline, on whichever thread queued them, before the caller
@@ -2183,6 +2170,13 @@ static void bridge_KeRemoveQueueDpc(void)
  * Queued properly now, and drained by the timer thread, which is the one thread
  * here that already has a guest stack and a TIB and runs nothing else urgent.
  *
+ * As on the real kernel, a DPC is queued at most once: inserting one that is
+ * already queued returns FALSE and keeps the queued arguments, and the drain
+ * dequeues it before its routine runs so the routine may queue it again. The
+ * KDPC's Inserted byte (+2) mirrors that for guest code that reads it; the
+ * queue itself is the truth. Guest threads and the timer thread's ISRs both
+ * insert, so the queue is touched only under g_dpc_lock.
+ *
  * ponytail: one queue, no IRQL, no per-processor list, and a DPC queued from a
  * DPC runs on the next drain rather than immediately. Nothing here depends on
  * DPC ordering beyond "after the ISR".
@@ -2190,30 +2184,95 @@ static void bridge_KeRemoveQueueDpc(void)
 #define XBOX_MAX_PENDING_DPC 64
 typedef struct { uint32_t dpc, arg1, arg2; } PendingDpc;
 static PendingDpc g_dpc_queue[XBOX_MAX_PENDING_DPC];
-static volatile LONG g_dpc_head, g_dpc_tail;
+static LONG g_dpc_head, g_dpc_tail;
+static volatile LONG g_dpc_lock;
 
-static void bridge_KeInsertQueueDpc(void)
+static void dpc_lock(void)
 {
-    uint32_t dpc  = STACK_ARG(0);
-    uint32_t arg1 = STACK_ARG(1);
-    uint32_t arg2 = STACK_ARG(2);
-    LONG tail, next;
+    while (InterlockedCompareExchange(&g_dpc_lock, 1, 0) != 0)
+        Sleep(0);
+}
 
-    if (!dpc) { g_eax = 0; return; }
+static void dpc_unlock(void)
+{
+    InterlockedExchange(&g_dpc_lock, 0);
+}
 
-    tail = g_dpc_tail;
-    next = (tail + 1) % XBOX_MAX_PENDING_DPC;
+/* Ring index of a queued DPC, or -1. Caller holds g_dpc_lock. */
+static LONG dpc_find(uint32_t dpc)
+{
+    LONG i;
+    for (i = g_dpc_head; i != g_dpc_tail; i = (i + 1) % XBOX_MAX_PENDING_DPC)
+        if (g_dpc_queue[i].dpc == dpc)
+            return i;
+    return -1;
+}
+
+static BOOLEAN dpc_remove(uint32_t dpc)
+{
+    BOOLEAN removed = 0;
+    LONG i, next;
+
+    if (!dpc)
+        return 0;
+    dpc_lock();
+    i = dpc_find(dpc);
+    if (i >= 0) {
+        /* Close the gap so the remaining order is kept. */
+        for (next = (i + 1) % XBOX_MAX_PENDING_DPC; next != g_dpc_tail;
+             i = next, next = (next + 1) % XBOX_MAX_PENDING_DPC)
+            g_dpc_queue[i] = g_dpc_queue[next];
+        g_dpc_tail = i;
+        if (bridge_va_mapped(dpc, 4))
+            BRIDGE_MEM8(dpc + 2) = 0;
+        removed = 1;
+    }
+    dpc_unlock();
+    return removed;
+}
+
+/* -- KeRemoveQueueDpc (ordinal 137) ------------------------
+ * BOOLEAN KeRemoveQueueDpc(PKDPC Dpc)
+ *
+ * Cancels a queued DPC, returning whether it was still in the queue.
+ */
+static void bridge_KeRemoveQueueDpc(void)
+{
+    g_eax = dpc_remove(STACK_ARG(0));
+}
+
+static BOOLEAN dpc_insert(uint32_t dpc, uint32_t arg1, uint32_t arg2)
+{
+    LONG next;
+
+    if (!dpc)
+        return 0;
+    dpc_lock();
+    if (dpc_find(dpc) >= 0) {
+        dpc_unlock();
+        return 0;
+    }
+    next = (g_dpc_tail + 1) % XBOX_MAX_PENDING_DPC;
     if (next == g_dpc_head) {
+        dpc_unlock();
         fprintf(stderr, "  [KERNEL] DPC queue full, dropping 0x%08X\n", dpc);
         fflush(stderr);
-        g_eax = 0;
-        return;
+        return 0;
     }
-    g_dpc_queue[tail].dpc  = dpc;
-    g_dpc_queue[tail].arg1 = arg1;
-    g_dpc_queue[tail].arg2 = arg2;
+    g_dpc_queue[g_dpc_tail].dpc  = dpc;
+    g_dpc_queue[g_dpc_tail].arg1 = arg1;
+    g_dpc_queue[g_dpc_tail].arg2 = arg2;
     g_dpc_tail = next;
-    g_eax = 1;
+    if (bridge_va_mapped(dpc, 4))
+        BRIDGE_MEM8(dpc + 2) = 1;
+    dpc_unlock();
+    return 1;
+}
+
+/* BOOLEAN KeInsertQueueDpc(PKDPC Dpc, PVOID SystemArgument1, PVOID SystemArgument2) */
+static void bridge_KeInsertQueueDpc(void)
+{
+    g_eax = dpc_insert(STACK_ARG(0), STACK_ARG(1), STACK_ARG(2));
 }
 
 /* Call a connected interrupt service routine.
@@ -2337,13 +2396,28 @@ static void kernel_drain_dpcs(void)
     /* Drain one snapshot.  A DPC is allowed to queue itself (or another DPC),
      * but that work belongs to the next scheduler pass.  Following the live
      * tail here turns a self-requeueing graphics DPC into an infinite loop and
-     * prevents the timer thread from ever delivering another vblank. */
-    LONG stop = g_dpc_tail;
+     * prevents the timer thread from ever delivering another vblank.  The
+     * snapshot is a count, because KeRemoveQueueDpc can shift entries. */
+    LONG left;
 
-    while (g_dpc_head != stop) {
-        LONG head = g_dpc_head;
-        PendingDpc d = g_dpc_queue[head];
-        g_dpc_head = (head + 1) % XBOX_MAX_PENDING_DPC;
+    dpc_lock();
+    left = (g_dpc_tail - g_dpc_head + XBOX_MAX_PENDING_DPC) % XBOX_MAX_PENDING_DPC;
+    dpc_unlock();
+
+    while (left-- > 0) {
+        PendingDpc d;
+
+        dpc_lock();
+        if (g_dpc_head == g_dpc_tail) {
+            dpc_unlock();
+            break;
+        }
+        d = g_dpc_queue[g_dpc_head];
+        g_dpc_head = (g_dpc_head + 1) % XBOX_MAX_PENDING_DPC;
+        /* Dequeued before it runs, so the routine may queue it again. */
+        if (bridge_va_mapped(d.dpc, 4))
+            BRIDGE_MEM8(d.dpc + 2) = 0;
+        dpc_unlock();
         kernel_run_dpc(d.dpc, d.arg1, d.arg2, XBOX_GM_DPC);
     }
 }
@@ -9940,6 +10014,32 @@ static void jsrf_test_write_stack(uint32_t *args, unsigned count)
     for (i = 0; i < count; ++i)
         BRIDGE_MEM32(JSRF_TEST_STACK_VA + i * 4u) = args[i];
     g_esp = JSRF_TEST_STACK_VA;
+}
+
+/* Straight to the queue rather than through the guest stack, which the
+ * test's threads would otherwise share. */
+BOOLEAN xbox_test_bridge_KeInsertQueueDpc(uint32_t DpcVa, uint32_t Arg1, uint32_t Arg2)
+{
+    return dpc_insert(DpcVa, Arg1, Arg2);
+}
+
+BOOLEAN xbox_test_bridge_KeRemoveQueueDpc(uint32_t DpcVa)
+{
+    return dpc_remove(DpcVa);
+}
+
+unsigned xbox_test_dpc_pending(void)
+{
+    LONG n;
+    dpc_lock();
+    n = (g_dpc_tail - g_dpc_head + XBOX_MAX_PENDING_DPC) % XBOX_MAX_PENDING_DPC;
+    dpc_unlock();
+    return (unsigned)n;
+}
+
+void xbox_test_drain_dpcs(void)
+{
+    kernel_drain_dpcs();
 }
 
 LONG xbox_test_bridge_KeSetEvent(uint32_t EventVa, LONG Increment, BOOLEAN Wait)
