@@ -2964,13 +2964,18 @@ class Lifter:
         # A window boundary is deliberately tested on the guest VA, not on the
         # translated host pointer: recomp_range_is_mmio is about what the VEH
         # is prepared to answer for.
+        #
+        # The element-wise paths go through the volatile MEM8/16/32 accessors.
+        # A plain pointer loop is one the host compiler may vectorise or turn
+        # back into a library call, which brings back both failures above.
         if "movsb" in m:
             return ["if (!g_df) { uint8_t *_d = (uint8_t*)XBOX_PTR(edi),"
                     " *_s = (uint8_t*)XBOX_PTR(esi); uint32_t _n = ecx;",
                     "  if ((_d + _n <= _s || _s + _n <= _d)"
                     " && !recomp_range_is_mmio(edi, _n)"
                     " && !recomp_range_is_mmio(esi, _n)) memcpy(_d, _s, _n);",
-                    "  else { uint32_t _i; for (_i = 0; _i < _n; _i++) _d[_i] = _s[_i]; }",
+                    "  else { uint32_t _i; for (_i = 0; _i < _n; _i++)"
+                    " MEM8(edi + _i) = MEM8(esi + _i); }",
                     "  esi += ecx; edi += ecx; }",
                     "else { uint32_t _i; for (_i = 0; _i < ecx; _i++)"
                     " MEM8(edi - _i) = MEM8(esi - _i); esi -= ecx; edi -= ecx; }",

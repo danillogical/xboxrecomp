@@ -54,8 +54,13 @@ class DirectionFlagLifterTest(unittest.TestCase):
         generated = _lift(Instruction(0, 2, "rep movsb", "", "f3a4"))
 
         # An explicit ascending byte loop, not memmove: memmove would give the
-        # copy-through-a-temporary answer, which is a different result.
-        self.assertIn("for (_i = 0; _i < _n; _i++) _d[_i] = _s[_i];", generated)
+        # copy-through-a-temporary answer, which is a different result. It goes
+        # through volatile MEM8, so the host compiler cannot vectorise it or
+        # turn it back into a library call -- an MMIO window needs every access
+        # to be one the VEH can decode.
+        self.assertIn("for (_i = 0; _i < _n; _i++) MEM8(edi + _i) = MEM8(esi + _i);",
+                      generated)
+        self.assertNotIn("_d[_i] = _s[_i]", generated)
         self.assertNotIn("memmove", generated)
 
     def test_rep_movsb_backward_case_is_still_a_loop(self):
