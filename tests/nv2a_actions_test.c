@@ -598,10 +598,168 @@ static void test_flip_stall(void)
           "READ_3D did not wrap");
 }
 
+/* ---- NV097_SET_VERTEX_DATA_ARRAY_OFFSET (F4, 2026-09-30) --------------------
+ *
+ * The strict horizon was closed and the F4 run then stalled with GET pinned at
+ * 0x8EF0: the walk rejected method 0x1720 with `unsupported_method` and stopped
+ * consuming the ring, so `put` advanced while `get` did not and no frame could
+ * ever be produced. 0x1720 is NV097_SET_VERTEX_DATA_ARRAY_OFFSET.
+ *
+ * The fix is not a bypass: the method is admitted through the measured, generated
+ * inventory (src/nv2a/nv2a_method_table.c, from
+ * scripts/gen-nv2a-method-inventory.py over the title's own rings) and then flows
+ * through the existing method-state path, which stores it in PGRAPHState.methods.
+ * These tests pin the properties the fix rests on: the measured command is
+ * accepted, it is staged, GET advances past it, and everything rejected before
+ * still is.
+ */
+
+/* The measured blocker: 0x1720 on an NV097-bound subchannel is accepted, staged,
+ * and the walk advances GET past it instead of returning unsupported_method. */
+static void test_vertex_data_array_offset_admitted(void)
+{
+    NV2AState *d = fresh_with(0);
+    Pb pb;
+
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);        /* bind the subchannel to NV097 */
+    pb_method(&pb, 0, 0x1720, 0x003CA000u);     /* the measured blocker */
+    kick(d, pb.start, pb.at);
+
+    CHECK(get_ptr(d) == pb.at,
+          "walk did not advance past 0x1720: get=%08X want=%08X (%s)",
+          get_ptr(d), pb.at, diag(d));
+    CHECK(strcmp(diag(d), "ok") == 0,
+          "expected ok after 0x1720, got %s", diag(d));
+    CHECK(d->pgraph.methods[0x1720 / 4] == 0x003CA000u,
+          "0x1720 not staged: methods[0x1720/4]=%08X", d->pgraph.methods[0x1720 / 4]);
+}
+
+/* The method is an indexed array, not one address. The inventory admits only the
+ * slots a real submission contained, which is the property that keeps the table
+ * measured rather than guessed: four measured slots are accepted, and the first
+ * slot the title never submitted is still rejected. */
+static void test_vertex_data_array_offset_indexed_range(void)
+{
+    /* Measured in the F4 ring: 0x1720, 0x172C, 0x1730, 0x1744. The array runs
+     * 0x1720 + 4*i for i in 0..15, so 0x1724 is a valid slot the title did NOT
+     * submit -- the control for "measured, not a blanket range". */
+    static const uint32_t admitted[] = { 0x1720u, 0x172Cu, 0x1730u, 0x1744u };
+    NV2AState *d;
+    Pb pb;
+
+    for (unsigned i = 0; i < sizeof(admitted) / sizeof(admitted[0]); ++i) {
+        d = fresh_with(0);
+        pb_begin(&pb, PB_BASE);
+        pb_method(&pb, 0, 0x0000, H_KELVIN);
+        pb_method(&pb, 0, admitted[i], 0x003CA000u + i);
+        kick(d, pb.start, pb.at);
+        CHECK(get_ptr(d) == pb.at, "measured slot 0x%04X did not advance (%s)",
+              admitted[i], diag(d));
+        CHECK(d->pgraph.methods[admitted[i] / 4] == 0x003CA000u + i,
+              "measured slot 0x%04X not staged (%08X)", admitted[i],
+              d->pgraph.methods[admitted[i] / 4]);
+    }
+
+    /* 0x1724 is inside the array but was never submitted, so it stays rejected.
+     * If this ever passes, the table stopped being a measured list. */
+    d = fresh_with(0);
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    pb_method(&pb, 0, 0x1724u, 0x003CA000u);
+    kick(d, pb.start, pb.at);
+    CHECK(strcmp(diag(d), "unsupported_method") == 0,
+          "unmeasured slot 0x1724 was admitted (%s); the table is no longer measured",
+          diag(d));
+    CHECK(get_ptr(d) == pb.start,
+          "rejected slot moved GET to %08X", get_ptr(d));
+}
+
+/* Admitting 0x1720 must not have loosened the rejection policy. An NV097 method
+ * that is not in the table still rejects the stream and leaves GET where it was,
+ * which is the behaviour the walk depends on to report a real gap. */
+static void test_unknown_method_still_rejected(void)
+{
+    static const uint32_t rejected[] = { 0x0104u, 0x1724u, 0x180Cu };
+    NV2AState *d;
+
+    for (unsigned i = 0; i < sizeof(rejected) / sizeof(rejected[0]); ++i) {
+        Pb pb;
+        d = fresh_with(0);
+        pb_begin(&pb, PB_BASE);
+        pb_method(&pb, 0, 0x0000, H_KELVIN);
+        pb_method(&pb, 0, rejected[i], 0);
+        kick(d, pb.start, pb.at);
+        CHECK(strcmp(diag(d), "unsupported_method") == 0,
+              "method 0x%04X was admitted (%s)", rejected[i], diag(d));
+        CHECK(get_ptr(d) == pb.start,
+              "method 0x%04X moved GET to %08X", rejected[i], get_ptr(d));
+    }
+}
+
+/* A subchannel bound to a class other than NV097 must not accept the method, and
+ * an unbound subchannel must not either. This is the "wrong class stays rejected"
+ * half of the contract, and it is what makes the fix class-correct rather than a
+ * global loosening. */
+static void test_vertex_data_array_offset_wrong_class_rejected(void)
+{
+    NV2AState *d;
+    Pb pb;
+
+    /* Bound to NV_MEMORY_TO_MEMORY_FORMAT (0x39), not NV097. */
+    d = fresh_with(0);
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_MEMCPY);
+    pb_method(&pb, 0, 0x1720, 0x003CA000u);
+    kick(d, pb.start, pb.at);
+    CHECK(strcmp(diag(d), "unsupported_method") == 0,
+          "0x1720 accepted on an NV_MEMCPY subchannel (%s)", diag(d));
+    CHECK(get_ptr(d) == pb.start,
+          "wrong-class 0x1720 moved GET to %08X", get_ptr(d));
+
+    /* No SET_OBJECT at all: staged_class is 0 and nothing is implemented. */
+    d = fresh_with(0);
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x1720, 0x003CA000u);
+    kick(d, pb.start, pb.at);
+    CHECK(strcmp(diag(d), "unsupported_method") == 0,
+          "0x1720 accepted on an unbound subchannel (%s)", diag(d));
+    CHECK(get_ptr(d) == pb.start,
+          "unbound 0x1720 moved GET to %08X", get_ptr(d));
+}
+
+/* The point of the fix: a stream whose first unknown method was 0x1720 now commits
+ * and carries GET to PUT, so the ring keeps being consumed rather than pinning. */
+static void test_walk_advances_through_the_f4_blocker(void)
+{
+    NV2AState *d = fresh_with(0);
+    Pb pb;
+
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    pb_method(&pb, 0, 0x1710u, 0);              /* present before the fix */
+    pb_method(&pb, 0, 0x1720u, 0x003CA000u);    /* the blocker */
+    pb_method(&pb, 0, 0x172Cu, 0x003CA010u);    /* the next measured slot */
+    pb_method(&pb, 0, 0x1760u, 0x00002042u);    /* a format method */
+    kick(d, pb.start, pb.at);
+
+    CHECK(get_ptr(d) == pb.at,
+          "walk did not consume the 0x1720 block: get=%08X want=%08X (%s)",
+          get_ptr(d), pb.at, diag(d));
+    CHECK(strcmp(diag(d), "ok") == 0, "expected ok, got %s", diag(d));
+    CHECK(d->pgraph.methods[0x1720 / 4] == 0x003CA000u, "0x1720 not staged");
+    CHECK(d->pgraph.methods[0x172C / 4] == 0x003CA010u, "0x172C not staged");
+}
+
 int main(void)
 {
     test_translator_reads_bound_class();
     test_method_state_is_not_register_state();
+    test_vertex_data_array_offset_admitted();
+    test_vertex_data_array_offset_indexed_range();
+    test_unknown_method_still_rejected();
+    test_vertex_data_array_offset_wrong_class_rejected();
+    test_walk_advances_through_the_f4_blocker();
     test_semaphore_dormant_when_unset();
     test_semaphore_written_only_on_commit();
     test_semaphore_bounds();
