@@ -1,5 +1,9 @@
-/* mcpx_apu_dsp_frame must mix down every bin the guest routed to, not the
+/* The monitor mixdown must mix down every bin the guest routed to, not the
  * first two. See README.md for the measurement that found this.
+ *
+ * It calls mcpx_apu_monitor_mixdown, which mcpx_apu_dsp_frame hands the VP's
+ * mixbins to. The frame function itself first copies the mixbins into GP DSP
+ * memory, which needs a running GP DSP this test does not build.
  *
  * Run with: ctest --test-dir <build>   (two arms; see CMakeLists.txt) */
 #include "apu_state.h"
@@ -20,9 +24,8 @@ int main(void)
     const char *expect_env = getenv("APU_MIXDOWN_EXPECT");
     const int expect_heard = expect_env ? atoi(expect_env) : 1;
 
-    /* Zeroed is deliberately enough: ram_ptr NULL makes dsp_ack_frame return
-     * before it touches guest memory, and monitor.point 0 is MON_AC97, which
-     * is not MON_VP, so the mixdown runs. */
+    /* Zeroed is deliberately enough: monitor.point 0 is MON_AC97, which is not
+     * MON_VP, so the mixdown runs. */
     MCPXAPUState *d = (MCPXAPUState *)calloc(1, sizeof(*d));
     static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     int i, b, nonzero_left = 0, nonzero_right = 0;
@@ -35,7 +38,7 @@ int main(void)
         for (i = 0; i < NUM_SAMPLES_PER_FRAME; ++i)
             mixbins[b][i] = 0.5f;
 
-    mcpx_apu_dsp_frame(d, mixbins);
+    mcpx_apu_monitor_mixdown(d, mixbins);
 
     for (i = 0; i < NUM_SAMPLES_PER_FRAME; ++i) {
         if (d->monitor.frame_buf[i][0]) nonzero_left = 1;

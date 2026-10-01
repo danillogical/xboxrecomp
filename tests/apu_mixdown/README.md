@@ -15,6 +15,11 @@ Titles route their 3D positional voices — their sound effects — to bins abov
 Music is on 2D voices and lands in bins 0 and 1, which is why it was always
 audible while no effect ever was.
 
+The test calls `mcpx_apu_monitor_mixdown`, the function `mcpx_apu_dsp_frame` hands
+the mixbins to. Since the GP DSP port the frame function first writes the mixbins
+into GP DSP memory, which needs a GP DSP the test does not create; calling the
+frame function crashed on a NULL `d->gp.dsp`.
+
 ## Running
 
     cmake -S tests/apu_mixdown -B build/apu-mixdown
