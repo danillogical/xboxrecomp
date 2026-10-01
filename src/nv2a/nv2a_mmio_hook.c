@@ -694,6 +694,14 @@ bool nv2a_hook_install_aperture(void *aperture, size_t size)
     return true;
 }
 
+/* Read-only, lock-free owner-state query: reads the same interlocked flag the
+ * install/disable paths write, so it never takes the owner lock and cannot
+ * deadlock a caller that already holds one. */
+bool nv2a_hook_owner_active(void)
+{
+    return InterlockedCompareExchange(&g_mmio_owner_active, 0, 0) != 0;
+}
+
 void nv2a_hook_disable_aperture(void)
 {
     AcquireSRWLockExclusive(&g_mmio_owner_lock);

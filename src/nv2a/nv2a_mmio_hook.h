@@ -71,6 +71,16 @@ typedef struct NV2AHookSubmissionSnapshot {
  * number of atomically accepted streams and is not a GPU completion signal. */
 bool nv2a_hook_get_submission_snapshot(NV2AHookSubmissionSnapshot *snapshot);
 
+/* Whether the MMIO state owner has taken over the register aperture. Once it
+ * has, the register file belongs to the VEH handler and the legacy ack-worker
+ * mutations are retired.
+ *
+ * Read-only and lock-free: it reads the interlocked flag the install path sets,
+ * takes no NV2A lock, and cannot deadlock against the submission walk. A caller
+ * that only wants "has ownership been claimed?" must use this rather than the
+ * submission snapshot, which does take the owner lock. */
+bool nv2a_hook_owner_active(void);
+
 /* Serialized NV2A PCI owner used by both VEH and the kernel HAL bridge. */
 bool nv2a_hook_pci_config_read(uint32_t offset, void *buffer, uint32_t length);
 bool nv2a_hook_pci_config_write(uint32_t offset, const void *buffer,

@@ -187,6 +187,13 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
  * stands down, so the count follows what was actually drawn. */
 void xbox_Nv2aFrameCounterFlip(void);
 
+/* How many times xbox_Nv2aFrameCounterFlip has been called. Read-only, and the
+ * honest witness that the swap path ran: the guest-visible counter delta is not
+ * one, because the counter walk is skipped when the memory base is unmapped or
+ * the registered address fails its readability check. Interlocked read, so it
+ * is safe against the submitting thread. */
+uint32_t xbox_Nv2aFrameCounterFlipCalls(void);
+
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
 /* Read it back: 0 until the title sets a mode. Pitch is optional. */

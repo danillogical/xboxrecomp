@@ -985,6 +985,16 @@ enum {
  * remains test-only. */
 #define M_SET_OBJECT 0x0000u
 
+/* The registered committed-method consumer, or NULL. Set once at bring-up from
+ * the host side; read by the walk under the PFIFO lock. Nothing here inspects
+ * what the consumer is or does -- the core must not depend on the kernel. */
+static nv2a_commit_consumer_fn g_commit_consumer;
+
+void nv2a_set_commit_consumer(nv2a_commit_consumer_fn fn)
+{
+    g_commit_consumer = fn;
+}
+
 /* Both capacities must hold a whole submission's word budget: a submission is
  * staged in full before any of it is committed, and every staged method
  * consumes exactly one parameter word, so a walk that stays inside its word
@@ -1569,6 +1579,7 @@ bool nv2a_submit_pending(NV2AState *d)
                 }
             }
             d->pfifo.staged[staged_count].subchannel = subchannel;
+            d->pfifo.staged[staged_count].class_id = staged_class[subchannel];
             d->pfifo.staged[staged_count].method = method;
             d->pfifo.staged[staged_count].param = param;
             ++staged_count;
@@ -1626,7 +1637,7 @@ bool nv2a_submit_pending(NV2AState *d)
     if (ok) {
         for (uint32_t i = 0; i < staged_count; ++i) {
             d->pfifo.sink[d->pfifo.sink_count].subchannel = d->pfifo.staged[i].subchannel;
-            d->pfifo.sink[d->pfifo.sink_count].class_id = staged_class[d->pfifo.staged[i].subchannel];
+            d->pfifo.sink[d->pfifo.sink_count].class_id = d->pfifo.staged[i].class_id;
             d->pfifo.sink[d->pfifo.sink_count].method = d->pfifo.staged[i].method;
             d->pfifo.sink[d->pfifo.sink_count].param = d->pfifo.staged[i].param;
             ++d->pfifo.sink_count;
@@ -1640,8 +1651,10 @@ bool nv2a_submit_pending(NV2AState *d)
              *
              * Only NV097 has method state in this model, so only NV097 is
              * captured this way; the other classes' parameters are recorded in
-             * the sink, which now carries the class. */
-            if (staged_class[d->pfifo.staged[i].subchannel] == NV097_CLASS
+             * the sink, which carries the class per entry. The class comes from
+             * the staging entry, not from binding_class[], so a mid-stream
+             * SET_OBJECT rebind cannot retro-label the methods before it. */
+            if (d->pfifo.staged[i].class_id == NV097_CLASS
                     && d->pfifo.staged[i].method / 4 < NV2A_PGRAPH_METHOD_WORDS) {
                 d->pgraph.methods[d->pfifo.staged[i].method / 4] = d->pfifo.staged[i].param;
             }
@@ -1649,6 +1662,20 @@ bool nv2a_submit_pending(NV2AState *d)
         memcpy(d->pfifo.binding_class, staged_class, sizeof(staged_class));
         memcpy(d->pfifo.binding_object, staged_object, sizeof(staged_object));
         if (actions) action_commit(d, &st);
+        /* Hand the committed methods to the registered consumer, in order, only
+         * now: after the whole submission succeeded (a rejected walk never
+         * reaches here, so it has no executor side effect) and after
+         * action_commit, so a committed semaphore release or surface is already
+         * visible to it. Runs under the PFIFO lock, so the consumer must be
+         * lock-free -- see the contract on nv2a_set_commit_consumer. */
+        if (g_commit_consumer) {
+            for (uint32_t i = 0; i < staged_count; ++i) {
+                g_commit_consumer(d->pfifo.staged[i].subchannel,
+                                  d->pfifo.staged[i].class_id,
+                                  d->pfifo.staged[i].method,
+                                  d->pfifo.staged[i].param);
+            }
+        }
         if (staged_count) {
             d->pfifo.submit_last_method = d->pfifo.staged[staged_count - 1].method;
             d->pfifo.submit_last_param = d->pfifo.staged[staged_count - 1].param;

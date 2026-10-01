@@ -26,6 +26,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../nv2a/nv2a_mmio_hook.h"   /* nv2a_hook_owner_active */
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 #define PB_MAX_METHODS 4096
@@ -62,6 +64,31 @@ static int pb_walk_enabled(void)
     if (s_scan_enabled < 0)
         s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
     return s_exec_enabled || s_scan_enabled;
+}
+
+/* When the MMIO state owner is installed, the submission walk owns execution:
+ * it feeds the executor the methods it actually committed, and this scan must
+ * not feed it a second time.
+ *
+ * The owner state must be read EVERY time, not cached. The ack worker (and so
+ * this scan) starts before the MMIO hook claims the aperture, so an early call
+ * legitimately sees "no owner" -- caching that answer would pin the decision to
+ * "execute" for the rest of the run and execute every method twice. Only the
+ * *notice* is cached, because a silently ignored RECOMP_PB_EXEC looks exactly
+ * like a title that submits nothing and one line is enough to say so. */
+static int s_scan_suppress_logged;
+
+static int scan_exec_suppressed(void)
+{
+    if (!nv2a_hook_owner_active()) return 0;
+    if (!s_scan_suppress_logged && s_exec_enabled > 0) {
+        s_scan_suppress_logged = 1;
+        fprintf(stderr, "  [PB] MMIO state owner active: the submission walk "
+                        "executes committed methods; this scan's execution is "
+                        "suppressed (survey only)\n");
+        fflush(stderr);
+    }
+    return 1;
 }
 
 /* Slot + 1 of each (subchannel, method) in s_seen. note() runs for every
@@ -154,7 +181,11 @@ void nv2a_pb_scan_report(void)
 {
     int i;
 
-    if (s_exec_enabled > 0)
+    /* Under the owner, the consumer owns the executor report too: it is the only
+     * caller, on its own 10 s cadence. Letting this path report as well would
+     * give the executor two callers and two cadences, and the second one would
+     * print all-zero counters from a worker that no longer executes anything. */
+    if (s_exec_enabled > 0 && !scan_exec_suppressed())
         nv2a_pb_exec_report();
     if (!s_seen_count || !getenv("RECOMP_PB_SCAN"))
         return;
@@ -251,9 +282,13 @@ void nv2a_pb_scan(uint32_t put_phys)
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t put = put_phys & PB_PHYS_MASK;
     uint32_t words = 0, jumps = 0, unknown = 0;
+    int suppress_exec;
 
     if (!pb_walk_enabled())
         return;
+    /* Asked once per walk, not per method: the answer cannot change inside one
+     * walk, and this is on the poll path. */
+    suppress_exec = scan_exec_suppressed();
     if (s_get == 0xFFFFFFFFu) {               /* never resynced: start at PUT */
         s_get = put;
         return;
@@ -327,8 +362,15 @@ void nv2a_pb_scan(uint32_t put_phys)
                 note(subch, m);
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
-                 * disagree about what the stream said. */
-                if (s_exec_enabled)
+                 * disagree about what the stream said.
+                 *
+                 * Unless the MMIO state owner is active. Then the submission
+                 * walk is the single source of committed methods and feeds the
+                 * executor itself; letting this scan feed it too would execute
+                 * every method twice, from two different walks that can
+                 * disagree about what was committed. The survey still counts,
+                 * because it is read-only; only the execution is suppressed. */
+                if (s_exec_enabled && !scan_exec_suppressed())
                     nv2a_pb_exec_method(subch, m, param);
                 s_get = (s_get + 4) & PB_PHYS_MASK;
                 words++;

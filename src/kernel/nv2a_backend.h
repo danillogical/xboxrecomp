@@ -103,4 +103,49 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
  * the semaphore context DMA object through RAMIN. */
 void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 
+/* ── Observation seam ────────────────────────────────────────────────────
+ *
+ * The executor's counters, for a caller that must not print or parse stderr.
+ * `nv2a_pb_exec_report()` is the human-readable view of these same fields.
+ *
+ * THREADING CONTRACT. The counters are plain fields written by the submission
+ * walk, which holds the PFIFO lock. These accessors take no lock of their own
+ * -- deliberately, because the consumer already runs under that lock and a
+ * self-locking accessor would deadlock against it. So a caller MUST either:
+ *   - already be inside the consumer callback (the PFIFO lock is held), or
+ *   - be a single-threaded fixture with no concurrent submission.
+ * Any other caller (a GUI thread, say) may observe torn or stale values,
+ * including a split 64-bit `pixels`. Do not call these from a thread that
+ * races the walk without adding its own synchronisation. */
+typedef struct {
+    uint32_t draws;
+    uint32_t clears;
+    uint64_t pixels;
+    uint32_t tris_drawn;
+    uint32_t flips;         /* NV097_FLIP_INCREMENT_WRITE (0x12C) only */
+    uint32_t flip_stalls;   /* NV097_FLIP_STALL (0x130): a swap that does not
+                             * advance flip_write, so it is NOT in `flips` */
+    uint32_t unhandled;     /* methods with no implementation */
+} Nv2aPbExecCounters;
+
+void nv2a_pb_exec_counters(Nv2aPbExecCounters *out);
+
+/* Register the executor as the GPU core's committed-method consumer. Called
+ * once at bring-up (before the guest runs) and gated on RECOMP_PB_EXEC by
+ * presence, exactly like the legacy scan path. Idempotent.
+ *
+ * Why this exists: with the MMIO state owner installed, the ack worker's body
+ * -- and with it the legacy PB scan that used to feed the executor -- is
+ * retired, so a PB_EXEC run executed nothing and reported nothing. The
+ * submission walk is the thing that actually knows which methods were
+ * committed, so it feeds the executor directly.
+ *
+ * Call before the guest starts. There is no runtime swap: like
+ * nv2a_backend_register, the registration is readiness, not a mode change. */
+void nv2a_pb_exec_register_commit_consumer(void);
+int  nv2a_pb_exec_consumer_registered(void);
+/* Methods the consumer skipped because their class is not NV097. Same threading
+ * contract as nv2a_pb_exec_counters. */
+uint32_t nv2a_pb_exec_skipped_non_nv097(void);
+
 #endif /* NV2A_BACKEND_H */

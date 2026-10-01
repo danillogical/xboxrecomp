@@ -868,11 +868,24 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off)
  * stalling, blocky video rather than a clock running away.
  */
 static DWORD g_frame_counter_flip_ms;
+/* How many times a completed swap was reported, regardless of whether any
+ * counter was registered or reachable. The counter walk below is skipped
+ * whenever g_memory_base is NULL or the address fails fence_readable, so the
+ * guest-visible delta is NOT a reliable witness that the flip path ran. This
+ * count is: it is the first statement, unconditional, and read with an
+ * interlocked load. */
+static volatile LONG g_frame_counter_flip_calls;
+
+uint32_t xbox_Nv2aFrameCounterFlipCalls(void)
+{
+    return (uint32_t)InterlockedCompareExchange(&g_frame_counter_flip_calls, 0, 0);
+}
 
 void xbox_Nv2aFrameCounterFlip(void)
 {
     int i;
 
+    InterlockedIncrement(&g_frame_counter_flip_calls);
     g_frame_counter_flip_ms = GetTickCount();
     if (!g_frame_counter_flip_ms)
         g_frame_counter_flip_ms = 1;          /* 0 means "never" */
@@ -2989,6 +3002,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     if (g_nv2a_memory) {
         xbox_Nv2aAckStart();
+        /* The submission walk is the only thing that knows which methods were
+         * COMMITTED, so with RECOMP_PB_EXEC set it feeds the executor directly.
+         * Registered here, before the guest runs, so no submission can be
+         * walked before the consumer exists. The core does not know what the
+         * consumer is; see nv2a_set_commit_consumer. */
+        {
+            extern void nv2a_pb_exec_register_commit_consumer(void);
+            nv2a_pb_exec_register_commit_consumer();
+        }
     }
 
     /*

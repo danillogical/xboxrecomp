@@ -186,8 +186,13 @@ typedef struct NV2AState {
          * PFIFO-owned rather than a local because a submission may stage a
          * whole budget's worth, and 4096 entries is 48 KB -- too much for the
          * submission thread's stack. Nothing is committed from it until the
-         * whole walk has succeeded. */
-        struct { uint32_t subchannel, method, param; } staged[NV2A_SUBMIT_MAX_WORDS];
+         * whole walk has succeeded.
+         *
+         * `class_id` is recorded PER ENTRY, at the moment the method is walked.
+         * It cannot be read from binding_class[] afterwards: SET_OBJECT rebinds
+         * a subchannel in place, so a mid-stream rebind would retro-label the
+         * methods that came before it. */
+        struct { uint32_t subchannel, class_id, method, param; } staged[NV2A_SUBMIT_MAX_WORDS];
     } pfifo;
 
     struct {
@@ -364,6 +369,29 @@ bool nv2a_set_fixture_binding(NV2AState *d, uint32_t subchannel,
 bool nv2a_set_fixture_execution(NV2AState *d, bool enabled);
 bool nv2a_submit_pending(NV2AState *d);
 const char *nv2a_submit_diagnostic(uint32_t code);
+
+/* Committed-method consumer (a host renderer/observer). This is the ONLY way
+ * the model hands committed methods to anything outside the GPU core: the core
+ * never calls into the kernel, and it never learns what the consumer does.
+ *
+ * Contract:
+ *  - The consumer is called from the submission walk, once per COMMITTED method,
+ *    only after the whole submission succeeded, and while the PFIFO lock is
+ *    held. It must therefore be lock-free and must not call back into
+ *    nv2a_submit_pending, the MMIO hook, or anything that takes the PFIFO lock.
+ *  - Rejected submissions call it zero times: a walk that fails commits nothing
+ *    and consumes nothing.
+ *  - Each entry carries the class that was bound when that method was walked, so
+ *    a mid-stream SET_OBJECT rebind does not retro-label earlier methods.
+ *  - Registration is optional and defaults to none.
+ *
+ * The setter itself is a plain store of a global the walk reads under the lock,
+ * so it must be called at bring-up -- before the guest can submit, or while the
+ * submitting worker is known to be finished (a fixture). Swapping the consumer
+ * while a walk is in flight is a data race, not a supported mode. */
+typedef void (*nv2a_commit_consumer_fn)(uint32_t subchannel, uint32_t class_id,
+                                        uint32_t method, uint32_t param);
+void nv2a_set_commit_consumer(nv2a_commit_consumer_fn fn);
 
 /* NV097 action methods: the semaphore release, and the software-method trap
  * and FLIP_STALL hold. Modelled but not admitted as hardware causes, so they

@@ -36,6 +36,14 @@
 #include "../d3d/d3d8_swizzle.h"
 #include "nv2a_backend.h"
 
+/* The commit seam's signature only. Including nv2a_state.h here would drag in
+ * nv2a_regs.h, whose NV097_* names collide with this file's own method-number
+ * table (30+ macro-redefinition warnings), so the one declaration needed is
+ * spelled out instead. The definition lives in the GPU core. */
+typedef void (*nv2a_commit_consumer_fn)(uint32_t subchannel, uint32_t class_id,
+                                        uint32_t method, uint32_t param);
+extern void nv2a_set_commit_consumer(nv2a_commit_consumer_fn fn);
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 extern void xbox_FramebufferWindowStart(void);
@@ -147,6 +155,9 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 }
 
 /* NV097 methods this executor acts on. */
+/* The NV097 class id, as the pushbuffer's SET_OBJECT binds it. Same value the
+ * GPU core and the generated method table use. */
+#define NV097_CLASS 0x97u
 /* Blending. The pair this title programs, read from its own pushbuffer
  * rather than guessed: BLEND_ENABLE written 1168 times and left on,
  * SFACTOR 0x0302 (SRC_ALPHA) and DFACTOR 0x0303 (ONE_MINUS_SRC_ALPHA).
@@ -274,6 +285,10 @@ static struct {
     uint32_t clear_color;
     uint32_t clears, unhandled_total;
     uint32_t flip_read, flip_write, flip_modulo, flips;
+    uint32_t flip_stalls;   /* NV097_FLIP_STALL: a completed swap that does not
+                             * advance flip_write, so it is NOT counted in
+                             * `flips`. Kept apart so a run can tell the two
+                             * swap paths apart. */
     uint32_t tris_drawn, tris_skipped_offscreen, batches_untransformed;
     /* Why a batch came out flat. "Untextured" has two causes that look
      * identical on screen and want opposite fixes: the batch carried no
@@ -962,6 +977,101 @@ static const Nv2aBackend *s_backend;
 void nv2a_backend_register(const Nv2aBackend *backend)
 {
     s_backend = backend;
+}
+
+/* ── Observation seam ───────────────────────────────────────── */
+
+void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
+
+/* The executor's counters, for a caller that must not print. The report below
+ * is the human-readable view of exactly these fields; a test or a periodic
+ * observer reads them here instead of parsing stderr.
+ *
+ * Takes no lock by design: the consumer already runs under the PFIFO lock, so a
+ * self-locking accessor would deadlock. Callers must be inside the consumer or
+ * a single-threaded fixture -- see the contract in nv2a_backend.h. */
+void nv2a_pb_exec_counters(Nv2aPbExecCounters *out)
+{
+    if (!out) return;
+    out->draws        = s_gpu.draws;
+    out->clears       = s_gpu.clears;
+    out->pixels       = s_gpu.pixels;
+    out->tris_drawn   = s_gpu.tris_drawn;
+    out->flips        = s_gpu.flips;
+    out->flip_stalls  = s_gpu.flip_stalls;
+    out->unhandled    = s_gpu.unhandled_total;
+}
+
+/* Bridge from the GPU core's commit seam to this executor. The core knows only
+ * the function pointer; it never learns that the consumer is the kernel-side
+ * executor. Registered once at bring-up when RECOMP_PB_EXEC is set.
+ *
+ * Called from the submission walk with the PFIFO lock held, so this must not
+ * take any lock, must not call back into the walk, and must not block. Only
+ * NV097 is executed; other classes are counted and skipped. */
+static uint32_t s_consumer_non_nv097;
+
+/* Periodic report, driven by the consumer itself rather than by a worker.
+ *
+ * The report must come from the OWNER path, because that is the only path that
+ * runs while the MMIO state owner is installed. It is called with the PFIFO
+ * lock held, so it must not block on anything that takes that lock -- the
+ * report is read-only apart from the framebuffer BMP write, which is accepted
+ * as an exploratory observation cost.
+ *
+ * The first report fires on the first committed method: `s_report_last` starts
+ * at 0 and GetTickCount() is already large by then, so the interval test is
+ * true immediately. That is deliberate -- an all-zero init-time report is what
+ * made the previous observation run unreadable. */
+static DWORD s_report_last;
+
+static void report_tick(void)
+{
+    DWORD now = GetTickCount();
+    if (now - s_report_last < 10000u && s_report_last != 0) return;
+    s_report_last = now ? now : 1u;
+    nv2a_pb_exec_report();
+}
+
+static void pb_exec_commit_consumer(uint32_t subchannel, uint32_t class_id,
+                                    uint32_t method, uint32_t param)
+{
+    if (class_id != NV097_CLASS) {
+        ++s_consumer_non_nv097;
+        return;
+    }
+    nv2a_pb_exec_method(subchannel, method, param);
+    report_tick();
+}
+
+uint32_t nv2a_pb_exec_skipped_non_nv097(void)
+{
+    return s_consumer_non_nv097;
+}
+
+/* Whether the commit-consumer registration happened, and how it is gated. */
+static int s_consumer_registered;
+
+int nv2a_pb_exec_consumer_registered(void)
+{
+    return s_consumer_registered;
+}
+
+void nv2a_pb_exec_register_commit_consumer(void)
+{
+    /* Presence only: RECOMP_PB_EXEC=0 still means "on", as it always has. */
+    if (!getenv("RECOMP_PB_EXEC")) return;
+    /* Re-assert on every call rather than latching: the core's pointer can be
+     * cleared by nv2a_set_commit_consumer(NULL) (a fixture's teardown, say), and
+     * a latch would then report "registered" while the walk delivered to
+     * nobody. Setting the same pointer twice is harmless, so this is idempotent
+     * in the useful sense. Only the notice is once. */
+    nv2a_set_commit_consumer(pb_exec_commit_consumer);
+    if (s_consumer_registered) return;
+    s_consumer_registered = 1;
+    fprintf(stderr, "  [GPU] PB executor registered on the submission walk "
+                    "(committed NV097 methods only)\n");
+    fflush(stderr);
 }
 
 static void current_surface(Nv2aSurface *out)
@@ -2694,8 +2804,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
         /* Verbose runs: the ranked unhandled-method report every 600 flips,
-         * so a run that is killed rather than exits still leaves one. */
-        if (pb_verbose() && s_gpu.flips % 600 == 0)
+         * so a run that is killed rather than exits still leaves one.
+         *
+         * Suppressed once the commit consumer is registered: the consumer is
+         * then the ONE report caller, on its own 10 s cadence, and a second
+         * cadence from inside a method would both duplicate the report and
+         * re-enter it while the walk holds the PFIFO lock. Without a consumer
+         * (the legacy scan path) this stays exactly as it was. */
+        if (!s_consumer_registered && pb_verbose() && s_gpu.flips % 600 == 0)
             nv2a_pb_exec_report();
         return;
 
@@ -2703,6 +2819,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         /* The stall ends when the buffer being read is the one just finished.
          * There is no scanout here to wait for, so that is now. */
         s_gpu.flip_read = s_gpu.flip_write;
+        /* A stall is a completed swap, but it is NOT a FLIP_INCREMENT_WRITE:
+         * it does not advance the write buffer, so it must not be counted in
+         * s_gpu.flips. It gets its own counter so a run can tell "the title
+         * flips by incrementing the write pointer" from "the title stalls on
+         * the read pointer", which are different D3D swap paths. */
+        s_gpu.flip_stalls++;
         /* And this is a completed swap, which is what a title's own swap
          * counter counts -- see xbox_Nv2aFrameCounterFlip. */
         xbox_Nv2aFrameCounterFlip();
@@ -3023,6 +3145,14 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] batches: %u textured, %u with no texcoords,"
                     " %u with texcoords but no usable stage\n",
             s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex);
+    /* The swap split, which the draw/clear counters above cannot show: a title
+     * that flips by advancing the write pointer and one that stalls on the read
+     * pointer are different D3D paths, and only one of them increments flips. */
+    fprintf(stderr, "[GPU] flips %u (increment-write), flip stalls %u;"
+                    " consumer: %s, %u non-NV097 method(s) skipped\n",
+            s_gpu.flips, s_gpu.flip_stalls,
+            s_consumer_registered ? "submission walk" : "none",
+            s_consumer_non_nv097);
     for (i = 0; i < s_tex_use_count; i++)
         fprintf(stderr, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
                 s_tex_use[i].offset, s_tex_use[i].width, s_tex_use[i].height,
