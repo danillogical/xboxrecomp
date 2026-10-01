@@ -824,6 +824,9 @@ KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
  * line for the whole processor on hardware, not just for one thread. */
 int     xbox_IrqlBlocksInterrupts(void);
 int     xbox_IrqlRaisedCount(void);
+/* Non-zero while any thread holds IRQL above DISPATCH_LEVEL, where device
+ * interrupts are masked. Counted only in serial guest mode (guest_meter.h). */
+int     xbox_IrqlBlocksDeviceInterrupts(void);
 
 /* Total crossings of the DISPATCH boundary, and who is holding it up.
  * A depth that is non-zero while this stops moving is stuck, not busy. */

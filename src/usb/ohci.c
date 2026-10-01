@@ -763,9 +763,10 @@ static int ohci_call_isr(OhciController *hc)
     g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
 
     {
-        int gm = xbox_GuestMeterEnter(XBOX_GM_USB_ISR);
+        /* Serial mode keeps the guest lock across the ISR's kernel calls. */
+        int gm = xbox_GuestSerialBeginAtomic(XBOX_GM_USB_ISR);
         fn();
-        xbox_GuestMeterRestore(gm, XBOX_GM_USB_ISR);
+        xbox_GuestSerialEndAtomic(gm, XBOX_GM_USB_ISR);
     }
 
     xbox_worker_stack_free(slot);

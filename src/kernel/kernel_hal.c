@@ -12,6 +12,7 @@
  */
 
 #include "kernel.h"
+#include "guest_meter.h"
 #include "nv2a/nv2a_mmio_hook.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -194,6 +195,19 @@ int xbox_IrqlBlocksInterrupts(void)
     return InterlockedCompareExchange(&g_irql_raised_count, 0, 0) != 0;
 }
 
+/* How many threads are above DISPATCH_LEVEL, at a device's level.
+ *
+ * An interrupt is masked at or above its own IRQL, not at DISPATCH_LEVEL. The
+ * bridge does not record a KINTERRUPT's IRQL, so any level above
+ * DISPATCH_LEVEL counts as masking every device. Kept only in serial guest
+ * mode, whose timer thread is the one reader. */
+static volatile LONG g_irql_device_count = 0;
+
+int xbox_IrqlBlocksDeviceInterrupts(void)
+{
+    return InterlockedCompareExchange(&g_irql_device_count, 0, 0) != 0;
+}
+
 /* The raw depth, for callers that want to report it. A count that only ever
  * grows is a leak somewhere in the raise/lower pairs, and the number says so
  * where a yes/no cannot. */
@@ -273,6 +287,13 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     int now = (new_level >= DISPATCH_LEVEL);
     LONG d;
 
+    if (xbox_GuestSerialEnabled()
+        && (old_level > DISPATCH_LEVEL) != (new_level > DISPATCH_LEVEL)) {
+        if (new_level > DISPATCH_LEVEL)
+            InterlockedIncrement(&g_irql_device_count);
+        else
+            InterlockedDecrement(&g_irql_device_count);
+    }
     if (now == was)
         return;
 

@@ -2127,7 +2127,7 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2,
  * ponytail: no lock is taken. Nothing else here runs at ISR IRQL, and the one
  * caller that matters is a device model on its own thread; if two of those
  * ever contend, this wants the interrupt object's own lock rather than a
- * global one.
+ * global one. Serial guest mode holds the guest lock for the routine instead.
  */
 static void bridge_KeSynchronizeExecution(void)
 {
@@ -2150,9 +2150,11 @@ static void bridge_KeSynchronizeExecution(void)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     {
-        int gm = xbox_GuestMeterEnter(XBOX_GM_SYNC_EXEC);
+        /* At the interrupt's IRQL: in serial mode nothing else runs until it
+         * returns, not even across its own kernel calls. */
+        int gm = xbox_GuestSerialBeginAtomic(XBOX_GM_SYNC_EXEC);
         fn();
-        xbox_GuestMeterRestore(gm, XBOX_GM_SYNC_EXEC);
+        xbox_GuestSerialEndAtomic(gm, XBOX_GM_SYNC_EXEC);
     }
     /* g_eax is whatever the routine returned, which is this call's result. */
 }
@@ -2196,6 +2198,16 @@ static void dpc_lock(void)
 static void dpc_unlock(void)
 {
     InterlockedExchange(&g_dpc_lock, 0);
+}
+
+/* Whether any DPC is queued. */
+static int dpc_pending(void)
+{
+    int n;
+    dpc_lock();
+    n = g_dpc_head != g_dpc_tail;
+    dpc_unlock();
+    return n;
 }
 
 /* Ring index of a queued DPC, or -1. Caller holds g_dpc_lock. */
@@ -2372,11 +2384,15 @@ int xbox_Nv2aAttachIrqLine(void)
  * the ISR runs, once per timer tick, until the guest acknowledges by clearing
  * the source. An ISR that declines leaves the line up, which is what an
  * unhandled interrupt looks like. */
+static int kernel_nv2a_irq_pending(void)
+{
+    return InterlockedCompareExchange(&g_nv2a_irq_line, 0, 0)
+        && xbox_GetConnectedInterrupt(NV2A_VECTOR);
+}
+
 static void kernel_deliver_nv2a_irq(void)
 {
-    if (!InterlockedCompareExchange(&g_nv2a_irq_line, 0, 0))
-        return;
-    if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
+    if (!kernel_nv2a_irq_pending())
         return;
     {
         static unsigned n;
@@ -2672,6 +2688,57 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
+/* Whether any timer with a DPC is due at `now`. */
+static int kernel_timer_dpc_due(long long now)
+{
+    int i, due = 0;
+
+    EnterCriticalSection(&g_timer_lock);
+    for (i = 0; i < XBOX_MAX_TIMERS && !due; i++)
+        due = g_timers[i].timer_va && g_timers[i].dpc_va && now >= g_timers[i].due_ms;
+    LeaveCriticalSection(&g_timer_lock);
+    return due;
+}
+
+/* One tick of interrupt and deferred work in serial guest mode.
+ *
+ * The interrupt, the queued DPCs and the due timers' DPCs run in one atomic
+ * section, so no guest thread runs between an ISR and the DPC it queued, as
+ * on hardware. The section is opened only when there is work, and it is left
+ * open for the caller's timer loop; *open says whether it was.
+ *
+ * IRQL is read with the lock held, so no guest code runs between the check
+ * and the routine. An ISR waits while any thread is above DISPATCH_LEVEL,
+ * and DPCs wait while any thread is at or above it. Both lines are polled, so
+ * deferred work runs on a later tick rather than being lost.
+ *
+ * Returns non-zero when the caller must leave timer DPCs for a later tick. */
+static int kernel_serial_tick(int *open, int *token, int *source)
+{
+    long long now = (long long)GetTickCount64();
+    int isr = kernel_nv2a_irq_pending();
+
+    *open = 0;
+    if (!isr && !dpc_pending() && !kernel_timer_dpc_due(now))
+        return 1;       /* no section, so a timer DPC falling due now waits */
+    *source = isr ? XBOX_GM_ISR : XBOX_GM_DPC;
+    *token = xbox_GuestSerialBeginAtomic(*source);
+    *open = 1;
+    if (isr) {
+        if (xbox_IrqlBlocksDeviceInterrupts())
+            xbox_GuestSerialNoteSkip(XBOX_GS_SKIP_ISR);
+        else
+            kernel_deliver_nv2a_irq();
+    }
+    if (xbox_IrqlBlocksInterrupts()) {
+        if (dpc_pending() || kernel_timer_dpc_due(now))
+            xbox_GuestSerialNoteSkip(XBOX_GS_SKIP_DPC);
+        return 1;
+    }
+    kernel_drain_dpcs();
+    return 0;
+}
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -2702,17 +2769,26 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
     for (;;) {
         long long now;
         int i;
+        int serial_open = 0, serial_token = 0, serial_source = XBOX_GM_DPC;
+        int defer_timer_dpcs = 0;
 
         Sleep(10);
-        kernel_deliver_nv2a_irq();   /* the GPU's interrupt line */
-        kernel_drain_dpcs();         /* deferred work, before due timers */
+        if (xbox_GuestSerialEnabled()) {
+            defer_timer_dpcs = kernel_serial_tick(&serial_open, &serial_token,
+                                                  &serial_source);
+        } else {
+            kernel_deliver_nv2a_irq();   /* the GPU's interrupt line */
+            kernel_drain_dpcs();         /* deferred work, before due timers */
+        }
         now = (long long)GetTickCount64();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
             uint32_t dpc, fired_va;
 
             EnterCriticalSection(&g_timer_lock);
-            if (!g_timers[i].timer_va || now < g_timers[i].due_ms) {
+            /* A deferred DPC timer stays due, untouched, for the next tick. */
+            if (!g_timers[i].timer_va || now < g_timers[i].due_ms
+                || (defer_timer_dpcs && g_timers[i].dpc_va)) {
                 LeaveCriticalSection(&g_timer_lock);
                 continue;
             }
@@ -2738,6 +2814,8 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                 }
             }
         }
+        if (serial_open)
+            xbox_GuestSerialEndAtomic(serial_token, serial_source);
     }
 }
 
