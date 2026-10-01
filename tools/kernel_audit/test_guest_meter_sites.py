@@ -10,7 +10,9 @@ added without the bracket does not fail anything; the meter just under-counts,
 which is the one thing a concurrency meter must not do quietly.
 
 The runtime calls a looked-up guest function as `fn();` in these files, so
-each such line must sit inside a bracket.
+each such line must sit inside a bracket. xbox_GuestSerialBeginAtomic and
+xbox_GuestSerialEndAtomic count: they are Enter and Restore plus serial mode's
+pin, for routines that keep the guest lock across their own kernel calls.
 """
 
 import os
@@ -38,8 +40,11 @@ def test_every_guest_call_is_bracketed():
             seen += 1
             before = " ".join(lines[max(0, i - 3):i])
             after = lines[i + 1] if i + 1 < len(lines) else ""
-            if "xbox_GuestMeterEnter(" not in before or \
-               "xbox_GuestMeterRestore(" not in after:
+            entered = ("xbox_GuestMeterEnter(" in before
+                       or "xbox_GuestSerialBeginAtomic(" in before)
+            restored = ("xbox_GuestMeterRestore(" in after
+                        or "xbox_GuestSerialEndAtomic(" in after)
+            if not (entered and restored):
                 bad.append(f"{os.path.relpath(path, ROOT)}:{i + 1}")
     assert seen >= 10, f"found only {seen} guest call sites; did the pattern change?"
     assert not bad, "unmetered guest calls:\n  " + "\n  ".join(bad)
