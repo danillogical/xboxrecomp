@@ -163,12 +163,9 @@
 #       define NV_PFIFO_CACHE1_DMA_STATE_ERROR_PROTECTION         6
 #define NV_PFIFO_CACHE1_DMA_INSTANCE                     0x0000122C
 #   define NV_PFIFO_CACHE1_DMA_INSTANCE_ADDRESS               0x0000FFFF
+/* PUT is a plain ring offset with no latch bits; the guest's set-bit-16-and-spin
+ * handshake is the write-buffer flush, NV_PFB_WBC_FLUSH. */
 #define NV_PFIFO_CACHE1_DMA_PUT                          0x00001240
-#   define NV_PFIFO_CACHE1_DMA_PUT_KICK                        (1 << 16)
-/* The stored PUT carries the ring offset in the low bits.  Bit 16 is the
- * kick request latch and must be excluded, so this is deliberately NOT the
- * 0x1FFFFFFF offset mask used elsewhere for the same register. */
-#       define NV_PFIFO_CACHE1_DMA_PUT_OFFSET                  0x1FFEFFFFu
 #define NV_PFIFO_CACHE1_DMA_GET                          0x00001244
 #define NV_PFIFO_CACHE1_REF                              0x00001248
 #define NV_PFIFO_CACHE1_DMA_SUBROUTINE                   0x0000124C

@@ -1697,20 +1697,12 @@ static void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int siz
         d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = (uint32_t)val;
         qemu_mutex_unlock(&d->pfifo.lock);
     } else if (addr == NV_USER_DMA_PUT) {
-        /* JSRF kicks by setting bit 16 of the DMA PUT value and then polling
-         * until the engine clears it (0x00191270, inlined at
-         * 0x001912C6..0x001912EA).  The latch is owned here, so the sequence
-         * must be: store the offset, run the pending submission, clear the
-         * bit.  Clearing it is the acknowledgement the guest waits for;
-         * leaving it set spins 0x00191290 forever. */
-        uint32_t offset = (uint32_t)val & NV_PFIFO_CACHE1_DMA_PUT_OFFSET;
-        pfifo_trace("user_write", NV_PFIFO_CACHE1_DMA_PUT, offset);
+        /* Stored as written, as xemu does: bit 16 is an ordinary offset bit
+         * once the ring passes 64 KB.  JSRF's set-bit-16-and-spin at
+         * 0x00191270 targets 0x100410, NV_PFB_WBC, which pfb_read answers. */
+        pfifo_trace("user_write", NV_PFIFO_CACHE1_DMA_PUT, (uint32_t)val);
         qemu_mutex_lock(&d->pfifo.lock);
-        if (val & NV_PFIFO_CACHE1_DMA_PUT_KICK) {
-            d->pfifo.kick_requests++;
-            d->pfifo.kick_last_put = offset;
-        }
-        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = offset;
+        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = (uint32_t)val;
         qemu_mutex_unlock(&d->pfifo.lock);
         nv2a_submit_pending(d);
         /* Per-submit diagnostic. GET only moves on success, so when it stays put
@@ -1729,13 +1721,6 @@ static void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int siz
                         d->pfifo.submit_diag_method, d->pfifo.submit_diag_subchannel,
                         d->pfifo.submit_diag_param, d->pfifo.submit_diag_get);
             submits++;
-        }
-        if (val & NV_PFIFO_CACHE1_DMA_PUT_KICK) {
-            qemu_mutex_lock(&d->pfifo.lock);
-            d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] &=
-                NV_PFIFO_CACHE1_DMA_PUT_OFFSET;
-            d->pfifo.kick_acks++;
-            qemu_mutex_unlock(&d->pfifo.lock);
         }
     }
 }
@@ -1804,26 +1789,12 @@ void pfifo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         nv2a_update_irq(d);
         break;
     case NV_PFIFO_CACHE1_DMA_PUT:
-        /* Same latch contract as the NV_USER alias above.  `addr` here is
+        /* Same plain store as the NV_USER alias above.  `addr` here is
          * already the block-local PFIFO offset, so it is the canonical slot. */
-        if (val & NV_PFIFO_CACHE1_DMA_PUT_KICK) {
-            uint32_t offset = (uint32_t)val & NV_PFIFO_CACHE1_DMA_PUT_OFFSET;
-            qemu_mutex_lock(&d->pfifo.lock);
-            d->pfifo.kick_requests++;
-            d->pfifo.kick_last_put = offset;
-            d->pfifo.regs[addr] = offset;
-            qemu_mutex_unlock(&d->pfifo.lock);
-            nv2a_submit_pending(d);
-            qemu_mutex_lock(&d->pfifo.lock);
-            d->pfifo.regs[addr] &= NV_PFIFO_CACHE1_DMA_PUT_OFFSET;
-            d->pfifo.kick_acks++;
-            qemu_mutex_unlock(&d->pfifo.lock);
-        } else {
-            qemu_mutex_lock(&d->pfifo.lock);
-            d->pfifo.regs[addr] = (uint32_t)val & NV_PFIFO_CACHE1_DMA_PUT_OFFSET;
-            qemu_mutex_unlock(&d->pfifo.lock);
-            nv2a_submit_pending(d);
-        }
+        qemu_mutex_lock(&d->pfifo.lock);
+        d->pfifo.regs[addr] = (uint32_t)val;
+        qemu_mutex_unlock(&d->pfifo.lock);
+        nv2a_submit_pending(d);
         break;
     default:
         d->pfifo.regs[addr] = val;
