@@ -153,12 +153,24 @@ def zig_toolchain() -> Path:
 def step_cross(build_dir: Path) -> tuple[int, list[str]]:
     zig_dir = zig_toolchain()
     env = child_env({'PATH': f'{ZIG_CACHE / "bin"}{os.pathsep}{os.environ.get("PATH", "")}'})
-    if not (build_dir / 'build.ninja').is_file():
-        configured = run(['cmake', '-S', str(ROOT), '-B', str(build_dir), '-G', 'Ninja',
-                          '-DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake',
-                          f'-DMINGW_SYSROOT={zig_dir / "lib"}'], env=env, cwd=str(ROOT))
-        if configured.returncode != 0:
-            raise RuntimeError(f'cmake configure failed: {configured.stderr.strip()[-400:]}')
+    # The archiver is named explicitly: zig presents as Clang, so CMake looks for an
+    # unprefixed llvm-ar first and can find an old host one whose archives lld-link
+    # cannot index, which fails every target that links a toolkit library. CMake
+    # keeps the archiver its first compiler detection chose, so a build directory
+    # whose rules name another one is started afresh.
+    ar = ZIG_CACHE / 'bin' / 'x86_64-w64-mingw32-ar'
+    rules = build_dir / 'CMakeFiles' / 'rules.ninja'
+    if rules.is_file() and str(ar) not in rules.read_text(encoding='utf-8', errors='replace'):
+        print(f'  {build_dir} archives with another ar; configuring it afresh')
+        shutil.rmtree(build_dir)
+    configured = run(['cmake', '-S', str(ROOT), '-B', str(build_dir), '-G', 'Ninja',
+                      '-DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-x86_64.cmake',
+                      f'-DMINGW_SYSROOT={zig_dir / "lib"}',
+                      f'-DCMAKE_AR={ar}',
+                      f'-DCMAKE_RANLIB={ZIG_CACHE / "bin" / "x86_64-w64-mingw32-ranlib"}'],
+                     env=env, cwd=str(ROOT))
+    if configured.returncode != 0:
+        raise RuntimeError(f'cmake configure failed: {configured.stderr.strip()[-400:]}')
     built = run(['ninja', '-C', str(build_dir), '-k', '0'], env=env)
     log = built.stdout + built.stderr
     (build_dir / 'posix-check-cross.log').write_text(log, encoding='utf-8')
