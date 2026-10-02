@@ -451,6 +451,22 @@ static long kernel_log_budget(void)
     return budget;
 }
 
+/* A bridge that accepts its call and does nothing, named the first time it runs.
+ *
+ * Dozens of ordinals are bridged as "ignore the arguments, return 0". That keeps
+ * an import from faulting, but a title can then wait forever for work the stub
+ * never does -- an APC never queued, a queue never fed, a scatter read never
+ * filled or completed -- and nothing in the log says the call happened. Like the
+ * "no bridge" warning below, this is once per bridge and outside the log budget,
+ * because a do-nothing bridge on a live path is usually why the title stopped.
+ * tools/kernel_audit/test_noop_bridges_are_named.py keeps every such bridge on it. */
+#define BRIDGE_NOOP(name) do { \
+    static volatile LONG noop_seen_; \
+    if (InterlockedExchange(&noop_seen_, 1) == 0) bridge_noop_first_call(name); \
+} while (0)
+
+static void bridge_noop_first_call(const char *name);
+
 #define KERNEL_LOG_ON()      (g_kernel_call_count <= kernel_log_budget())
 /* Some sites logged at a tighter cap than the rest; keep them proportional. */
 #define KERNEL_LOG_ON_HALF() (g_kernel_call_count <= kernel_log_budget() / 2)
@@ -462,6 +478,13 @@ static long kernel_log_budget(void)
 
 /* Guest return address of the call currently in a bridge. */
 RECOMP_TLS uint32_t g_xbox_kernel_caller;
+
+static void bridge_noop_first_call(const char *name)
+{
+    fprintf(stderr, "  [KERNEL] first call to %s from 0x%08X: bridged as a no-op"
+                    " returning 0\n", name, g_xbox_kernel_caller);
+    fflush(stderr);
+}
 
 /* ── Per-ordinal bridge functions ─────────────────────────
  *
@@ -2615,6 +2638,7 @@ static void bridge_MmClaimGpuInstanceMemory(void)
  * way, so registration is accepted and dropped. */
 static void bridge_HalRegisterShutdownNotification(void)
 {
+    BRIDGE_NOOP("HalRegisterShutdownNotification");
     g_eax = 0;
 }
 
@@ -4281,6 +4305,7 @@ static void bridge_MmMapIoSpace(void)
  */
 static void bridge_MmPersistContiguousMemory(void)
 {
+    BRIDGE_NOOP("MmPersistContiguousMemory");
     /* No-op stub */
     g_eax = 0;
 }
@@ -6300,12 +6325,14 @@ static void bridge_RtlGetCallersAddress(void)
 /* 297: VOID RtlMapGenericMask(PACCESS_MASK AccessMask, PRTL_GENERIC_MAPPING) */
 static void bridge_RtlMapGenericMask(void)
 {
+    BRIDGE_NOOP("RtlMapGenericMask");
     g_eax = 0;
 }
 
 /* 319: ULONG RtlWalkFrameChain(PVOID *Callers, ULONG Count, ULONG Flags) */
 static void bridge_RtlWalkFrameChain(void)
 {
+    BRIDGE_NOOP("RtlWalkFrameChain");
     g_eax = 0;
 }
 
@@ -6343,6 +6370,7 @@ static void bridge_RtlCaptureContext(void)
  *       up per stdcall_args_for_ordinal (20 bytes in kernel_bridge.c). */
 static void bridge_RtlCaptureStackBackTrace(void)
 {
+    BRIDGE_NOOP("RtlCaptureStackBackTrace");
     g_eax = 0;
 }
 
@@ -6469,6 +6497,7 @@ static void bridge_DbgBreakPointWithStatus(void)
 /* --- DbgLoadImageSymbols (ordinal 7, 3 args = 12 bytes) --- */
 static void bridge_DbgLoadImageSymbols(void)
 {
+    BRIDGE_NOOP("DbgLoadImageSymbols");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -6495,6 +6524,7 @@ static void bridge_DbgPrint(void)
 /* --- DbgPrompt (ordinal 10, 2 args = 8 bytes) --- */
 static void bridge_DbgPrompt(void)
 {
+    BRIDGE_NOOP("DbgPrompt");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
@@ -6503,6 +6533,7 @@ static void bridge_DbgPrompt(void)
 /* --- DbgUnLoadImageSymbols (ordinal 11, 3 args = 12 bytes) --- */
 static void bridge_DbgUnLoadImageSymbols(void)
 {
+    BRIDGE_NOOP("DbgUnLoadImageSymbols");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -6517,6 +6548,7 @@ static void bridge_DbgUnLoadImageSymbols(void)
 /* --- ExAcquireReadWriteLockExclusive (ordinal 12, 1 arg = 4 bytes) --- */
 static void bridge_ExAcquireReadWriteLockExclusive(void)
 {
+    BRIDGE_NOOP("ExAcquireReadWriteLockExclusive");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -6524,6 +6556,7 @@ static void bridge_ExAcquireReadWriteLockExclusive(void)
 /* --- ExAcquireReadWriteLockShared (ordinal 13, 1 arg = 4 bytes) --- */
 static void bridge_ExAcquireReadWriteLockShared(void)
 {
+    BRIDGE_NOOP("ExAcquireReadWriteLockShared");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -6638,6 +6671,7 @@ static void bridge_ExInterlockedCompareExchange64(void)
 /* --- ExReadWriteRefurbInfo (ordinal 25, 3 args = 12 bytes) --- */
 static void bridge_ExReadWriteRefurbInfo(void)
 {
+    BRIDGE_NOOP("ExReadWriteRefurbInfo");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -6647,6 +6681,7 @@ static void bridge_ExReadWriteRefurbInfo(void)
 /* --- ExRaiseException (ordinal 26, 1 arg = 4 bytes) --- */
 static void bridge_ExRaiseException(void)
 {
+    BRIDGE_NOOP("ExRaiseException");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -6654,6 +6689,7 @@ static void bridge_ExRaiseException(void)
 /* --- ExRaiseStatus (ordinal 27, 1 arg = 4 bytes) --- */
 static void bridge_ExRaiseStatus(void)
 {
+    BRIDGE_NOOP("ExRaiseStatus");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -6661,6 +6697,7 @@ static void bridge_ExRaiseStatus(void)
 /* --- ExReleaseReadWriteLock (ordinal 28, 1 arg = 4 bytes) --- */
 static void bridge_ExReleaseReadWriteLock(void)
 {
+    BRIDGE_NOOP("ExReleaseReadWriteLock");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -6760,6 +6797,7 @@ static void bridge_ExfInterlockedRemoveHeadList(void)
 /* --- FscInvalidateIdleBlocks (ordinal 36, 0 args = 0 bytes) --- */
 static void bridge_FscInvalidateIdleBlocks(void)
 {
+    BRIDGE_NOOP("FscInvalidateIdleBlocks");
     g_eax = 0;
 }
 
@@ -6771,6 +6809,7 @@ static void bridge_FscInvalidateIdleBlocks(void)
 /* --- HalEnableSystemInterrupt (ordinal 43, 2 args = 8 bytes) --- */
 static void bridge_HalEnableSystemInterrupt(void)
 {
+    BRIDGE_NOOP("HalEnableSystemInterrupt");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
@@ -6779,12 +6818,14 @@ static void bridge_HalEnableSystemInterrupt(void)
 /* --- HalEnableSecureTrayEject (ordinal 365, 0 args = 0 bytes) --- */
 static void bridge_HalEnableSecureTrayEject(void)
 {
+    BRIDGE_NOOP("HalEnableSecureTrayEject");
     g_eax = 0;
 }
 
 /* --- HalWriteSMCScratchRegister (ordinal 366, 1 arg = 4 bytes) --- */
 static void bridge_HalWriteSMCScratchRegister(void)
 {
+    BRIDGE_NOOP("HalWriteSMCScratchRegister");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -6909,6 +6950,7 @@ static void bridge_IoAllocateIrp(void)
 /* --- IoBuildAsynchronousFsdRequest (ordinal 60, 7 args = 28 bytes) --- */
 static void bridge_IoBuildAsynchronousFsdRequest(void)
 {
+    BRIDGE_NOOP("IoBuildAsynchronousFsdRequest");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -6922,6 +6964,7 @@ static void bridge_IoBuildAsynchronousFsdRequest(void)
 /* --- IoCheckShareAccess (ordinal 63, 5 args = 20 bytes) --- */
 static void bridge_IoCheckShareAccess(void)
 {
+    BRIDGE_NOOP("IoCheckShareAccess");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -6962,6 +7005,7 @@ static void bridge_IoQueryVolumeInformation(void)
 /* --- IoQueueThreadIrp (ordinal 77, 1 arg = 4 bytes) --- */
 static void bridge_IoQueueThreadIrp(void)
 {
+    BRIDGE_NOOP("IoQueueThreadIrp");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -6986,6 +7030,7 @@ static void bridge_IoSetShareAccess(void)
 /* --- IoDismountVolume (ordinal 90, 1 arg = 4 bytes) --- */
 static void bridge_IoDismountVolume(void)
 {
+    BRIDGE_NOOP("IoDismountVolume");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -6993,6 +7038,7 @@ static void bridge_IoDismountVolume(void)
 /* --- IoDismountVolumeByName (ordinal 91, 1 arg = 4 bytes) --- */
 static void bridge_IoDismountVolumeByName(void)
 {
+    BRIDGE_NOOP("IoDismountVolumeByName");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -7191,6 +7237,7 @@ static void bridge_KeSuspendThread(void)
 /* --- KeAlertResumeThread (ordinal 92, 1 arg = 4 bytes) --- */
 static void bridge_KeAlertResumeThread(void)
 {
+    BRIDGE_NOOP("KeAlertResumeThread");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -7198,6 +7245,7 @@ static void bridge_KeAlertResumeThread(void)
 /* --- KeBoostPriorityThread (ordinal 94, 2 args = 8 bytes) --- */
 static void bridge_KeBoostPriorityThread(void)
 {
+    BRIDGE_NOOP("KeBoostPriorityThread");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
@@ -7206,6 +7254,7 @@ static void bridge_KeBoostPriorityThread(void)
 /* --- KeEnterCriticalRegion (ordinal 101, 0 args = 0 bytes) --- */
 static void bridge_KeEnterCriticalRegion(void)
 {
+    BRIDGE_NOOP("KeEnterCriticalRegion");
     g_eax = 0;
 }
 
@@ -7270,6 +7319,7 @@ static void bridge_KeInitializeQueue(void)
 /* --- KeInsertByKeyDeviceQueue (ordinal 114, 3 args = 12 bytes) --- */
 static void bridge_KeInsertByKeyDeviceQueue(void)
 {
+    BRIDGE_NOOP("KeInsertByKeyDeviceQueue");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7279,6 +7329,7 @@ static void bridge_KeInsertByKeyDeviceQueue(void)
 /* --- KeInsertDeviceQueue (ordinal 115, 2 args = 8 bytes) --- */
 static void bridge_KeInsertDeviceQueue(void)
 {
+    BRIDGE_NOOP("KeInsertDeviceQueue");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
@@ -7287,6 +7338,7 @@ static void bridge_KeInsertDeviceQueue(void)
 /* --- KeInsertHeadQueue (ordinal 116, 2 args = 8 bytes) --- */
 static void bridge_KeInsertHeadQueue(void)
 {
+    BRIDGE_NOOP("KeInsertHeadQueue");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
@@ -7295,6 +7347,7 @@ static void bridge_KeInsertHeadQueue(void)
 /* --- KeInsertQueue (ordinal 117, 2 args = 8 bytes) --- */
 static void bridge_KeInsertQueue(void)
 {
+    BRIDGE_NOOP("KeInsertQueue");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
@@ -7319,12 +7372,14 @@ static void bridge_KeInsertQueueApc(void)
 /* --- KeIsExecutingDpc (ordinal 121, 0 args = 0 bytes) --- */
 static void bridge_KeIsExecutingDpc(void)
 {
+    BRIDGE_NOOP("KeIsExecutingDpc");
     g_eax = 0;
 }
 
 /* --- KeLeaveCriticalRegion (ordinal 122, 0 args = 0 bytes) --- */
 static void bridge_KeLeaveCriticalRegion(void)
 {
+    BRIDGE_NOOP("KeLeaveCriticalRegion");
     g_eax = 0;
 }
 
@@ -7337,6 +7392,7 @@ static void bridge_KeRaiseIrqlToSynchLevel(void)
 /* --- KeRemoveByKeyDeviceQueue (ordinal 133, 2 args = 8 bytes) --- */
 static void bridge_KeRemoveByKeyDeviceQueue(void)
 {
+    BRIDGE_NOOP("KeRemoveByKeyDeviceQueue");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
@@ -7345,6 +7401,7 @@ static void bridge_KeRemoveByKeyDeviceQueue(void)
 /* --- KeRemoveDeviceQueue (ordinal 134, 1 arg = 4 bytes) --- */
 static void bridge_KeRemoveDeviceQueue(void)
 {
+    BRIDGE_NOOP("KeRemoveDeviceQueue");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -7352,6 +7409,7 @@ static void bridge_KeRemoveDeviceQueue(void)
 /* --- KeRemoveEntryDeviceQueue (ordinal 135, 2 args = 8 bytes) --- */
 static void bridge_KeRemoveEntryDeviceQueue(void)
 {
+    BRIDGE_NOOP("KeRemoveEntryDeviceQueue");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
@@ -7360,6 +7418,7 @@ static void bridge_KeRemoveEntryDeviceQueue(void)
 /* --- KeRemoveQueue (ordinal 136, 1 arg = 4 bytes) --- */
 static void bridge_KeRemoveQueue(void)
 {
+    BRIDGE_NOOP("KeRemoveQueue");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -7372,6 +7431,7 @@ static void bridge_KeRemoveQueue(void)
 /* --- KeRundownQueue (ordinal 141, 1 arg = 4 bytes) --- */
 static void bridge_KeRundownQueue(void)
 {
+    BRIDGE_NOOP("KeRundownQueue");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -7397,6 +7457,7 @@ static void bridge_KeSetEventBoostPriority(void)
 /* --- KeSetPriorityProcess (ordinal 147, 2 args = 8 bytes) --- */
 static void bridge_KeSetPriorityProcess(void)
 {
+    BRIDGE_NOOP("KeSetPriorityProcess");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
@@ -7405,6 +7466,7 @@ static void bridge_KeSetPriorityProcess(void)
 /* --- KeSetPriorityThread (ordinal 148, 2 args = 8 bytes) --- */
 static void bridge_KeSetPriorityThread(void)
 {
+    BRIDGE_NOOP("KeSetPriorityThread");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
@@ -7413,6 +7475,7 @@ static void bridge_KeSetPriorityThread(void)
 /* --- KeTestAlertThread (ordinal 155, 1 arg = 4 bytes) --- */
 static void bridge_KeTestAlertThread(void)
 {
+    BRIDGE_NOOP("KeTestAlertThread");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -7420,6 +7483,7 @@ static void bridge_KeTestAlertThread(void)
 /* --- KiUnlockDispatcherDatabase (ordinal 163, 1 arg = 4 bytes) --- */
 static void bridge_KiUnlockDispatcherDatabase(void)
 {
+    BRIDGE_NOOP("KiUnlockDispatcherDatabase");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -7435,12 +7499,14 @@ static void bridge_KeGetCurrentIrql(void)
 /* --- KeGetCurrentThread (ordinal 104, 0 args = 0 bytes) --- */
 static void bridge_KeGetCurrentThread(void)
 {
+    BRIDGE_NOOP("KeGetCurrentThread");
     g_eax = 0;
 }
 
 /* --- KeSetDisableBoostThread (ordinal 144, 2 args = 8 bytes) --- */
 static void bridge_KeSetDisableBoostThread(void)
 {
+    BRIDGE_NOOP("KeSetDisableBoostThread");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
@@ -7496,6 +7562,7 @@ static void bridge_MmDbgQueryAvailablePages(void)
 /* --- MmDbgReleaseAddress (ordinal 377, 2 args = 8 bytes) --- */
 static void bridge_MmDbgReleaseAddress(void)
 {
+    BRIDGE_NOOP("MmDbgReleaseAddress");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
@@ -7533,6 +7600,7 @@ static void bridge_NtCancelTimer(void)
 /* --- NtCreateIoCompletion (ordinal 191, 4 args = 16 bytes) --- */
 static void bridge_NtCreateIoCompletion(void)
 {
+    BRIDGE_NOOP("NtCreateIoCompletion");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7567,6 +7635,7 @@ static void bridge_NtCreateTimer(void)
 /* --- NtOpenDirectoryObject (ordinal 201, 3 args = 12 bytes) --- */
 static void bridge_NtOpenDirectoryObject(void)
 {
+    BRIDGE_NOOP("NtOpenDirectoryObject");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7600,6 +7669,7 @@ static void bridge_NtProtectVirtualMemory(void)
 /* --- NtQueueApcThread (ordinal 206, 5 args = 20 bytes) --- */
 static void bridge_NtQueueApcThread(void)
 {
+    BRIDGE_NOOP("NtQueueApcThread");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7611,6 +7681,7 @@ static void bridge_NtQueueApcThread(void)
 /* --- NtQueryDirectoryObject (ordinal 208, 7 args = 28 bytes) --- */
 static void bridge_NtQueryDirectoryObject(void)
 {
+    BRIDGE_NOOP("NtQueryDirectoryObject");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7624,6 +7695,7 @@ static void bridge_NtQueryDirectoryObject(void)
 /* --- NtQueryEvent (ordinal 209, 4 args = 16 bytes) --- */
 static void bridge_NtQueryEvent(void)
 {
+    BRIDGE_NOOP("NtQueryEvent");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7634,6 +7706,7 @@ static void bridge_NtQueryEvent(void)
 /* --- NtQueryIoCompletion (ordinal 212, 5 args = 20 bytes) --- */
 static void bridge_NtQueryIoCompletion(void)
 {
+    BRIDGE_NOOP("NtQueryIoCompletion");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7645,6 +7718,7 @@ static void bridge_NtQueryIoCompletion(void)
 /* --- NtQueryMutant (ordinal 213, 5 args = 20 bytes) --- */
 static void bridge_NtQueryMutant(void)
 {
+    BRIDGE_NOOP("NtQueryMutant");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7656,6 +7730,7 @@ static void bridge_NtQueryMutant(void)
 /* --- NtQuerySemaphore (ordinal 214, 5 args = 20 bytes) --- */
 static void bridge_NtQuerySemaphore(void)
 {
+    BRIDGE_NOOP("NtQuerySemaphore");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7667,6 +7742,7 @@ static void bridge_NtQuerySemaphore(void)
 /* --- NtQueryTimer (ordinal 216, 5 args = 20 bytes) --- */
 static void bridge_NtQueryTimer(void)
 {
+    BRIDGE_NOOP("NtQueryTimer");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7678,6 +7754,7 @@ static void bridge_NtQueryTimer(void)
 /* --- NtReadFileScatter (ordinal 220, 8 args = 32 bytes) --- */
 static void bridge_NtReadFileScatter(void)
 {
+    BRIDGE_NOOP("NtReadFileScatter");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7692,6 +7769,7 @@ static void bridge_NtReadFileScatter(void)
 /* --- NtRemoveIoCompletion (ordinal 223, 5 args = 20 bytes) --- */
 static void bridge_NtRemoveIoCompletion(void)
 {
+    BRIDGE_NOOP("NtRemoveIoCompletion");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7703,6 +7781,7 @@ static void bridge_NtRemoveIoCompletion(void)
 /* --- NtSetIoCompletion (ordinal 227, 5 args = 20 bytes) --- */
 static void bridge_NtSetIoCompletion(void)
 {
+    BRIDGE_NOOP("NtSetIoCompletion");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7714,6 +7793,7 @@ static void bridge_NtSetIoCompletion(void)
 /* --- NtSetTimerEx (ordinal 229, 8 args = 32 bytes) --- */
 static void bridge_NtSetTimerEx(void)
 {
+    BRIDGE_NOOP("NtSetTimerEx");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7728,6 +7808,7 @@ static void bridge_NtSetTimerEx(void)
 /* --- NtSignalAndWaitForSingleObjectEx (ordinal 230, 5 args = 20 bytes) --- */
 static void bridge_NtSignalAndWaitForSingleObjectEx(void)
 {
+    BRIDGE_NOOP("NtSignalAndWaitForSingleObjectEx");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7739,6 +7820,7 @@ static void bridge_NtSignalAndWaitForSingleObjectEx(void)
 /* --- NtWriteFileGather (ordinal 237, 8 args = 32 bytes) --- */
 static void bridge_NtWriteFileGather(void)
 {
+    BRIDGE_NOOP("NtWriteFileGather");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7758,6 +7840,7 @@ static void bridge_NtWriteFileGather(void)
 /* --- ObCreateObject (ordinal 239, 7 args = 28 bytes) --- */
 static void bridge_ObCreateObject(void)
 {
+    BRIDGE_NOOP("ObCreateObject");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7771,6 +7854,7 @@ static void bridge_ObCreateObject(void)
 /* --- ObInsertObject (ordinal 241, 6 args = 24 bytes) --- */
 static void bridge_ObInsertObject(void)
 {
+    BRIDGE_NOOP("ObInsertObject");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7783,6 +7867,7 @@ static void bridge_ObInsertObject(void)
 /* --- ObMakeTemporaryObject (ordinal 242, 1 arg = 4 bytes) --- */
 static void bridge_ObMakeTemporaryObject(void)
 {
+    BRIDGE_NOOP("ObMakeTemporaryObject");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -7790,6 +7875,7 @@ static void bridge_ObMakeTemporaryObject(void)
 /* --- ObOpenObjectByName (ordinal 243, 4 args = 16 bytes) --- */
 static void bridge_ObOpenObjectByName(void)
 {
+    BRIDGE_NOOP("ObOpenObjectByName");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7800,6 +7886,7 @@ static void bridge_ObOpenObjectByName(void)
 /* --- ObOpenObjectByPointer (ordinal 244, 5 args = 20 bytes) --- */
 static void bridge_ObOpenObjectByPointer(void)
 {
+    BRIDGE_NOOP("ObOpenObjectByPointer");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
@@ -7811,6 +7898,7 @@ static void bridge_ObOpenObjectByPointer(void)
 /* --- ObReferenceObjectByPointer (ordinal 248, 1 arg = 4 bytes) --- */
 static void bridge_ObReferenceObjectByPointer(void)
 {
+    BRIDGE_NOOP("ObReferenceObjectByPointer");
     (void)STACK_ARG(0);
     g_eax = 0;
 }
@@ -7900,6 +7988,7 @@ static void bridge_PsQueryStatistics(void)
 /* --- PsSetCreateThreadNotifyRoutine (ordinal 257, 2 args = 8 bytes) --- */
 static void bridge_PsSetCreateThreadNotifyRoutine(void)
 {
+    BRIDGE_NOOP("PsSetCreateThreadNotifyRoutine");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     g_eax = 0;
@@ -8370,6 +8459,7 @@ static void bridge_READ_PORT_BUFFER_ULONG(void)
 /* --- WRITE_PORT_BUFFER_UCHAR (ordinal 332, 3 args = 12 bytes) --- */
 static void bridge_WRITE_PORT_BUFFER_UCHAR(void)
 {
+    BRIDGE_NOOP("WRITE_PORT_BUFFER_UCHAR");
     (void)STACK_ARG(0);
     (void)STACK_ARG(1);
     (void)STACK_ARG(2);
