@@ -5736,9 +5736,22 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
     if (result + size > XBOX_HEAP_TOP) {
-        fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u, used %u/%u)\n",
-                size, g_heap_next - XBOX_HEAP_BASE,
-                (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE));
+        {
+            /* The bump pointer alone says "used"; a free-block table says how
+             * much of that is actually free. Report both so an exhausted-looking
+             * heap that is mostly free blocks is not misread as real demand. */
+            uint32_t fb = 0, largest = 0;
+            for (int i = 0; i < g_heap_block_count; i++)
+                if (g_heap_blocks[i].free && g_heap_blocks[i].size) {
+                    fb += g_heap_blocks[i].size;
+                    if (g_heap_blocks[i].size > largest)
+                        largest = g_heap_blocks[i].size;
+                }
+            fprintf(stderr, "xbox_HeapAlloc: out of memory (requested %u align %u, "
+                    "bump %u/%u, free blocks %u bytes, largest %u)\n",
+                    size, alignment, g_heap_next - XBOX_HEAP_BASE,
+                    (unsigned)(XBOX_HEAP_TOP - XBOX_HEAP_BASE), fb, largest);
+        }
         /* Who ate the heap? Group live blocks by size -- an exhausted heap is
          * nearly always one request size repeated, and the count names it. */
         {
@@ -5768,6 +5781,17 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
             }
         }
         return 0;
+    }
+
+    /* The bytes the bump pointer skips to reach the alignment are real heap.
+     * Record them as a free block so a later request can use them, as the
+     * contiguous arena does. Left unrecorded, every 64 KB-aligned 4 KB region
+     * (JSRF makes hundreds, one per small file) stranded 60 KB for good. */
+    if (result > g_heap_next && g_heap_block_count + 2 <= XBOX_HEAP_MAX_BLOCKS) {
+        g_heap_blocks[g_heap_block_count].addr = g_heap_next;
+        g_heap_blocks[g_heap_block_count].size = result - g_heap_next;
+        g_heap_blocks[g_heap_block_count].free = 1;
+        g_heap_block_count++;
     }
 
     g_heap_next = result + size;

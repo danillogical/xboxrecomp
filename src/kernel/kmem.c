@@ -114,6 +114,55 @@ uint32_t kmem_heap_reuse(struct kmem_block *b, int *count, int cap,
         }
         return b[i].addr;
     }
+
+    /* No free block starts on the alignment. Carve an aligned piece out of a
+     * larger free block and keep what is left in front and behind it free.
+     * Without this a 64 KB-aligned request (every NtAllocateVirtualMemory with
+     * base 0) can never be served from a free block that coalescing left
+     * starting off a 64 KB boundary, so freed memory is stranded: JSRF's file
+     * loader ran the 48 MB heap out of room with 12 free blocks that each
+     * could have held the request. Whole-block (legacy) mode keeps its old
+     * behaviour. */
+    if (!split || align < 2)
+        return 0;
+    for (i = 0; i < *count; i++) {
+        uint64_t first, blk_end, keep_end;
+        uint32_t front, back, keep, blk_addr;
+        int front_ok, back_ok;
+
+        if (!b[i].free || b[i].size < size)
+            continue;
+        first = ((uint64_t)b[i].addr + align - 1) & ~((uint64_t)align - 1);
+        blk_end = (uint64_t)b[i].addr + b[i].size;
+        if (first + size > blk_end)
+            continue;
+        keep = (size + (KMEM_HEAP_MIN_BLOCK - 1)) & ~(KMEM_HEAP_MIN_BLOCK - 1);
+        if (keep < size)
+            keep = size;
+        keep_end = first + keep;
+        if (keep_end > blk_end)
+            keep_end = blk_end;
+        front = (uint32_t)(first - b[i].addr);
+        back = (uint32_t)(blk_end - keep_end);
+        if (back < KMEM_HEAP_MIN_BLOCK) {
+            keep_end = blk_end;
+            back = 0;
+        }
+        blocks_split_room(b, *count, cap, i, front != 0, back != 0,
+                          &front_ok, &back_ok);
+        if (!front_ok || !back_ok)
+            continue;
+        blk_addr = b[i].addr;
+        b[i].addr = (uint32_t)first;
+        b[i].size = (uint32_t)(keep_end - first);
+        b[i].free = 0;
+        if (back)
+            blocks_insert_after(b, count, cap, i, (uint32_t)keep_end, back, 1);
+        if (front)
+            blocks_insert_before(b, count, cap, i, blk_addr, front, 1);
+        *split_result = 1;
+        return (uint32_t)first;
+    }
     return 0;
 }
 

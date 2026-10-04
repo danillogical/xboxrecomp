@@ -126,6 +126,31 @@ static void test_heap_reuse_alignment_and_legacy(void)
     CHECK(sr == 0 && count == 2 && b[1].size == 0x10000u);
 }
 
+/* A 64 KB-aligned request against a free block that starts off the boundary
+ * but contains an aligned piece. Before the carve this returned 0, so freed
+ * memory could never serve NtAllocateVirtualMemory(base 0). */
+static void test_heap_reuse_carves_aligned_piece(void)
+{
+    struct kmem_block b[8] = { { 0x00A00870u, 0x00100000u, 1 } };
+    int count = 1, sr, i, found = 0;
+    uint32_t a, freebytes = 0;
+    struct kmem_block c[4] = { { 0x00B00010u, 0x8000u, 1 } };
+    int n = 1;
+
+    a = kmem_heap_reuse(b, &count, 8, 0x55000u, 0x10000u, !g_legacy, &sr);
+    CHECK(a == 0x00A10000u);
+    CHECK(blocks_ordered(b, count));
+    for (i = 0; i < count; i++) {
+        if (b[i].addr == a && a) { CHECK(!b[i].free && b[i].size == 0x55000u); found = 1; }
+        if (b[i].free) freebytes += b[i].size;
+    }
+    CHECK(found);
+    /* the front [0xA00870, 0xA10000) and the back remainder both stay free */
+    CHECK(freebytes == 0x00100000u - 0x55000u);
+    /* a request that cannot fit even when aligned is refused */
+    CHECK(kmem_heap_reuse(c, &n, 4, 0x8000u, 0x10000u, 1, &sr) == 0);
+}
+
 /* ── Contiguous arena ────────────────────────────────────── */
 
 #define ARENA_BASE 0x80000000u
@@ -691,6 +716,7 @@ int main(void)
     test_heap_reuse_table_full_hands_out_whole_block();
     test_heap_reuse_small_tail_stays();
     test_heap_reuse_alignment_and_legacy();
+    test_heap_reuse_carves_aligned_piece();
     test_arena_free_then_reuse();
     test_arena_merges_neighbours();
     test_arena_aligned_carve();
