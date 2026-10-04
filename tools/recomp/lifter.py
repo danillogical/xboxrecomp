@@ -3976,7 +3976,44 @@ class Lifter:
         if m == "fld1":
             return [f"fp_push(1.0); /* fld1 */"]
 
-        return [f"/* FPU: {m} {insn.op_str} */"]
+        if m == "fisttp":
+            # SSE3 store-integer-with-truncation, then pop. Truncation is
+            # RC=3 whatever the control word says.
+            if ops and ops[0].type == "mem":
+                size = ops[0].mem_size
+                int_type = {2: "int16_t", 4: "int32_t", 8: "int64_t"}.get(
+                    size, "int32_t")
+                return [f"{_smem_accessor(size)}({_fmt_mem(ops[0])}) = "
+                        f"({int_type})recomp_fist(fp_top(), "
+                        f"(uint16_t)(g_fp_control_word | 0x0C00), {size * 8});"
+                        f" fp_pop(); /* fisttp */"]
+            return self._unimplemented(insn, m)
+        if m in _FCMOVCC_JCC:
+            # No flag setter is tracked here (lift_basic_block handles that
+            # case); fall back on the materialised _flags like cmovcc does.
+            if not ops:
+                return self._unimplemented(insn, m)
+            self._record_flag_gap(insn.address, m)
+            src = self._st_expr(self._st_index(ops[-1].reg))
+            return [f"if (_flags /* {m} */) fp_top() = {src};"]
+        if m in ("fnclex", "fnop", "fwait", "wait"):
+            # Decision, not omission: x87 exception flags and pending
+            # exceptions are not modelled (all exceptions are masked), so
+            # there is nothing for these to clear or wait for.
+            return [f"(void)0; /* {m}: x87 exception state not modelled */"]
+
+        # Anything else is untranslated. It used to become a bare comment
+        # and vanish silently; it now reports itself at runtime.
+        return self._unimplemented(insn, m)
+
+
+# fcmovcc -> the jcc whose EFLAGS condition it tests.
+_FCMOVCC_JCC = {
+    "fcmove": "je", "fcmovne": "jne",
+    "fcmovb": "jb", "fcmovnb": "jae",
+    "fcmovbe": "jbe", "fcmovnbe": "ja",
+    "fcmovu": "jp", "fcmovnu": "jnp",
+}
 
 
 def _is_rep_compare(insn):
@@ -4180,6 +4217,19 @@ def lift_basic_block(lifter, bb, flag_state=None, materialise=None):
                     f"if ({cond}) "
                     + _fmt_operand_write(curr.operands[0], src)
                     + f" /* {curr.mnemonic} */")
+                i += 1
+                continue
+
+        # fcmovcc: st0 = st(i) when the EFLAGS condition holds. The flags
+        # come from the preceding integer test (fnstsw ax; test ah, 1).
+        if (curr.mnemonic in _FCMOVCC_JCC
+                and last_flag_setter and len(curr.operands) >= 1):
+            cond = _make_condition(_FCMOVCC_JCC[curr.mnemonic],
+                                   last_flag_setter, last_flag_ops)
+            if cond and curr.operands[-1].type == "reg":
+                src = lifter._st_expr(lifter._st_index(curr.operands[-1].reg))
+                stmts.append(f"if ({cond[0]}) fp_top() = {src};"
+                             f" /* {curr.mnemonic} */")
                 i += 1
                 continue
 

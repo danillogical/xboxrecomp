@@ -178,6 +178,74 @@ class FpuLifterTest(unittest.TestCase):
         self.assertIn("fp_st1()", lifted)
         self.assertNotIn("fp_top() = fp_top()", lifted)
 
+    def _clamp_block(self, cmov):
+        """The MSVC clamp tail: fcom st(1); xor eax,eax; fnstsw ax;
+        test ah,1; fcmov<cc> st(0),st(1); fxch st(1); fstp st(0)."""
+        insns = [
+            Instruction(0x100, 2, "fcom", "st(1)", "d8d1"),
+            Instruction(0x102, 2, "xor", "eax, eax", "31c0"),
+            Instruction(0x104, 2, "fnstsw", "ax", "dfe0"),
+            Instruction(0x106, 3, "test", "ah, 1", "f6c401"),
+            Instruction(0x109, 2, cmov, "st(0), st(1)", "dac9"),
+        ]
+        insns[0].operands = [Operand(type="reg", reg="st(1)")]
+        insns[1].operands = [Operand(type="reg", reg="eax"),
+                             Operand(type="reg", reg="eax")]
+        insns[2].operands = [Operand(type="reg", reg="ax")]
+        insns[3].operands = [Operand(type="reg", reg="ah"),
+                             Operand(type="imm", imm=1)]
+        insns[4].operands = [Operand(type="reg", reg="st(0)"),
+                             Operand(type="reg", reg="st(1)")]
+        from .lifter import lift_basic_block
+        bb = BasicBlock(start=0x100, instructions=insns)
+        stmts, _ = lift_basic_block(Lifter(), bb)
+        return "\n".join(stmts)
+
+    def test_fcmove_and_fcmovne_are_translated_not_dropped(self):
+        """Regression: both were emitted as a bare `/* FPU: ... */` comment,
+        so the [0,1] clamp in JSRF's sub_0014C870/sub_0014C850 never took
+        its conditional move."""
+        for cmov in ("fcmove", "fcmovne"):
+            out = self._clamp_block(cmov)
+            self.assertNotIn("/* FPU:", out, cmov)
+            self.assertNotIn("RECOMP_UNIMPL", out, cmov)
+            self.assertRegex(out, r"if \(.*\) fp_top\(\) = fp_st1\(\);", cmov)
+            self.assertIn(f"/* {cmov} */", out)
+
+    def test_fcmov_without_tracked_flags_uses_materialised_flags(self):
+        insn = Instruction(0, 2, "fcmovb", "st(0), st(1)", "dac1")
+        insn.operands = [Operand(type="reg", reg="st(0)"),
+                         Operand(type="reg", reg="st(1)")]
+        out = " ".join(Lifter().lift_instruction(insn))
+        self.assertIn("if (_flags", out)
+        self.assertIn("fp_top() = fp_st1()", out)
+
+    def test_unhandled_fpu_instruction_reports_itself(self):
+        lifter = Lifter()
+        insn = Instruction(0x200, 2, "f2xm1_bogus", "", "")
+        insn.operands = []
+        out = " ".join(lifter.lift_instruction(insn))
+        self.assertIn('RECOMP_UNIMPL("f2xm1_bogus", 0x00000200u);', out)
+        self.assertIn("f2xm1_bogus", lifter.unimplemented)
+
+    def test_fldenv_is_reported_fisttp_translated_fnclex_decided(self):
+        lifter = Lifter()
+        mem = Operand(type="mem", mem_base="edi", mem_size=8)
+        fldenv = Instruction(0x300, 3, "fldenv", "[edi]", "")
+        fldenv.operands = [Operand(type="mem", mem_base="edi", mem_size=0)]
+        self.assertIn("RECOMP_UNIMPL", " ".join(lifter.lift_instruction(fldenv)))
+        fisttp = Instruction(0x304, 2, "fisttp", "qword ptr [edi]", "")
+        fisttp.operands = [mem]
+        out = " ".join(lifter.lift_instruction(fisttp))
+        self.assertIn("0x0C00", out)
+        self.assertIn("fp_pop()", out)
+        self.assertNotIn("RECOMP_UNIMPL", out)
+        fnclex = Instruction(0x308, 2, "fnclex", "", "")
+        fnclex.operands = []
+        out = " ".join(lifter.lift_instruction(fnclex))
+        self.assertNotIn("RECOMP_UNIMPL", out)
+        self.assertNotIn("fnclex", lifter.unimplemented)
+
 
 if __name__ == "__main__":
     unittest.main()
