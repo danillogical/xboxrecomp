@@ -800,6 +800,11 @@ NTSTATUS xbox_test_bridge_NtClearEvent(uint32_t EventVa);
 NTSTATUS xbox_test_bridge_NtSetEvent(uint32_t EventVa);
 NTSTATUS xbox_test_bridge_NtPulseEvent(uint32_t EventVa);
 NTSTATUS xbox_test_bridge_NtWaitForSingleObject(uint32_t EventVa, BOOLEAN Alertable, int TimeoutMs);
+void     xbox_test_set_file_apc_routine(uint32_t va, void (*fn)(void));
+void     xbox_test_complete_file_io(uint32_t event_token, uint32_t apc_routine,
+                                    uint32_t apc_context, uint32_t iostatus);
+unsigned xbox_test_file_apc_pending(void);
+NTSTATUS xbox_test_bridge_KeDelayExecutionThread(BOOLEAN alertable, int interval_ms);
 /* Directory-enumeration seam (D2 context-release fixture): real bridge handlers
  * driven through the guest stack, using NtOpenFile as the title does. */
 NTSTATUS xbox_test_bridge_NtOpenFile(uint32_t handle_va, uint32_t access,

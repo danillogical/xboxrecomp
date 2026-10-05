@@ -127,6 +127,21 @@ if(BUILD_TESTING AND WIN32)
     add_test(NAME xbox_dir_context_release_bridge
              COMMAND xbox_dir_context_release_test bridge)
     set_tests_properties(xbox_dir_context_release_bridge PROPERTIES TIMEOUT 60)
+
+    # A file APC must still be pending when NtReadFile's completion returns,
+    # and an alertable zero-interval delay must be what runs it. Inline
+    # delivery fails the first assertion.
+    add_executable(xbox_file_apc_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/kernel_file_apc_test.c
+    )
+    target_include_directories(xbox_file_apc_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${XBOXRECOMP_SRC_DIR}
+    )
+    target_link_libraries(xbox_file_apc_test PRIVATE
+        xbox_kernel platform kernel32)
+    add_test(NAME xbox_file_apc COMMAND xbox_file_apc_test)
+    set_tests_properties(xbox_file_apc PROPERTIES TIMEOUT 20)
 endif()
 
 # The allocator and kernel-memory decisions in kmem.c have no host dependency,

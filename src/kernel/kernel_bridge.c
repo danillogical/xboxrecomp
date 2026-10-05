@@ -1611,6 +1611,9 @@ static void bridge_KeResetEvent(void)
     recomp_diag_record(11, event_ptr, g_xbox_kernel_caller, g_eax);
 }
 
+/* File-I/O APCs queued by bridge_complete_file_io. Defined with the queue. */
+static void bridge_drain_file_apcs(void);
+
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
 static void bridge_KeWaitForSingleObject(void)
 {
@@ -1622,6 +1625,9 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
     HANDLE h;
+
+    if (alertable)
+        bridge_drain_file_apcs();
 
     if (guest_va_is_inplace_kevent(object)) {
         g_eax = (uint32_t)xbox_KeWaitInplaceEvent(
@@ -1653,6 +1659,9 @@ static void bridge_NtWaitForSingleObject(void)
     recomp_diag_record(8, diag_object, g_xbox_kernel_caller, 0);
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
+
+    if (alertable)
+        bridge_drain_file_apcs();
 
     if (guest_va_is_inplace_kevent(diag_object)) {
         g_eax = (uint32_t)xbox_KeWaitInplaceEvent(
@@ -1752,6 +1761,9 @@ static void bridge_NtWaitForSingleObjectEx(void)
         fflush(stderr);
     }
 
+    if (alertable)
+        bridge_drain_file_apcs();
+
     g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
         handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
         XBOX_TO_NATIVE(timeout_ptr));
@@ -1827,6 +1839,9 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
             fflush(stderr);
         }
     }
+
+    if (alertable)
+        bridge_drain_file_apcs();
 
     g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
         count, handles, wait_type, (BOOLEAN)alertable,
@@ -1908,6 +1923,11 @@ static void bridge_KeDelayExecutionThread(void)
     uint32_t alertable    = STACK_ARG(1);
     uint32_t interval_ptr = STACK_ARG(2);
 
+    /* Before the native delay, including a zero interval. JSRF's poller
+     * passes 0 ms, which yields and returns, and reads the completion flag
+     * only after this call returns. */
+    if (alertable)
+        bridge_drain_file_apcs();
 
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
@@ -3419,21 +3439,49 @@ static void bridge_NtOpenFile(void)
 /*
  * Completion for a file request that carried an Event or an APC routine.
  *
- * Both bridges below do the I/O synchronously, and used to drop args 1-3
- * (Event, ApcRoutine, ApcContext) on the floor. A title that issues an async
- * request and waits alertably for the completion then waits forever: Halo's
- * cache-partition setup does exactly that, gives up after its 5-second SleepEx,
- * and asserts "setup for new cache file failed (#0)".
+ * Both bridges below do the I/O synchronously: the bytes are in the buffer and
+ * the status block is written before this runs. The event is signalled here,
+ * so a waiter blocked on it wakes as soon as it waits.
  *
- * ponytail: the APC runs inline here rather than at the next alertable wait.
- * The data really is ready by then, so the observable result matches; a title
- * that depends on the APC *not* having run yet would notice. A per-thread
- * deferred queue drained at alertable waits was tried for Halo's map streamer
- * and made no difference (it still issues one 14 KB batch and stops), so it was
- * dropped rather than risk changing this shared path for the other titles.
+ * The APC does not run here. JSRF's ADX poller at 0x140BA0 sets the in-flight
+ * flag, calls NtReadFile, and only then tests that flag. The completion clears
+ * the flag and does not promote the file; the poller promotes only when it
+ * observed the flag set and the alertable delay at 0x145C28 then cleared it.
+ * Running the APC inside NtReadFile clears the flag first, the delay is
+ * skipped, and the file stays in state 2 with both flags clear. f10's
+ * title.adx slot was that state after a 51200-byte read from offset 0.
+ *
+ * The APC is queued on the issuing thread and delivered at the next alertable
+ * wait on that thread, before the native wait. A zero interval still delivers.
+ * JSRF passes 0 ms, which yields and returns, and the poller reads the flag
+ * after that return. An APC queued by one of the routines being delivered
+ * stays queued until the next alertable wait. A full queue delivers that one
+ * APC inline and logs it, because dropping it would lose the completion.
+ *
+ * Halo's cache setup waits alertably and also waits on the event, which is
+ * already signalled, so the wait still returns once the APC has run. A title
+ * that reads an APC-published flag before any alertable wait sees the flag
+ * still clear. RECOMP_ASYNC_IO does not change this queue: it only rewrites
+ * the status returned to the guest after the read has finished.
  */
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va);
 static void kernel_thunk_dispatch(void);
+
+#define BRIDGE_FILE_APC_MAX 32
+
+typedef struct {
+    uint32_t routine;
+    uint32_t context;
+    uint32_t iostatus;
+} bridge_file_apc_t;
+
+static RECOMP_TLS bridge_file_apc_t t_file_apc[BRIDGE_FILE_APC_MAX];
+static RECOMP_TLS int t_file_apc_count;
+
+/* A fixture installs one routine the dispatch tables do not know. NULL in a
+ * title. Checked only for that exact VA. */
+static recomp_func_t g_test_file_apc_fn;
+static uint32_t g_test_file_apc_va;
 
 static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
                             uint32_t iostatus)
@@ -3442,7 +3490,10 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
      * latter -- 0xFE0000FC, one of our own synthetic thunk VAs -- so the recomp
      * dispatch correctly fails to find it and the kernel fallback is the one
      * that matters. Checking only recomp_lookup left it undelivered. */
-    recomp_func_t fn = recomp_lookup(apc_routine);
+    recomp_func_t fn = NULL;
+    if (g_test_file_apc_fn && apc_routine == g_test_file_apc_va)
+        fn = g_test_file_apc_fn;
+    if (!fn) fn = recomp_lookup(apc_routine);
     if (!fn) fn = recomp_lookup_manual(apc_routine);
     if (!fn) fn = recomp_lookup_kernel(apc_routine);
     if (fn) {
@@ -3470,8 +3521,51 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
     }
 }
 
-/* Per-thread pending-APC ring. An APC is delivered on the thread that issued
- * the request, which is also the thread that waits, so thread-local is right. */
+/* The issuing thread is the thread that waits. The register file is already
+ * thread-local, so the queue is too. */
+static void bridge_queue_file_apc(uint32_t routine, uint32_t context,
+                                  uint32_t iostatus)
+{
+    if (!routine)
+        return;
+    if (t_file_apc_count >= BRIDGE_FILE_APC_MAX) {
+        fprintf(stderr, "  [KERNEL] file APC queue full; delivering inline"
+                " routine=0x%08X\n", routine);
+        fflush(stderr);
+        deliver_one_apc(routine, context, iostatus);
+        return;
+    }
+    fprintf(stderr, "  [KERNEL] file APC queued routine=0x%08X"
+            " context=0x%08X ios=0x%08X pending=%d\n",
+            routine, context, iostatus, t_file_apc_count + 1);
+    fflush(stderr);
+    t_file_apc[t_file_apc_count].routine = routine;
+    t_file_apc[t_file_apc_count].context = context;
+    t_file_apc[t_file_apc_count].iostatus = iostatus;
+    t_file_apc_count++;
+}
+
+static void bridge_drain_file_apcs(void)
+{
+    bridge_file_apc_t batch[BRIDGE_FILE_APC_MAX];
+    int n = t_file_apc_count;
+    int i;
+
+    if (n <= 0)
+        return;
+    if (n > BRIDGE_FILE_APC_MAX)
+        n = BRIDGE_FILE_APC_MAX;
+    memcpy(batch, t_file_apc, (size_t)n * sizeof(batch[0]));
+    /* A routine that queues another APC must not be delivered in this pass.
+     * Zeroing first makes that new APC land in an empty queue. */
+    t_file_apc_count = 0;
+    fprintf(stderr, "  [KERNEL] file APC drain count=%d first=0x%08X\n",
+            n, batch[0].routine);
+    fflush(stderr);
+    for (i = 0; i < n; i++)
+        deliver_one_apc(batch[i].routine, batch[i].context, batch[i].iostatus);
+}
+
 static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
                                     uint32_t apc_context, uint32_t iostatus)
 {
@@ -3479,9 +3573,8 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
         HANDLE ev = bridge_resolve_handle(event_token);
         if (ev) SetEvent(ev);
     }
-    if (apc_routine) {
-        deliver_one_apc(apc_routine, apc_context, iostatus);
-    }
+    if (apc_routine)
+        bridge_queue_file_apc(apc_routine, apc_context, iostatus);
 }
 
 /* -- XeLoadSection / XeUnloadSection (ordinals 327/328, 1 arg = 4 bytes) --
@@ -4797,8 +4890,11 @@ static void bridge_KeWaitForMultipleObjects(void)
     uint32_t count      = STACK_ARG(0);
     uint32_t objects_va = STACK_ARG(1);
     uint32_t wait_type  = STACK_ARG(2);
-    uint32_t alertable  = STACK_ARG(5);   /* 3=WaitReason, 4=WaitMode */
-    uint32_t timeout_va = STACK_ARG(6);
+    uint32_t wait_reason = STACK_ARG(3);
+    uint32_t wait_mode   = STACK_ARG(4);
+    uint32_t alertable   = STACK_ARG(5);
+    uint32_t timeout_va  = STACK_ARG(6);
+    uint32_t wait_block  = STACK_ARG(7);
     HANDLE handles[BRIDGE_MAXIMUM_WAIT_OBJECTS];
     uint32_t i;
 
@@ -4812,11 +4908,14 @@ static void bridge_KeWaitForMultipleObjects(void)
         handles[i] = bridge_resolve_handle(
             objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
 
+    if (alertable)
+        bridge_drain_file_apcs();
+
     g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
         count, (PVOID *)handles, wait_type,
-        STACK_ARG(3), (KPROCESSOR_MODE)STACK_ARG(4),
+        wait_reason, (KPROCESSOR_MODE)wait_mode,
         (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
-        XBOX_TO_NATIVE(STACK_ARG(7)));
+        XBOX_TO_NATIVE(wait_block));
 
     recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
 }
@@ -10367,5 +10466,42 @@ NTSTATUS xbox_test_bridge_NtWaitForSingleObject(uint32_t EventVa, BOOLEAN Alerta
     args[2] = timeout_ptr;
     jsrf_test_write_stack(args, 3);
     bridge_NtWaitForSingleObject();
+    return (NTSTATUS)g_eax;
+}
+
+void xbox_test_set_file_apc_routine(uint32_t va, void (*fn)(void))
+{
+    g_test_file_apc_va = va;
+    g_test_file_apc_fn = (recomp_func_t)fn;
+}
+
+void xbox_test_complete_file_io(uint32_t event_token, uint32_t apc_routine,
+                                uint32_t apc_context, uint32_t iostatus)
+{
+    bridge_complete_file_io(event_token, apc_routine, apc_context, iostatus);
+}
+
+unsigned xbox_test_file_apc_pending(void)
+{
+    return t_file_apc_count > 0 ? (unsigned)t_file_apc_count : 0u;
+}
+
+/* interval_ms == 0 is the yield JSRF's poller passes. The guest converter
+ * turns 0 ms into a zero LARGE_INTEGER, not an infinite wait. */
+NTSTATUS xbox_test_bridge_KeDelayExecutionThread(BOOLEAN alertable, int interval_ms)
+{
+    uint32_t args[3];
+    int64_t relative;
+
+    if (interval_ms < 0)
+        interval_ms = 0;
+    relative = -(int64_t)interval_ms * 10000;
+    BRIDGE_MEM32(JSRF_TEST_TIMEOUT_VA) = (uint32_t)relative;
+    BRIDGE_MEM32(JSRF_TEST_TIMEOUT_VA + 4u) = (uint32_t)((uint64_t)relative >> 32);
+    args[0] = 1; /* UserMode, ignored by the delay */
+    args[1] = alertable ? 1u : 0u;
+    args[2] = JSRF_TEST_TIMEOUT_VA;
+    jsrf_test_write_stack(args, 3);
+    bridge_KeDelayExecutionThread();
     return (NTSTATUS)g_eax;
 }
