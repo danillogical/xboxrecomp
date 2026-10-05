@@ -3509,7 +3509,17 @@ static void deliver_one_apc(uint32_t apc_routine, uint32_t apc_context,
             fn();
             xbox_GuestMeterRestore(gm, XBOX_GM_IO_APC);
         }
-        g_esp += 12;
+        /* A direct routine pops only the dummy return. The three arguments
+         * stay, and this removes them.
+         *
+         * kernel_thunk_dispatch has already removed both. NtUserIoApcDispatcher
+         * is stdcall 12, and the thunk adds those 12 on the way out. Adding
+         * them again leaves the waiter 12 bytes high. JSRF's poller delay
+         * (0x145C28) then pops esi from that shifted frame, so the promotion
+         * at 0x140C1B stores through the wrong pointer and the file slot stays
+         * in state 2. */
+        if (fn != kernel_thunk_dispatch)
+            g_esp += 12;
     } else {
         uint32_t ord = 0;
         if (apc_routine >= KERNEL_VA_BASE && apc_routine < KERNEL_VA_END) {
@@ -3545,6 +3555,44 @@ static void bridge_queue_file_apc(uint32_t routine, uint32_t context,
     t_file_apc_count++;
 }
 
+/* JSRF's title.adx callback. Observation only: after it runs, record the
+ * file slot and sample it on the next kernel entries of this thread. The
+ * poller at 0x140BA0 promotes +0x18 only after its own alertable delay
+ * returns, so the first sample after that delay is the promotion result.
+ * 0x1401B0 is the callback 0x1407E0 passes for every file on this path;
+ * the slot identity is what makes a line title.adx. */
+#define BRIDGE_ADX_APC_CONTEXT 0x001401B0u
+#define BRIDGE_ADX_IOS_OFFSET  0x12Cu
+static RECOMP_TLS uint32_t t_adx_watch_obj;
+static RECOMP_TLS int t_adx_watch_left;
+
+static int bridge_guest_readable(uint32_t va, uint32_t bytes)
+{
+    if (va < 0x10000u)
+        return 0;
+    if (bytes > 0x04000000u - va)
+        return 0;
+    return 1;
+}
+
+static void bridge_log_adx_file(const char *where, uint32_t obj)
+{
+    uint32_t head, pos, sec, flag148, flag14c;
+
+    if (!bridge_guest_readable(obj, 0x150u))
+        return;
+    head = BRIDGE_MEM32(obj);
+    pos = BRIDGE_MEM32(obj + 0x18);
+    sec = BRIDGE_MEM32(obj + 0x20);
+    flag148 = BRIDGE_MEM32(obj + 0x148);
+    flag14c = BRIDGE_MEM32(obj + 0x14C);
+    fprintf(stderr, "  [ADXIO] %s obj=0x%08X b1=%u pos=0x%08X sec=0x%08X"
+            " f148=%u f14c=%u caller=0x%08X\n",
+            where, obj, (head >> 8) & 0xFFu, pos, sec, flag148, flag14c,
+            g_xbox_kernel_caller);
+    fflush(stderr);
+}
+
 static void bridge_drain_file_apcs(void)
 {
     bridge_file_apc_t batch[BRIDGE_FILE_APC_MAX];
@@ -3559,11 +3607,20 @@ static void bridge_drain_file_apcs(void)
     /* A routine that queues another APC must not be delivered in this pass.
      * Zeroing first makes that new APC land in an empty queue. */
     t_file_apc_count = 0;
-    fprintf(stderr, "  [KERNEL] file APC drain count=%d first=0x%08X\n",
-            n, batch[0].routine);
+    /* Caller before delivery. The completion routine enters the kernel
+     * dispatch and overwrites g_xbox_kernel_caller with its dummy return. */
+    fprintf(stderr, "  [KERNEL] file APC drain count=%d first=0x%08X caller=0x%08X\n",
+            n, batch[0].routine, g_xbox_kernel_caller);
     fflush(stderr);
-    for (i = 0; i < n; i++)
+    for (i = 0; i < n; i++) {
         deliver_one_apc(batch[i].routine, batch[i].context, batch[i].iostatus);
+        if (batch[i].context == BRIDGE_ADX_APC_CONTEXT
+            && batch[i].iostatus >= BRIDGE_ADX_IOS_OFFSET) {
+            t_adx_watch_obj = batch[i].iostatus - BRIDGE_ADX_IOS_OFFSET;
+            t_adx_watch_left = 2;
+            bridge_log_adx_file("after-apc", t_adx_watch_obj);
+        }
+    }
 }
 
 static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
@@ -9886,6 +9943,10 @@ static void kernel_thunk_dispatch(void)
      * lock, which is the one fact a deadlock report otherwise lacks. */
     g_xbox_kernel_caller = g_esp ? BRIDGE_MEM32(g_esp) : 0;
     g_esp += 4;
+    if (t_adx_watch_left > 0 && t_adx_watch_obj) {
+        bridge_log_adx_file("kernel", t_adx_watch_obj);
+        t_adx_watch_left--;
+    }
 
     /* Name the bridge that corrupts a watched dword.
      *
@@ -10473,6 +10534,18 @@ void xbox_test_set_file_apc_routine(uint32_t va, void (*fn)(void))
 {
     g_test_file_apc_va = va;
     g_test_file_apc_fn = (recomp_func_t)fn;
+}
+
+/* JSRF queues 0xFE000068, which is NtUserIoApcDispatcher. Arm that synthetic
+ * slot so a test can deliver it through the real thunk instead of the stub. */
+void xbox_test_arm_io_apc_dispatcher(void)
+{
+    int slot = (int)((0xFE000068u - KERNEL_VA_BASE) / 4u);
+
+    g_slot_ordinals[slot] = 232;
+    g_slot_arg_bytes[slot] = stdcall_args_for_ordinal(232);
+    g_slot_bridges[slot] = bridge_for_ordinal(232);
+    g_slot_arg_unknown[slot] = 0;
 }
 
 void xbox_test_complete_file_io(uint32_t event_token, uint32_t apc_routine,

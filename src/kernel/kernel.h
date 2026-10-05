@@ -801,6 +801,7 @@ NTSTATUS xbox_test_bridge_NtSetEvent(uint32_t EventVa);
 NTSTATUS xbox_test_bridge_NtPulseEvent(uint32_t EventVa);
 NTSTATUS xbox_test_bridge_NtWaitForSingleObject(uint32_t EventVa, BOOLEAN Alertable, int TimeoutMs);
 void     xbox_test_set_file_apc_routine(uint32_t va, void (*fn)(void));
+void     xbox_test_arm_io_apc_dispatcher(void);
 void     xbox_test_complete_file_io(uint32_t event_token, uint32_t apc_routine,
                                     uint32_t apc_context, uint32_t iostatus);
 unsigned xbox_test_file_apc_pending(void);

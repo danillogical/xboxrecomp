@@ -163,6 +163,21 @@ int main(void)
                 "the alertable delay runs the queued batch");
     ok &= check(g_esp == TEST_STACK, "overflow delivery restores the guest stack");
 
+    /* The title's APC routine is NtUserIoApcDispatcher, not the stub above.
+     * The thunk already pops that stdcall frame. A second pop of 12 leaves
+     * the waiter high, which is the slot 0x145C28's pop esi then reads. */
+    xbox_test_arm_io_apc_dispatcher();
+    g_esp = TEST_STACK;
+    /* 0x20000 is inside the fixture RAM. The dispatcher reads the status
+     * block before it looks the completion up, so a low address faults. */
+    xbox_test_complete_file_io(0, 0xFE000068u, 0x001401B0u, 0x00020000u);
+    ok &= check(xbox_test_file_apc_pending() == 1, "dispatcher APC stays queued");
+    ok &= check(hits == before + 33, "queuing the dispatcher does not run the stub");
+    st = xbox_test_bridge_KeDelayExecutionThread(TRUE, 0);
+    ok &= check(st == STATUS_SUCCESS, "dispatcher APC delay succeeds");
+    ok &= check(xbox_test_file_apc_pending() == 0, "dispatcher APC delay drains it");
+    ok &= check(g_esp == TEST_STACK, "dispatcher APC delivery restores the guest stack");
+
     free(ram);
     printf("%s: %u file-APC checks passed\n", ok ? "PASS" : "FAIL", checks);
     return ok ? 0 : 1;

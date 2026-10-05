@@ -168,6 +168,26 @@ static void fb_present_observe(void)
         return;
 
     n = InterlockedCompareExchange(&s_present_serial, 0, 0);
+    /* The boot presenter stops calling the update once phase +0x24 is set.
+     * Sample that field around the flip count where f9-f11 stopped, without
+     * writing guest memory. */
+    if (n == 400 || n == 900 || n == 990 || n == 1000 || n == 1001) {
+        static LONG phase_logged;
+        ptrdiff_t mem = xbox_GetMemoryOffset();
+        uint32_t phase = *(volatile uint32_t *)((uintptr_t)0x22FCE0u + mem);
+        if (phase >= 0x10000u && phase + 0x87E8u < 0x04000000u && (phase & 3u) == 0
+            && phase_logged != n) {
+            uint32_t f10 = *(volatile uint32_t *)((uintptr_t)(phase + 0x10u) + mem);
+            uint32_t f24 = *(volatile uint32_t *)((uintptr_t)(phase + 0x24u) + mem);
+            uint32_t u0 = *(volatile uint32_t *)((uintptr_t)(phase + 0x87E0u) + mem);
+            uint32_t u1 = *(volatile uint32_t *)((uintptr_t)(phase + 0x87E4u) + mem);
+            fprintf(stderr, "  [FBPHASE] presents=%ld obj=0x%08X +10=%u +24=0x%08X"
+                    " upd=%u/%u\n",
+                    n, phase, f10, f24, u0, u1);
+            fflush(stderr);
+            phase_logged = n;
+        }
+    }
     hash = fb_hash_rgb();
     changed = !have_hash || hash != last_hash;
     boundary = every > 0 && n >= every && (n / every) != (seen / every);
