@@ -446,6 +446,83 @@ static void se_frame(MCPXAPUState *d)
  * APU frame thread (background processing)
  * ============================================================ */
 
+/* The guest spins at loc_001A18D0 until a GP DMA write clears the dword at
+ * MEM32(0x001BA858)+0x810 from 3 to 0. This reports that dword and the GP run
+ * state from the frame thread, which already holds d->lock. It does not write
+ * guest memory and it does not decide whether the GP runs. Lines are capped:
+ * two before the dword is 3, eight while it stays 3, four if GPRST or
+ * apu_active changes after that cap, and one when the dword leaves 3. */
+static void apu_note_dsp_wait(MCPXAPUState *d, int apu_active)
+{
+    static int idle_lines, stuck_lines, change_lines, seen_three, seen_clear;
+    static int last_active = -1;
+    static int64_t last_ms;
+    static uint32_t last_gprst, calls;
+    uint32_t base = 0, wva = 0, word = 0, word_va = 0;
+    uint32_t gps = 0, sge0 = 0, sge0_va = 0, gprst, sectl, fectl;
+    const uint8_t *p = NULL;
+    int64_t now;
+    int report = 0;
+
+    if (!g_apu_ram_ptr || !d)
+        return;
+    calls++;
+    base = *(volatile uint32_t *)(g_apu_ram_ptr + 0x001BA858u);
+    /* host(va) = g_apu_ram_ptr + translated_va. Do not mask to 26 bits: that
+     * reads low RAM for a window address. apu_guest_dma_ptr is that rule. */
+    if (base >= 0x00010000u) {
+        wva = base + 0x810u;
+        if (wva >= base) {
+            p = apu_guest_dma_ptr(wva, 4, &word_va);
+            if (p)
+                word = *(volatile uint32_t *)p;
+        }
+    }
+    gprst = d->gp.regs[NV_PAPU_GPRST];
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (word == 3 && base >= 0x00010000u) {
+        seen_three = 1;
+        if (stuck_lines < 8 && (stuck_lines == 0 || now - last_ms >= 2000)) {
+            report = 1;
+            stuck_lines++;
+        } else if (change_lines < 4 &&
+                   (gprst != last_gprst || apu_active != last_active)) {
+            report = 1;
+            change_lines++;
+        }
+    } else if (seen_three && !seen_clear) {
+        seen_clear = 1;
+        report = 1;
+    } else if (!seen_three && idle_lines < 2) {
+        idle_lines++;
+        report = 1;
+    }
+    if (!report)
+        return;
+    last_ms = now;
+    last_gprst = gprst;
+    last_active = apu_active;
+    sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
+    fectl = qatomic_read(&d->regs[NV_PAPU_FECTL]);
+    gps = qatomic_read(&d->regs[NV_PAPU_GPSADDR]);
+    if (gps != 0) {
+        p = apu_guest_dma_ptr(gps, 4, NULL);
+        if (p)
+            sge0 = *(const uint32_t *)p;
+        if (sge0 != 0)
+            (void)apu_guest_dma_ptr(sge0, 4, &sge0_va);
+    }
+    fprintf(stderr,
+            "[APUWAIT] active=%d pause=%d sectl=%08X fectl=%08X gprst=%08X "
+            "realtime=%d gps=%08X sge0=%08X sge0_va=%08X base=%08X "
+            "word_va=%08X word=%08X frames=%d epdiv=%d gpcycles=%d calls=%u\n",
+            apu_active, d->pause_requested ? 1 : 0,
+            sectl, fectl, gprst, d->gp.realtime ? 1 : 0,
+            gps, sge0, sge0_va, base, word_va, word,
+            d->frame_count, d->ep_frame_div, g_dbg.gp.cycles, calls);
+    fflush(stderr);
+}
+
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
@@ -471,6 +548,8 @@ static void *mcpx_apu_frame_thread(void *arg)
         bool apu_active = (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !(fectl & NV_PAPU_FECTL_FEMETHMODE_HALTED);
+
+        apu_note_dsp_wait(d, apu_active ? 1 : 0);
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
