@@ -3170,6 +3170,40 @@ static int bridge_is_cdrom_device(const char *path)
     return _stricmp(path, "\\Device\\CdRom0") == 0;
 }
 
+/* Observation only. When the guest opens the JSRF disc-error marker file,
+ * print the guest stack as it is at this bridge. The kernel return was
+ * already popped into g_xbox_kernel_caller; words at and above g_esp are
+ * the arguments and the caller's frame. Nothing here is written back. */
+static void bridge_note_fatal_file(const char *path)
+{
+    uint32_t esp, i, shown;
+    static int dumps;
+
+    if (!path || (!strstr(path, "JSRF_FATAL") && !strstr(path, "FATAL.ERR")))
+        return;
+    if (dumps >= 8)
+        return;
+    dumps++;
+    esp = g_esp;
+    fprintf(stderr, "  [FATAL-FILE] #%d path=%s kernel_caller=%08X esp=%08X\n",
+            dumps, path, g_xbox_kernel_caller, esp);
+    fprintf(stderr, "  [FATAL-FILE] stack");
+    shown = 0;
+    for (i = 0; i < 128 && shown < 48; i++) {
+        uint32_t a = esp + i * 4u;
+        uint32_t w;
+        if (a < 0x00010000u || a >= (uint32_t)XBOX_TOTAL_RAM - 4u)
+            break;
+        w = BRIDGE_MEM32(a);
+        if (i < 12 || (w >= 0x00011000u && w < 0x001C3F60u)) {
+            fprintf(stderr, " +%03X=%08X", i * 4u, w);
+            shown++;
+        }
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
 /* Open a file by delegating to the ported xbox_NtCreateFile kernel HLE. */
 static NTSTATUS bridge_create_file_impl(
     uint32_t handle_va, ACCESS_MASK access, uint32_t obj_attrs_va,
@@ -3187,6 +3221,7 @@ static NTSTATUS bridge_create_file_impl(
         bridge_write_iostatus(iostatus_va, STATUS_OBJECT_PATH_NOT_FOUND, 0);
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
+    bridge_note_fatal_file(name.Buffer);
 
     if (bridge_is_cdrom_device(name.Buffer)) {
         fprintf(stderr, "  [FILE] %s -> synthetic DVD device handle\n",

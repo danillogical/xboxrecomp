@@ -41,6 +41,7 @@ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
  * thread is never reading the one being filled. */
 static uint32_t     *s_present[2];
 static volatile LONG s_present_idx = -1;   /* -1 until the first flip */
+static volatile LONG s_present_serial;     /* increments once per published flip */
 
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
 {
@@ -102,6 +103,93 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     }
     /* Published only once it is whole. */
     InterlockedExchange(&s_present_idx, next);
+    InterlockedIncrement(&s_present_serial);
+}
+
+int xbox_FramebufferDumpBmp(const char *path);
+
+/* Hash and, when asked, keep the frames a person would see.
+ *
+ * RECOMP_FB_PRESENT_DUMP_EVERY=<n> arms this. RECOMP_FB_PRESENT_DUMP_AFTER_S
+ * waits that many seconds from the first window-thread sample, because the
+ * question is the transition after a long hold, not the logos before it.
+ * A line is printed every n published flips and at least every 10 seconds.
+ * A BMP is written when the visible pixels change, and once a minute while
+ * they do not, so a frozen disclaimer is a file plus a stable hash rather
+ * than a directory of copies. Capped at 400 files. Guest state is not
+ * touched. The window thread does the disk write; the flip path only
+ * copies pixels and increments the counter. */
+static unsigned long long fb_hash_rgb(void)
+{
+    unsigned long long h = 14695981039346656037ull;
+    uint32_t n = s_fb_width * s_fb_height, i;
+    if (!s_rgb)
+        return 0;
+    for (i = 0; i < n; i++) {
+        h ^= s_rgb[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static void fb_present_observe(void)
+{
+    const char *every_env;
+    static int ready = -1;
+    static int every, after_s, writes;
+    static DWORD t0, last_beat, last_anchor;
+    static LONG seen;
+    static unsigned long long last_hash;
+    static int have_hash;
+    LONG n;
+    unsigned long long hash;
+    int changed, boundary;
+    DWORD now, sec;
+
+    if (ready < 0) {
+        every_env = getenv("RECOMP_FB_PRESENT_DUMP_EVERY");
+        every = every_env ? atoi(every_env) : 0;
+        ready = every > 0;
+        {
+            const char *a = getenv("RECOMP_FB_PRESENT_DUMP_AFTER_S");
+            after_s = a ? atoi(a) : 0;
+            if (after_s < 0)
+                after_s = 0;
+        }
+        t0 = GetTickCount();
+        last_beat = t0;
+        last_anchor = t0;
+    }
+    if (!ready || !s_rgb)
+        return;
+    now = GetTickCount();
+    sec = (now - t0) / 1000u;
+    if (sec < (DWORD)after_s)
+        return;
+
+    n = InterlockedCompareExchange(&s_present_serial, 0, 0);
+    hash = fb_hash_rgb();
+    changed = !have_hash || hash != last_hash;
+    boundary = every > 0 && n >= every && (n / every) != (seen / every);
+    if (changed || boundary || now - last_beat >= 10000u) {
+        fprintf(stderr, "  [FBPRESENT] t=%us presents=%ld hash=%016llx %s\n",
+                sec, n, hash, changed ? "CHANGED" : "unchanged");
+        fflush(stderr);
+        last_beat = now;
+    }
+    if ((changed || now - last_anchor >= 60000u) && writes < 400) {
+        const char *prefix = getenv("RECOMP_FB_DUMP");
+        if (prefix && prefix[0]) {
+            char path[512];
+            snprintf(path, sizeof path, "%sp%04d.bmp", prefix, writes);
+            xbox_FramebufferDumpBmp(path);
+            writes++;
+            last_anchor = now;
+        }
+    }
+    have_hash = 1;
+    last_hash = hash;
+    seen = n;
 }
 
 /* Which keys are down, for the pad stand-in in src/input.
@@ -342,6 +430,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 xbox_FramebufferDumpBmp(dump);
             }
         }
+        fb_present_observe();
         Sleep(16);
     }
 
