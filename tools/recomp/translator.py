@@ -3505,8 +3505,26 @@ class BatchTranslator:
         lines.extend([
             "};",
             "",
-            f"static const size_t g_recomp_table_size = "
-            f"{len(translations)};",
+            # The count is DERIVED from the array, never written as a literal.
+            #
+            # It used to be emitted as `= <len(translations)>;`, a second,
+            # independent statement of the same fact. That is a two-truths
+            # invariant: a hand patch that removed one row (JSRF's
+            # `remove-b5f3a-dispatch`) left the literal one too high, so
+            # recomp_dispatch_init() read one entry past the end of the array and
+            # the host died with an access violation BEFORE guest_entry -- with
+            # every static gate green, because no checker compared the two.
+            #
+            # `sizeof` cannot disagree with the array it measures, so the defect
+            # class is now structurally impossible rather than merely detected.
+            # Keep the `g_recomp_table_size` identifier: it is the name every
+            # reader and call site already uses.
+            "static const size_t g_recomp_table_size =",
+            "    sizeof(g_recomp_table) / sizeof(g_recomp_table[0]);",
+            "",
+            "/* A patch that removes a row must not restate this count. If the two",
+            " * ever disagree, the build is wrong in a way no other check sees: see",
+            " * tools/recomp/test_dispatch_flat.py's table-size control. */",
             "",
             "/* ----------------------------------------------------------------",
             " * Flat, directly-indexed dispatch.",

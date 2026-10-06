@@ -134,6 +134,28 @@ def test_generated_dispatch_flat_matches_binary_search():
         print("     " + r.stdout.strip())
 
 
+def test_dispatch_table_size_is_derived_not_a_literal():
+    """The declared count must be derived from the array, never restated.
+
+    JSRF shipped a host crash through a fully green suite this way: a hand patch
+    removed one row from `g_recomp_table[]` and left the emitted literal one too
+    high, so `recomp_dispatch_init()` read past the end of the array and the
+    process died with an access violation before `guest_entry`. A literal is a
+    second, independent statement of the same fact and can therefore disagree
+    with it; `sizeof` cannot. This is the generator half of the fix.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        disp = os.path.join(tmp, "d.c")
+        BatchTranslator._write_dispatch_table(
+            object.__new__(BatchTranslator), TRANSLATIONS, disp, "recomp_funcs.h")
+        src = open(disp).read()
+        assert "sizeof(g_recomp_table) / sizeof(g_recomp_table[0])" in src, \
+            [l for l in src.splitlines() if "g_recomp_table_size" in l]
+        # and no bare literal survives anywhere in the unit
+        assert "g_recomp_table_size = %d;" % len(TRANSLATIONS) not in src
+        assert "g_recomp_table_size = 4;" not in src, src[:600]
+
+
 def test_empty_translation_set_does_not_divide_by_zero():
     with tempfile.TemporaryDirectory() as tmp:
         disp = os.path.join(tmp, "d.c")
