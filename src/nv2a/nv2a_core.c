@@ -21,6 +21,36 @@ static uint32_t g_pending_instance_guest_base;
 static uint8_t *g_pending_instance_host_ptr;
 static uint32_t g_pending_instance_size;
 
+NV2ASubmitState g_nv2a_submit_state;
+
+/* Log bookkeeping for the submit diagnostics; cleared with the state above. */
+#define NV2A_ADMIT_LOG_MAX  256
+#define NV2A_ADMIT_PENDING  16
+typedef struct { uint32_t class_id, method, param, at; } AdmitRecord;
+static uint32_t g_reject_lines;
+static uint32_t g_last_reject_diag;
+static uint32_t g_logged_consecutive;
+static bool g_admit_banner;
+static AdmitRecord g_admit_seen[NV2A_ADMIT_LOG_MAX];
+static uint32_t g_admit_seen_count;
+static AdmitRecord g_admit_pending[NV2A_ADMIT_PENDING];
+static uint32_t g_admit_pending_count;
+static int g_admit_unknown = -1;
+
+void nv2a_admit_unknown_override(int value)
+{
+    g_admit_unknown = value < 0 ? -1 : value != 0;
+}
+
+bool nv2a_admit_unknown_enabled(void)
+{
+    if (g_admit_unknown < 0) {
+        const char *v = getenv("RECOMP_NV2A_ADMIT_UNKNOWN");
+        g_admit_unknown = v != NULL && strcmp(v, "1") == 0;
+    }
+    return g_admit_unknown != 0;
+}
+
 static bool instance_binding_valid(uint32_t guest_base, const uint8_t *host_ptr,
                                    uint32_t size)
 {
@@ -69,6 +99,13 @@ void nv2a_reset_standalone_for_test(void)
     g_pending_instance_guest_base = 0;
     g_pending_instance_host_ptr = NULL;
     g_pending_instance_size = 0;
+    memset(&g_nv2a_submit_state, 0, sizeof(g_nv2a_submit_state));
+    g_reject_lines = 0;
+    g_last_reject_diag = 0;
+    g_logged_consecutive = 0;
+    g_admit_banner = false;
+    g_admit_seen_count = 0;
+    g_admit_pending_count = 0;
 }
 
 static bool pci_config_access_valid(uint32_t offset, uint32_t length)
@@ -1469,6 +1506,9 @@ bool nv2a_submit_pending(NV2AState *d)
     bool ok = true;
     bool actions = nv2a_actions_enabled();
     uint32_t stop = NV2A_SUBMIT_OK;
+    bool admit = nv2a_admit_unknown_enabled();
+    AdmitRecord admitted[NV2A_ADMIT_PENDING];
+    uint32_t admitted_count = 0, admitted_total = 0;
     ActionStage st;
     if (!d) return false;
     qemu_mutex_lock(&d->pfifo.lock);
@@ -1555,7 +1595,11 @@ bool nv2a_submit_pending(NV2AState *d)
                 staged_class[subchannel] = class_id;
                 staged_object[subchannel] = param;
             } else if (method != 0x0100u &&
-                       !nv2a_method_implemented(staged_class[subchannel], method)) {
+                       !nv2a_method_implemented(staged_class[subchannel], method) &&
+                       !(admit && (staged_class[subchannel] == NV097_CLASS ||
+                                   staged_class[subchannel] == NV_MEMCPY_CLASS ||
+                                   staged_class[subchannel] == NV_SURFACES2D_CLASS ||
+                                   staged_class[subchannel] == NV_IMAGEBLIT_CLASS))) {
                 d->pfifo.submit_diag = NV2A_SUBMIT_UNSUPPORTED_METHOD;
                 d->pfifo.submit_diag_get = address;
                 d->pfifo.submit_diag_subchannel = subchannel;
@@ -1563,6 +1607,18 @@ bool nv2a_submit_pending(NV2AState *d)
                 d->pfifo.submit_diag_param = param;
                 ok = false;
                 goto done;
+            }
+            if (method != M_SET_OBJECT && method != 0x0100u &&
+                !nv2a_method_implemented(staged_class[subchannel], method)) {
+                /* Admitted by the switch: staged like an implemented method. */
+                ++admitted_total;
+                if (admitted_count < NV2A_ADMIT_PENDING) {
+                    admitted[admitted_count].class_id = staged_class[subchannel];
+                    admitted[admitted_count].method = method;
+                    admitted[admitted_count].param = param;
+                    admitted[admitted_count].at = address;
+                    ++admitted_count;
+                }
             }
             if (actions && staged_class[subchannel] == NV097_CLASS) {
                 uint32_t code = action_method(d, &st, subchannel, method, param);
@@ -1684,6 +1740,18 @@ bool nv2a_submit_pending(NV2AState *d)
         pfifo_trace("submit_commit", NV_PFIFO_CACHE1_DMA_GET, pc);
         ++d->pfifo.submit_successes;
         d->pfifo.submit_diag = NV2A_SUBMIT_OK;
+        g_nv2a_submit_state.admitted_unknown += admitted_total;
+        for (uint32_t i = 0; i < admitted_count; ++i) {
+            uint32_t j;
+            for (j = 0; j < g_admit_seen_count; ++j)
+                if (g_admit_seen[j].class_id == admitted[i].class_id &&
+                    g_admit_seen[j].method == admitted[i].method) break;
+            if (j < g_admit_seen_count || g_admit_seen_count >= NV2A_ADMIT_LOG_MAX ||
+                g_admit_pending_count >= NV2A_ADMIT_PENDING)
+                continue;
+            g_admit_seen[g_admit_seen_count++] = admitted[i];
+            g_admit_pending[g_admit_pending_count++] = admitted[i];
+        }
         if (actions) {
             /* A hold keeps the rest of the interrupted packet, and the
              * subroutine return, for the walk that resumes after it. */
@@ -1711,6 +1779,28 @@ done:
     d->pfifo.submit_words += words;
     d->pfifo.submit_packets += packets;
     d->pfifo.submit_diag_get = (d->pfifo.submit_diag == NV2A_SUBMIT_OK) ? pc : d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
+    {
+        /* Published once per walk under the generation protocol, so a reader
+         * never pairs fields from two walks. */
+        NV2ASubmitState *ss = &g_nv2a_submit_state;
+        InterlockedIncrement(&ss->generation);
+        ss->diag = d->pfifo.submit_diag;
+        ss->method = d->pfifo.submit_diag_method;
+        ss->subchannel = d->pfifo.submit_diag_subchannel;
+        ss->param = d->pfifo.submit_diag_param;
+        ss->at = d->pfifo.submit_diag_get;
+        ss->get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
+        ss->put = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
+        if (ok) {
+            ++ss->successes;
+            ss->consecutive_rejections = 0;
+        } else {
+            ++ss->rejections;
+            ++ss->consecutive_rejections;
+        }
+        /* The interlocked increment is a full barrier: the fields land first. */
+        InterlockedIncrement(&ss->generation);
+    }
     qemu_mutex_unlock(&d->pfifo.lock);
     if (ok && stop == NV2A_SUBMIT_SOFTWARE_METHOD)
         nv2a_update_irq(d);
@@ -1724,6 +1814,63 @@ static uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
     if (addr == NV_USER_DMA_PUT) return d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
     if (addr == NV_USER_DMA_GET) return d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
     return 0;
+}
+
+/* Log the walk that just finished: rejection edges and diag changes, sparse
+ * repeat counts, recovery, and newly admitted unknown methods. */
+static void nv2a_log_submit_result(NV2AState *d)
+{
+    NV2ASubmitState st;
+    AdmitRecord pend[NV2A_ADMIT_PENDING];
+    uint32_t pend_count, prev;
+    bool banner = false;
+
+    qemu_mutex_lock(&d->pfifo.lock);
+    st = g_nv2a_submit_state;
+    pend_count = g_admit_pending_count;
+    memcpy(pend, g_admit_pending, sizeof(pend[0]) * pend_count);
+    g_admit_pending_count = 0;
+    if (pend_count && !g_admit_banner) g_admit_banner = banner = true;
+    prev = g_logged_consecutive;
+    g_logged_consecutive = st.consecutive_rejections;
+    qemu_mutex_unlock(&d->pfifo.lock);
+
+    if (st.consecutive_rejections) {
+        bool edge = st.consecutive_rejections == 1 || st.diag != g_last_reject_diag;
+        uint32_t n = st.consecutive_rejections;
+        if (edge) {
+            if (g_reject_lines < 256) {
+                ++g_reject_lines;
+                fprintf(stderr, "  [PFIFO] reject diag=%s method=%04X subch=%u param=%08X"
+                        " at=%08X get=%08X put=%08X successes=%u rejections=%u\n",
+                        nv2a_submit_diagnostic(st.diag), st.method, st.subchannel,
+                        st.param, st.at, st.get, st.put, st.successes, st.rejections);
+                fflush(stderr);
+            }
+        } else if (n == 16 || n == 256 || n == 4096 || n == 65536) {
+            fprintf(stderr, "  [PFIFO] still rejecting n=%u diag=%s method=%04X subch=%u"
+                    " param=%08X at=%08X get=%08X put=%08X\n",
+                    n, nv2a_submit_diagnostic(st.diag), st.method, st.subchannel,
+                    st.param, st.at, st.get, st.put);
+            fflush(stderr);
+        }
+        g_last_reject_diag = st.diag;
+    } else if (prev) {
+        fprintf(stderr, "  [PFIFO] recovered after %u rejections get=%08X put=%08X"
+                " successes=%u\n", prev, st.get, st.put, st.successes);
+        fflush(stderr);
+        g_last_reject_diag = 0;
+    }
+    if (banner) {
+        fprintf(stderr, "[NV2A] RECOMP_NV2A_ADMIT_UNKNOWN=1: unknown methods on known"
+                " classes are captured as state, not executed (exploratory; ledger L44)\n");
+        fflush(stderr);
+    }
+    for (uint32_t i = 0; i < pend_count; ++i) {
+        fprintf(stderr, "  [PFIFO] admit-unknown class=%02X method=%04X param=%08X at=%08X\n",
+                pend[i].class_id, pend[i].method, pend[i].param, pend[i].at);
+        fflush(stderr);
+    }
 }
 
 static void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
@@ -1765,6 +1912,7 @@ static void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int siz
                         d->pfifo.submit_diag_param, d->pfifo.submit_diag_get);
             submits++;
         }
+        nv2a_log_submit_result(d);
     }
 }
 

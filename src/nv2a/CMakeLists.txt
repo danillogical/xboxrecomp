@@ -53,4 +53,22 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME nv2a_actions COMMAND nv2a_actions_test)
     set_tests_properties(nv2a_actions PROPERTIES TIMEOUT 20)
+
+    # Rejection/recovery log lines, the published submit state, and the
+    # RECOMP_NV2A_ADMIT_UNKNOWN switch.
+    add_executable(nv2a_submit_diag_test
+        nv2a_core.c
+        nv2a_method_table.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/nv2a_submit_diag_test.c
+    )
+    target_include_directories(nv2a_submit_diag_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(NOT MSVC)
+        target_compile_options(nv2a_submit_diag_test PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+    target_link_libraries(nv2a_submit_diag_test PRIVATE platform)
+    if(WIN32)
+        target_link_libraries(nv2a_submit_diag_test PRIVATE kernel32)
+    endif()
+    add_test(NAME nv2a_submit_diag COMMAND nv2a_submit_diag_test)
+    set_tests_properties(nv2a_submit_diag PROPERTIES TIMEOUT 20)
 endif()

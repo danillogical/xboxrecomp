@@ -368,6 +368,30 @@ bool nv2a_set_fixture_binding(NV2AState *d, uint32_t subchannel,
                               uint32_t object, uint32_t class_id);
 bool nv2a_set_fixture_execution(NV2AState *d, bool enabled);
 bool nv2a_submit_pending(NV2AState *d);
+
+/* What the most recent submit walk did, published once per walk. The per-submit
+ * "[PFIFO] submit" line stops at #63, so a walk rejected later in a run was
+ * invisible; this is the state a dump or the collector reads. generation is
+ * odd while a walk is writing it. */
+typedef struct NV2ASubmitState {
+    volatile LONG generation;   /* odd while being written, even when stable */
+    uint32_t diag;              /* NV2A_SUBMIT_* code of the most recent walk */
+    uint32_t method, subchannel, param, at;
+    uint32_t get, put;
+    uint32_t successes, rejections, consecutive_rejections;
+    uint32_t admitted_unknown;
+} NV2ASubmitState;
+/* Exported on Windows so a dump and the linker map name it, like g_nv2a_mmio_snapshot. */
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+extern NV2ASubmitState g_nv2a_submit_state;
+
+/* RECOMP_NV2A_ADMIT_UNKNOWN switch: -1 re-reads the environment on next use,
+ * 0 forces off, 1 forces on. Exploratory; unknown methods on known classes are
+ * captured as state, not executed. */
+void nv2a_admit_unknown_override(int value);
+bool nv2a_admit_unknown_enabled(void);
 const char *nv2a_submit_diagnostic(uint32_t code);
 
 /* Committed-method consumer (a host renderer/observer). This is the ONLY way
