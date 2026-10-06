@@ -132,6 +132,25 @@ static unsigned long long fb_hash_rgb(void)
     return h;
 }
 
+/* JSRF's boot presenter stops calling the update once phase +0x24 is set; read
+ * that object without writing guest memory. The bound is written as
+ * phase < limit - span so a garbage pointer near 0xFFFFFFFF cannot wrap past it. */
+static void fb_phase_sample(LONG n, const char *why)
+{
+    ptrdiff_t mem = xbox_GetMemoryOffset();
+    uint32_t phase = *(volatile uint32_t *)((uintptr_t)0x22FCE0u + mem);
+    if (phase >= 0x10000u && phase < 0x04000000u - 0x87E8u && (phase & 3u) == 0) {
+        uint32_t f10 = *(volatile uint32_t *)((uintptr_t)(phase + 0x10u) + mem);
+        uint32_t f24 = *(volatile uint32_t *)((uintptr_t)(phase + 0x24u) + mem);
+        uint32_t u0 = *(volatile uint32_t *)((uintptr_t)(phase + 0x87E0u) + mem);
+        uint32_t u1 = *(volatile uint32_t *)((uintptr_t)(phase + 0x87E4u) + mem);
+        fprintf(stderr, "  [FBPHASE] presents=%ld (%s) obj=0x%08X +10=%u +24=0x%08X"
+                " upd=%u/%u\n",
+                n, why, phase, f10, f24, u0, u1);
+        fflush(stderr);
+    }
+}
+
 static void fb_present_observe(void)
 {
     const char *every_env;
@@ -168,24 +187,26 @@ static void fb_present_observe(void)
         return;
 
     n = InterlockedCompareExchange(&s_present_serial, 0, 0);
-    /* The boot presenter stops calling the update once phase +0x24 is set.
-     * Sample that field around the flip count where f9-f11 stopped, without
-     * writing guest memory. */
-    if (n == 400 || n == 900 || n == 990 || n == 1000 || n == 1001) {
-        static LONG phase_logged;
-        ptrdiff_t mem = xbox_GetMemoryOffset();
-        uint32_t phase = *(volatile uint32_t *)((uintptr_t)0x22FCE0u + mem);
-        if (phase >= 0x10000u && phase + 0x87E8u < 0x04000000u && (phase & 3u) == 0
-            && phase_logged != n) {
-            uint32_t f10 = *(volatile uint32_t *)((uintptr_t)(phase + 0x10u) + mem);
-            uint32_t f24 = *(volatile uint32_t *)((uintptr_t)(phase + 0x24u) + mem);
-            uint32_t u0 = *(volatile uint32_t *)((uintptr_t)(phase + 0x87E0u) + mem);
-            uint32_t u1 = *(volatile uint32_t *)((uintptr_t)(phase + 0x87E4u) + mem);
-            fprintf(stderr, "  [FBPHASE] presents=%ld obj=0x%08X +10=%u +24=0x%08X"
-                    " upd=%u/%u\n",
-                    n, phase, f10, f24, u0, u1);
-            fflush(stderr);
-            phase_logged = n;
+    /* Sample the boot phase once on crossing each mark, and once whenever the
+     * present count has stood still for a second. The stop moved from 1000 to
+     * 888 between builds, so an exact-count list misses it; a 16 ms poll can
+     * also step over an exact count. */
+    {
+        static const LONG marks[] = { 400, 900 };
+        static unsigned next_mark;
+        static LONG stall_n = -1, stall_logged = -1;
+        static DWORD stall_since;
+        if (next_mark < sizeof(marks) / sizeof(marks[0]) && n >= marks[next_mark]) {
+            fb_phase_sample(n, "mark");
+            while (next_mark < sizeof(marks) / sizeof(marks[0]) && n >= marks[next_mark])
+                next_mark++;
+        }
+        if (n != stall_n) {
+            stall_n = n;
+            stall_since = now;
+        } else if (n > 0 && now - stall_since >= 1000u && stall_logged != n) {
+            fb_phase_sample(n, "stalled 1s");
+            stall_logged = n;
         }
     }
     hash = fb_hash_rgb();

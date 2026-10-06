@@ -2239,6 +2239,8 @@ class FunctionTranslator:
         has_conditionals = any(
             insn.is_cond_jump or insn.mnemonic.startswith("set")
             or insn.mnemonic.startswith("cmov")
+            # The lifter's fcmovcc fallback reads _flags (lifter.py:3990-3998).
+            or insn.mnemonic.startswith("fcmov")
             for insn in instructions)
         if has_conditionals:
             lines.append(f"    int _flags = 0; /* fallback flag var */")

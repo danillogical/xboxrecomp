@@ -3568,7 +3568,8 @@ static RECOMP_TLS int t_adx_watch_left;
 
 static int bridge_guest_readable(uint32_t va, uint32_t bytes)
 {
-    if (va < 0x10000u)
+    /* The va bound comes first: 0x04000000u - va underflows for a VA past it. */
+    if (va < 0x10000u || va >= 0x04000000u)
         return 0;
     if (bytes > 0x04000000u - va)
         return 0;
@@ -3598,6 +3599,7 @@ static void bridge_drain_file_apcs(void)
     bridge_file_apc_t batch[BRIDGE_FILE_APC_MAX];
     int n = t_file_apc_count;
     int i;
+    uint32_t caller;
 
     if (n <= 0)
         return;
@@ -3608,9 +3610,11 @@ static void bridge_drain_file_apcs(void)
      * Zeroing first makes that new APC land in an empty queue. */
     t_file_apc_count = 0;
     /* Caller before delivery. The completion routine enters the kernel
-     * dispatch and overwrites g_xbox_kernel_caller with its dummy return. */
+     * dispatch and overwrites g_xbox_kernel_caller with its dummy return, so
+     * it is saved here and restored for the wait that called this drain. */
+    caller = g_xbox_kernel_caller;
     fprintf(stderr, "  [KERNEL] file APC drain count=%d first=0x%08X caller=0x%08X\n",
-            n, batch[0].routine, g_xbox_kernel_caller);
+            n, batch[0].routine, caller);
     fflush(stderr);
     for (i = 0; i < n; i++) {
         deliver_one_apc(batch[i].routine, batch[i].context, batch[i].iostatus);
@@ -3621,6 +3625,7 @@ static void bridge_drain_file_apcs(void)
             bridge_log_adx_file("after-apc", t_adx_watch_obj);
         }
     }
+    g_xbox_kernel_caller = caller;
 }
 
 static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
