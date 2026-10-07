@@ -148,4 +148,36 @@ int  nv2a_pb_exec_consumer_registered(void);
  * contract as nv2a_pb_exec_counters. */
 uint32_t nv2a_pb_exec_skipped_non_nv097(void);
 
+/* A narrow read-only view of the ordered transform/vertex state, for tests that
+ * must distinguish CORRECT ORDERED DELIVERY from a dispatcher that merely ends up
+ * holding the last value written.
+ *
+ * The counters above cannot show this: an admitted `0x0BB0`..`0x0BBC` group is
+ * "handled", so it does not increment `unhandled`, and the counters carry no
+ * values. The state itself lives in file-static `s_vp` / `s_gpu.attr[]`, which no
+ * accessor exposed.
+ *
+ * What is observable, and what is not (measured from the implementation, not
+ * assumed):
+ *   - The constant COMPONENT is a pure function of the method:
+ *     `((method - 0x0B80)/4) % 4`. The constant INDEX advances only on the
+ *     fourth component (method `0x0BBC`). So permuting `0x0BB0`/`0BB4`/`0BB8`
+ *     while leaving `0x0BBC` last yields BYTE-IDENTICAL state -- order is NOT
+ *     observable there, and a test that claims otherwise is testing nothing.
+ *   - Moving `0x0BBC` earlier IS observable: it closes the group early, so the
+ *     remaining writes land in the NEXT constant and `const_load` advances twice.
+ *   - Two successive full groups must land in successive constants with
+ *     `const_load` advancing once per group.
+ *
+ * Same threading contract as the counters: call only from inside the consumer
+ * callback, or from a single-threaded fixture. */
+typedef struct {
+    uint32_t const_load;         /* the load cursor after the last write */
+    uint32_t const_count;        /* constants copied out (clamped to 192) */
+    float    consts[192][4];     /* s_vp.c[0..const_count-1] */
+    uint32_t attr_offset[16];    /* s_gpu.attr[i].offset, post-dma_resolve */
+} Nv2aPbExecVpView;
+
+void nv2a_pb_exec_vp_view(Nv2aPbExecVpView *out);
+
 #endif /* NV2A_BACKEND_H */

@@ -642,9 +642,14 @@ static void test_vertex_data_array_offset_admitted(void)
 static void test_vertex_data_array_offset_indexed_range(void)
 {
     /* Measured in the F4 ring: 0x1720, 0x172C, 0x1730, 0x1744. The array runs
-     * 0x1720 + 4*i for i in 0..15, so 0x1724 is a valid slot the title did NOT
-     * submit -- the control for "measured, not a blanket range". */
-    static const uint32_t admitted[] = { 0x1720u, 0x172Cu, 0x1730u, 0x1744u };
+     * 0x1720 + 4*i for i in 0..15, so 0x1734 is a valid slot the title did NOT
+     * submit -- the control for "measured, not a blanket range".
+     *
+     * 0x1724 used to be this control, but it became MEASURED on 2026-10-07: the
+     * walk's own `[PFIFO] admit-unknown` witness named it, so the table now
+     * admits it. Using it as the unmeasured exemplar would assert that the table
+     * is stale rather than that it is measured. 0x1734 is still unmeasured. */
+    static const uint32_t admitted[] = { 0x1720u, 0x1724u, 0x172Cu, 0x1730u, 0x1744u };
     NV2AState *d;
     Pb pb;
 
@@ -661,15 +666,15 @@ static void test_vertex_data_array_offset_indexed_range(void)
               d->pgraph.methods[admitted[i] / 4]);
     }
 
-    /* 0x1724 is inside the array but was never submitted, so it stays rejected.
+    /* 0x1734 is inside the array but was never submitted, so it stays rejected.
      * If this ever passes, the table stopped being a measured list. */
     d = fresh_with(0);
     pb_begin(&pb, PB_BASE);
     pb_method(&pb, 0, 0x0000, H_KELVIN);
-    pb_method(&pb, 0, 0x1724u, 0x003CA000u);
+    pb_method(&pb, 0, 0x1734u, 0x003CA000u);
     kick(d, pb.start, pb.at);
     CHECK(strcmp(diag(d), "unsupported_method") == 0,
-          "unmeasured slot 0x1724 was admitted (%s); the table is no longer measured",
+          "unmeasured slot 0x1734 was admitted (%s); the table is no longer measured",
           diag(d));
     CHECK(get_ptr(d) == pb.start,
           "rejected slot moved GET to %08X", get_ptr(d));
@@ -680,7 +685,13 @@ static void test_vertex_data_array_offset_indexed_range(void)
  * which is the behaviour the walk depends on to report a real gap. */
 static void test_unknown_method_still_rejected(void)
 {
-    static const uint32_t rejected[] = { 0x0104u, 0x1724u, 0x180Cu };
+    /* All three must be genuinely unmeasured. 0x1724 was in this list until
+     * 2026-10-07, when the walk's own `[PFIFO] admit-unknown` witness named it
+     * and the table began admitting it; keeping it here would assert that a
+     * measured method is rejected. 0x1734 and 0x1750 are inside the
+     * vertex-array-offset range but were never submitted, so they stay the
+     * "in range yet unmeasured" control. */
+    static const uint32_t rejected[] = { 0x0104u, 0x1734u, 0x180Cu, 0x1750u };
     NV2AState *d;
 
     for (unsigned i = 0; i < sizeof(rejected) / sizeof(rejected[0]); ++i) {

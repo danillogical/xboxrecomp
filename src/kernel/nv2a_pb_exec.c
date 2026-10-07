@@ -1061,6 +1061,27 @@ int nv2a_pb_exec_consumer_registered(void)
     return s_consumer_registered;
 }
 
+/* See nv2a_backend.h for the threading contract and for what this can and cannot
+ * distinguish. The short version: the constant COMPONENT is a function of the
+ * method and the constant INDEX advances only on the fourth component, so this
+ * view proves group-boundary ordering and index advancement, not a permutation of
+ * the first three components. */
+void nv2a_pb_exec_vp_view(Nv2aPbExecVpView *out)
+{
+    if (!out) return;
+    uint32_t n = s_vp.const_load;
+    if (n > VP_CONSTS) n = VP_CONSTS;      /* the cursor can exceed the array:
+                                            * the write is guarded, the ++ is not */
+    out->const_load = s_vp.const_load;
+    out->const_count = n;
+    for (uint32_t i = 0; i < VP_CONSTS; ++i) {
+        for (unsigned k = 0; k < 4; ++k)
+            out->consts[i][k] = s_vp.c[i][k];
+    }
+    for (unsigned i = 0; i < NV_VERTEX_ATTRS; ++i)
+        out->attr_offset[i] = s_gpu.attr[i].offset;
+}
+
 void nv2a_pb_exec_register_commit_consumer(void)
 {
     /* Presence only: RECOMP_PB_EXEC=0 still means "on", as it always has. */
