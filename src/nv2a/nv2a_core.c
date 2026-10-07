@@ -1917,11 +1917,13 @@ bool nv2a_submit_pending(NV2AState *d)
         memcpy(d->pfifo.binding_object, staged_object, sizeof(staged_object));
         if (actions) action_commit(d, &st);
         /* Hand the committed methods to the registered consumer, in order, only
-         * now: after the whole submission succeeded (a rejected walk never
-         * reaches here, so it has no executor side effect) and after
-         * action_commit, so a committed semaphore release or surface is already
-         * visible to it. Runs under the PFIFO lock, so the consumer must be
-         * lock-free -- see the contract on nv2a_set_commit_consumer. */
+         * now: after THIS UNIT succeeded (a rejected unit never reaches here, so
+         * it has no executor side effect) and after action_commit, so a
+         * committed semaphore release or surface is already visible to it. This
+         * runs once per unit, so a multi-unit walk delivers each unit's methods
+         * in stream order across successive commits. Runs under the PFIFO lock,
+         * so the consumer must be lock-free -- see the contract on
+         * nv2a_set_commit_consumer. */
         if (g_commit_consumer) {
             for (uint32_t i = 0; i < staged_count; ++i) {
                 g_commit_consumer(d->pfifo.staged[i].subchannel,
