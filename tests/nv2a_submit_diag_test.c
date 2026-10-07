@@ -692,17 +692,20 @@ static void test_budget_stop_transcript(void)
     /* Build a stream that exhausts the WORD budget INSIDE a packet's parameters.
      *
      * The arithmetic is forced by the walk's own guards, so it is worth writing
-     * down. The sink guard rejects a header when `staged + count > 4096`, and a
-     * single packet can carry at most 2047 parameters, so one packet can never
-     * reach 4096 words -- the stop would always land on a header. The parameter
-     * path is reachable only by ARRANGING the totals so the word count crosses
-     * 4096 while parameters remain:
+     * down, including the SET_OBJECT that opens the stream (1 header + 1 handle =
+     * 2 words, and it is NOT staged because SET_OBJECT is handled separately):
      *
-     *   packet 1: count 2047  -> 1 header + 2047 params = 2048 words, staged 2047
-     *   packet 2: count 2043  -> 1 header + 2043 params = 4092 words, staged 4090
-     *   packet 3: count    5  -> header passes (staged+count = 4095 <= 4096),
-     *                            then words reaches 4096 with 1 param still
-     *                            unread, so the stop is INSIDE the packet.
+     *   SET_OBJECT:              2 words                    words 2
+     *   packet 1: count 2047  -> 1 header + 2047 params  = 2048 words, words 2050
+     *   packet 2: count 2043  -> 1 header + 2043 params  = 2044 words, words 4094
+     *   packet 3: count    5  -> header passes the sink check (staged 4090 + 5 =
+     *                            4095 <= 4096), taking words to 4095; ONE parameter
+     *                            is then read (words 4096) and the next hits the
+     *                            cap with FOUR still unread.
+     *
+     * So the stop is INSIDE the packet with count == 4 -- not 1, which is what the
+     * earlier version of this comment claimed by leaving the SET_OBJECT out of its
+     * own account.
      *
      * Non-incrementing packets are used because an incrementing count that large
      * would run the method past 0x1FFC and be rejected by the method-range check
@@ -740,11 +743,15 @@ static void test_budget_stop_transcript(void)
     CHECK(g_nv2a_submit_state.budget_method == 0x1760u,
           "straddling method is %04X, want 1760",
           g_nv2a_submit_state.budget_method);
-    CHECK(g_nv2a_submit_state.budget_words >= NV2A_SUBMIT_MAX_WORDS,
-          "budget_words=%u, want >= %u", g_nv2a_submit_state.budget_words,
+    /* Exact frontier, not a bound: the shape above fixes all three. */
+    CHECK(g_nv2a_submit_state.budget_words == NV2A_SUBMIT_MAX_WORDS,
+          "budget_words=%u, want exactly %u", g_nv2a_submit_state.budget_words,
           NV2A_SUBMIT_MAX_WORDS);
-    CHECK(g_nv2a_submit_state.budget_count > 0,
-          "budget_count=%u, want the parameters still unread",
+    CHECK(g_nv2a_submit_state.budget_packets == 4u,
+          "budget_packets=%u, want 4 (SET_OBJECT + three packets)",
+          g_nv2a_submit_state.budget_packets);
+    CHECK(g_nv2a_submit_state.budget_count == 4u,
+          "budget_count=%u, want exactly 4 parameters unread",
           g_nv2a_submit_state.budget_count);
     /* local_pc is where the walk was consuming, which is NOT the rollback
      * origin `at`. Reporting `at` as the failure point is the trap this field
@@ -752,6 +759,37 @@ static void test_budget_stop_transcript(void)
     CHECK(g_nv2a_submit_state.budget_local_pc != g_nv2a_submit_state.at,
           "budget_local_pc (%08X) must not equal the rollback origin at (%08X)",
           g_nv2a_submit_state.budget_local_pc, g_nv2a_submit_state.at);
+    /* The frontier is inside the third packet's parameters, and `local_pc` is the
+     * address the walk was consuming when the cap fired -- NOT the rollback origin
+     * `at`, which is where the stream restarts. In word terms: 2 (SET_OBJECT) +
+     * 2048 (packet 1) + 2044 (packet 2) + 1 (packet 3's header) + 1 (its first
+     * parameter) = 4096 words consumed, so the frontier is PB_BASE + 4096*4. */
+    CHECK(g_nv2a_submit_state.budget_local_pc == pb.start + 4096u * 4u,
+          "budget_local_pc=%08X, want %08X (PB_BASE + 4096 words)",
+          g_nv2a_submit_state.budget_local_pc, pb.start + 4096u * 4u);
+
+    /* The trajectory must be DENSE and chronological, and its newest entries must
+     * be the parameters actually consumed -- that is what makes it usable as a
+     * cyclic-walk discriminator, which the old header-only ring was not. */
+    CHECK(d->pfifo.budget_trace_count == 64u,
+          "budget_trace_count=%u, want a full 64-word window",
+          d->pfifo.budget_trace_count);
+    {
+        /* The last word consumed is the FIRST parameter of packet 3, i.e. the
+         * value 0x11110000 the loop wrote at offset 0. */
+        uint32_t last = d->pfifo.budget_trace_word[63];
+        CHECK(last == 0x11110000u,
+              "newest trajectory word is %08X, want 11110000 (packet 3's first parameter)",
+              last);
+        /* The window must be contiguous, so it is a real trajectory rather than a
+         * sparse ring of headers. */
+        CHECK(d->pfifo.budget_trace_va[63] - d->pfifo.budget_trace_va[62] == 4u,
+              "trajectory addresses are not contiguous: %08X then %08X",
+              d->pfifo.budget_trace_va[62], d->pfifo.budget_trace_va[63]);
+        CHECK(d->pfifo.budget_trace_va[63] == g_nv2a_submit_state.budget_local_pc - 4u,
+              "the newest trajectory entry (%08X) is not the word before the frontier (%08X)",
+              d->pfifo.budget_trace_va[63], g_nv2a_submit_state.budget_local_pc);
+    }
 
     /* The transcript is ALSO printed, so a run whose dump is not read still
      * shows which limit fired. */
@@ -763,12 +801,54 @@ static void test_budget_stop_transcript(void)
           "the log must name the word cap:\n%s", log);
 
     /* A later retry must NOT overwrite the latched first stop: the first is the
-     * event of interest, and a rejection is retried on every kick. */
-    kick(d, pb.start, pb.at);
-    CHECK(g_nv2a_submit_state.budget_stops == 2,
-          "budget_stops=%u, want 2 after a retry", g_nv2a_submit_state.budget_stops);
-    CHECK(g_nv2a_submit_state.budget_local_pc != 0,
-          "the latched transcript was wiped by a retry");
+     * event of interest, and a rejection is retried on every kick. The trajectory
+     * must freeze with it -- otherwise the array would describe the most recent
+     * walk while the scalars describe the first, and the two would contradict
+     * each other.
+     *
+     * The retry DELIBERATELY changes a word the walk will consume. Retrying the
+     * identical stream and comparing counts cannot detect the defect, because the
+     * counts are identical either way; only the CONTENTS differ. The whole 64-word
+     * window is compared, not a couple of entries: the corrupted word lands
+     * mid-window, so spot-checking the ends would miss it. */
+    {
+        uint32_t va_before[64], word_before[64];
+        uint32_t trace_before = d->pfifo.budget_trace_count;
+        uint32_t pc_before = g_nv2a_submit_state.budget_local_pc;
+        unsigned k, changed = 0;
+
+        memcpy(va_before, d->pfifo.budget_trace_va, sizeof(va_before));
+        memcpy(word_before, d->pfifo.budget_trace_word, sizeof(word_before));
+
+        /* Corrupt a word INSIDE the window the retry will consume -- mid-window,
+         * where a rolling trajectory would record the new value. */
+        wr32(g_window, g_nv2a_submit_state.budget_local_pc - 32u * 4u, 0xDEADBEEFu);
+
+        kick(d, pb.start, pb.at);
+
+        CHECK(g_nv2a_submit_state.budget_stops == 2,
+              "budget_stops=%u, want 2 after a retry", g_nv2a_submit_state.budget_stops);
+        CHECK(g_nv2a_submit_state.budget_local_pc == pc_before,
+              "the latched frontier was overwritten by a retry (%08X -> %08X)",
+              pc_before, g_nv2a_submit_state.budget_local_pc);
+        CHECK(d->pfifo.budget_trace_count == trace_before,
+              "the trajectory kept rolling after the first stop (%u -> %u)",
+              trace_before, d->pfifo.budget_trace_count);
+        for (k = 0; k < 64u; ++k) {
+            if (d->pfifo.budget_trace_word[k] != word_before[k] ||
+                d->pfifo.budget_trace_va[k] != va_before[k]) {
+                if (!changed) {
+                    fprintf(stderr, "FAIL trajectory[%u] changed after a retry: "
+                            "va %08X->%08X word %08X->%08X\n", k,
+                            va_before[k], d->pfifo.budget_trace_va[k],
+                            word_before[k], d->pfifo.budget_trace_word[k]);
+                }
+                ++changed;
+            }
+        }
+        CHECK(changed == 0,
+              "%u of 64 trajectory entries were replaced by a later walk", changed);
+    }
 }
 
 int main(void)

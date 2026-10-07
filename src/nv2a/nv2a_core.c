@@ -1557,10 +1557,18 @@ static void submit_budget_stop(NV2AState *d, uint32_t get, uint32_t put,
 
 /* Record one consumed word in the rolling trajectory. Called on EVERY word the
  * walk consumes (header and parameter), so the trace is chronological and
- * dense -- which is what makes it usable as a cyclic-walk discriminator. */
+ * dense -- which is what makes it usable as a cyclic-walk discriminator.
+ *
+ * Recording STOPS once a budget stop has been latched. Otherwise the array would
+ * keep rolling on every retry that follows the rejection, and the trajectory
+ * published alongside the latched scalars would describe the most RECENT walk
+ * rather than the one that actually stopped -- i.e. it would disagree with the
+ * fields it is meant to explain. */
 static void submit_trace_word(NV2AState *d, uint32_t va, uint32_t word)
 {
-    uint32_t i = d->pfifo.budget_trace_count;
+    uint32_t i;
+    if (d->pfifo.budget_stops) return;        /* the first stop is already latched */
+    i = d->pfifo.budget_trace_count;
     if (i < 64) {
         d->pfifo.budget_trace_va[i] = va;
         d->pfifo.budget_trace_word[i] = word;
