@@ -112,6 +112,59 @@ static void test_last_draw_in_a_frame_wins(void)
     CHECK(present_track_flip(&t, FALLBACK, NULL) == B);
 }
 
+/* The reason a flip reports must name the branch that actually decided it.
+ *
+ * This is what makes a same-flip trace's `reason=` field load-bearing: without
+ * it, "drew into this surface" and "a stale surface from an earlier frame"
+ * report the same address and a source-selection defect is invisible.
+ *
+ * Each case asserts BOTH the classifier's answer and that present_track_flip
+ * really took that branch for the same state, so the two cannot drift apart.
+ */
+static void test_reason_names_the_branch_that_decided(void)
+{
+    Nv2aPresentTrack t;
+    int used = -1;
+
+    /* Nothing has happened: the caller's fallback, and no drawn surface yet. */
+    memset(&t, 0, sizeof(t));
+    CHECK(strcmp(present_track_reason(t.drawn_this_frame, t.targeted_this_frame,
+                                      0, t.drawn_offset),
+                 "fallback_color_offset") == 0);
+    CHECK(present_track_flip(&t, FALLBACK, &used) == FALLBACK);
+
+    /* A previous frame's drawn surface survives into a frame that draws
+     * nothing: that is the stale branch, not the fallback. */
+    memset(&t, 0, sizeof(t));
+    present_track_drawn(&t, A);
+    (void)present_track_flip(&t, FALLBACK, &used);        /* clears the flags */
+    CHECK(strcmp(present_track_reason(t.drawn_this_frame, t.targeted_this_frame,
+                                      0, t.drawn_offset),
+                 "stale_drawn_offset") == 0);
+    used = -1;
+    CHECK(present_track_flip(&t, FALLBACK, &used) == A);
+    CHECK(used == 0);
+
+    /* A drawn batch this frame wins, and says so. */
+    memset(&t, 0, sizeof(t));
+    present_track_targeted(&t, B);
+    present_track_drawn(&t, A);
+    CHECK(strcmp(present_track_reason(t.drawn_this_frame, t.targeted_this_frame,
+                                      0, t.drawn_offset),
+                 "drawn_this_frame") == 0);
+    CHECK(present_track_flip(&t, FALLBACK, &used) == A);
+
+    /* A clear-only frame uses the targeted surface, and says so. */
+    memset(&t, 0, sizeof(t));
+    present_track_targeted(&t, B);
+    CHECK(strcmp(present_track_reason(t.drawn_this_frame, t.targeted_this_frame,
+                                      1, t.drawn_offset),
+                 "targeted_this_frame") == 0);
+    used = -1;
+    CHECK(present_track_flip(&t, FALLBACK, &used) == B);
+    CHECK(used == 1);
+}
+
 int main(void)
 {
     test_software_drawn_frame();
@@ -120,6 +173,7 @@ int main(void)
     test_drawn_wins_over_targeted_in_the_same_frame();
     test_flip_clears_the_per_frame_flags();
     test_last_draw_in_a_frame_wins();
+    test_reason_names_the_branch_that_decided();
 
     printf("nv2a_present_track_test: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

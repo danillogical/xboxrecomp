@@ -59,4 +59,28 @@ static inline uint32_t present_track_flip(Nv2aPresentTrack *t, uint32_t fallback
     return done;
 }
 
+/* Why a flip chose what it chose, named from the state that was in effect
+ * BEFORE present_track_flip ran (it clears both per-frame flags).
+ *
+ * This exists so a same-flip trace can report a *reason* rather than only an
+ * address. "The surface it drew into" and "a surface left over from an earlier
+ * frame because nothing drew" produce the same uint32_t and are different
+ * defects, so a record that cannot tell them apart cannot localize a bug.
+ *
+ * Kept here, next to the preference order it describes, so it is host-testable
+ * and cannot drift from that order without the test noticing. */
+static inline const char *present_track_reason(int drawn_this_frame,
+                                               int targeted_this_frame,
+                                               int used_targeted,
+                                               uint32_t drawn_offset)
+{
+    if (drawn_this_frame)
+        return "drawn_this_frame";
+    if (targeted_this_frame && used_targeted)
+        return "targeted_this_frame";
+    if (drawn_offset)
+        return "stale_drawn_offset";
+    return "fallback_color_offset";
+}
+
 #endif

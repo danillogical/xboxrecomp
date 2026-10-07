@@ -891,6 +891,288 @@ static uint32_t surface_bpp(void)
     return s_gpu.pitch / s_gpu.clip_w;
 }
 
+/* ---------------------------------------------------------------------------
+ * Same-flip draw/present trace (RECOMP_FLIP_TRACE).
+ *
+ * Why this exists. The surfaces a flip can publish were previously compared
+ * against a frozen minidump taken much later, so "the executor selected a
+ * black surface" and "the guest drew elsewhere afterwards" could not be told
+ * apart: the two observations were never from the same event. This records
+ * them at ONE NV097_FLIP_STALL, keyed on (flip_stalls, present serial), and
+ * hashes every surface the guest has ever designated a colour target plus the
+ * bytes actually handed to the window.
+ *
+ * It is strictly observational. It does not choose, redirect, force a resolve,
+ * write guest memory, or alter the present call; it only reads state that the
+ * flip path already produced and hashes guest RAM (an ordinary load).
+ * ------------------------------------------------------------------------- */
+
+/* Every distinct surface offset the guest has named with
+ * SET_SURFACE_COLOR_OFFSET. This is what makes the candidate set complete by
+ * construction rather than a convenient subset: if a surface is presented, the
+ * guest named it here first. Bounded, and a title uses a handful. */
+#define PB_TRACE_MAX_SURFACES 8
+static uint32_t s_trace_surface[PB_TRACE_MAX_SURFACES];
+static int      s_trace_surface_count;
+
+static void trace_note_surface(uint32_t color_offset)
+{
+    int i;
+    if (!color_offset)
+        return;
+    for (i = 0; i < s_trace_surface_count; i++)
+        if (s_trace_surface[i] == color_offset)
+            return;
+    if (s_trace_surface_count < PB_TRACE_MAX_SURFACES)
+        s_trace_surface[s_trace_surface_count++] = color_offset;
+}
+
+/* FNV-1a-64 over a surface converted exactly the way fb_present.c converts the
+ * frame it publishes, so a hash here is comparable with an [FBPRESENT] line and
+ * with the archived surface hashes. Raw 16-bit words would not be. */
+static unsigned long long trace_hash_surface(uint32_t resolved_va, uint32_t bpp)
+{
+    unsigned long long h = 14695981039346656037ull;
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint32_t w = s_gpu.clip_w, ht = s_gpu.clip_h, y, x;
+
+    if (!w || !ht || !s_gpu.pitch)
+        return 0;
+    if (resolved_va < XBOX_CONTIG_BASE
+        || resolved_va + (uint64_t)ht * s_gpu.pitch
+           > (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
+        return 0;                          /* outside the window: do not read */
+    for (y = 0; y < ht; y++) {
+        const uint8_t *row = mem + resolved_va + (size_t)y * s_gpu.pitch;
+        for (x = 0; x < w; x++) {
+            uint32_t v;
+            if (bpp == 2) {
+                uint16_t t = ((const uint16_t *)row)[x];
+                v = (((uint32_t)((t >> 11) & 0x1F) * 255u / 31u) << 16)
+                  | (((uint32_t)((t >>  5) & 0x3F) * 255u / 63u) <<  8)
+                  |  ((uint32_t)( t        & 0x1F) * 255u / 31u);
+            } else if (bpp == 4) {
+                v = ((const uint32_t *)row)[x];
+            } else if (bpp == 8) {
+                v = ((const uint32_t *)row)[x * 2];   /* 2x-wide, as fb_convert */
+            } else {
+                return 0;
+            }
+            h ^= v;
+            h *= 1099511628211ull;
+        }
+    }
+    return h;
+}
+
+/* Why present_track_flip returned what it did. The classifier lives in
+ * nv2a_present_track.h, next to the preference order it names, so it is
+ * host-tested and cannot drift from that order. */
+static const char *trace_reason(int drawn_this_frame, int targeted_this_frame,
+                                int used_targeted, uint32_t drawn_offset)
+{
+    return present_track_reason(drawn_this_frame, targeted_this_frame,
+                                used_targeted, drawn_offset);
+}
+
+/* A ring of the batches since the previous flip.
+ *
+ * The flip-level record above says WHICH surface was published and that it was
+ * drawn this frame. It cannot say which batch drew it or what that batch read,
+ * and those are different defects: a composite that samples the offscreen
+ * surface and writes black is not the same failure as a composite that samples
+ * the surface it is itself writing (a feedback read), or one whose texture
+ * binding was never valid. This ring keeps the last few batches so the flip
+ * record can name them.
+ *
+ * Purely a record of values already computed; nothing here influences a draw. */
+#define PB_TRACE_BATCHES 32
+typedef struct PbTraceBatch {
+    uint32_t target;        /* colour surface the batch wrote into */
+    uint32_t tex_off;       /* bound texture, as the sampler will read it */
+    uint32_t tex_fmt;
+    uint32_t tex_w, tex_h;
+    uint32_t idx_count;
+    uint32_t tris;          /* triangles this batch actually rasterised */
+    uint32_t pixels;        /* pixel writes this batch made */
+    uint8_t  tex_valid, textured, screen_space, ffp, refused;
+} PbTraceBatch;
+
+static PbTraceBatch s_tbatch[PB_TRACE_BATCHES];
+static int s_tbatch_head;       /* next slot */
+static int s_tbatch_count;
+
+static void trace_batch(uint32_t target, uint32_t tris, uint32_t pixels,
+                        int tex_valid, int textured, int screen_space, int ffp,
+                        int refused)
+{
+    PbTraceBatch *b = &s_tbatch[s_tbatch_head];
+    b->target      = target;
+    b->tex_off     = s_gpu.tex.offset;
+    b->tex_fmt     = s_gpu.tex.color;
+    b->tex_w       = s_gpu.tex.width;
+    b->tex_h       = s_gpu.tex.height;
+    b->idx_count   = s_gpu.idx_count;
+    b->tris        = tris;
+    b->pixels      = pixels;
+    b->tex_valid   = (uint8_t)tex_valid;
+    b->textured    = (uint8_t)textured;
+    b->screen_space = (uint8_t)screen_space;
+    b->ffp         = (uint8_t)ffp;
+    b->refused     = (uint8_t)refused;
+    s_tbatch_head = (s_tbatch_head + 1) % PB_TRACE_BATCHES;
+    if (s_tbatch_count < PB_TRACE_BATCHES)
+        s_tbatch_count++;
+}
+
+/* Counts over the whole traced window, so "the composite never ran" and "the
+ * composite ran and produced black" are distinguishable without reading every
+ * ring line. */
+static uint32_t s_tb_total, s_tb_self_sample, s_tb_refused,
+                s_tb_untransformed, s_tb_textured, s_tb_drew;
+
+extern uint32_t xbox_FramebufferPresentSerial(void);
+extern unsigned long long xbox_FramebufferPresentHash(void);
+
+static void trace_flip(uint32_t selected, int used_targeted,
+                       int drawn_this_frame, int targeted_this_frame,
+                       uint32_t drawn_before, uint32_t targeted_before,
+                       uint32_t published_va)
+{
+    static int limit = -1, from = -1, change_only = -1, emitted;
+    static uint32_t last_key[6];
+    static int have_key;
+    uint32_t bpp = surface_bpp();
+    unsigned long long published;
+    uint32_t key[6];
+    int i;
+    int emit;
+
+    if (limit < 0) {
+        const char *e = getenv("RECOMP_FLIP_TRACE");
+        const char *f = getenv("RECOMP_FLIP_TRACE_FROM");
+        const char *c = getenv("RECOMP_FLIP_TRACE_CHANGE");
+        limit = e ? atoi(e) : 0;
+        from = f ? atoi(f) : 0;
+        change_only = c ? atoi(c) : 0;
+        if (from < 0) from = 0;
+    }
+    /* The per-frame batch counters belong to the frame that just ended, so they
+     * are consumed and cleared on EVERY flip, whether or not this one is
+     * printed. Clearing only on printed flips would make a later record's
+     * "frame" totals span several frames. */
+    emit = limit > 0 && emitted < limit && (int)s_gpu.flip_stalls >= from;
+
+    if (emit) {
+        key[0] = selected; key[1] = s_gpu.color_offset;
+        key[2] = s_gpu.drawn_offset; key[3] = s_present.drawn_offset;
+        key[4] = s_present.targeted_offset;
+        key[5] = (uint32_t)(drawn_this_frame | (targeted_this_frame << 1)
+                            | (used_targeted << 2));
+        if (change_only) {
+            if (have_key) {
+                for (i = 0; i < 6; i++)
+                    if (key[i] != last_key[i]) break;
+                if (i == 6)
+                    emit = 0;              /* nothing about the decision moved */
+            }
+            if (emit) {
+                for (i = 0; i < 6; i++) last_key[i] = key[i];
+                have_key = 1;
+            }
+        }
+    }
+
+    if (!emit) {
+        s_tb_total = s_tb_self_sample = s_tb_untransformed = 0;
+        s_tb_textured = s_tb_drew = 0;
+        s_tbatch_count = 0;
+        s_tbatch_head = 0;
+        return;
+    }
+    emitted++;
+
+    published = xbox_FramebufferPresentHash();
+
+    /* The decision, and the exact rule that produced it. */
+    fprintf(stderr,
+            "  [FLIPTRACE] stalls=%u serial=%u selected=0x%08X -> 0x%08X"
+            " reason=%s drawn_this_frame=%d targeted_this_frame=%d"
+            " used_targeted=%d\n",
+            s_gpu.flip_stalls, xbox_FramebufferPresentSerial(),
+            selected, dma_resolve(selected),
+            trace_reason(drawn_this_frame, targeted_this_frame, used_targeted,
+                         drawn_before),
+            drawn_this_frame, targeted_this_frame, used_targeted);
+    fprintf(stderr,
+            "  [FLIPTRACE]   state: color_offset=0x%08X -> 0x%08X"
+            " drawn_offset=0x%08X -> 0x%08X targeted=0x%08X -> 0x%08X"
+            " pitch=%u bpp=%u clip=%ux%u+%u+%u flips=%u"
+            " flip_read=%u flip_write=%u modulo=%u\n",
+            s_gpu.color_offset, dma_resolve(s_gpu.color_offset),
+            s_gpu.drawn_offset, dma_resolve(s_gpu.drawn_offset),
+            s_present.targeted_offset, dma_resolve(s_present.targeted_offset),
+            s_gpu.pitch, bpp, s_gpu.clip_w, s_gpu.clip_h,
+            s_gpu.clip_x, s_gpu.clip_y, s_gpu.flips,
+            s_gpu.flip_read, s_gpu.flip_write, s_gpu.flip_modulo);
+    /* What was actually published, at this same event. */
+    fprintf(stderr,
+            "  [FLIPTRACE]   published 0x%08X hash=%016llx\n",
+            published_va, published);
+    /* Every surface the guest has ever named a colour target, plus the bound
+     * texture: content per candidate, at this same event. */
+    for (i = 0; i < s_trace_surface_count; i++) {
+        uint32_t raw = s_trace_surface[i];
+        uint32_t rva = dma_resolve(raw);
+        fprintf(stderr,
+                "  [FLIPTRACE]   cand[%d] raw=0x%08X va=0x%08X hash=%016llx\n",
+                i, raw, rva, trace_hash_surface(rva, bpp));
+    }
+    if (s_gpu.tex.offset)
+        fprintf(stderr,
+                "  [FLIPTRACE]   bound_texture va=0x%08X %ux%u fmt=0x%02X"
+                " hash=%016llx\n",
+                s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
+                s_gpu.tex.color,
+                trace_hash_surface(s_gpu.tex.offset,
+                                   s_gpu.tex.pitch ? s_gpu.tex.pitch
+                                                   / (s_gpu.tex.width ? s_gpu.tex.width : 1)
+                                                   : 2));
+
+    /* The batches that produced this frame, newest last, and the frame's own
+     * totals. The ring is what connects the published surface to the pass that
+     * filled it: `self=1` means the batch sampled the very surface it wrote,
+     * and `tris=0` means the batch was counted but rasterised nothing. */
+    fprintf(stderr,
+            "  [FLIPTRACE]   frame batches=%u drew=%u textured=%u"
+            " self_sample=%u untransformed=%u\n",
+            s_tb_total, s_tb_drew, s_tb_textured, s_tb_self_sample,
+            s_tb_untransformed);
+    if (s_tbatch_count) {
+        int n = s_tbatch_count < PB_TRACE_BATCHES ? s_tbatch_count
+                                                  : PB_TRACE_BATCHES;
+        int start = (s_tbatch_head - n + PB_TRACE_BATCHES) % PB_TRACE_BATCHES;
+        int k;
+        for (k = 0; k < n; k++) {
+            const PbTraceBatch *b = &s_tbatch[(start + k) % PB_TRACE_BATCHES];
+            fprintf(stderr,
+                    "  [FLIPTRACE]     b[%d] target=0x%08X tex=0x%08X fmt=0x%02X"
+                    " %ux%u valid=%d uv=%d self=%d tris=%u px=%u\n",
+                    k, b->target, b->tex_off, b->tex_fmt, b->tex_w, b->tex_h,
+                    b->tex_valid, b->textured,
+                    b->tex_off && b->tex_off == dma_resolve(b->target),
+                    b->tris, b->pixels);
+        }
+    }
+    /* Per-frame counters reset at the flip, so the next frame's totals are its
+     * own and not the run's. */
+    s_tb_total = s_tb_self_sample = s_tb_untransformed = 0;
+    s_tb_textured = s_tb_drew = 0;
+    s_tbatch_count = 0;
+    s_tbatch_head = 0;
+    fflush(stderr);
+}
+
 
 /* Write the current surface out as a 24-bit BMP.
  *
@@ -2161,12 +2443,18 @@ static void backend_batch(void)
 static void raster_batch(void)
 {
     uint32_t before = s_gpu.tris_drawn;
+    uint32_t px_before = (uint32_t)s_gpu.pixels;
+    int screen_space, refused = 0;
 
     s_vp.gen++;
     if (s_gpu.idx_count < 3)
         return;
-    if (!batch_is_screen_space()) {
+    screen_space = batch_is_screen_space();
+    if (!screen_space) {
         s_gpu.batches_untransformed++;
+        s_tb_total++;
+        s_tb_untransformed++;
+        trace_batch(s_gpu.color_offset, 0, 0, s_gpu.tex.valid, 0, 0, 0, 0);
         return;
     }
     if (s_backend && s_backend->draw) {
@@ -2219,6 +2507,26 @@ static void raster_batch(void)
     }
 
     for_each_triangle(raster_tri, NULL);
+
+    /* Record this batch, and whether it sampled the surface it wrote into.
+     * A batch that reads its own render target is a feedback read: on hardware
+     * the sampled copy is the pre-pass contents, and here it is whatever the
+     * pass has written so far -- which for a full-screen pass is undefined but
+     * deterministic, and can be black. This is a measurement of an already
+     * computed address pair; it changes nothing. */
+    {
+        uint32_t tris = s_gpu.tris_drawn - before;
+        uint32_t px = (uint32_t)s_gpu.pixels - px_before;
+        int self = s_gpu.tex.valid && s_gpu.tex.offset
+                && s_gpu.tex.offset == dma_resolve(s_gpu.color_offset);
+        const VertexAttr *tc = texcoord_attr();
+        s_tb_total++;
+        if (tris) s_tb_drew++;
+        if (s_gpu.tex.valid) s_tb_textured++;
+        if (self) s_tb_self_sample++;
+        trace_batch(s_gpu.color_offset, tris, px, s_gpu.tex.valid,
+                    tc->offset && tc->stride, screen_space, batch_is_ffp(), 0);
+    }
 
     if (s_gpu.tris_drawn && (s_gpu.tris_drawn % 500) == 0)
         fprintf(stderr, "  [GPU] %u triangles rasterised\n", s_gpu.tris_drawn);
@@ -2728,6 +3036,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
     case NV097_SET_SURFACE_COLOR_OFFSET:
         s_gpu.color_offset = param;
+        /* Record every surface the guest names a colour target, so the
+         * same-flip trace's candidate set is complete by construction: a
+         * surface cannot be presented unless the guest named it here. */
+        trace_note_surface(param);
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
         s_gpu.clear_color = param;
@@ -2869,8 +3181,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (s_gpu.pitch) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
             int used_targeted = 0;
-            uint32_t done = present_track_flip(&s_present, s_gpu.color_offset,
-                                               &used_targeted);
+            uint32_t done;
+            /* The per-frame flags must be read BEFORE present_track_flip, which
+             * clears them; they are what distinguishes "this surface was drawn
+             * into during this frame" from "this is a stale offset kept because
+             * nothing drew". Read-only. */
+            int drawn_this_frame = s_present.drawn_this_frame;
+            int targeted_this_frame = s_present.targeted_this_frame;
+            uint32_t drawn_before = s_present.drawn_offset;
+
+            done = present_track_flip(&s_present, s_gpu.color_offset,
+                                      &used_targeted);
             if (used_targeted) {
                 static unsigned n_targeted;
                 if (n_targeted++ < 8) {
@@ -2881,8 +3202,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 }
             }
             if (done) {
-                xbox_FramebufferWindowSet(dma_resolve(done), s_gpu.pitch);
-                xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);
+                uint32_t pub = dma_resolve(done);
+                xbox_FramebufferWindowSet(pub, s_gpu.pitch);
+                xbox_FramebufferWindowPresent(pub, s_gpu.pitch);
+                /* Observational, and deliberately AFTER the present call so the
+                 * published hash names the bytes that call just handed the
+                 * window. It reads state; it changes none. */
+                trace_flip(done, used_targeted, drawn_this_frame,
+                           targeted_this_frame, drawn_before,
+                           s_present.targeted_offset, pub);
             }
         }
         if (s_backend && s_backend->flip)

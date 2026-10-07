@@ -52,6 +52,8 @@ int  xbox_VideoPlayFile(const char *host_path) { (void)host_path; return 0; }
 void xbox_FramebufferWindowStart(void) {}
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(void) {}
+uint32_t xbox_FramebufferPresentSerial(void) { return 0; }
+unsigned long long xbox_FramebufferPresentHash(void) { return 0; }
 IDirect3DDevice8 *xbox_GetD3DDevice(void) { return NULL; }
 
 extern ptrdiff_t g_xbox_mem_offset;

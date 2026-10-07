@@ -119,17 +119,46 @@ int xbox_FramebufferDumpBmp(const char *path);
  * than a directory of copies. Capped at 400 files. Guest state is not
  * touched. The window thread does the disk write; the flip path only
  * copies pixels and increments the counter. */
-static unsigned long long fb_hash_rgb(void)
+static unsigned long long fb_hash_words(const uint32_t *p, uint32_t n)
 {
     unsigned long long h = 14695981039346656037ull;
-    uint32_t n = s_fb_width * s_fb_height, i;
-    if (!s_rgb)
+    uint32_t i;
+    if (!p)
         return 0;
     for (i = 0; i < n; i++) {
-        h ^= s_rgb[i];
+        h ^= p[i];
         h *= 1099511628211ull;
     }
     return h;
+}
+
+static unsigned long long fb_hash_rgb(void)
+{
+    return fb_hash_words(s_rgb, s_fb_width * s_fb_height);
+}
+
+/* The present serial, for keying an observation on the published flip rather
+ * than on a timestamp. Read-only. */
+uint32_t xbox_FramebufferPresentSerial(void)
+{
+    return (uint32_t)InterlockedCompareExchange(&s_present_serial, 0, 0);
+}
+
+/* A hash of the frame the flip path last handed the window: the bytes that were
+ * actually published, not a fresh read of guest memory. Call it from the
+ * flipping thread immediately after xbox_FramebufferWindowPresent, so the
+ * buffer it names is the one that call just filled. Read-only.
+ *
+ * This exists so a same-flip trace can compare "what the executor believes it
+ * selected" against "what the window was actually given" at one event; the
+ * published copy and the selected source are otherwise only ever compared
+ * across different instants. */
+unsigned long long xbox_FramebufferPresentHash(void)
+{
+    LONG idx = InterlockedCompareExchange(&s_present_idx, 0, 0);
+    if (idx < 0 || idx > 1 || !s_present[idx])
+        return 0;
+    return fb_hash_words(s_present[idx], s_fb_width * s_fb_height);
 }
 
 /* JSRF's boot presenter stops calling the update once phase +0x24 is set; read
@@ -502,4 +531,6 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (v
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
+uint32_t xbox_FramebufferPresentSerial(void) { return 0; }
+unsigned long long xbox_FramebufferPresentHash(void) { return 0; }
 #endif
