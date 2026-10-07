@@ -1622,8 +1622,10 @@ bool nv2a_submit_pending(NV2AState *d)
     uint32_t stop = NV2A_SUBMIT_OK;
     bool admit = nv2a_admit_unknown_enabled();
     AdmitRecord admitted[NV2A_ADMIT_LOG_MAX];
-    /* `admitted_total` is the uncapped count for the whole walk; `admitted_count`
-     * is how many candidates this UNIT holds for the dedupe log. */
+    /* `admitted_total` counts the unknown methods admitted by the CURRENT unit
+     * (it is added to the published total and cleared at each unit commit);
+     * `admitted_count` is how many of them this unit holds as dedupe
+     * candidates. */
     uint32_t admitted_count = 0, admitted_total = 0;
     /* Units committed by this walk, and the structural per-call word bound. */
     uint32_t units = 0, unit_words_total = 0, unit_limit = 0;
@@ -1776,9 +1778,10 @@ bool nv2a_submit_pending(NV2AState *d)
             if (method != M_SET_OBJECT && method != 0x0100u &&
                 !nv2a_method_implemented(staged_class[subchannel], method)) {
                 /* Admitted by the switch: staged like an implemented method.
-                 * admitted_total is the uncapped count; admitted[] only holds
-                 * the candidates for the dedupe log, which cannot accept more
-                 * than NV2A_ADMIT_LOG_MAX distinct entries anyway. */
+                 * admitted_total counts this unit's admissions (uncapped, and
+                 * published then cleared at the unit commit); admitted[] only
+                 * holds the candidates for the dedupe log, which cannot accept
+                 * more than NV2A_ADMIT_LOG_MAX distinct entries anyway. */
                 ++admitted_total;
                 if (admitted_count < NV2A_ADMIT_LOG_MAX) {
                     admitted[admitted_count].class_id = staged_class[subchannel];
@@ -1935,7 +1938,14 @@ bool nv2a_submit_pending(NV2AState *d)
         pfifo_trace("submit_commit", NV_PFIFO_CACHE1_DMA_GET, pc);
         ++d->pfifo.submit_successes;
         d->pfifo.submit_diag = NV2A_SUBMIT_OK;
+        /* Account for THIS unit's admissions, then clear the counter. Both are
+         * required together: `admitted_unknown` is a published total and this
+         * loop runs once PER UNIT, so adding a walk-cumulative `admitted_total`
+         * here would count every earlier unit again at each later commit -- a
+         * two-unit walk of 4090 + 6137 unknown methods published 10227 instead
+         * of 6137. `admitted_total` therefore counts the current unit only. */
         g_nv2a_submit_state.admitted_unknown += admitted_total;
+        admitted_total = 0;
         for (uint32_t i = 0; i < admitted_count; ++i) {
             uint32_t j;
             for (j = 0; j < g_admit_seen_count; ++j)

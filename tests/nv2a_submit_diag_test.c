@@ -1130,6 +1130,60 @@ static void test_unit_rollback_and_retry(void)
     nv2a_set_kick_observer(NULL);
 }
 
+/* T3: a MULTI-UNIT walk must publish each unit's admissions exactly once.
+ *
+ * The published `admitted_unknown` is a running total, and the commit block
+ * runs once PER UNIT. A walk-cumulative counter added at each unit commit
+ * therefore counts every earlier unit again: with two units admitting 4090 and
+ * 6137 methods the total came out as 4090 + (4090 + 6137) = 10227 instead of
+ * 6137. The count is now per unit, published and then cleared.
+ *
+ * The stream is deliberately built from unknown methods on every unit, so a
+ * regression cannot pass by having one unit admit nothing. */
+static void test_multi_unit_admission_accounting(void)
+{
+    NV2AState *d = fresh();
+    Pb pb;
+    uint32_t i, expect = 0;
+    unsigned p;
+
+    set_env("RECOMP_NV2A_ADMIT_UNKNOWN", "1");
+    nv2a_admit_unknown_override(-1);
+    CHECK(nv2a_admit_unknown_enabled(), "the switch did not arm");
+
+    observer_reset();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);                 /* bind NV097 */
+    /* Two units. Unit 1: packets of 2047 and 2043 params (4094 words); unit 2:
+     * one packet of 2047 params. All parameters use an unknown method, so every
+     * staged method is an admission. */
+    {
+        static const uint32_t counts[3] = { 2047u, 2043u, 2047u };
+        for (p = 0; p < 3; ++p) {
+            pb_word(&pb, 0x40000000u | (counts[p] << 18) | UNKNOWN_NV097);
+            for (i = 0; i < counts[p]; ++i) pb_word(&pb, 0x33330000u + (expect++));
+        }
+    }
+    kick(d, pb.start, pb.at);
+
+    CHECK(get_ptr(d) == pb.at,
+          "the multi-unit admitted stream did not drain (get=%08X, want %08X; diag=%s)",
+          get_ptr(d), pb.at, diag(d));
+    CHECK(g_nv2a_submit_state.units == 2,
+          "units=%u, want 2", g_nv2a_submit_state.units);
+    CHECK(g_nv2a_submit_state.rejections == 0,
+          "rejections=%u on a fully admitted stream",
+          g_nv2a_submit_state.rejections);
+    /* The exact expected total: every parameter of every unit, once. */
+    CHECK(g_nv2a_submit_state.admitted_unknown == 2047u + 2043u + 2047u,
+          "admitted_unknown=%u, want %u (each unit must be counted once, not re-added)",
+          g_nv2a_submit_state.admitted_unknown, 2047u + 2043u + 2047u);
+
+    set_env("RECOMP_NV2A_ADMIT_UNKNOWN", NULL);
+    nv2a_admit_unknown_override(-1);
+    nv2a_set_kick_observer(NULL);
+}
+
 int main(void)
 {
     /* Start from a known environment whatever the caller exported. */
@@ -1149,6 +1203,7 @@ int main(void)
     test_budget_stop_transcript();
     test_unit_split_preserves_order();
     test_unit_rollback_and_retry();
+    test_multi_unit_admission_accounting();
 
     if (g_failures) {
         fprintf(stderr, "nv2a_submit_diag_test: %d failure(s)\n", g_failures);
