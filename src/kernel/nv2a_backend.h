@@ -164,8 +164,11 @@ uint32_t nv2a_pb_exec_skipped_non_nv097(void);
  *     fourth component (method `0x0BBC`). So permuting `0x0BB0`/`0BB4`/`0BB8`
  *     while leaving `0x0BBC` last yields BYTE-IDENTICAL state -- order is NOT
  *     observable there, and a test that claims otherwise is testing nothing.
- *   - Moving `0x0BBC` earlier IS observable: it closes the group early, so the
- *     remaining writes land in the NEXT constant and `const_load` advances twice.
+ *   - Moving `0x0BBC` earlier IS observable: it writes component 3 of the
+ *     CURRENT constant and advances the cursor at once, so the components that
+ *     follow land in the NEXT constant. The observable difference is that SPLIT,
+ *     not the number of advances: the cursor moves ONCE, because only `0x0BBC`
+ *     matches `slot % 4 == 3` among these four.
  *   - Two successive full groups must land in successive constants with
  *     `const_load` advancing once per group.
  *
