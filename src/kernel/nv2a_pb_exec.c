@@ -329,6 +329,17 @@ static int s_unhandled_count;
 #define NV_TEX_LAST  0x1BFC
 static uint32_t s_tex_reg[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
 static uint8_t  s_tex_set[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
+/* Stage 0's enable bit, defaulting on so a title that never writes
+ * SET_TEXTURE_CONTROL0 keeps the sampling behaviour it had.
+ *
+ * The address and the bit are written out here rather than taken from
+ * nv2a_regs.h because this file deliberately does not include it -- it defines
+ * the few method ids it acts on locally, which is why the sibling constants
+ * above are #defines too. Both values are from that header:
+ * NV097_SET_TEXTURE_CONTROL0 = 0x1B0C, ENABLE = (1 << 30). */
+#define NV097_SET_TEXTURE_CONTROL0        0x1B0C
+#define NV097_SET_TEXTURE_CONTROL0_ENABLE (1u << 30)
+static int s_tex0_enabled = 1;
 
 /* Formats whose dimensions come from the format word and whose coordinates
  * arrive normalised, rather than from a pitch and SET_TEXTURE_IMAGE_RECT with
@@ -343,12 +354,23 @@ static void record_tex_reg(uint32_t method, uint32_t param)
 {
     s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
     s_tex_set[(method - NV_TEX_FIRST) / 4] = 1;
+    /* Stage 0's enable bit. On hardware a disabled stage samples nothing, and
+     * a title that disables stage 0 for its scene batches while a texture
+     * offset is still bound must not have those batches sample the surface they
+     * are drawing into. This executor kept sampling, which turned every such
+     * batch into a feedback read of its own render target.
+     *
+     * Default 1 so a title that never writes CONTROL0 keeps the behaviour it
+     * had: only an explicit disable turns sampling off. */
+    if (method == NV097_SET_TEXTURE_CONTROL0)
+        s_tex0_enabled = (param & NV097_SET_TEXTURE_CONTROL0_ENABLE) ? 1 : 0;
     /* A pitch is a linear texture's property. A swizzled one has no rows and
      * so no pitch, and requiring one here refused every swizzled texture --
      * which is nearly all of them, since swizzled is the Xbox default. That
      * left the title's own textures unsampled and every textured quad drawn in
      * flat vertex colour. */
-    s_gpu.tex.valid = s_gpu.tex.offset && s_gpu.tex.width && s_gpu.tex.height
+    s_gpu.tex.valid = s_tex0_enabled
+                   && s_gpu.tex.offset && s_gpu.tex.width && s_gpu.tex.height
                    && (tex_size_from_format(s_gpu.tex.color)
                        || s_gpu.tex.pitch);
 }
@@ -532,6 +554,20 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
 #define NV097_SET_COMPOSITE_MATRIX_LAST  0x06BC
 #define NV097_SET_VIEWPORT_OFFSET_FIRST  0x0A20
 #define NV097_SET_VIEWPORT_OFFSET_LAST   0x0A2C
+/* The viewport SCALE, which is a separate method from the offset above. */
+#define NV097_SET_VIEWPORT_SCALE_FIRST   0x0AF0
+#define NV097_SET_VIEWPORT_SCALE_LAST    0x0AFC
+/* Where the viewport pair lands in the vertex-program constant file. These are
+ * the hardware's own slots, not a convention: nv2a_regs.h names them
+ * XFCTX_VPSCL = 0x3a = 58 and XFCTX_VPOFF = 0x3b = 59, and xemu's pgraph
+ * writes vsh_constants[XFCTX_VPSCL]/[XFCTX_VPOFF] from these two methods. The
+ * XDK vertex programs this title runs end with
+ *     MUL o0.xyz = r12 * c[58]
+ *     MAD o0.xyz = r12 * r1 + c[59]  FINAL
+ * so a zero c[58]/c[59] collapses every vertex to the screen origin, the
+ * triangles have zero area, and the rasteriser draws nothing at all. */
+#define NV_VP_CONST_VIEWPORT_SCALE   58
+#define NV_VP_CONST_VIEWPORT_OFFSET  59
 #define NV097_SET_TRANSFORM_EXEC_MODE    0x1E94
 #define NV_XFORM_MODE_PROGRAM            2   /* low two bits; 0 = fixed */
 
@@ -3274,8 +3310,26 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
         if (method >= NV097_SET_VIEWPORT_OFFSET_FIRST
          && method <= NV097_SET_VIEWPORT_OFFSET_LAST) {
-            memcpy(&s_gpu.vp_offset[(method - NV097_SET_VIEWPORT_OFFSET_FIRST) / 4],
-                   &param, 4);
+            uint32_t i = (method - NV097_SET_VIEWPORT_OFFSET_FIRST) / 4;
+            memcpy(&s_gpu.vp_offset[i], &param, 4);
+            /* Also into the vertex-program constant file, which is where the
+             * XDK vertex programs actually read it (see the slot note above).
+             * The fixed-function path above still needs vp_offset, so both are
+             * written rather than one replacing the other. */
+            if (i < 4)
+                memcpy(&s_vp.c[NV_VP_CONST_VIEWPORT_OFFSET][i], &param, 4);
+            break;
+        }
+        if (method >= NV097_SET_VIEWPORT_SCALE_FIRST
+         && method <= NV097_SET_VIEWPORT_SCALE_LAST) {
+            uint32_t i = (method - NV097_SET_VIEWPORT_SCALE_FIRST) / 4;
+            /* The scale has no fixed-function consumer here: it exists for the
+             * vertex program's c[58]. Until this was handled the method was
+             * unhandled entirely -- 28k occurrences in one run -- and every
+             * vertex-program batch collapsed to the origin. */
+            if (i < 4)
+                memcpy(&s_vp.c[NV_VP_CONST_VIEWPORT_SCALE][i], &param, 4);
+            s_vp.gen++;
             break;
         }
         if (method == NV097_SET_TRANSFORM_EXEC_MODE) {
