@@ -666,6 +666,111 @@ static void test_retry_recovers_after_pushbuffer_patch(void)
     nv2a_set_kick_observer(NULL);
 }
 
+/* The budget transcript must be readable AFTER the run, and must say WHICH limit
+ * fired and WHERE -- including the case that used to print nothing at all.
+ *
+ * Why this test exists: the walk can exhaust its budget at a packet HEADER or
+ * inside a packet's PARAMETERS, and only the header path used to print. A
+ * parameter-heavy stream therefore stopped SILENTLY, and the investigation could
+ * only infer "inside a packet" from the absence of a dump. Worse, the submit log
+ * stops after 64 walks and the old "last 32 visits" array was written only at
+ * headers but indexed by total words, so its slots were sparse and out of order.
+ *
+ * This drives a single packet whose parameter count exceeds the word budget, so
+ * the stop is deterministic and the transcript is the only record of it. */
+static void test_budget_stop_transcript(void)
+{
+    NV2AState *d;
+    Pb pb;
+    const char *log;
+    uint32_t i;
+
+    d = fresh();
+    CHECK(g_nv2a_submit_state.budget_stops == 0,
+          "reset left budget_stops=%u", g_nv2a_submit_state.budget_stops);
+
+    /* Build a stream that exhausts the WORD budget INSIDE a packet's parameters.
+     *
+     * The arithmetic is forced by the walk's own guards, so it is worth writing
+     * down. The sink guard rejects a header when `staged + count > 4096`, and a
+     * single packet can carry at most 2047 parameters, so one packet can never
+     * reach 4096 words -- the stop would always land on a header. The parameter
+     * path is reachable only by ARRANGING the totals so the word count crosses
+     * 4096 while parameters remain:
+     *
+     *   packet 1: count 2047  -> 1 header + 2047 params = 2048 words, staged 2047
+     *   packet 2: count 2043  -> 1 header + 2043 params = 4092 words, staged 4090
+     *   packet 3: count    5  -> header passes (staged+count = 4095 <= 4096),
+     *                            then words reaches 4096 with 1 param still
+     *                            unread, so the stop is INSIDE the packet.
+     *
+     * Non-incrementing packets are used because an incrementing count that large
+     * would run the method past 0x1FFC and be rejected by the method-range check
+     * first -- a different diagnostic. 0x1760 is in the generated table. */
+    cap_begin();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);                 /* bind NV097 */
+    {
+        static const uint32_t counts[3] = { 2047u, 2043u, 5u };
+        for (unsigned p = 0; p < 3; ++p) {
+            pb_word(&pb, 0x40000000u | (counts[p] << 18) | 0x1760u);
+            for (i = 0; i < counts[p]; ++i) pb_word(&pb, 0x11110000u + i);
+        }
+    }
+    kick(d, pb.start, pb.at);
+
+    log = cap_end();
+    CHECK(get_ptr(d) == pb.start,
+          "a rejected budget stream must not move GET (got %08X, want %08X)",
+          get_ptr(d), pb.start);
+    CHECK(strcmp(nv2a_submit_diagnostic(g_nv2a_submit_state.diag),
+                 "budget_exhausted") == 0,
+          "diag is %s, want budget_exhausted",
+          nv2a_submit_diagnostic(g_nv2a_submit_state.diag));
+
+    /* The latched transcript is what a dump reads later. */
+    CHECK(g_nv2a_submit_state.budget_stops == 1,
+          "budget_stops=%u, want 1", g_nv2a_submit_state.budget_stops);
+    CHECK(g_nv2a_submit_state.budget_in_param == 1,
+          "the stop must be reported INSIDE the parameters (in_param=%u)",
+          g_nv2a_submit_state.budget_in_param);
+    CHECK(g_nv2a_submit_state.budget_at_packet_limit == 0,
+          "the WORD cap fired, not the packet cap (at_packet_limit=%u)",
+          g_nv2a_submit_state.budget_at_packet_limit);
+    CHECK(g_nv2a_submit_state.budget_method == 0x1760u,
+          "straddling method is %04X, want 1760",
+          g_nv2a_submit_state.budget_method);
+    CHECK(g_nv2a_submit_state.budget_words >= NV2A_SUBMIT_MAX_WORDS,
+          "budget_words=%u, want >= %u", g_nv2a_submit_state.budget_words,
+          NV2A_SUBMIT_MAX_WORDS);
+    CHECK(g_nv2a_submit_state.budget_count > 0,
+          "budget_count=%u, want the parameters still unread",
+          g_nv2a_submit_state.budget_count);
+    /* local_pc is where the walk was consuming, which is NOT the rollback
+     * origin `at`. Reporting `at` as the failure point is the trap this field
+     * exists to avoid, so they must differ here. */
+    CHECK(g_nv2a_submit_state.budget_local_pc != g_nv2a_submit_state.at,
+          "budget_local_pc (%08X) must not equal the rollback origin at (%08X)",
+          g_nv2a_submit_state.budget_local_pc, g_nv2a_submit_state.at);
+
+    /* The transcript is ALSO printed, so a run whose dump is not read still
+     * shows which limit fired. */
+    CHECK(count_of(log, "budget_exhausted") >= 1,
+          "no budget_exhausted line in the log:\n%s", log);
+    CHECK(count_of(log, "stopped INSIDE a packet's parameters") == 1,
+          "the log must name the parameter path:\n%s", log);
+    CHECK(count_of(log, "LIMIT=words(4096)") == 1,
+          "the log must name the word cap:\n%s", log);
+
+    /* A later retry must NOT overwrite the latched first stop: the first is the
+     * event of interest, and a rejection is retried on every kick. */
+    kick(d, pb.start, pb.at);
+    CHECK(g_nv2a_submit_state.budget_stops == 2,
+          "budget_stops=%u, want 2 after a retry", g_nv2a_submit_state.budget_stops);
+    CHECK(g_nv2a_submit_state.budget_local_pc != 0,
+          "the latched transcript was wiped by a retry");
+}
+
 int main(void)
 {
     /* Start from a known environment whatever the caller exported. */
@@ -681,6 +786,7 @@ int main(void)
     test_retry_with_nothing_rejected();
     test_retry_recovers_after_ramht_write();
     test_retry_recovers_after_pushbuffer_patch();
+    test_budget_stop_transcript();
 
     if (g_failures) {
         fprintf(stderr, "nv2a_submit_diag_test: %d failure(s)\n", g_failures);
