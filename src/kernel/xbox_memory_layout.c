@@ -16,6 +16,7 @@
 #include "kernel.h"
 #include "recomp_diagnostics.h"   /* jsrf_slot_watch_alias_* prototypes (A2h alias census) */
 #include "kmem.h"
+#include "fence_snapshot.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -708,18 +709,69 @@ static struct {
     uint32_t device_ptr_va;
     uint32_t src_off;
     uint32_t ptr_off;
+    FenceSnapshot snap;   /* src counter as of the last consumed kick */
 } g_fence_mirrors[XBOX_MAX_FENCE_MIRRORS];
-static int g_fence_mirror_count = 0;
+/* Published with an interlocked store after the entry is filled, because the
+ * kick observer (guest thread) and the worker tick read entries below it. */
+static volatile LONG g_fence_mirror_count = 0;
+
+/* The GPU core's kick-observer seam, declared here rather than by including
+ * nv2a_state.h, which the kernel does not depend on. The event values are
+ * NV2A_KICK and NV2A_COMMIT in src/nv2a/nv2a_state.h. */
+typedef void (*nv2a_kick_observer_fn)(int event);
+extern void nv2a_set_kick_observer(nv2a_kick_observer_fn fn);
+enum { FENCE_EVENT_KICK = 1, FENCE_EVENT_COMMIT = 2 };
+
+static uint32_t fence_word(uint32_t va)
+{
+    return *(volatile uint32_t *)((uintptr_t)va + g_memory_offset);
+}
+
+/* Follow mirror i to its device; 0 while any link of the chain is unreadable. */
+static int fence_mirror_device(int i, uint32_t *dev)
+{
+    if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
+        return 0;
+    *dev = fence_word(g_fence_mirrors[i].device_ptr_va);
+    return fence_readable(*dev + g_fence_mirrors[i].ptr_off, 4)
+        && fence_readable(*dev + g_fence_mirrors[i].src_off, 4);
+}
+
+/* Runs on the thread that wrote PUT or walked the ring, with the MMIO owner
+ * lock held, which serializes every kick and commit; the worker tick reads
+ * the snapshots concurrently through fence_snapshot_value. Lock-free. */
+static void fence_mirror_observe(int event)
+{
+    LONG n = InterlockedCompareExchange(&g_fence_mirror_count, 0, 0);
+    for (LONG i = 0; i < n; i++) {
+        uint32_t dev;
+        if (event == FENCE_EVENT_KICK) {
+            /* D3D advances the counter before it writes PUT, so the value now
+             * covers every fence whose command lies before this PUT. */
+            if (fence_mirror_device((int)i, &dev))
+                fence_snapshot_kick(&g_fence_mirrors[i].snap,
+                                    fence_word(dev + g_fence_mirrors[i].src_off));
+        } else if (event == FENCE_EVENT_COMMIT) {
+            fence_snapshot_commit(&g_fence_mirrors[i].snap);
+        }
+    }
+}
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t src_off, uint32_t ptr_off)
 {
-    if (g_fence_mirror_count >= XBOX_MAX_FENCE_MIRRORS)
+    LONG n = g_fence_mirror_count;
+    if (n >= XBOX_MAX_FENCE_MIRRORS)
         return -1;
-    g_fence_mirrors[g_fence_mirror_count].device_ptr_va = device_ptr_va;
-    g_fence_mirrors[g_fence_mirror_count].src_off = src_off;
-    g_fence_mirrors[g_fence_mirror_count].ptr_off = ptr_off;
-    g_fence_mirror_count++;
+    memset(&g_fence_mirrors[n], 0, sizeof(g_fence_mirrors[n]));
+    g_fence_mirrors[n].device_ptr_va = device_ptr_va;
+    g_fence_mirrors[n].src_off = src_off;
+    g_fence_mirrors[n].ptr_off = ptr_off;
+    InterlockedExchange(&g_fence_mirror_count, n + 1);
+    /* Registered with the first mirror, so a title without one has no observer;
+     * the title registers mirrors before its entry point runs. */
+    if (n == 0)
+        nv2a_set_kick_observer(fence_mirror_observe);
     fprintf(stderr, "  NV2A fence mirror: device at 0x%08X,"
             " +0x%X -> *(+0x%X)\n",
             device_ptr_va, src_off, ptr_off);
@@ -936,28 +988,38 @@ static void frame_counters_tick(void)
     }
 }
 
+/* RECOMP_FENCE_MIRROR_LIVE (presence) mirrors the live counter even after a
+ * commit: an A/B escape hatch. Read once, on the worker thread that ticks. */
+static int g_fence_mirror_live = -1;
+static int g_fence_publish_noted;
+
 static void fence_mirrors_tick(void)
 {
-    for (int i = 0; i < g_fence_mirror_count; i++) {
+    LONG n = InterlockedCompareExchange(&g_fence_mirror_count, 0, 0);
+    if (g_fence_mirror_live < 0)
+        g_fence_mirror_live = getenv("RECOMP_FENCE_MIRROR_LIVE") != NULL;
+    for (int i = 0; i < n; i++) {
         uint32_t dev, get_ptr;
 
-        if (!fence_readable(g_fence_mirrors[i].device_ptr_va, 4))
+        if (!fence_mirror_device(i, &dev))
             continue;
-        dev = *(volatile uint32_t *)((uintptr_t)g_fence_mirrors[i].device_ptr_va
-                                     + g_memory_offset);
-        if (!fence_readable(dev + g_fence_mirrors[i].ptr_off, 4)
-                || !fence_readable(dev + g_fence_mirrors[i].src_off, 4))
-            continue;
-        get_ptr = *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].ptr_off)
-                                         + g_memory_offset);
+        get_ptr = fence_word(dev + g_fence_mirrors[i].ptr_off);
         if (!fence_readable(get_ptr, 4))
             continue;
         {
             volatile uint32_t *fence =
                 (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
-            uint32_t value =
-                *(volatile uint32_t *)((uintptr_t)(dev + g_fence_mirrors[i].src_off)
-                                       + g_memory_offset);
+            const FenceSnapshot *snap = &g_fence_mirrors[i].snap;
+            uint32_t value = fence_snapshot_value(
+                snap, fence_word(dev + g_fence_mirrors[i].src_off), g_fence_mirror_live);
+            if (!g_fence_publish_noted && !g_fence_mirror_live
+                    && fence_snapshot_has_published(snap)) {
+                g_fence_publish_noted = 1;
+                fprintf(stderr, "[NV2A] fence mirror: publishing the fence of the last"
+                        " consumed kick (RECOMP_FENCE_MIRROR_LIVE=1 restores the live"
+                        " mirror)\n");
+                fflush(stderr);
+            }
             if (*fence != value) {
                 /* The NV2A semaphore release may own this word; it logs the overlap. */
                 extern void nv2a_note_fence_mirror_write(const volatile void *, uint32_t);
@@ -5915,34 +5977,11 @@ static void heap_free_locked(uint32_t xbox_va)
                 frees, xbox_va, g_heap_block_count);
         fflush(stderr);
     }
-    for (int i = 0; i < g_heap_block_count; i++) {
-        if (g_heap_blocks[i].addr != xbox_va || g_heap_blocks[i].free) {
-            continue;
-        }
-        g_heap_blocks[i].free = 1;
-        if (++matched % 512 == 0) {
-            fprintf(stderr, "  [HEAP] frees=%d matched=%d blocks=%d\n",
-                    frees, matched, g_heap_block_count);
-            fflush(stderr);
-        }
-
-        /* Coalesce with neighbours. Blocks are recorded in bump order, so
-         * index order is address order and adjacency is a simple end==start
-         * test. Keeps large contiguous requests satisfiable after a lot of
-         * small churn. */
-        if (i + 1 < g_heap_block_count && g_heap_blocks[i + 1].free &&
-            g_heap_blocks[i].addr + g_heap_blocks[i].size == g_heap_blocks[i + 1].addr) {
-            g_heap_blocks[i].size += g_heap_blocks[i + 1].size;
-            g_heap_blocks[i + 1].size = 0;
-            g_heap_blocks[i + 1].addr = 0;
-        }
-        if (i > 0 && g_heap_blocks[i - 1].free &&
-            g_heap_blocks[i - 1].addr + g_heap_blocks[i - 1].size == g_heap_blocks[i].addr) {
-            g_heap_blocks[i - 1].size += g_heap_blocks[i].size;
-            g_heap_blocks[i].size = 0;
-            g_heap_blocks[i].addr = 0;
-        }
-        return;
+    if (kmem_heap_free(g_heap_blocks, &g_heap_block_count, xbox_va) &&
+        ++matched % 512 == 0) {
+        fprintf(stderr, "  [HEAP] frees=%d matched=%d blocks=%d\n",
+                frees, matched, g_heap_block_count);
+        fflush(stderr);
     }
 }
 

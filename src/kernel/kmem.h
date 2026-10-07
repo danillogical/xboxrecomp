@@ -103,6 +103,12 @@ uint32_t kmem_arena_alloc(struct kmem_arena *a, uint32_t size,
 /* Free the live block starting at addr: 1 if freed, 0 if not one of ours. */
 int kmem_arena_free(struct kmem_arena *a, uint32_t addr);
 
+/* Free the live block in b[0..*count) starting exactly at addr and merge it
+ * with free address-adjacent neighbours: 1 if freed, 0 otherwise. The old heap
+ * free left size-0 placeholders and looked only at i+-1, so frees beside a
+ * placeholder stopped merging. */
+int kmem_heap_free(struct kmem_block *b, int *count, uint32_t addr);
+
 /* Bytes from va to the end of the live block containing it, 0 if none. */
 uint32_t kmem_arena_block_size(const struct kmem_arena *a, uint32_t va);
 

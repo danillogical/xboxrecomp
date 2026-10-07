@@ -1612,7 +1612,28 @@ static void bridge_KeResetEvent(void)
 }
 
 /* File-I/O APCs queued by bridge_complete_file_io. Defined with the queue. */
-static void bridge_drain_file_apcs(void);
+static int bridge_drain_file_apcs(void);
+
+#ifndef STATUS_USER_APC
+#define STATUS_USER_APC ((NTSTATUS)0x000000C0L)
+#endif
+
+/* NT checks a signalled object before delivering, and an alertable wait that
+ * delivers a user APC returns STATUS_USER_APC. Takes the result of a zero-timeout
+ * probe of the wait; returns 1 with g_eax set when that settles the wait, 0 when
+ * the caller must do the full wait. */
+static int bridge_alertable_probe_result(NTSTATUS probe)
+{
+    if (probe != (NTSTATUS)0x00000102L) {       /* not STATUS_TIMEOUT */
+        g_eax = (uint32_t)probe;
+        return 1;
+    }
+    if (bridge_drain_file_apcs() > 0) {
+        g_eax = (uint32_t)STATUS_USER_APC;
+        return 1;
+    }
+    return 0;
+}
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
 static void bridge_KeWaitForSingleObject(void)
@@ -1624,23 +1645,29 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t wait_mode = STACK_ARG(2);
     uint32_t alertable = STACK_ARG(3);
     uint32_t timeout_ptr = STACK_ARG(4);
+    LARGE_INTEGER zero = {0};
     HANDLE h;
 
-    if (alertable)
-        bridge_drain_file_apcs();
-
     if (guest_va_is_inplace_kevent(object)) {
-        g_eax = (uint32_t)xbox_KeWaitInplaceEvent(
-            object, XBOX_TO_NATIVE(object), BRIDGE_MEM8(object),
-            (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        if (!(alertable && bridge_alertable_probe_result(xbox_KeWaitInplaceEvent(
+                object, XBOX_TO_NATIVE(object), BRIDGE_MEM8(object),
+                (BOOLEAN)alertable, &zero))))
+            g_eax = (uint32_t)xbox_KeWaitInplaceEvent(
+                object, XBOX_TO_NATIVE(object), BRIDGE_MEM8(object),
+                (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
     } else if ((h = ke_shadow_lookup(object)) != NULL) {
-        g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-            h, wait_reason, wait_mode,
-            (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        if (!(alertable && bridge_alertable_probe_result(xbox_KeWaitForSingleObject(
+                h, wait_reason, wait_mode, (BOOLEAN)alertable, &zero))))
+            g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+                h, wait_reason, wait_mode,
+                (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
     } else {
-        g_eax = (uint32_t)xbox_KeWaitForSingleObject(
-            XBOX_TO_NATIVE(object), wait_reason, wait_mode,
-            (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        if (!(alertable && bridge_alertable_probe_result(xbox_KeWaitForSingleObject(
+                XBOX_TO_NATIVE(object), wait_reason, wait_mode,
+                (BOOLEAN)alertable, &zero))))
+            g_eax = (uint32_t)xbox_KeWaitForSingleObject(
+                XBOX_TO_NATIVE(object), wait_reason, wait_mode,
+                (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
     }
 
     recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
@@ -1659,18 +1686,21 @@ static void bridge_NtWaitForSingleObject(void)
     recomp_diag_record(8, diag_object, g_xbox_kernel_caller, 0);
     uint32_t alertable   = STACK_ARG(1);
     uint32_t timeout_ptr = STACK_ARG(2);
-
-    if (alertable)
-        bridge_drain_file_apcs();
+    LARGE_INTEGER zero = {0};
 
     if (guest_va_is_inplace_kevent(diag_object)) {
-        g_eax = (uint32_t)xbox_KeWaitInplaceEvent(
-            diag_object, XBOX_TO_NATIVE(diag_object), BRIDGE_MEM8(diag_object),
-            (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        if (!(alertable && bridge_alertable_probe_result(xbox_KeWaitInplaceEvent(
+                diag_object, XBOX_TO_NATIVE(diag_object), BRIDGE_MEM8(diag_object),
+                (BOOLEAN)alertable, &zero))))
+            g_eax = (uint32_t)xbox_KeWaitInplaceEvent(
+                diag_object, XBOX_TO_NATIVE(diag_object), BRIDGE_MEM8(diag_object),
+                (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
     } else {
         HANDLE handle = bridge_resolve_handle(diag_object);
-        g_eax = (uint32_t)xbox_NtWaitForSingleObject(
-            handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
+        if (!(alertable && bridge_alertable_probe_result(xbox_NtWaitForSingleObject(
+                handle, (BOOLEAN)alertable, &zero))))
+            g_eax = (uint32_t)xbox_NtWaitForSingleObject(
+                handle, (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_ptr));
     }
 
     recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
@@ -1752,6 +1782,7 @@ static void bridge_NtWaitForSingleObjectEx(void)
     uint32_t wait_mode   = STACK_ARG(1);
     uint32_t alertable   = STACK_ARG(2);
     uint32_t timeout_ptr = STACK_ARG(3);
+    LARGE_INTEGER zero = {0};
 
     static int logged = 0;
     if (logged++ < 20) {
@@ -1761,12 +1792,11 @@ static void bridge_NtWaitForSingleObjectEx(void)
         fflush(stderr);
     }
 
-    if (alertable)
-        bridge_drain_file_apcs();
-
-    g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
-        handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
-        XBOX_TO_NATIVE(timeout_ptr));
+    if (!(alertable && bridge_alertable_probe_result(xbox_NtWaitForSingleObjectEx(
+            handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable, &zero))))
+        g_eax = (uint32_t)xbox_NtWaitForSingleObjectEx(
+            handle, (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
+            XBOX_TO_NATIVE(timeout_ptr));
 
     recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
 }
@@ -1816,6 +1846,7 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
     uint32_t wait_mode   = STACK_ARG(3);   /* KernelMode / UserMode */
     uint32_t alertable   = STACK_ARG(4);
     uint32_t timeout_ptr = STACK_ARG(5);
+    LARGE_INTEGER zero = {0};
 
     (void)wait_mode;
     HANDLE   handles[MAXIMUM_WAIT_OBJECTS];
@@ -1840,12 +1871,11 @@ static void bridge_NtWaitForMultipleObjectsEx(void)
         }
     }
 
-    if (alertable)
-        bridge_drain_file_apcs();
-
-    g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
-        count, handles, wait_type, (BOOLEAN)alertable,
-        XBOX_TO_NATIVE(timeout_ptr));
+    if (!(alertable && bridge_alertable_probe_result(xbox_NtWaitForMultipleObjectsEx(
+            count, handles, wait_type, (BOOLEAN)alertable, &zero))))
+        g_eax = (uint32_t)xbox_NtWaitForMultipleObjectsEx(
+            count, handles, wait_type, (BOOLEAN)alertable,
+            XBOX_TO_NATIVE(timeout_ptr));
 
     recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
 }
@@ -1926,8 +1956,10 @@ static void bridge_KeDelayExecutionThread(void)
     /* Before the native delay, including a zero interval. JSRF's poller
      * passes 0 ms, which yields and returns, and reads the completion flag
      * only after this call returns. */
-    if (alertable)
-        bridge_drain_file_apcs();
+    if (alertable && bridge_drain_file_apcs() > 0) {
+        g_eax = (uint32_t)STATUS_USER_APC;
+        return;
+    }
 
     g_eax = (uint32_t)xbox_KeDelayExecutionThread(
         (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable,
@@ -3594,7 +3626,7 @@ static void bridge_log_adx_file(const char *where, uint32_t obj)
     fflush(stderr);
 }
 
-static void bridge_drain_file_apcs(void)
+static int bridge_drain_file_apcs(void)
 {
     bridge_file_apc_t batch[BRIDGE_FILE_APC_MAX];
     int n = t_file_apc_count;
@@ -3602,7 +3634,7 @@ static void bridge_drain_file_apcs(void)
     uint32_t caller;
 
     if (n <= 0)
-        return;
+        return 0;
     if (n > BRIDGE_FILE_APC_MAX)
         n = BRIDGE_FILE_APC_MAX;
     memcpy(batch, t_file_apc, (size_t)n * sizeof(batch[0]));
@@ -3626,6 +3658,7 @@ static void bridge_drain_file_apcs(void)
         }
     }
     g_xbox_kernel_caller = caller;
+    return n;
 }
 
 static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
@@ -4957,6 +4990,7 @@ static void bridge_KeWaitForMultipleObjects(void)
     uint32_t alertable   = STACK_ARG(5);
     uint32_t timeout_va  = STACK_ARG(6);
     uint32_t wait_block  = STACK_ARG(7);
+    LARGE_INTEGER zero = {0};
     HANDLE handles[BRIDGE_MAXIMUM_WAIT_OBJECTS];
     uint32_t i;
 
@@ -4970,14 +5004,15 @@ static void bridge_KeWaitForMultipleObjects(void)
         handles[i] = bridge_resolve_handle(
             objects_va ? BRIDGE_MEM32(objects_va + i * 4) : 0);
 
-    if (alertable)
-        bridge_drain_file_apcs();
-
-    g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
-        count, (PVOID *)handles, wait_type,
-        wait_reason, (KPROCESSOR_MODE)wait_mode,
-        (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
-        XBOX_TO_NATIVE(wait_block));
+    if (!(alertable && bridge_alertable_probe_result(xbox_KeWaitForMultipleObjects(
+            count, (PVOID *)handles, wait_type, wait_reason,
+            (KPROCESSOR_MODE)wait_mode, (BOOLEAN)alertable, &zero,
+            XBOX_TO_NATIVE(wait_block)))))
+        g_eax = (uint32_t)xbox_KeWaitForMultipleObjects(
+            count, (PVOID *)handles, wait_type,
+            wait_reason, (KPROCESSOR_MODE)wait_mode,
+            (BOOLEAN)alertable, XBOX_TO_NATIVE(timeout_va),
+            XBOX_TO_NATIVE(wait_block));
 
     recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
 }

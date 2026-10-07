@@ -557,9 +557,11 @@ static DWORD WINAPI ptimer_service_thread(void *opaque)
     HANDLE wake = g_ptimer_wake_event;
     uint64_t next_vblank_ns = 0;
     uint64_t frame_ns = 0;
+    ULONGLONG last_retry_ms = 0;
     for (;;) {
         uint64_t delay_ns, now_ns;
         uint32_t pending_before, pmc_before;
+        bool retried = false, stalled;
         AcquireSRWLockExclusive(&g_mmio_owner_lock);
         if (InterlockedCompareExchange(&g_ptimer_stopping, 0, 0)) {
             ReleaseSRWLockExclusive(&g_mmio_owner_lock);
@@ -593,11 +595,28 @@ static DWORD WINAPI ptimer_service_thread(void *opaque)
                                   ? next_vblank_ns - now_ns : 0;
             if (until_vblank < delay_ns) delay_ns = until_vblank;
         }
+
+        /* A rejected walk is sticky: GET stays put and D3D's ring-space wait
+         * only polls, it never kicks again. Re-walk at most every 100 ms so a
+         * rejection that has since cleared is consumed. The owner lock held
+         * here serializes this walk with the guest's PUT writes. */
+        stalled = InterlockedCompareExchange(&g_mmio_owner_active, 0, 0) &&
+                  g_nv2a_submit_state.consecutive_rejections > 0;
+        if (stalled) {
+            ULONGLONG now_ms = GetTickCount64();
+            if (now_ms - last_retry_ms >= 100) {
+                last_retry_ms = now_ms;
+                retried = nv2a_retry_stalled_walk(nv2a);
+            }
+            if (delay_ns > 100000000ull) delay_ns = 100000000ull;
+        }
+
         /* Never a zero-length wait: `ptimer_wait_ms(0)` returns immediately and
          * this loop would spin instead of idling between frames. */
         if (delay_ns < 1000000ull) delay_ns = 1000000ull;
         if (InterlockedCompareExchange(&g_mmio_owner_active, 0, 0) &&
-            (pending_before != nv2a->ptimer.pending_interrupts ||
+            (retried ||
+             pending_before != nv2a->ptimer.pending_interrupts ||
              pmc_before != nv2a->pmc.pending_interrupts)) {
             publish_diagnostic_state(nv2a, false, 0, 0);
         }

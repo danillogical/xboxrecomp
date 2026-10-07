@@ -329,6 +329,29 @@ int kmem_arena_free(struct kmem_arena *a, uint32_t addr)
     return 0;
 }
 
+int kmem_heap_free(struct kmem_block *b, int *count, uint32_t addr)
+{
+    int i;
+
+    for (i = 0; i < *count; i++) {
+        if (!b[i].size || b[i].free || b[i].addr != addr)
+            continue;
+        b[i].free = 1;
+        if (i + 1 < *count && b[i + 1].size && b[i + 1].free &&
+            b[i].addr + b[i].size == b[i + 1].addr) {
+            b[i].size += b[i + 1].size;
+            blocks_remove(b, count, i + 1);
+        }
+        if (i > 0 && b[i - 1].size && b[i - 1].free &&
+            b[i - 1].addr + b[i - 1].size == b[i].addr) {
+            b[i - 1].size += b[i].size;
+            blocks_remove(b, count, i);
+        }
+        return 1;
+    }
+    return 0;
+}
+
 uint32_t kmem_arena_block_size(const struct kmem_arena *a, uint32_t va)
 {
     int i;

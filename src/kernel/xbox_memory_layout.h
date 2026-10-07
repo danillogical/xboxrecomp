@@ -163,6 +163,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
  * the wait never ends. What the wait needs is the counter, which is what the
  * synchronous model has completed.
  *
+ * With the MMIO state owner installed the value is not read live: the counter
+ * is sampled at each PUT write and published only once the submission walk has
+ * consumed that kick (fence_snapshot.h), so a rejected walk does not complete
+ * fences whose commands it never read. Until the first commit, and whenever
+ * RECOMP_FENCE_MIRROR_LIVE is set, the live counter is mirrored as before.
+ *
  * Returns 0 on success, -1 if the table is full.
  */
 /* Advance a frame/swap counter inside the D3D device at ~60 Hz.

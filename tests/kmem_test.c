@@ -704,6 +704,130 @@ static void test_vm_region_table_full(void)
     CHECK(vm_alloc(&base, &size, KMEM_MEM_RESERVE) == KMEM_STATUS_SUCCESS);
 }
 
+/* ── Guest heap free ─────────────────────────────────────── */
+
+/* No slot of a heap table may be a size-0 placeholder: the merge removes it. */
+static int no_empty_slots(const struct kmem_block *b, int count)
+{
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (!b[i].size)
+            return 0;
+    return 1;
+}
+
+static void test_heap_free_merges_the_review_scenario(void)
+{
+    /* A, B, C adjacent and live, then a free tail. */
+    struct kmem_block b[8] = {
+        { 0x00100000u, 0x100u, 0 },
+        { 0x00100100u, 0x100u, 0 },
+        { 0x00100200u, 0x100u, 0 },
+    };
+    int count = 3;
+
+    CHECK(kmem_heap_free(b, &count, 0x00100100u) == 1);      /* B */
+    CHECK(count == 3 && b[1].free);
+    CHECK(kmem_heap_free(b, &count, 0x00100000u) == 1);      /* A joins B */
+    CHECK(count == 2);
+    CHECK(b[0].addr == 0x00100000u && b[0].size == 0x200u && b[0].free);
+    CHECK(kmem_heap_free(b, &count, 0x00100200u) == 1);      /* C joins A+B */
+    CHECK(count == 1);
+    CHECK(b[0].addr == 0x00100000u && b[0].size == 0x300u && b[0].free);
+    CHECK(blocks_ordered(b, count));
+    CHECK(no_empty_slots(b, count));
+}
+
+static void test_heap_free_between_two_free_blocks(void)
+{
+    struct kmem_block b[8] = {
+        { 0x00100000u, 0x100u, 1 },
+        { 0x00100100u, 0x100u, 0 },
+        { 0x00100200u, 0x100u, 1 },
+        { 0x00100300u, 0x100u, 0 },
+    };
+    int count = 4;
+
+    CHECK(kmem_heap_free(b, &count, 0x00100100u) == 1);
+    CHECK(count == 2);
+    CHECK(b[0].addr == 0x00100000u && b[0].size == 0x300u && b[0].free);
+    CHECK(b[1].addr == 0x00100300u && b[1].size == 0x100u && !b[1].free);
+    CHECK(blocks_ordered(b, count));
+    CHECK(no_empty_slots(b, count));
+}
+
+static void test_heap_free_does_not_merge_across_a_gap_or_a_live_block(void)
+{
+    struct kmem_block b[8] = {
+        { 0x00100000u, 0x100u, 1 },
+        { 0x00100200u, 0x100u, 0 },     /* a gap before it */
+        { 0x00100300u, 0x100u, 0 },
+    };
+    int count = 3;
+
+    CHECK(kmem_heap_free(b, &count, 0x00100200u) == 1);
+    CHECK(count == 3 && b[0].size == 0x100u && b[1].free && b[1].size == 0x100u);
+    CHECK(kmem_heap_free(b, &count, 0x00100300u) == 1);
+    CHECK(count == 2 && b[1].addr == 0x00100200u && b[1].size == 0x200u && b[1].free);
+    CHECK(b[0].addr == 0x00100000u && b[0].size == 0x100u);
+    CHECK(no_empty_slots(b, count));
+}
+
+static void test_heap_free_rejects_unknown_and_double_free(void)
+{
+    struct kmem_block b[4] = {
+        { 0x00100000u, 0x100u, 0 },
+        { 0x00100100u, 0x100u, 1 },
+    };
+    int count = 2;
+
+    CHECK(kmem_heap_free(b, &count, 0x00200000u) == 0);      /* not ours */
+    CHECK(kmem_heap_free(b, &count, 0x00100010u) == 0);      /* inside a block */
+    CHECK(kmem_heap_free(b, &count, 0x00100100u) == 0);      /* already free */
+    CHECK(count == 2 && !b[0].free && b[1].free && b[1].size == 0x100u);
+
+    CHECK(kmem_heap_free(b, &count, 0x00100000u) == 1);
+    CHECK(count == 1 && b[0].addr == 0x00100000u && b[0].size == 0x200u && b[0].free);
+    CHECK(kmem_heap_free(b, &count, 0x00100000u) == 0);      /* double free */
+    CHECK(count == 1 && b[0].size == 0x200u);
+    CHECK(no_empty_slots(b, count));
+}
+
+/* Every order of freeing four adjacent live blocks ends as one free block
+ * with no size-0 slot on the way. */
+static void test_heap_free_any_order_leaves_no_placeholders(void)
+{
+    int perm[24][4], n = 0, p, i;
+
+    for (p = 0; p < 256; p++) {
+        int a = p & 3, c = (p >> 2) & 3, d = (p >> 4) & 3, e = (p >> 6) & 3;
+
+        if (a == c || a == d || a == e || c == d || c == e || d == e)
+            continue;
+        perm[n][0] = a; perm[n][1] = c; perm[n][2] = d; perm[n][3] = e;
+        n++;
+    }
+    CHECK(n == 24);
+    for (p = 0; p < n; p++) {
+        struct kmem_block b[8];
+        int count = 4;
+
+        for (i = 0; i < 4; i++) {
+            b[i].addr = 0x00100000u + (uint32_t)i * 0x100u;
+            b[i].size = 0x100u;
+            b[i].free = 0;
+        }
+        for (i = 0; i < 4; i++) {
+            CHECK(kmem_heap_free(b, &count, 0x00100000u + (uint32_t)perm[p][i] * 0x100u) == 1);
+            CHECK(no_empty_slots(b, count));
+            CHECK(blocks_ordered(b, count));
+        }
+        CHECK(count == 1);
+        CHECK(b[0].addr == 0x00100000u && b[0].size == 0x400u && b[0].free);
+    }
+}
+
 int main(void)
 {
     const char *v = getenv("KMEM_TEST_AS_LEGACY");
@@ -734,6 +858,11 @@ int main(void)
     test_vm_release_returns_the_region();
     test_vm_base_zero_and_bad_type();
     test_vm_region_table_full();
+    test_heap_free_merges_the_review_scenario();
+    test_heap_free_between_two_free_blocks();
+    test_heap_free_does_not_merge_across_a_gap_or_a_live_block();
+    test_heap_free_rejects_unknown_and_double_free();
+    test_heap_free_any_order_leaves_no_placeholders();
 
     printf("kmem_test: %d checks, %d failed%s\n", g_checks, g_failures,
            g_legacy ? " (legacy behaviour)" : "");

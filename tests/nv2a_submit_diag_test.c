@@ -523,6 +523,149 @@ static void test_override_minus_one_reads_environment(void)
     CHECK(!nv2a_admit_unknown_enabled(), "override(-1) with the variable unset is enabled");
 }
 
+/* ── kick observer and stalled-walk retry ────────────────────────────── */
+
+static unsigned g_kicks, g_commits;
+
+static void observer(int event)
+{
+    if (event == NV2A_KICK) ++g_kicks;
+    else if (event == NV2A_COMMIT) ++g_commits;
+}
+
+static void observer_reset(void)
+{
+    g_kicks = g_commits = 0;
+    nv2a_set_kick_observer(observer);
+}
+
+#define H_LATE    0x00000010u   /* bound into RAMHT only after a rejection */
+#define INST_LATE 0x1030u
+
+static void test_observer_counts_kicks_and_commits(void)
+{
+    NV2AState *d = fresh();
+    Pb pb;
+    unsigned i;
+
+    observer_reset();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    kick(d, pb.start, pb.at);           /* GET write: not a kick */
+    for (i = 1; i < 5; ++i) {
+        pb_method(&pb, 0, 0x1760u, 0x00002042u);
+        kick_put(d, pb.at);
+    }
+    CHECK(g_kicks == 5, "kicks %u, want 5", g_kicks);
+    CHECK(g_commits == 5, "commits %u, want 5", g_commits);
+
+    pb_method(&pb, 0, UNKNOWN_NV097, 0);
+    kick_put(d, pb.at);
+    CHECK(g_kicks == 6, "rejected submit: kicks %u, want 6", g_kicks);
+    CHECK(g_commits == 5, "rejected submit committed (%u)", g_commits);
+
+    nv2a_set_kick_observer(NULL);
+    pb_begin(&pb, PB_BASE + 0x200u);
+    pb_method(&pb, 0, 0x1760u, 0x00002042u);
+    kick(d, pb.start, pb.at);
+    CHECK(g_kicks == 6 && g_commits == 5, "a cleared observer was still called");
+}
+
+static void test_retry_with_nothing_rejected(void)
+{
+    NV2AState *d = fresh();
+    Pb pb;
+    const char *log;
+
+    observer_reset();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    kick(d, pb.start, pb.at);
+    g_kicks = g_commits = 0;
+
+    cap_begin();
+    CHECK(!nv2a_retry_stalled_walk(d), "retry walked with nothing rejected");
+    log = cap_end();
+    CHECK(g_kicks == 0 && g_commits == 0, "retry with nothing rejected called the observer");
+    CHECK(count_of(log, "[PFIFO] ") == 0, "retry with nothing rejected logged:\n%s", log);
+    nv2a_set_kick_observer(NULL);
+}
+
+/* A rejection that becomes valid without a PUT write: the handle is bound
+ * into RAMHT afterwards. */
+static void test_retry_recovers_after_ramht_write(void)
+{
+    NV2AState *d = fresh();
+    Pb pb;
+    const char *log;
+
+    observer_reset();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_LATE);
+    pb_method(&pb, 0, 0x1760u, 0x00002042u);
+    kick(d, pb.start, pb.at);
+    CHECK(strcmp(diag(d), "invalid_handle") == 0, "diag %s", diag(d));
+    CHECK(g_nv2a_submit_state.consecutive_rejections == 1, "consecutive %u",
+          g_nv2a_submit_state.consecutive_rejections);
+    CHECK(g_kicks == 1 && g_commits == 0, "kicks %u commits %u", g_kicks, g_commits);
+
+    /* Still unbound: a retry walks again, fails again, and does not commit. */
+    cap_begin();
+    CHECK(!nv2a_retry_stalled_walk(d), "retry committed with the handle still missing");
+    log = cap_end();
+    CHECK(g_commits == 0 && g_kicks == 1, "failed retry: kicks %u commits %u", g_kicks, g_commits);
+    CHECK(g_nv2a_submit_state.consecutive_rejections == 2,
+          "a retried rejection is counted (consecutive %u)",
+          g_nv2a_submit_state.consecutive_rejections);
+    CHECK(count_of(log, "[PFIFO] recovered") == 0, "recovered while still stuck");
+
+    ramht_insert(H_LATE, INST_LATE);
+    wr32(g_ramin, INST_LATE, 0x97u);
+    cap_begin();
+    CHECK(nv2a_retry_stalled_walk(d), "retry did not commit once the handle existed (%s)", diag(d));
+    log = cap_end();
+    CHECK(get_ptr(d) == pb.at, "retry left GET at %08X, want %08X", get_ptr(d), pb.at);
+    CHECK(g_commits == 1, "commits %u, want 1", g_commits);
+    CHECK(g_kicks == 1, "retry reported a kick (%u)", g_kicks);
+    CHECK(g_nv2a_submit_state.consecutive_rejections == 0, "consecutive %u after retry",
+          g_nv2a_submit_state.consecutive_rejections);
+    CHECK(count_of(log, "[PFIFO] recovered after ") == 1, "recovered line missing:\n%s", log);
+
+    CHECK(!nv2a_retry_stalled_walk(d), "retry walked again after recovery");
+    CHECK(g_commits == 1, "second retry committed");
+    nv2a_set_kick_observer(NULL);
+}
+
+/* The same, repaired by patching the bad method word in the pushbuffer. */
+static void test_retry_recovers_after_pushbuffer_patch(void)
+{
+    NV2AState *d = fresh();
+    Pb pb;
+    uint32_t bad_at;
+    const char *log;
+
+    observer_reset();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    bad_at = pb.at;
+    pb_method(&pb, 0, UNKNOWN_NV097, 0);
+    kick(d, pb.start, pb.at);
+    CHECK(g_nv2a_submit_state.consecutive_rejections == 1, "consecutive %u",
+          g_nv2a_submit_state.consecutive_rejections);
+
+    wr32(g_window, bad_at, hdr(0, 0x1760u, 1));
+    wr32(g_window, bad_at + 4, 0x00002042u);
+    cap_begin();
+    CHECK(nv2a_retry_stalled_walk(d), "retry did not commit the patched stream (%s)", diag(d));
+    log = cap_end();
+    CHECK(get_ptr(d) == pb.at, "GET %08X, want %08X", get_ptr(d), pb.at);
+    CHECK(g_commits == 1 && g_kicks == 1, "kicks %u commits %u", g_kicks, g_commits);
+    CHECK(count_of(log, "[PFIFO] recovered after ") == 1, "recovered line missing:\n%s", log);
+    CHECK(g_nv2a_submit_state.consecutive_rejections == 0, "consecutive %u",
+          g_nv2a_submit_state.consecutive_rejections);
+    nv2a_set_kick_observer(NULL);
+}
+
 int main(void)
 {
     /* Start from a known environment whatever the caller exported. */
@@ -534,6 +677,10 @@ int main(void)
     test_admit_unknown_on();
     test_admit_unknown_boundaries();
     test_override_minus_one_reads_environment();
+    test_observer_counts_kicks_and_commits();
+    test_retry_with_nothing_rejected();
+    test_retry_recovers_after_ramht_write();
+    test_retry_recovers_after_pushbuffer_patch();
 
     if (g_failures) {
         fprintf(stderr, "nv2a_submit_diag_test: %d failure(s)\n", g_failures);

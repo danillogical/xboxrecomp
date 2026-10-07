@@ -1032,6 +1032,20 @@ void nv2a_set_commit_consumer(nv2a_commit_consumer_fn fn)
     g_commit_consumer = fn;
 }
 
+/* The registered kick observer, or NULL; same registration rule as above. */
+static nv2a_kick_observer_fn volatile g_kick_observer;
+
+void nv2a_set_kick_observer(nv2a_kick_observer_fn fn)
+{
+    g_kick_observer = fn;
+}
+
+static void kick_observer_notify(int event)
+{
+    nv2a_kick_observer_fn fn = g_kick_observer;
+    if (fn) fn(event);
+}
+
 /* Both capacities must hold a whole submission's word budget: a submission is
  * staged in full before any of it is committed, and every staged method
  * consumes exactly one parameter word, so a walk that stays inside its word
@@ -1802,6 +1816,10 @@ done:
         InterlockedIncrement(&ss->generation);
     }
     qemu_mutex_unlock(&d->pfifo.lock);
+    /* Outside the PFIFO lock. A walk that stopped at a hold has not consumed
+     * the kick yet; the walk that resumes it to PUT reports the commit. */
+    if (ok && stop == NV2A_SUBMIT_OK)
+        kick_observer_notify(NV2A_COMMIT);
     if (ok && stop == NV2A_SUBMIT_SOFTWARE_METHOD)
         nv2a_update_irq(d);
     return ok;
@@ -1873,6 +1891,27 @@ static void nv2a_log_submit_result(NV2AState *d)
     }
 }
 
+/* Log a walk triggered by a PUT write, or retried in its place. */
+static void log_kicked_walk(NV2AState *d)
+{
+    /* Per-submit diagnostic. GET only moves on success, so when it stays put
+     * the reason is here and nowhere else -- the walk's own diag, plus the
+     * exact packet that stopped it. Kept in the model rather than re-added
+     * per investigation, because "why did the ring not drain" is the question
+     * this model gets asked most often. */
+    static unsigned long submits;
+    if (submits < 64)
+        fprintf(stderr, "  [PFIFO] submit #%lu diag=%s get=%08X put=%08X"
+                " method=%03X subch=%u param=%08X at=%08X\n",
+                submits, nv2a_submit_diagnostic(d->pfifo.submit_diag),
+                d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET],
+                d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT],
+                d->pfifo.submit_diag_method, d->pfifo.submit_diag_subchannel,
+                d->pfifo.submit_diag_param, d->pfifo.submit_diag_get);
+    submits++;
+    nv2a_log_submit_result(d);
+}
+
 static void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;
@@ -1894,26 +1933,24 @@ static void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int siz
         qemu_mutex_lock(&d->pfifo.lock);
         d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = (uint32_t)val;
         qemu_mutex_unlock(&d->pfifo.lock);
+        kick_observer_notify(NV2A_KICK);
         nv2a_submit_pending(d);
-        /* Per-submit diagnostic. GET only moves on success, so when it stays put
-         * the reason is here and nowhere else -- the walk's own diag, plus the
-         * exact packet that stopped it. Kept in the model rather than re-added
-         * per investigation, because "why did the ring not drain" is the question
-         * this model gets asked most often. */
-        {
-            static unsigned long submits;
-            if (submits < 64)
-                fprintf(stderr, "  [PFIFO] submit #%lu diag=%s get=%08X put=%08X"
-                        " method=%03X subch=%u param=%08X at=%08X\n",
-                        submits, nv2a_submit_diagnostic(d->pfifo.submit_diag),
-                        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET],
-                        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT],
-                        d->pfifo.submit_diag_method, d->pfifo.submit_diag_subchannel,
-                        d->pfifo.submit_diag_param, d->pfifo.submit_diag_get);
-            submits++;
-        }
-        nv2a_log_submit_result(d);
+        log_kicked_walk(d);
     }
+}
+
+bool nv2a_retry_stalled_walk(NV2AState *d)
+{
+    uint32_t stalled;
+    bool committed;
+    if (!d) return false;
+    qemu_mutex_lock(&d->pfifo.lock);
+    stalled = g_nv2a_submit_state.consecutive_rejections;
+    qemu_mutex_unlock(&d->pfifo.lock);
+    if (!stalled) return false;
+    committed = nv2a_submit_pending(d);
+    log_kicked_walk(d);
+    return committed;
 }
 
 uint64_t pfifo_read(void *opaque, hwaddr addr, unsigned int size)

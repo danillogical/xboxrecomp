@@ -35,6 +35,7 @@
  * Morton order, not a second one that can disagree with it. */
 #include "../d3d/d3d8_swizzle.h"
 #include "nv2a_backend.h"
+#include "nv2a_present_track.h"
 
 /* The commit seam's signature only. Including nv2a_state.h here would drag in
  * nv2a_regs.h, whose NV097_* names collide with this file's own method-number
@@ -309,6 +310,9 @@ static struct {
     int      composite_set;
     uint32_t batches_ffp;
 } s_gpu;
+
+/* Which colour surface a flip presents; see nv2a_present_track.h. */
+static Nv2aPresentTrack s_present;
 
 /* Unhandled methods, ranked. The interesting output is not that something was
  * skipped but which things dominate, because that is the order to implement
@@ -1679,6 +1683,7 @@ static void raster_triangle(const float a[2], const float b[2],
     }
     s_gpu.tris_drawn++;
     s_gpu.drawn_offset = s_gpu.color_offset;
+    present_track_drawn(&s_present, s_gpu.color_offset);
 }
 
 /* Attribute 3 is diffuse colour in every NV2A layout that sets one. Absent it,
@@ -2148,6 +2153,7 @@ static void raster_batch(void)
             s_gpu.batches_ffp++;
         backend_batch();
         s_gpu.drawn_offset = s_gpu.color_offset;
+        present_track_drawn(&s_present, s_gpu.color_offset);
         return;
     }
     if (batch_is_ffp()) {
@@ -2715,6 +2721,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.blend_dfactor = param;
         break;
     case NV097_CLEAR_SURFACE:
+        if (param & 0xF0)
+            present_track_targeted(&s_present, s_gpu.color_offset);
         clear_surface(param);
         break;
 
@@ -2725,6 +2733,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.inline_count = 0;
             s_gpu.imm_count = 0;
         } else {
+            present_track_targeted(&s_present, s_gpu.color_offset);
             /* Three ways a batch can have arrived, and only one is in use at
              * a time: vertices completed by SET_VERTEX4F, a payload written
              * with INLINE_ARRAY, or indices into the title's own arrays. */
@@ -2838,8 +2847,18 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * writing. */
         if (s_gpu.pitch) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
-            uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset
-                                               : s_gpu.color_offset;
+            int used_targeted = 0;
+            uint32_t done = present_track_flip(&s_present, s_gpu.color_offset,
+                                               &used_targeted);
+            if (used_targeted) {
+                static unsigned n_targeted;
+                if (n_targeted++ < 8) {
+                    fprintf(stderr, "  [FBPRESENT] presenting targeted 0x%08X"
+                            " (no drawn batch this frame; last drawn 0x%08X)\n",
+                            done, s_gpu.drawn_offset);
+                    fflush(stderr);
+                }
+            }
             if (done) {
                 xbox_FramebufferWindowSet(dma_resolve(done), s_gpu.pitch);
                 xbox_FramebufferWindowPresent(dma_resolve(done), s_gpu.pitch);

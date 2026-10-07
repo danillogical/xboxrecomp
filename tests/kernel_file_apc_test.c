@@ -17,6 +17,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* An alertable wait or delay that delivered APCs returns this. */
+#ifndef STATUS_USER_APC
+#define STATUS_USER_APC ((NTSTATUS)0x000000C0L)
+#endif
+
+#define EVENT_VA 0x00101000u
+
 typedef void (*recomp_func_t)(void);
 
 recomp_func_t recomp_lookup(uint32_t xbox_va) { (void)xbox_va; return NULL; }
@@ -87,6 +94,19 @@ static void test_apc(void)
     g_esp += 4;
 }
 
+/* A notification event's DISPATCHER_HEADER, in place in guest RAM. */
+static void init_header(uint32_t va, uint8_t type, LONG signaled)
+{
+    uint8_t *p = ram + (va - CANONICAL_LO);
+    uint32_t list = va + 8u;
+    memset(p, 0, 16);
+    p[0] = type;
+    p[2] = 4;
+    *(LONG *)(p + 4) = signaled;
+    *(uint32_t *)(p + 8) = list;
+    *(uint32_t *)(p + 12) = list;
+}
+
 static void queue(uint32_t ctx, uint32_t ios)
 {
     xbox_test_complete_file_io(0, APC_VA, ctx, ios);
@@ -97,6 +117,7 @@ int main(void)
     int ok = 1;
     int before;
     int i;
+    ULONGLONG t0;
     NTSTATUS st;
 
     ram = (uint8_t *)calloc(1, RAM_SIZE);
@@ -115,7 +136,7 @@ int main(void)
     ok &= check(hits == 0, "non-alertable delay does not run the APC");
 
     st = xbox_test_bridge_KeDelayExecutionThread(TRUE, 0);
-    ok &= check(st == STATUS_SUCCESS, "alertable zero delay returns success");
+    ok &= check(st == STATUS_USER_APC, "alertable delay that delivered an APC returns STATUS_USER_APC");
     ok &= check(xbox_test_file_apc_pending() == 0, "alertable delay drains the queue");
     ok &= check(hits == 1, "alertable delay runs the APC once");
     ok &= check(hits == 1 && hit_ctx[0] == 0x11u && hit_ios[0] == 0x22u,
@@ -131,7 +152,7 @@ int main(void)
     queue(0xB2u, 0xB200u);
     ok &= check(xbox_test_file_apc_pending() == 2, "two APCs stay queued");
     st = xbox_test_bridge_KeDelayExecutionThread(TRUE, 0);
-    ok &= check(st == STATUS_SUCCESS && hits == before + 2, "both APCs run");
+    ok &= check(st == STATUS_USER_APC && hits == before + 2, "both APCs run");
     ok &= check(hit_ctx[before] == 0xB1u && hit_ctx[before + 1] == 0xB2u,
                 "APCs run in queue order");
     ok &= check(xbox_test_file_apc_pending() == 0, "the batch is empty afterwards");
@@ -139,11 +160,11 @@ int main(void)
     before = hits;
     queue(0xA1u, 0xA100u);
     st = xbox_test_bridge_KeDelayExecutionThread(TRUE, 0);
-    ok &= check(st == STATUS_SUCCESS && hits == before + 1 && hit_ctx[before] == 0xA1u,
+    ok &= check(st == STATUS_USER_APC && hits == before + 1 && hit_ctx[before] == 0xA1u,
                 "an APC queued by an APC does not run in the same drain");
     ok &= check(xbox_test_file_apc_pending() == 1, "the follow-up stays pending");
     st = xbox_test_bridge_KeDelayExecutionThread(TRUE, 0);
-    ok &= check(st == STATUS_SUCCESS && hits == before + 2 && hit_ctx[before + 1] == 0xA2u
+    ok &= check(st == STATUS_USER_APC && hits == before + 2 && hit_ctx[before + 1] == 0xA2u
                 && hit_ios[before + 1] == 0xA2A2u,
                 "the next alertable delay runs the follow-up");
     ok &= check(xbox_test_file_apc_pending() == 0, "the follow-up is gone");
@@ -158,7 +179,7 @@ int main(void)
                 "the overflow APC runs inline");
     ok &= check(xbox_test_file_apc_pending() == 32, "the queued batch is still there");
     st = xbox_test_bridge_KeDelayExecutionThread(TRUE, 0);
-    ok &= check(st == STATUS_SUCCESS && hits == before + 33
+    ok &= check(st == STATUS_USER_APC && hits == before + 33
                 && xbox_test_file_apc_pending() == 0,
                 "the alertable delay runs the queued batch");
     ok &= check(g_esp == TEST_STACK, "overflow delivery restores the guest stack");
@@ -174,9 +195,63 @@ int main(void)
     ok &= check(xbox_test_file_apc_pending() == 1, "dispatcher APC stays queued");
     ok &= check(hits == before + 33, "queuing the dispatcher does not run the stub");
     st = xbox_test_bridge_KeDelayExecutionThread(TRUE, 0);
-    ok &= check(st == STATUS_SUCCESS, "dispatcher APC delay succeeds");
+    ok &= check(st == STATUS_USER_APC, "dispatcher APC delay reports the delivery");
     ok &= check(xbox_test_file_apc_pending() == 0, "dispatcher APC delay drains it");
     ok &= check(g_esp == TEST_STACK, "dispatcher APC delivery restores the guest stack");
+
+    /* ── Delivery ends the wait ─────────────────────────────────────── */
+    xbox_test_set_file_apc_routine(APC_VA, test_apc);
+    g_esp = TEST_STACK;
+
+    /* An alertable delay with nothing queued is an ordinary delay. */
+    t0 = GetTickCount64();
+    st = xbox_test_bridge_KeDelayExecutionThread(TRUE, 30);
+    ok &= check(st == STATUS_SUCCESS, "alertable delay with no APC returns STATUS_SUCCESS");
+    ok &= check(GetTickCount64() - t0 >= 15, "alertable delay with no APC still sleeps");
+
+    /* A queued APC ends a long alertable delay at once. */
+    before = hits;
+    queue(0xC1u, 0xC100u);
+    t0 = GetTickCount64();
+    st = xbox_test_bridge_KeDelayExecutionThread(TRUE, 2000);
+    ok &= check(st == STATUS_USER_APC, "2 s alertable delay with an APC returns STATUS_USER_APC");
+    ok &= check(GetTickCount64() - t0 < 1000, "the APC ended the 2 s delay promptly");
+    ok &= check(hits == before + 1 && xbox_test_file_apc_pending() == 0,
+                "the delay ran the queued APC");
+
+    /* Unsignalled event, APC queued, long timeout: the APC wins. */
+    init_header(EVENT_VA, (uint8_t)XboxNotificationEvent, 1);
+    xbox_test_bridge_KeResetEvent(EVENT_VA);
+    before = hits;
+    queue(0xD1u, 0xD100u);
+    t0 = GetTickCount64();
+    st = xbox_test_bridge_KeWaitForSingleObject(EVENT_VA, TRUE, 10000);
+    ok &= check(st == STATUS_USER_APC, "alertable wait on an unsignalled event returns STATUS_USER_APC");
+    ok &= check(GetTickCount64() - t0 < 2000, "the APC ended the 10 s wait promptly");
+    ok &= check(hits == before + 1 && xbox_test_file_apc_pending() == 0,
+                "the wait ran the queued APC");
+
+    /* Signalled event, APC queued: the object's status wins and the APC waits. */
+    xbox_test_bridge_KeSetEvent(EVENT_VA, 1, FALSE);
+    before = hits;
+    queue(0xD2u, 0xD200u);
+    st = xbox_test_bridge_KeWaitForSingleObject(EVENT_VA, TRUE, 10000);
+    ok &= check(st == STATUS_SUCCESS, "alertable wait on a signalled event returns STATUS_SUCCESS");
+    ok &= check(xbox_test_file_apc_pending() == 1, "the APC is still queued after a signalled wait");
+    ok &= check(hits == before, "a signalled wait does not run the APC");
+
+    /* A non-alertable wait never drains. */
+    xbox_test_bridge_KeResetEvent(EVENT_VA);
+    st = xbox_test_bridge_KeWaitForSingleObject(EVENT_VA, FALSE, 30);
+    ok &= check(st == STATUS_TIMEOUT, "non-alertable wait times out");
+    ok &= check(xbox_test_file_apc_pending() == 1 && hits == before,
+                "a non-alertable wait leaves the APC alone");
+
+    /* Clean up: the next alertable delay delivers it. */
+    st = xbox_test_bridge_KeDelayExecutionThread(TRUE, 0);
+    ok &= check(st == STATUS_USER_APC && hits == before + 1 && xbox_test_file_apc_pending() == 0,
+                "the leftover APC is delivered by a later alertable delay");
+    ok &= check(g_esp == TEST_STACK, "waits restore the guest stack");
 
     free(ram);
     printf("%s: %u file-APC checks passed\n", ok ? "PASS" : "FAIL", checks);

@@ -417,6 +417,32 @@ typedef void (*nv2a_commit_consumer_fn)(uint32_t subchannel, uint32_t class_id,
                                         uint32_t method, uint32_t param);
 void nv2a_set_commit_consumer(nv2a_commit_consumer_fn fn);
 
+/* Kick observer: told when the guest writes PUT and when a walk consumes it.
+ *
+ *  - NV2A_KICK: every NV_USER_DMA_PUT write, after PUT is stored and before
+ *    the walk it triggers.
+ *  - NV2A_COMMIT: after every walk that committed and reached PUT, from any
+ *    caller (a PUT write, a resumed hold, nv2a_retry_stalled_walk). A rejected
+ *    walk, a walk that stops at a hold, and a hold that is not yet released
+ *    report nothing.
+ *
+ * Called on the walking thread with the PFIFO lock released (in the runtime
+ * the MMIO owner lock is held), so the observer must be lock-free and must not
+ * call back into the model. Same registration rule as the commit consumer:
+ * set it before the guest can submit; NULL clears it. */
+enum { NV2A_KICK = 1, NV2A_COMMIT = 2 };
+typedef void (*nv2a_kick_observer_fn)(int event);
+void nv2a_set_kick_observer(nv2a_kick_observer_fn fn);
+
+/* Re-walk a stalled ring without a PUT write. Only when the last walk was
+ * rejected (g_nv2a_submit_state.consecutive_rejections > 0): walks GET..PUT
+ * and logs exactly as a PUT-triggered walk, and returns true when it
+ * committed. Otherwise walks nothing and returns false. Reports no NV2A_KICK.
+ * A rejection can clear without a new kick (a RAMHT entry bound, a pushbuffer
+ * word patched), and D3D's ring-space wait never kicks, so something must
+ * retry; the MMIO hook's PTIMER thread does, under the owner lock. */
+bool nv2a_retry_stalled_walk(NV2AState *d);
+
 /* NV097 action methods: the semaphore release, and the software-method trap
  * and FLIP_STALL hold. Modelled but not admitted as hardware causes, so they
  * run only when RECOMP_NV2A_ACTIONS is exactly "1" (read once). */

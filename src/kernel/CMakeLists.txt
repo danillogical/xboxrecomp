@@ -155,3 +155,21 @@ if(BUILD_TESTING)
     add_test(NAME xbox_kmem COMMAND xbox_kmem_test)
     set_tests_properties(xbox_kmem PROPERTIES TIMEOUT 20)
 endif()
+
+# Header-only decisions: the fence value a kick publishes and the colour
+# surface a flip presents. No host dependency, so they run everywhere.
+if(BUILD_TESTING)
+    add_executable(fence_snapshot_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/fence_snapshot_test.c
+    )
+    target_include_directories(fence_snapshot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME fence_snapshot COMMAND fence_snapshot_test)
+    set_tests_properties(fence_snapshot PROPERTIES TIMEOUT 20)
+
+    add_executable(nv2a_present_track_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/nv2a_present_track_test.c
+    )
+    target_include_directories(nv2a_present_track_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME nv2a_present_track COMMAND nv2a_present_track_test)
+    set_tests_properties(nv2a_present_track PROPERTIES TIMEOUT 20)
+endif()
