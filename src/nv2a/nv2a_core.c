@@ -1489,6 +1489,93 @@ static bool walk_hold_released(NV2AState *d)
     }
 }
 
+/* One emitter for BOTH budget exits, and a transcript that survives the log cap.
+ *
+ * The walk can exhaust its budget in two places: at a packet HEADER (the
+ * word/packet caps checked at the top of the loop) and inside a packet's
+ * PARAMETERS (the word cap checked in the `count` branch). Only the header path
+ * used to print anything, so a parameter-heavy stream -- the case that actually
+ * happened, and the case that matters -- exhausted the budget silently. That is
+ * why the earlier investigation could only infer "inside a packet" from the
+ * ABSENCE of a dump.
+ *
+ * This latches the first stop into NV2AState, so it survives the 64-line submit
+ * cap and any stderr filtering, and prints the same shape from both paths. The
+ * trajectory records the words ACTUALLY consumed in order; the old
+ * `trace[words & 31]` array was written only at headers and indexed by total
+ * words, so on a parameter-heavy stream its slots were sparse, stale and out of
+ * chronological order -- it could not distinguish a long valid stream from a
+ * cyclic walk.
+ *
+ * `local_pc` is the address being consumed at the limit. It is NOT
+ * submit_diag_get: that is the rollback origin, where the stream is retried
+ * from, and reporting it as the failure point is a known trap. */
+static void submit_budget_stop(NV2AState *d, uint32_t get, uint32_t put,
+                               uint32_t begin, uint32_t end, uint32_t pc,
+                               uint32_t words, uint32_t packets,
+                               uint32_t count, uint32_t method, uint32_t ret,
+                               uint32_t local_pc, bool in_param,
+                               bool at_packet_limit)
+{
+    bool first = d->pfifo.budget_stops == 0;
+    ++d->pfifo.budget_stops;
+    if (!first) return;                       /* latch the FIRST stop only */
+
+    d->pfifo.budget_local_pc = local_pc;
+    d->pfifo.budget_words = words;
+    d->pfifo.budget_packets = packets;
+    d->pfifo.budget_count = count;
+    d->pfifo.budget_method = method;
+    d->pfifo.budget_ret = ret;
+    d->pfifo.budget_get = get;
+    d->pfifo.budget_put = put;
+    d->pfifo.budget_in_param = in_param;
+    d->pfifo.budget_at_packet_limit = at_packet_limit;
+
+    fprintf(stderr, "  [PFIFO] budget_exhausted get=%08X put=%08X begin=%08X"
+            " end=%08X words=%u packets=%u pc=%08X local_pc=%08X%s\n",
+            get, put, begin, end, words, packets, pc, local_pc,
+            at_packet_limit ? " LIMIT=packets(1024)" : " LIMIT=words(4096)");
+    fprintf(stderr, "          %s; count=%u method=%04X ret=%08X\n",
+            in_param ? "stopped INSIDE a packet's parameters"
+                     : "stopped at a packet header",
+            count, method, ret);
+    if (count) {
+        fprintf(stderr, "          the straddling packet: method=%04X count=%u"
+                " (%u parameter word(s) still to read)\n", method, count, count);
+    }
+    fprintf(stderr, "          last %u consumed words (address:word):",
+            d->pfifo.budget_trace_count);
+    for (uint32_t i = 0; i < d->pfifo.budget_trace_count; ++i) {
+        if (i % 4u == 0u) fprintf(stderr, "\n            ");
+        fprintf(stderr, "%08X:%08X ", d->pfifo.budget_trace_va[i],
+                d->pfifo.budget_trace_word[i]);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+}
+
+/* Record one consumed word in the rolling trajectory. Called on EVERY word the
+ * walk consumes (header and parameter), so the trace is chronological and
+ * dense -- which is what makes it usable as a cyclic-walk discriminator. */
+static void submit_trace_word(NV2AState *d, uint32_t va, uint32_t word)
+{
+    uint32_t i = d->pfifo.budget_trace_count;
+    if (i < 64) {
+        d->pfifo.budget_trace_va[i] = va;
+        d->pfifo.budget_trace_word[i] = word;
+        d->pfifo.budget_trace_count = i + 1;
+        return;
+    }
+    /* Full: shift down by one so the newest 64 are always present. */
+    memmove(&d->pfifo.budget_trace_va[0], &d->pfifo.budget_trace_va[1],
+            63 * sizeof(d->pfifo.budget_trace_va[0]));
+    memmove(&d->pfifo.budget_trace_word[0], &d->pfifo.budget_trace_word[1],
+            63 * sizeof(d->pfifo.budget_trace_word[0]));
+    d->pfifo.budget_trace_va[63] = va;
+    d->pfifo.budget_trace_word[63] = word;
+}
+
 /* The fence mirror (xbox_memory_layout.c) writes the word D3D's fence wait
  * polls, which in JSRF is the word the semaphore release targets. Two writers
  * of one word would fight without either noticing, so the mirror reports each
@@ -1514,7 +1601,6 @@ bool nv2a_submit_pending(NV2AState *d)
 {
     uint32_t get, put, pc, ret = 0, words = 0, packets = 0;
     uint32_t seen[1024]; unsigned seen_count = 0;
-    uint32_t trace[32] = { 0 };   /* ring of recent walk addresses, for the budget dump */
     uint32_t staged_count = 0;
     uint32_t staged_class[8], staged_object[8];
     bool ok = true;
@@ -1543,6 +1629,13 @@ bool nv2a_submit_pending(NV2AState *d)
      * (NV2A_SUBMIT_MAX_WORDS), and the submission is still committed
      * all-or-nothing. */
     d->pfifo.sink_count = 0;
+    /* The budget transcript describes ONE walk. budget_stops is deliberately NOT
+     * cleared here: it latches the FIRST stop across the run, which is the event
+     * of interest, so a later retry cannot overwrite it. The trace is only
+     * cleared while no stop has been latched, so the latched transcript survives
+     * the retries that follow a rejection -- otherwise an external reader (a
+     * test, or the run report) would find the fields already wiped. */
+    if (d->pfifo.budget_stops == 0) d->pfifo.budget_trace_count = 0;
     memcpy(staged_class, d->pfifo.binding_class, sizeof(staged_class));
     memcpy(staged_object, d->pfifo.binding_object, sizeof(staged_object));
     get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
@@ -1575,8 +1668,14 @@ bool nv2a_submit_pending(NV2AState *d)
         uint32_t h;
         if (count) {
             uint32_t param;
-            if (words >= NV2A_SUBMIT_MAX_WORDS) { d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false; goto done; }
+            if (words >= NV2A_SUBMIT_MAX_WORDS) {
+                d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false;
+                submit_budget_stop(d, get, put, begin, end, pc, words, packets,
+                                   count, method, ret, pc, true, false);
+                goto done;
+            }
             if (pc == put || !submit_read_word(d, pc, &param)) { d->pfifo.submit_diag = pc == put ? NV2A_SUBMIT_TRUNCATED : NV2A_SUBMIT_UNREADABLE; ok = false; goto done; }
+            submit_trace_word(d, pc, param);
             pc = submit_advance(d, pc); ++words;
             /* Production SET_OBJECT walks RAMHT in claimed PRAMIN.
              * The fixture seam stays opt-in for isolated 11b4b2 tests. */
@@ -1659,30 +1758,17 @@ bool nv2a_submit_pending(NV2AState *d)
             continue;
         }
         address = pc;
-        trace[words & 31u] = address;
         if (words >= NV2A_SUBMIT_MAX_WORDS || packets >= 1024) {
             d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false;
-            /* A jump-free walk consumes at most PUT-GET words: it only ever
-             * advances, and a packet header's parameters are counted as they
-             * are consumed. So a jump-free walk that reaches the word budget
-             * was already longer than the budget, and reaching it with a cyclic
-             * jump or call trace means the walk never left the ring. The
-             * 32-address dump below is what tells those two apart. */
-            fprintf(stderr, "  [PFIFO] budget_exhausted get=%08X put=%08X"
-                    " begin=%08X end=%08X words=%u packets=%u pc=%08X\n",
-                    get, put, begin, end, words, packets, pc);
-            fprintf(stderr, "          last 32 visit addresses:");
-            for (unsigned i = 0; i < 32; ++i) {
-                if (i % 8u == 0u) fprintf(stderr, "\n            ");
-                fprintf(stderr, "%08X ", trace[(words - 32u + i) & 31u]);
-            }
-            fprintf(stderr, "\n");
-            fflush(stderr);
+            submit_budget_stop(d, get, put, begin, end, pc, words, packets,
+                               count, method, ret, address, false,
+                               packets >= 1024);
             break;
         }
         for (unsigned i = 0; i < seen_count; ++i) if (seen[i * 2] == pc && seen[i * 2 + 1] == ret) { d->pfifo.submit_diag = NV2A_SUBMIT_LOOP; ok = false; goto done; }
         if (seen_count < 512) { seen[seen_count * 2] = pc; seen[seen_count * 2 + 1] = ret; ++seen_count; }
         if (!submit_read_word(d, pc, &h)) { d->pfifo.submit_diag = NV2A_SUBMIT_UNREADABLE; ok = false; break; }
+        submit_trace_word(d, pc, h);
         pc = submit_advance(d, pc); ++words; ++packets;
         if ((h & 0xe0000003u) == 0x20000000u || (h & 3u) == 1u || (h & 3u) == 2u || h == 0x00020000u) {
             uint32_t target;
@@ -1803,6 +1889,17 @@ done:
         ss->subchannel = d->pfifo.submit_diag_subchannel;
         ss->param = d->pfifo.submit_diag_param;
         ss->at = d->pfifo.submit_diag_get;
+        /* The latched FIRST budget stop, republished every walk so a dump taken
+         * at any later time still sees it. It is never cleared by a retry. */
+        ss->budget_stops = d->pfifo.budget_stops;
+        ss->budget_local_pc = d->pfifo.budget_local_pc;
+        ss->budget_words = d->pfifo.budget_words;
+        ss->budget_packets = d->pfifo.budget_packets;
+        ss->budget_count = d->pfifo.budget_count;
+        ss->budget_method = d->pfifo.budget_method;
+        ss->budget_ret = d->pfifo.budget_ret;
+        ss->budget_in_param = d->pfifo.budget_in_param ? 1u : 0u;
+        ss->budget_at_packet_limit = d->pfifo.budget_at_packet_limit ? 1u : 0u;
         ss->get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
         ss->put = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
         if (ok) {

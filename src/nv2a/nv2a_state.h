@@ -193,6 +193,35 @@ typedef struct NV2AState {
          * a subchannel in place, so a mid-stream rebind would retro-label the
          * methods that came before it. */
         struct { uint32_t subchannel, class_id, method, param; } staged[NV2A_SUBMIT_MAX_WORDS];
+
+        /* The FIRST budget rejection's own transcript.
+         *
+         * Why this exists rather than relying on the log: the `[PFIFO] submit`
+         * lines stop after 64 walks, and the diagnostic dump is printed only on
+         * the HEADER path -- the parameter path (which is where an over-long
+         * packet exhausts the budget) printed nothing at all. So the one event
+         * that matters most for "why did the walk stop" was the least
+         * observable. These fields are latched once, on the first budget
+         * rejection, and are printed by a single emitter that BOTH paths call.
+         *
+         * `local_pc` is the address the walk was consuming when the limit fired.
+         * It is deliberately separate from submit_diag_get, which is the
+         * rollback origin (where the stream will be retried from) -- reporting
+         * that as the failure point is a known trap. */
+        uint32_t budget_stops;            /* how many budget rejections seen */
+        uint32_t budget_local_pc;         /* where the walk was at the limit */
+        uint32_t budget_words, budget_packets;
+        uint32_t budget_count, budget_method, budget_ret;
+        uint32_t budget_get, budget_put;
+        bool     budget_in_param;         /* limit fired mid-packet vs at a header */
+        bool     budget_at_packet_limit;  /* the 1024-packet cap, not the word cap */
+        /* A trajectory of the words actually consumed, in order, so a
+         * parameter-heavy stream is not misread as a header-only one. The old
+         * `trace[words & 31]` array was written only at headers and indexed by
+         * TOTAL words, so its slots were sparse, stale and out of order. */
+        uint32_t budget_trace_va[64];
+        uint32_t budget_trace_word[64];
+        uint32_t budget_trace_count;
     } pfifo;
 
     struct {
@@ -380,6 +409,20 @@ typedef struct NV2ASubmitState {
     uint32_t get, put;
     uint32_t successes, rejections, consecutive_rejections;
     uint32_t admitted_unknown;
+    /* The FIRST budget rejection's own transcript, latched so it survives both
+     * the 64-line submit log and any stderr filtering. A budget stop is the one
+     * event the log could not show when it happened inside a packet's
+     * parameters, because only the header path used to print. These fields make
+     * the stop readable from a dump after the run.
+     *
+     * `local_pc` is where the walk was consuming at the limit, which is NOT
+     * `at`: `at` is the rollback origin the stream is retried from. */
+    uint32_t budget_stops;
+    uint32_t budget_local_pc;
+    uint32_t budget_words, budget_packets;
+    uint32_t budget_count, budget_method, budget_ret;
+    uint32_t budget_in_param;        /* 1 = mid-packet, 0 = at a header */
+    uint32_t budget_at_packet_limit; /* 1 = the 1024-packet cap fired */
 } NV2ASubmitState;
 /* Exported on Windows so a dump and the linker map name it, like g_nv2a_mmio_snapshot. */
 #ifdef _WIN32
