@@ -24,8 +24,14 @@ static uint32_t g_pending_instance_size;
 NV2ASubmitState g_nv2a_submit_state;
 
 /* Log bookkeeping for the submit diagnostics; cleared with the state above. */
+/* One capacity for both the dedupe log and the pending witness queue, so the
+ * set of distinct unknown methods a walk can report is exactly the set it can
+ * remember; two constants could drift and silently truncate the witness. The
+ * walk's per-submission admitted[] is sized by it as well, because a single
+ * walk is what fills the queue. This is the bound on distinct (class, method)
+ * pairs reported: a submission with more is truncated here, never silently at
+ * a smaller per-walk limit. */
 #define NV2A_ADMIT_LOG_MAX  256
-#define NV2A_ADMIT_PENDING  16
 typedef struct { uint32_t class_id, method, param, at; } AdmitRecord;
 static uint32_t g_reject_lines;
 static uint32_t g_last_reject_diag;
@@ -33,7 +39,7 @@ static uint32_t g_logged_consecutive;
 static bool g_admit_banner;
 static AdmitRecord g_admit_seen[NV2A_ADMIT_LOG_MAX];
 static uint32_t g_admit_seen_count;
-static AdmitRecord g_admit_pending[NV2A_ADMIT_PENDING];
+static AdmitRecord g_admit_pending[NV2A_ADMIT_LOG_MAX];
 static uint32_t g_admit_pending_count;
 static int g_admit_unknown = -1;
 
@@ -1615,8 +1621,12 @@ bool nv2a_submit_pending(NV2AState *d)
     bool actions = nv2a_actions_enabled();
     uint32_t stop = NV2A_SUBMIT_OK;
     bool admit = nv2a_admit_unknown_enabled();
-    AdmitRecord admitted[NV2A_ADMIT_PENDING];
+    AdmitRecord admitted[NV2A_ADMIT_LOG_MAX];
+    /* `admitted_total` is the uncapped count for the whole walk; `admitted_count`
+     * is how many candidates this UNIT holds for the dedupe log. */
     uint32_t admitted_count = 0, admitted_total = 0;
+    /* Units committed by this walk, and the structural per-call word bound. */
+    uint32_t units = 0, unit_words_total = 0, unit_limit = 0;
     ActionStage st;
     if (!d) return false;
     qemu_mutex_lock(&d->pfifo.lock);
@@ -1630,12 +1640,15 @@ bool nv2a_submit_pending(NV2AState *d)
         d->pfifo.hold = NV2A_HOLD_NONE;
         action_stage_begin(d, &st);
     }
-    /* sink_count is cleared per submission, because the sink records the methods
-     * this submission walked. Its payload is written for diagnostics and tests
-     * and has no production reader; sink_count is the diagnostic/test seam. The
-     * staging area and the sink both cover the walk's whole word budget
-     * (NV2A_SUBMIT_MAX_WORDS), and the submission is still committed
-     * all-or-nothing. */
+    /* sink_count is cleared per UNIT, because the sink records the methods the
+     * current unit walked. Its payload is written for diagnostics and tests and
+     * has no production reader; sink_count is the diagnostic/test seam. The
+     * staging area and the sink both cover one unit's whole word budget
+     * (NV2A_SUBMIT_MAX_WORDS), and each unit is committed all-or-nothing. The
+     * unit loop below resets this again between units, which is REQUIRED: the
+     * commit loop writes sink[sink_count++], and across units the total staged
+     * can exceed the array, so without the reset a later unit would overflow
+     * sink[]. */
     d->pfifo.sink_count = 0;
     /* The budget transcript describes ONE walk. budget_stops is deliberately NOT
      * cleared here: it latches the FIRST stop across the run, which is the event
@@ -1672,11 +1685,42 @@ bool nv2a_submit_pending(NV2AState *d)
         ret = d->pfifo.carry_ret;
         if (count > NV2A_SUBMIT_MAX_WORDS) { d->pfifo.submit_diag = NV2A_SUBMIT_SINK_FULL; ok = false; goto done; }
     }
+    /* ── Unit loop: bounded prefix commit at WHOLE-PACKET boundaries ────────
+     *
+     * A submission can be longer than the staging capacity (4096 words), and
+     * real JSRF title kicks are: the title-transition kick is 5732 words. The
+     * walk therefore consumes the ring in UNITS, each ending at a packet
+     * header, each committed all-or-nothing. Atomicity is per unit, not per
+     * submission (compat ledger L40).
+     *
+     * The yield predicate is the WORD term only, and it is evaluated at a
+     * packet header where `count` is the incoming packet's parameter count:
+     *
+     *     words + 1 + count > NV2A_SUBMIT_MAX_WORDS
+     *
+     * A packet is at most 2047 parameters (an 11-bit field), so a unit that
+     * starts empty always fits at least one complete packet and the loop
+     * always advances. That is why NO in-packet carry is needed, and why a
+     * packet is never split -- the only case that could commit half a matrix.
+     *
+     * The packet term (1024) is deliberately NOT a yield: it stays a stop, so
+     * a stream of many tiny packets still rejects as it does today
+     * (tests/test_nv2a_contract.c pins exactly that for 1025 one-word
+     * packets, which is under the word budget and would otherwise accept).
+     *
+     * `units` counts committed units; `unit_words_total` is the structural
+     * cycle backstop that replaces the old "one walk <= 4096 words" cap: a
+     * call-free walk can only exceed the ring size by cycling. */
+    unit_limit = d->pfifo.pushbuffer_size / 4u;
+    if (!unit_limit) unit_limit = NV2A_SUBMIT_MAX_WORDS;
+    for (;;) {
+    uint32_t unit_words = 0;
+    bool yielded = false;
     while (pc != put || count) {
         uint32_t h;
         if (count) {
             uint32_t param;
-            if (words >= NV2A_SUBMIT_MAX_WORDS) {
+            if (unit_words >= NV2A_SUBMIT_MAX_WORDS) {
                 d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false;
                 submit_budget_stop(d, get, put, begin, end, pc, words, packets,
                                    count, method, ret, pc, true, false);
@@ -1684,7 +1728,7 @@ bool nv2a_submit_pending(NV2AState *d)
             }
             if (pc == put || !submit_read_word(d, pc, &param)) { d->pfifo.submit_diag = pc == put ? NV2A_SUBMIT_TRUNCATED : NV2A_SUBMIT_UNREADABLE; ok = false; goto done; }
             submit_trace_word(d, pc, param);
-            pc = submit_advance(d, pc); ++words;
+            pc = submit_advance(d, pc); ++words; ++unit_words;
             /* Production SET_OBJECT walks RAMHT in claimed PRAMIN.
              * The fixture seam stays opt-in for isolated 11b4b2 tests. */
             if (method == M_SET_OBJECT) {
@@ -1731,9 +1775,12 @@ bool nv2a_submit_pending(NV2AState *d)
             }
             if (method != M_SET_OBJECT && method != 0x0100u &&
                 !nv2a_method_implemented(staged_class[subchannel], method)) {
-                /* Admitted by the switch: staged like an implemented method. */
+                /* Admitted by the switch: staged like an implemented method.
+                 * admitted_total is the uncapped count; admitted[] only holds
+                 * the candidates for the dedupe log, which cannot accept more
+                 * than NV2A_ADMIT_LOG_MAX distinct entries anyway. */
                 ++admitted_total;
-                if (admitted_count < NV2A_ADMIT_PENDING) {
+                if (admitted_count < NV2A_ADMIT_LOG_MAX) {
                     admitted[admitted_count].class_id = staged_class[subchannel];
                     admitted[admitted_count].method = method;
                     admitted[admitted_count].param = param;
@@ -1766,18 +1813,51 @@ bool nv2a_submit_pending(NV2AState *d)
             continue;
         }
         address = pc;
-        if (words >= NV2A_SUBMIT_MAX_WORDS || packets >= 1024) {
+        /* The PACKET cap stays a STOP, not a yield: a stream of many tiny
+         * packets is rejected exactly as it is today (1025 one-word packets is
+         * under the word budget and would otherwise accept).
+         * tests/test_nv2a_contract.c pins that case. Evaluated before the yield
+         * so a packet-bound stream terminates on the same walk. */
+        if (packets >= 1024) {
             d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false;
             submit_budget_stop(d, get, put, begin, end, pc, words, packets,
-                               count, method, ret, address, false,
-                               packets >= 1024);
+                               count, method, ret, address, false, true);
+            break;
+        }
+        /* Yield point: end this unit AT this header -- not yet consumed -- when
+         * the incoming packet would not fit in the remaining unit budget. The
+         * header word is PEEKED, not consumed, so the next unit re-reads it and
+         * no packet is ever split. Only packet headers are tested; a jump/call
+         * word falls through to the normal path below.
+         *
+         * `unit_words > 0` guarantees progress: a unit that has consumed
+         * nothing never yields, and a packet is at most 2048 words, so the
+         * first packet of every unit always fits. */
+        if (count == 0 && pc != put && unit_words > 0) {
+            uint32_t hpeek;
+            if (!submit_read_word(d, pc, &hpeek)) { d->pfifo.submit_diag = NV2A_SUBMIT_UNREADABLE; ok = false; break; }
+            if ((hpeek & 0xe0030003u) == 0u || (hpeek & 0xe0030003u) == 0x40000000u) {
+                uint32_t pcount = (hpeek >> 18) & 0x7ffu;
+                if (unit_words + 1u + pcount > NV2A_SUBMIT_MAX_WORDS) {
+                    yielded = true;
+                    break;
+                }
+            }
+        }
+        /* Defensive and expected-unreachable: the yield above keeps a unit at or
+         * under the budget, so the word cap cannot be reached at a header. Kept
+         * as a fail-closed guard rather than deleted. */
+        if (unit_words >= NV2A_SUBMIT_MAX_WORDS) {
+            d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false;
+            submit_budget_stop(d, get, put, begin, end, pc, words, packets,
+                               count, method, ret, address, false, false);
             break;
         }
         for (unsigned i = 0; i < seen_count; ++i) if (seen[i * 2] == pc && seen[i * 2 + 1] == ret) { d->pfifo.submit_diag = NV2A_SUBMIT_LOOP; ok = false; goto done; }
         if (seen_count < 512) { seen[seen_count * 2] = pc; seen[seen_count * 2 + 1] = ret; ++seen_count; }
         if (!submit_read_word(d, pc, &h)) { d->pfifo.submit_diag = NV2A_SUBMIT_UNREADABLE; ok = false; break; }
         submit_trace_word(d, pc, h);
-        pc = submit_advance(d, pc); ++words; ++packets;
+        pc = submit_advance(d, pc); ++words; ++unit_words; ++packets;
         if ((h & 0xe0000003u) == 0x20000000u || (h & 3u) == 1u || (h & 3u) == 2u || h == 0x00020000u) {
             uint32_t target;
             if ((h & 3u) == 2u) { if (ret) { d->pfifo.submit_diag = NV2A_SUBMIT_LOOP; ok = false; break; } ret = pc; }
@@ -1793,7 +1873,14 @@ bool nv2a_submit_pending(NV2AState *d)
             count = (h >> 18) & 0x7ffu; method = h & 0x1ffcu; subchannel = (h >> 13) & 7u;
             non_inc = (h & 0x40000000u) != 0;
             if (!non_inc && count && method + 4u * (count - 1u) > 0x1ffcu) { d->pfifo.submit_diag = NV2A_SUBMIT_METHOD_RANGE; ok = false; break; }
-            if (d->pfifo.sink_count + staged_count + count > NV2A_SUBMIT_MAX_WORDS) { d->pfifo.submit_diag = NV2A_SUBMIT_SINK_FULL; ok = false; break; }
+            /* Defensive and expected-unreachable: the yield at the top of this
+             * header path keeps a unit's staged set at or under the array, so
+             * this cannot fire. It is a fail-closed guard for the array bound,
+             * and it is deliberately UNIT-scoped: the old submission-wide form
+             * (sink_count + staged_count + count, where staged_count was never
+             * reset) is exactly what used to reject a legitimate multi-unit
+             * submission before the yield could split it. */
+            if (staged_count + count > NV2A_SUBMIT_MAX_WORDS) { d->pfifo.submit_diag = NV2A_SUBMIT_SINK_FULL; ok = false; break; }
             continue;
         }
         d->pfifo.submit_diag = NV2A_SUBMIT_RESERVED; d->pfifo.submit_diag_get = address; ok = false; break;
@@ -1855,7 +1942,7 @@ bool nv2a_submit_pending(NV2AState *d)
                 if (g_admit_seen[j].class_id == admitted[i].class_id &&
                     g_admit_seen[j].method == admitted[i].method) break;
             if (j < g_admit_seen_count || g_admit_seen_count >= NV2A_ADMIT_LOG_MAX ||
-                g_admit_pending_count >= NV2A_ADMIT_PENDING)
+                g_admit_pending_count >= NV2A_ADMIT_LOG_MAX)
                 continue;
             g_admit_seen[g_admit_seen_count++] = admitted[i];
             g_admit_pending[g_admit_pending_count++] = admitted[i];
@@ -1882,7 +1969,37 @@ bool nv2a_submit_pending(NV2AState *d)
                 d->pfifo.submit_diag_param = d->pfifo.staged[staged_count - 1].param;
             }
         }
+        /* This unit is committed. Account for it, then either continue with
+         * the next unit or stop. */
+        ++units;
+        unit_words_total += unit_words;
+        /* The structural cycle backstop. The unit loop replaces the old
+         * "one walk <= 4096 words" cap, which also bounded a cycling ring; a
+         * call-free walk can only exceed the whole ring by cycling. This is a
+         * structural bound, NOT a raised budget. */
+        if (unit_words_total > unit_limit) {
+            d->pfifo.submit_diag = NV2A_SUBMIT_LOOP;
+            ok = false;
+            break;
+        }
+        if (yielded) {
+            /* More ring to consume. Reset the per-UNIT state and walk on from
+             * the header we stopped at.
+             *
+             * sink_count MUST be reset here: the sink is a per-unit record and
+             * the commit loop above writes sink[sink_count++]. Across units the
+             * total staged can exceed NV2A_SUBMIT_MAX_WORDS, so without this
+             * reset a second unit would write past the end of sink[]. */
+            staged_count = 0;
+            admitted_count = 0;
+            d->pfifo.sink_count = 0;
+            unit_words = 0;
+            if (actions) action_stage_begin(d, &st);
+            continue;
+        }
     }
+    break;
+    }  /* end unit loop */
 done:
     d->pfifo.submit_words += words;
     d->pfifo.submit_packets += packets;
@@ -1908,6 +2025,11 @@ done:
         ss->budget_ret = d->pfifo.budget_ret;
         ss->budget_in_param = d->pfifo.budget_in_param ? 1u : 0u;
         ss->budget_at_packet_limit = d->pfifo.budget_at_packet_limit ? 1u : 0u;
+        /* Units: how many all-or-nothing groups THIS walk committed, and the
+         * running total. A single-unit walk is the pre-unit behaviour. */
+        ss->units = units;
+        ss->units_total += units;
+        ss->loop_bound = unit_limit;
         ss->get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
         ss->put = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
         if (ok) {
@@ -1944,7 +2066,7 @@ static uint64_t user_read(void *opaque, hwaddr addr, unsigned int size)
 static void nv2a_log_submit_result(NV2AState *d)
 {
     NV2ASubmitState st;
-    AdmitRecord pend[NV2A_ADMIT_PENDING];
+    AdmitRecord pend[NV2A_ADMIT_LOG_MAX];
     uint32_t pend_count, prev;
     bool banner = false;
 

@@ -87,14 +87,17 @@ enum {
  * Adapted from xemu's nv2a_int.h
  * ============================================================ */
 
-/* One submission's walk budget, in words, and the capacity of everything the
- * walk stages or records for that submission.
+/* One UNIT's walk budget, in words, and the capacity of everything the walk
+ * stages or records for that unit.
  *
- * The walk commits a submission all-or-nothing: it stages every method before
- * it commits any of them, so the staging array and the sink both have to hold
- * a whole budget's worth. Each staged method consumes exactly one parameter
- * word, so staged methods <= walked words <= NV2A_SUBMIT_MAX_WORDS. The walk
- * separately bounds itself to 1024 packets, which is unchanged. */
+ * Atomicity is per UNIT, not per submission. The walk commits a unit
+ * all-or-nothing: it stages every method of the unit before it commits any of
+ * them, so the staging array and the sink both have to hold a whole budget's
+ * worth. Each staged method consumes exactly one parameter word, so staged
+ * methods <= walked words <= NV2A_SUBMIT_MAX_WORDS. A unit ends at a
+ * WHOLE-PACKET boundary, and a packet is at most 2048 words, so the walk can
+ * always make progress one packet at a time. The walk separately bounds a unit
+ * to 1024 packets, which is unchanged. */
 #define NV2A_SUBMIT_MAX_WORDS 4096
 
 typedef struct NV2AState {
@@ -161,6 +164,18 @@ typedef struct NV2AState {
         uint32_t submit_diag_method;
         uint32_t submit_diag_param;
         uint32_t submit_successes;
+        /* Units committed by the most recent walk, and cumulatively across the
+         * run. Atomicity is per UNIT: one walk may commit several units, and a
+         * walk that rejects a later unit still leaves the earlier ones
+         * committed with GET at the rejected unit's own start. */
+        uint32_t submit_units;
+        uint32_t submit_units_total;
+        /* The per-call structural cycle bound the most recent walk used:
+         * pushbuffer_size / 4, the ring's own word count. This is NOT a budget
+         * -- the unit budget is still NV2A_SUBMIT_MAX_WORDS -- it is a property
+         * of the ring, and a call-free walk cannot visit more words than the
+         * ring holds without repeating an address. */
+        uint32_t submit_loop_bound;
         /* PFIFO object bindings.  Production SET_OBJECT walks RAMHT in the
          * claimed PRAMIN window.  fixture_* remains a test-only seam. */
         uint32_t binding_class[8];
@@ -423,6 +438,18 @@ typedef struct NV2ASubmitState {
     uint32_t budget_count, budget_method, budget_ret;
     uint32_t budget_in_param;        /* 1 = mid-packet, 0 = at a header */
     uint32_t budget_at_packet_limit; /* 1 = the 1024-packet cap fired */
+    /* Units committed by the most recent walk, and cumulatively across the run.
+     * Appended AFTER the budget transcript so the field order an existing
+     * reader already decodes is unchanged: a reader that asks for the size it
+     * knows simply stops before these, and never misreads them as a budget
+     * field. Atomicity is per UNIT, so `units` is the count of all-or-nothing
+     * groups this one walk committed. */
+    uint32_t units;
+    uint32_t units_total;
+    /* The per-call structural cycle bound that walk used: the ring's own word
+     * count (pushbuffer_size / 4). NOT a budget -- the unit budget is still
+     * NV2A_SUBMIT_MAX_WORDS. See the walk for why it is not a raised limit. */
+    uint32_t loop_bound;
 } NV2ASubmitState;
 /* Exported on Windows so a dump and the linker map name it, like g_nv2a_mmio_snapshot. */
 #ifdef _WIN32

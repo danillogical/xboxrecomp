@@ -494,6 +494,81 @@ static void test_admit_unknown_boundaries(void)
           g_nv2a_submit_state.admitted_unknown);
 }
 
+/* 6. The witness must cover a WHOLE walk, not a prefix of it.
+ *
+ * The `[PFIFO] admit-unknown` line is the only admissible provenance for
+ * adding a method to the generated admission table (ledger L39), so a walk
+ * that reports only its first N unknown methods silently loses the rest: the
+ * run looks complete while the tail is invisible, and the offline decode of
+ * the same region disagrees with the log. That is exactly what happened when
+ * the report was capped at 16 -- a real run logged 0x0420-0x042C and
+ * 0x0480-0x04AC and then rejected, while 35 methods were missing.
+ *
+ * 20 distinct unknown NV097 methods in ONE walk: every one must be reported,
+ * and the reported set must be exactly the submitted set. 20 is chosen to sit
+ * just above the old 16-entry cap while staying well inside the 256 capacity,
+ * so the test fails on the truncation rather than on a capacity boundary. */
+/* 20 consecutive NV097 methods that are absent from nv2a_method_table.c. The
+ * method field is 13 bits, so the range must stay under 0x2000. */
+#define MANY_UNKNOWN_BASE  0x1EA8u
+#define MANY_UNKNOWN_COUNT 20u
+
+static void test_admit_unknown_witness_is_not_truncated(void)
+{
+    NV2AState *d;
+    Pb pb;
+    const char *log;
+    char needle[64];
+    unsigned i, found = 0;
+
+    /* The fixture methods must really be absent, or the walk would not admit
+     * them and the test would pass for the wrong reason. */
+    for (i = 0; i < MANY_UNKNOWN_COUNT; ++i) {
+        uint32_t m = MANY_UNKNOWN_BASE + 4u * i;
+        CHECK(!nv2a_method_implemented(0x97u, m),
+              "fixture method %04X is implemented on NV097", m);
+    }
+
+    d = fresh();
+    nv2a_admit_unknown_override(1);
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    for (i = 0; i < MANY_UNKNOWN_COUNT; ++i)
+        pb_method(&pb, 0, MANY_UNKNOWN_BASE + 4u * i, 0x1000u + i);
+
+    cap_begin();
+    kick(d, pb.start, pb.at);
+    log = cap_end();
+
+    /* The stream itself still drains: the cap is on the WITNESS, not the walk. */
+    CHECK(get_ptr(d) == pb.at, "many-unknown stream did not drain (get=%08X; %s)",
+          get_ptr(d), diag(d));
+    CHECK(g_nv2a_submit_state.rejections == 0, "rejections %u on an admitted stream",
+          g_nv2a_submit_state.rejections);
+    CHECK(g_nv2a_submit_state.admitted_unknown == MANY_UNKNOWN_COUNT,
+          "admitted_unknown=%u, want %u",
+          g_nv2a_submit_state.admitted_unknown, MANY_UNKNOWN_COUNT);
+    CHECK(count_of(log, "admit-unknown") == MANY_UNKNOWN_COUNT,
+          "admit-unknown lines: %u, want %u (the witness was truncated)\n%s",
+          count_of(log, "admit-unknown"), MANY_UNKNOWN_COUNT, log);
+
+    /* Not just the COUNT: each specific method must be named. Counting alone
+     * would accept a witness that reported one method twenty times. */
+    for (i = 0; i < MANY_UNKNOWN_COUNT; ++i) {
+        uint32_t m = MANY_UNKNOWN_BASE + 4u * i;
+        unsigned n;
+        snprintf(needle, sizeof(needle),
+                 "[PFIFO] admit-unknown class=97 method=%04X param=%08X", m,
+                 0x1000u + i);
+        n = count_of(log, needle);
+        if (n == 1) ++found;
+        CHECK(n == 1, "method %04X: witness line %u times, want 1", m, n);
+    }
+    CHECK(found == MANY_UNKNOWN_COUNT,
+          "only %u of %u distinct methods were named in the witness", found,
+          MANY_UNKNOWN_COUNT);
+}
+
 /* -1 reads the environment on next use; exactly "1" enables. */
 static void test_override_minus_one_reads_environment(void)
 {
@@ -710,15 +785,41 @@ static void test_budget_stop_transcript(void)
      * Non-incrementing packets are used because an incrementing count that large
      * would run the method past 0x1FFC and be rejected by the method-range check
      * first -- a different diagnostic. 0x1760 is in the generated table. */
+    /* Build a stream that exhausts the PACKET budget.
+     *
+     * This test used to drive the WORD cap from inside a packet's parameters,
+     * with counts 2047/2043/5 chosen so the 4096-word cap fired four parameters
+     * into the third packet. That is no longer reachable, and the reason is
+     * structural rather than a changed constant: the walk now ends a UNIT at a
+     * packet header when the incoming packet would not fit
+     * (unit_words + 1 + count > NV2A_SUBMIT_MAX_WORDS). A packet is at most
+     * 1 + 2047 = 2048 words, so a unit that starts empty always fits at least
+     * one whole packet, and after that packet the unit is at most 4096 words.
+     * The in-parameter word cap therefore cannot fire for a header-driven
+     * packet; it survives only as a fail-closed guard.
+     *
+     * The 1024-PACKET cap is still reachable and still a STOP (it is
+     * deliberately not a yield: 1025 one-word packets is under the word budget,
+     * and treating it as a yield would make the contract case in
+     * tests/test_nv2a_contract.c accept). So the transcript's job -- proving
+     * that the FIRST stop is latched, readable from a dump, and frozen against
+     * a retry -- is tested through the packet cap instead. */
     cap_begin();
     pb_begin(&pb, PB_BASE);
     pb_method(&pb, 0, 0x0000, H_KELVIN);                 /* bind NV097 */
-    {
-        static const uint32_t counts[3] = { 2047u, 2043u, 5u };
-        for (unsigned p = 0; p < 3; ++p) {
-            pb_word(&pb, 0x40000000u | (counts[p] << 18) | 0x1760u);
-            for (i = 0; i < counts[p]; ++i) pb_word(&pb, 0x11110000u + i);
-        }
+    /* 1024 packets of count 1 (2 words each: header + one parameter), so the
+     * stream reaches the packet cap at 2050 words -- well under the word
+     * budget, which is what makes the packet cap the limit under test.
+     *
+     * count 1 rather than 0 matters for the retry below: with a parameter
+     * present, a word inside the trajectory window can be corrupted WITHOUT
+     * changing control flow, which is what lets the retry reach the same cap
+     * and prove the latched transcript is not overwritten. Corrupting a
+     * one-word NOP header would instead reject as an unknown opcode and never
+     * reach the budget stop at all. */
+    for (i = 0; i < 1024u; ++i) {
+        pb_word(&pb, (1u << 18) | 0x1760u);
+        pb_word(&pb, 0x22220000u + i);
     }
     kick(d, pb.start, pb.at);
 
@@ -734,53 +835,40 @@ static void test_budget_stop_transcript(void)
     /* The latched transcript is what a dump reads later. */
     CHECK(g_nv2a_submit_state.budget_stops == 1,
           "budget_stops=%u, want 1", g_nv2a_submit_state.budget_stops);
-    CHECK(g_nv2a_submit_state.budget_in_param == 1,
-          "the stop must be reported INSIDE the parameters (in_param=%u)",
-          g_nv2a_submit_state.budget_in_param);
-    CHECK(g_nv2a_submit_state.budget_at_packet_limit == 0,
-          "the WORD cap fired, not the packet cap (at_packet_limit=%u)",
+    CHECK(g_nv2a_submit_state.budget_at_packet_limit == 1,
+          "the PACKET cap fired, so at_packet_limit must be 1 (got %u)",
           g_nv2a_submit_state.budget_at_packet_limit);
-    CHECK(g_nv2a_submit_state.budget_method == 0x1760u,
-          "straddling method is %04X, want 1760",
-          g_nv2a_submit_state.budget_method);
-    /* Exact frontier, not a bound: the shape above fixes all three. */
-    CHECK(g_nv2a_submit_state.budget_words == NV2A_SUBMIT_MAX_WORDS,
-          "budget_words=%u, want exactly %u", g_nv2a_submit_state.budget_words,
-          NV2A_SUBMIT_MAX_WORDS);
-    CHECK(g_nv2a_submit_state.budget_packets == 4u,
-          "budget_packets=%u, want 4 (SET_OBJECT + three packets)",
-          g_nv2a_submit_state.budget_packets);
-    CHECK(g_nv2a_submit_state.budget_count == 4u,
-          "budget_count=%u, want exactly 4 parameters unread",
-          g_nv2a_submit_state.budget_count);
+    CHECK(g_nv2a_submit_state.budget_in_param == 0,
+          "a packet-cap stop is at a HEADER, so in_param must be 0 (got %u)",
+          g_nv2a_submit_state.budget_in_param);
+    CHECK(g_nv2a_submit_state.budget_packets == 1024u,
+          "budget_packets=%u, want 1024", g_nv2a_submit_state.budget_packets);
+    CHECK(g_nv2a_submit_state.budget_words < NV2A_SUBMIT_MAX_WORDS,
+          "the word budget must NOT be reached (words=%u)",
+          g_nv2a_submit_state.budget_words);
     /* local_pc is where the walk was consuming, which is NOT the rollback
      * origin `at`. Reporting `at` as the failure point is the trap this field
      * exists to avoid, so they must differ here. */
     CHECK(g_nv2a_submit_state.budget_local_pc != g_nv2a_submit_state.at,
           "budget_local_pc (%08X) must not equal the rollback origin at (%08X)",
           g_nv2a_submit_state.budget_local_pc, g_nv2a_submit_state.at);
-    /* The frontier is inside the third packet's parameters, and `local_pc` is the
-     * address the walk was consuming when the cap fired -- NOT the rollback origin
-     * `at`, which is where the stream restarts. In word terms: 2 (SET_OBJECT) +
-     * 2048 (packet 1) + 2044 (packet 2) + 1 (packet 3's header) + 1 (its first
-     * parameter) = 4096 words consumed, so the frontier is PB_BASE + 4096*4. */
-    CHECK(g_nv2a_submit_state.budget_local_pc == pb.start + 4096u * 4u,
-          "budget_local_pc=%08X, want %08X (PB_BASE + 4096 words)",
-          g_nv2a_submit_state.budget_local_pc, pb.start + 4096u * 4u);
+    /* The frontier is the header the walk refused to consume. It is exactly
+     * `budget_words` words past the start, because words counts every word
+     * consumed and the frontier is the next unconsumed one -- asserted
+     * self-consistently rather than with a hardcoded offset. */
+    CHECK(g_nv2a_submit_state.budget_local_pc ==
+              pb.start + g_nv2a_submit_state.budget_words * 4u,
+          "budget_local_pc=%08X is not budget_words (%u) past the start %08X",
+          g_nv2a_submit_state.budget_local_pc,
+          g_nv2a_submit_state.budget_words, pb.start);
 
-    /* The trajectory must be DENSE and chronological, and its newest entries must
-     * be the parameters actually consumed -- that is what makes it usable as a
-     * cyclic-walk discriminator, which the old header-only ring was not. */
+    /* The trajectory must be DENSE and chronological: that is what makes it
+     * usable as a cyclic-walk discriminator, which the old header-only ring was
+     * not. */
     CHECK(d->pfifo.budget_trace_count == 64u,
           "budget_trace_count=%u, want a full 64-word window",
           d->pfifo.budget_trace_count);
     {
-        /* The last word consumed is the FIRST parameter of packet 3, i.e. the
-         * value 0x11110000 the loop wrote at offset 0. */
-        uint32_t last = d->pfifo.budget_trace_word[63];
-        CHECK(last == 0x11110000u,
-              "newest trajectory word is %08X, want 11110000 (packet 3's first parameter)",
-              last);
         /* The window must be contiguous, so it is a real trajectory rather than a
          * sparse ring of headers. */
         CHECK(d->pfifo.budget_trace_va[63] - d->pfifo.budget_trace_va[62] == 4u,
@@ -795,10 +883,8 @@ static void test_budget_stop_transcript(void)
      * shows which limit fired. */
     CHECK(count_of(log, "budget_exhausted") >= 1,
           "no budget_exhausted line in the log:\n%s", log);
-    CHECK(count_of(log, "stopped INSIDE a packet's parameters") == 1,
-          "the log must name the parameter path:\n%s", log);
-    CHECK(count_of(log, "LIMIT=words(4096)") == 1,
-          "the log must name the word cap:\n%s", log);
+    CHECK(count_of(log, "LIMIT=packets(1024)") == 1,
+          "the log must name the packet cap:\n%s", log);
 
     /* A later retry must NOT overwrite the latched first stop: the first is the
      * event of interest, and a rejection is retried on every kick. The trajectory
@@ -821,8 +907,16 @@ static void test_budget_stop_transcript(void)
         memcpy(word_before, d->pfifo.budget_trace_word, sizeof(word_before));
 
         /* Corrupt a word INSIDE the window the retry will consume -- mid-window,
-         * where a rolling trajectory would record the new value. */
-        wr32(g_window, g_nv2a_submit_state.budget_local_pc - 32u * 4u, 0xDEADBEEFu);
+         * where a rolling trajectory would record the new value.
+         *
+         * The offset must land on a PARAMETER, not a header. Packets here are
+         * two words (header + one parameter), so an even offset from the
+         * frontier -- which is itself a header -- is another header, and
+         * corrupting a header changes control flow: the retry then rejects as
+         * an unknown opcode and never reaches the budget stop at all, so the
+         * latched-first-stop property would go untested. 31 words is odd, so it
+         * is a parameter, and it is still inside the 64-word window. */
+        wr32(g_window, g_nv2a_submit_state.budget_local_pc - 31u * 4u, 0xDEADBEEFu);
 
         kick(d, pb.start, pb.at);
 
@@ -851,6 +945,191 @@ static void test_budget_stop_transcript(void)
     }
 }
 
+/* ── bounded prefix commit: units at whole-packet boundaries ─────────────── */
+
+/* Record what the commit consumer was handed, in order, so a test can prove
+ * that a multi-unit walk delivers every method exactly once and in stream
+ * order. Sized above 2 * NV2A_SUBMIT_MAX_WORDS so a two-unit stream cannot
+ * overflow it. */
+#define CONSUMER_MAX 8192
+static uint32_t g_cons_method[CONSUMER_MAX];
+static uint32_t g_cons_param[CONSUMER_MAX];
+static unsigned g_cons_count;
+
+static void consuming_observer(uint32_t subchannel, uint32_t class_id,
+                               uint32_t method, uint32_t param)
+{
+    (void)subchannel; (void)class_id;
+    if (g_cons_count < CONSUMER_MAX) {
+        g_cons_method[g_cons_count] = method;
+        g_cons_param[g_cons_count] = param;
+    }
+    ++g_cons_count;
+}
+
+static void consumer_reset(void)
+{
+    g_cons_count = 0;
+    nv2a_set_commit_consumer(consuming_observer);
+}
+
+/* T1: a submission longer than one unit is consumed in units, in order, and
+ * the walk ACCEPTS. This is the positive case for the whole change, and it is
+ * the one that must fail if the yield predicate is removed.
+ *
+ * The stream is SET_OBJECT (2 words), then packets of 2047, 2043 and 2047
+ * parameters. Unit 1 ends at packet 3's header (2 + 2048 + 2044 = 4094 words;
+ * 4094 + 1 + 2047 > 4096), so unit 2 is the third packet alone.
+ *
+ * The third packet deliberately carries 2047 parameters rather than 5, so the
+ * TWO UNITS TOGETHER stage 6138 methods -- more than sink[] holds. That is what
+ * makes this test detect a missing per-unit sink_count reset: with only 4096
+ * methods in total the two units would exactly fill the array and an overflow
+ * would go unnoticed. */
+static void test_unit_split_preserves_order(void)
+{
+    NV2AState *d = fresh();
+    Pb pb;
+    uint32_t i, expect_param = 0;
+    unsigned p;
+
+    observer_reset();
+    consumer_reset();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);                 /* bind NV097 */
+    {
+        static const uint32_t counts[3] = { 2047u, 2043u, 2047u };
+        for (p = 0; p < 3; ++p) {
+            pb_word(&pb, 0x40000000u | (counts[p] << 18) | 0x1760u);
+            for (i = 0; i < counts[p]; ++i) pb_word(&pb, 0x11110000u + (expect_param++));
+        }
+    }
+    kick(d, pb.start, pb.at);
+
+    /* The whole stream drained: a multi-unit walk reaches PUT. */
+    CHECK(get_ptr(d) == pb.at,
+          "the multi-unit walk did not drain (get=%08X, want %08X; diag=%s)",
+          get_ptr(d), pb.at, diag(d));
+    CHECK(g_nv2a_submit_state.units == 2,
+          "units=%u, want 2 (the stream is longer than one unit)",
+          g_nv2a_submit_state.units);
+    CHECK(g_commits == 1,
+          "commits=%u, want exactly 1 (the fence is published once, at PUT)",
+          g_commits);
+    CHECK(g_nv2a_submit_state.budget_stops == 0,
+          "budget_stops=%u, want 0 (nothing was rejected)",
+          g_nv2a_submit_state.budget_stops);
+    /* The sink is a per-unit record: it must hold ONE unit's worth, never the
+     * sum of both. This is the assertion that catches a missing per-unit
+     * reset, which would otherwise write past the end of sink[]. */
+    CHECK(d->pfifo.sink_count <= NV2A_SUBMIT_MAX_WORDS,
+          "sink_count=%u exceeds the sink array (%u): a unit reset is missing",
+          d->pfifo.sink_count, NV2A_SUBMIT_MAX_WORDS);
+
+    /* Every parameter, exactly once, in stream order. The SET_OBJECT handle is
+     * staged too, so it is expected first. Total staged = 1 + 2047 + 2043 +
+     * 2047 = 6138, which is more than sink[] holds -- that is the point. */
+    CHECK(g_cons_count == 1u + 2047u + 2043u + 2047u,
+          "consumer saw %u methods, want %u", g_cons_count,
+          1u + 2047u + 2043u + 2047u);
+    CHECK(g_cons_method[0] == 0x0000u,
+          "first consumed method is %04X, want 0000 (SET_OBJECT)",
+          g_cons_method[0]);
+    for (i = 1; i < g_cons_count; ++i) {
+        if (g_cons_method[i] != 0x1760u) {
+            CHECK(0, "consumed method[%u] is %04X, want 1760 (order lost)",
+                  i, g_cons_method[i]);
+            break;
+        }
+        if (g_cons_param[i] != 0x11110000u + (i - 1u)) {
+            CHECK(0, "consumed param[%u] is %08X, want %08X (order lost)",
+                  i, g_cons_param[i], 0x11110000u + (i - 1u));
+            break;
+        }
+    }
+    nv2a_set_commit_consumer(NULL);
+    nv2a_set_kick_observer(NULL);
+}
+
+/* T2: when a LATER unit rejects, the earlier units' methods stay committed but
+ * nothing from the failing unit is delivered, GET stays at the failing unit's
+ * start, and no fence is published. A retry then delivers ONLY the previously
+ * failing unit -- never a second copy of unit 1.
+ *
+ * The stream is chosen so a yield genuinely precedes the bad packet: SET_OBJECT
+ * (2 words) + a 2047-parameter packet (2048) + a 2045-parameter packet (2046)
+ * reaches exactly 4096 words, and 4096 + 1 + 1 > 4096, so unit 1 ends at the
+ * bad packet's header and the bad packet is unit 2's first (and only) packet. */
+static void test_unit_rollback_and_retry(void)
+{
+    NV2AState *d = fresh();
+    Pb pb;
+    uint32_t i;
+    unsigned after_first;
+
+    observer_reset();
+    consumer_reset();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);                 /* bind NV097 */
+    /* Unit 1: two large supported packets (4096 words exactly). */
+    {
+        static const uint32_t counts[2] = { 2047u, 2045u };
+        uint32_t k = 0;
+        for (i = 0; i < 2; ++i) {
+            uint32_t j;
+            pb_word(&pb, 0x40000000u | (counts[i] << 18) | 0x1760u);
+            for (j = 0; j < counts[i]; ++j) pb_word(&pb, 0xAAAA0000u + (k++));
+        }
+    }
+    /* Unit 2: one packet whose method is NOT in the table, so this unit
+     * rejects. Its offset is kept so the retry can patch it. */
+    {
+        uint32_t bad_off = pb.at;
+        pb_word(&pb, (1u << 18) | UNKNOWN_NV097);
+        pb_word(&pb, 0xBBBB0000u);
+
+        kick(d, pb.start, pb.at);
+
+        CHECK(g_nv2a_submit_state.units == 1,
+              "units=%u, want 1 (unit 1 committed, unit 2 rejected)",
+              g_nv2a_submit_state.units);
+        CHECK(g_commits == 0,
+              "commits=%u, want 0 (a rejected later unit must not publish the fence)",
+              g_commits);
+        CHECK(strcmp(diag(d), "unsupported_method") == 0,
+              "diag is %s, want unsupported_method", diag(d));
+        /* Unit 1's methods were delivered; unit 2's were not. Unit 1 is the
+         * SET_OBJECT plus both large packets' parameters. */
+        CHECK(g_cons_count == 1u + 2047u + 2045u,
+              "consumer saw %u methods, want %u (unit 2 must not be delivered)",
+              g_cons_count, 1u + 2047u + 2045u);
+        after_first = g_cons_count;
+
+        /* GET must sit at unit 2's first header -- the rollback origin for the
+         * failing unit, NOT the start of the whole submission. `bad_off` is
+         * already an absolute guest address (pb.at), not an offset. */
+        CHECK(get_ptr(d) == bad_off,
+              "GET=%08X, want %08X (unit 2's start, not the submission start %08X)",
+              get_ptr(d), bad_off, pb.start);
+
+        /* Patch the offending method to a supported one and retry. Only unit 2
+         * may be delivered now: unit 1 must not be re-sent. */
+        wr32(g_window, bad_off, (1u << 18) | 0x1760u);
+        kick_put(d, pb.at);
+
+        CHECK(get_ptr(d) == pb.at,
+              "the retry did not drain (get=%08X, want %08X; diag=%s)",
+              get_ptr(d), pb.at, diag(d));
+        CHECK(g_commits == 1,
+              "commits=%u, want 1 after the retry succeeded", g_commits);
+        CHECK(g_cons_count == after_first + 1u,
+              "the retry delivered %u methods, want exactly 1 (unit 1 must not be redelivered)",
+              g_cons_count - after_first);
+    }
+    nv2a_set_commit_consumer(NULL);
+    nv2a_set_kick_observer(NULL);
+}
+
 int main(void)
 {
     /* Start from a known environment whatever the caller exported. */
@@ -861,12 +1140,15 @@ int main(void)
     test_default_contract_forced_off();
     test_admit_unknown_on();
     test_admit_unknown_boundaries();
+    test_admit_unknown_witness_is_not_truncated();
     test_override_minus_one_reads_environment();
     test_observer_counts_kicks_and_commits();
     test_retry_with_nothing_rejected();
     test_retry_recovers_after_ramht_write();
     test_retry_recovers_after_pushbuffer_patch();
     test_budget_stop_transcript();
+    test_unit_split_preserves_order();
+    test_unit_rollback_and_retry();
 
     if (g_failures) {
         fprintf(stderr, "nv2a_submit_diag_test: %d failure(s)\n", g_failures);
