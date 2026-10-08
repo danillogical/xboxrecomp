@@ -19,13 +19,22 @@
  * `KeSetEvent` for a vblank waiter, which can block for as long as the reading
  * takes to climb back.
  *
- * WHAT THIS IS NOT. It is a LATENT defect repair. It is NOT shown to have
- * caused any archived worker death: across the archive, wrap windows do not
- * predict worker loss (six wrapped runs kept their workers, including
- * `…223953-965-title008-frames-late`; seven unwrapped runs lost theirs), and
- * run 507's ADX workers stop ~9.6 s BEFORE its own wrap instant. An earlier
- * version of this comment asserted that correlation as measured fact; it was
- * falsified by Turn Review and is withdrawn.
+ * WHAT THIS IS NOT. It is a LATENT defect repair, and the wrap is ASSOCIATED
+ * with worker loss without the mechanism being established. Over the 81
+ * archived runs with ADX workers, a run whose window contains a wrap loses a
+ * worker about 41.7% of the time versus 12.3% for one whose window does not, so
+ * the association is real; but six wrapped runs kept their workers (including
+ * `…223953-965-title008-frames-late`) and seven unwrapped runs lost theirs, and
+ * those unwrapped deaths are not explained by this at all.
+ *
+ * An earlier version of this comment asserted the UNIVERSAL form as measured
+ * fact ("every wrapped run loses its workers"); that was falsified and is
+ * withdrawn. A second version over-corrected to "wrap windows do not predict
+ * worker loss", which is also false. Timing comparisons in this area must align
+ * three clocks with three zeros: the QPC product (uptime-relative),
+ * GetTickCount64, and `[FBPRESENT] t=`, which is relative to the FIRST PRESENT.
+ * Run 507 is 9.6 s from its wrap on the uncorrected axis but about 3.4 s once
+ * both offsets are applied.
  *
  * WHAT THIS TEST DRIVES. `nv2a_vblank_advance` is the loop's scheduling rule
  * as a pure function, so this needs no device, no clock and no thread. It

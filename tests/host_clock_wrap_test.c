@@ -33,6 +33,13 @@
  * overflow -- which is how an earlier version of this test passed the wrong way
  * round.
  *
+ * RESIDUAL GAP, stated rather than left implicit: this translation unit compiles
+ * `host_clock_wrap_test.c` alone, so it pins `host_clock.h` and NOT
+ * `qemu_shim.h`. A shim that stopped calling `nv2a_qpc_to_ns` (and re-inlined a
+ * naive expression) would not be caught here. Closing that would need the test
+ * to link the shim, which drags in the Windows headers and the QPC call for no
+ * additional arithmetic coverage; the gap is accepted and recorded instead.
+ *
  * WHAT IT ASSERTS:
  *   1. the pre-fix expression really does jump backward (so the test would
  *      fail if the arithmetic were not the defect);

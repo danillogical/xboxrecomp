@@ -281,10 +281,15 @@ void nv2a_update_irq(NV2AState *d)
  *    phase alignments; the SIGNED overflow instant (922.337 s) jumps FORWARD in
  *    the consumer's uint64 view and re-arms harmlessly.
  *
- *    This is a LATENT defect repair. It is NOT shown to have caused any
- *    archived worker death: across the archive, wrap windows do not predict
- *    worker loss (wrapped runs kept their workers as often as they lost them),
- *    and run 507's workers stop ~9.6 s BEFORE its own wrap instant.
+ *    This is a LATENT defect repair, and the wrap is ASSOCIATED with worker
+ *    loss without the mechanism being established. Over the 81 archived runs
+ *    with ADX workers, a run whose window contains a wrap loses a worker about
+ *    41.7% of the time versus 12.3% for one whose window does not -- so the
+ *    association is real -- but six wrapped runs kept their workers, seven
+ *    unwrapped runs lost theirs, and the deaths in those unwrapped runs are not
+ *    explained by this at all. (Timing comparisons here must align the three
+ *    clocks: the QPC product, GetTickCount64, and `[FBPRESENT] t=`, which is
+ *    relative to the FIRST PRESENT, not process start.)
  *  - `now >= next + 4*frame` means the loop was away for several frames: re-arm
  *    from now rather than emitting a catch-up burst, which would present as a
  *    storm of interrupts the guest never saw.

@@ -2555,12 +2555,22 @@ static void raster_batch(void)
     }
     /* WHICH term of the validity predicate failed. `batches_no_tex` alone
      * cannot distinguish a stage the guest explicitly DISABLED from one whose
-     * offset/geometry was never bound -- and those have opposite fixes. The
-     * step change to ~94% untexturable batches at the disclaimer-to-backdrop
-     * boundary is measured; this is what says whether the guest asked for it
-     * (an explicit CONTROL0 disable, which the executor must honour) or
-     * whether state was lost (a reset or a missing method). Counted once per
-     * batch, in the same place as the counters above, so the two always sum. */
+     * offset/geometry was never bound -- and those have opposite fixes.
+     *
+     * LIMITATION, stated because it was once overstated here: the first test is
+     * `!s_tex0_enabled`, and `s_tex0_enabled` is a single sticky flag set only by
+     * a decoded `SET_TEXTURE_CONTROL0` write. So this splits "the flag is 0"
+     * from "the flag is 1 but offset/dimensions/format are missing". It CANNOT
+     * distinguish "the guest disabled stage 0" from "the model cleared or never
+     * received the enable bit" -- the hypothesis it was written to exclude. The
+     * printed label below is therefore an interpretation of a bit the model
+     * holds, not an observation of guest intent; whether the guest intended
+     * stage 0 disabled is INFERRED. A stronger discriminator would latch whether
+     * `SET_TEXTURE_CONTROL0` was ever written, how many times, and its last
+     * value, so "never received" is separable from "explicitly cleared".
+     *
+     * Counted once per batch, in the same place as the counters above, so the
+     * terms always sum. */
     if (!s_gpu.tex.valid) {
         if (!s_tex0_enabled) {
             ++s_gpu.batches_stage_disabled;
@@ -3600,9 +3610,11 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] batches: %u textured, %u with no texcoords,"
                     " %u with texcoords but no usable stage\n",
             s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex);
-    /* The stage-validity split. This is what distinguishes a stage the guest
-     * DISABLED (honour it) from state that was never bound or was lost (a
-     * defect) -- they look identical in the line above. */
+    /* The stage-validity split: which term of the predicate failed. NOTE the
+     * first term is the sticky enable flag, so "stage disabled by the guest" is
+     * an interpretation of model state, NOT an observation of guest intent --
+     * it cannot be distinguished from the flag never being received. See the
+     * longer note at the counter. */
     fprintf(stderr, "[GPU]   no-stage cause: %u stage disabled by the guest,"
                     " %u no offset, %u no dimensions, %u unusable format,"
                     " %u other\n",
