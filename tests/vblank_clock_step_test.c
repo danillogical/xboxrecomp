@@ -2,21 +2,30 @@
  *
  * THE DEFECT THIS PINS. The vblank service loop kept a deadline
  * (`next_vblank_ns`) in the same units as the clock reading (`now_ns`). When
- * the host clock overflowed -- `qemu_clock_get_ns` formed `QPC * 1e9` in a
- * signed 64-bit temporary, which wraps every 1844.67 s of host uptime at this
- * host's 10 MHz counter -- `now_ns` jumped backward from about +9.2e18 to about
- * -9.2e18 while `next_vblank_ns` stayed near +9.2e18. Neither
- * `now >= next` nor `now >= next + 4*frame` was then true, so NO pulse was
- * emitted until the reading climbed back (about 30 minutes), and the computed
- * wait became about 49 days.
+ * the host clock overflowed, the reading could jump BACKWARD to near zero while
+ * the deadline sat near the top of the range. Neither `now >= next` nor
+ * `now >= next + 4*frame` is then true, so pulses stop until the reading climbs
+ * back, and the computed wait becomes enormous.
  *
- * WHY IT MATTERED. No pulse means no PCRTC interrupt, no ISR, no DPC and no
- * `KeSetEvent` for the ADX middleware's vsync event. Its worker threads block
- * forever, `title.adx` is opened and never read, and the guest holds on the
- * loading screen. Measured per archived run: run 507 lost those workers at
- * t~286 s with the wrap instant 290 s into the run, and every archived run
- * whose window contained a wrap lost them while every run whose window did not
- * kept them.
+ * The two wrap points are distinct and are easy to conflate: the SIGNED product
+ * overflow at 2^63/1e9 counts (922.337 s of uptime at 10 MHz) makes the int64
+ * result negative, and the consumer holds it in a uint64_t, so that reading
+ * jumps FORWARD and re-arms harmlessly. It is the UNSIGNED product wrap at
+ * 2^64/1e9 counts (1844.674 s) that steps the reading backward. A C
+ * reproduction of the pre-fix loop stalls only at the unsigned wrap, and only
+ * for a minority of phase alignments.
+ *
+ * WHY IT MATTERS. No pulse means no PCRTC interrupt, no ISR, no DPC and no
+ * `KeSetEvent` for a vblank waiter, which can block for as long as the reading
+ * takes to climb back.
+ *
+ * WHAT THIS IS NOT. It is a LATENT defect repair. It is NOT shown to have
+ * caused any archived worker death: across the archive, wrap windows do not
+ * predict worker loss (six wrapped runs kept their workers, including
+ * `…223953-965-title008-frames-late`; seven unwrapped runs lost theirs), and
+ * run 507's ADX workers stop ~9.6 s BEFORE its own wrap instant. An earlier
+ * version of this comment asserted that correlation as measured fact; it was
+ * falsified by Turn Review and is withdrawn.
  *
  * WHAT THIS TEST DRIVES. `nv2a_vblank_advance` is the loop's scheduling rule
  * as a pure function, so this needs no device, no clock and no thread. It
@@ -29,7 +38,7 @@
  *   2. across the backward jump the rule re-arms and RESUMES pulsing within a
  *      few frames, rather than stalling;
  *   3. the deadline never ends up unreachably far ahead of the reading, which
- *      is the state that produced the multi-day sleep.
+ *      is the state that produced the enormous sleep.
  *
  * The root-cause fix is in `qemu_clock_get_ns` (src/nv2a/qemu_shim.h) and is
  * pinned by host_clock_wrap_test.c. This test pins the LOOP's defence, so a
@@ -115,7 +124,7 @@ int main(void)
         CHECK(pulses_after > 0,
               "vblank delivery did NOT resume after the clock stepped backward: "
               "%d pulse(s) in the 20 frames after the jump. This is the defect "
-              "-- the guest's vblank waiters would block forever.",
+              "-- a vblank waiter would block until the reading climbed back.",
               pulses_after);
         CHECK(frames_to_resume <= 2,
               "delivery resumed only after %d frame(s); a re-arm should take at "

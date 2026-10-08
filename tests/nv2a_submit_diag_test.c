@@ -1055,23 +1055,36 @@ static void test_budget_stop_resumes_at_committed_boundary(void)
      * driver. */
     matched_before = d->pfifo.budget_resume_matched;
     mismatched_before = d->pfifo.budget_resume_mismatched;
-
-    cap_begin();
-    kick_put(d, pb.at);
-    cap_end();
     {
-        uint32_t m = d->pfifo.budget_resume_matched;
-        uint32_t x = d->pfifo.budget_resume_mismatched;
-        CHECK(m + x == matched_before + mismatched_before + 1u,
-              "the resume was not audited at all (matched %u->%u, mismatched %u->%u)",
-              matched_before, m, mismatched_before, x);
-        CHECK(m == matched_before + 1u,
-              "the resume did not begin at the committed boundary (%08X): "
-              "matched=%u mismatched=%u (a mismatch means the submission was "
-              "restarted, not resumed)", committed_get, m, x);
-        CHECK(x == mismatched_before,
-              "a resume was counted as a mismatch (%u -> %u) although GET was at "
-              "the committed boundary %08X", mismatched_before, x, committed_get);
+        uint32_t stalled_before = d->pfifo.budget_resume_stalled;
+        uint32_t drained_before = d->pfifo.budget_resume_drained;
+
+        cap_begin();
+        kick_put(d, pb.at);
+        cap_end();
+        {
+            uint32_t m = d->pfifo.budget_resume_matched;
+            uint32_t x = d->pfifo.budget_resume_mismatched;
+            CHECK(m + x == matched_before + mismatched_before + 1u,
+                  "the resume was not audited at all (matched %u->%u, mismatched %u->%u)",
+                  matched_before, m, mismatched_before, x);
+            CHECK(m == matched_before + 1u,
+                  "the resume did not begin at the committed boundary (%08X): "
+                  "matched=%u mismatched=%u (a mismatch means the submission was "
+                  "restarted, not resumed)", committed_get, m, x);
+            CHECK(x == mismatched_before,
+                  "a resume was counted as a mismatch (%u -> %u) although GET was at "
+                  "the committed boundary %08X", mismatched_before, x, committed_get);
+            /* The positive arm must also show that the resume was NOT a stall,
+             * and that it DRAINED -- otherwise the new counters would only ever
+             * be exercised in the negative direction. */
+            CHECK(d->pfifo.budget_resume_stalled == stalled_before,
+                  "a resume that made progress was counted as a STALL (%u -> %u)",
+                  stalled_before, d->pfifo.budget_resume_stalled);
+            CHECK(d->pfifo.budget_resume_drained == drained_before + 1u,
+                  "a resume that reached PUT was not counted as drained "
+                  "(%u -> %u)", drained_before, d->pfifo.budget_resume_drained);
+        }
     }
 }
 

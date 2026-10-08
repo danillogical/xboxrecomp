@@ -333,6 +333,11 @@ typedef struct NV2AState {
         uint32_t budget_resume_matched;
         uint32_t budget_resume_mismatched;
         uint32_t budget_resume_stalled;
+        /* The machine-readable DRAIN evidence: resumes whose walk reached the
+         * stop's PUT, i.e. the whole submission was consumed. This is a subset
+         * of `matched` (right boundary AND progress) and is the counter that
+         * establishes resumable chunking without parsing the log. */
+        uint32_t budget_resume_drained;
         /* The ring index of the event whose resume is being classified, so the
          * walk's end can decide whether that resume progressed. */
         uint32_t budget_resume_event;
@@ -660,11 +665,14 @@ typedef struct NV2ASubmitState {
      *
      * `resume_stalled` counts resumptions that began at the correct committed
      * boundary but made NO progress -- the zero-commit livelock, and the case
-     * the boundary comparison alone cannot name. A run with stops but zero
-     * stalls and zero mismatches is genuinely resuming; a run with stalls is
-     * re-walking the same rejected stream. Appended last so every earlier
-     * reader's field offsets are unchanged. */
+     * the boundary comparison alone cannot name. `resume_drained` counts those
+     * whose walk reached the stop's PUT, which is the drain evidence that
+     * establishes resumable chunking. A run with stops, zero stalls, zero
+     * mismatches and a drained count equal to its stop count is genuinely
+     * resuming. Appended last so every earlier reader's field offsets are
+     * unchanged. */
     uint32_t budget_resume_stalled;
+    uint32_t budget_resume_drained;
 } NV2ASubmitState;
 /* Exported on Windows so a dump and the linker map name it, like g_nv2a_mmio_snapshot. */
 #ifdef _WIN32

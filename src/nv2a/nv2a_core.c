@@ -273,10 +273,18 @@ void nv2a_update_irq(NV2AState *d)
  *  - A clock that moved BACKWARD (`now + 4*frame < next`) means the deadline
  *    belongs to a different time base and can never be reached by waiting.
  *    Re-arm from now. This is the clause that matters: without it a host clock
- *    wrap leaves `next` about 2^63 while `now` restarts near 0, so NO pulse is
- *    emitted for as long as it takes the clock to climb back, and every thread
- *    waiting on a vertical blank blocks forever. Measured: run 507's ADX vsync
- *    workers died at t~286 s with the wrap instant 290 s into the run.
+ *    wrap leaves `next` near the top of the range while `now` restarts near 0,
+ *    so pulses CAN stop -- for some phase alignments, until the reading climbs
+ *    back -- and a thread waiting on a vertical blank can block for that long.
+ *    A C reproduction of the pre-fix loop stalls only at the UNSIGNED product
+ *    wrap (every 1844.674 s of uptime at 10 MHz) and only for a minority of
+ *    phase alignments; the SIGNED overflow instant (922.337 s) jumps FORWARD in
+ *    the consumer's uint64 view and re-arms harmlessly.
+ *
+ *    This is a LATENT defect repair. It is NOT shown to have caused any
+ *    archived worker death: across the archive, wrap windows do not predict
+ *    worker loss (wrapped runs kept their workers as often as they lost them),
+ *    and run 507's workers stop ~9.6 s BEFORE its own wrap instant.
  *  - `now >= next + 4*frame` means the loop was away for several frames: re-arm
  *    from now rather than emitting a catch-up burst, which would present as a
  *    storm of interrupts the guest never saw.
@@ -2230,18 +2238,33 @@ done:
      * past where it started, or committed at least one unit, or reached PUT.
      *
      * The check runs once, at the walk's end, where the outcome is known; it is
-     * observational and changes nothing about the walk. */
+     * observational and changes nothing about the walk.
+     *
+     * THREE outcomes, classified ONCE here (not increment-then-decrement):
+     *   drained  -- the walk reached the stop's PUT, so the whole submission
+     *               was consumed. This is the machine-readable form of the
+     *               drain evidence that establishes resumable chunking.
+     *   stalled  -- right boundary, no progress: the zero-commit livelock.
+     *   matched  -- right boundary and progress, but not all the way to PUT
+     *               (a legitimate multi-unit walk that stopped again).
+     * A wrong boundary is `mismatched`, counted where the boundary is checked. */
     if (d->pfifo.budget_resume_event != NV2A_BUDGET_NO_RESUME) {
         uint32_t idx = d->pfifo.budget_resume_event;
         NV2ABudgetEvent *ev = &d->pfifo.budget_events[idx];
         uint32_t end_get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
         bool progressed = (units > 0) || (end_get != ev->resume_start_get) || ok;
-        if (ev->start_was_committed && !progressed) {
-            /* Right boundary, no progress: move it out of `matched`. */
-            if (d->pfifo.budget_resume_matched)
-                --d->pfifo.budget_resume_matched;
-            ++d->pfifo.budget_resume_stalled;
-            ev->resume_stalled = 1u;
+        bool drained = (end_get == ev->resume_put) && ev->resume_put != 0u;
+        if (ev->start_was_committed) {
+            if (!progressed) {
+                /* Right boundary, no progress: move it out of `matched` and
+                 * name it. This is what the boundary check alone cannot see. */
+                if (d->pfifo.budget_resume_matched)
+                    --d->pfifo.budget_resume_matched;
+                ++d->pfifo.budget_resume_stalled;
+                ev->resume_stalled = 1u;
+            } else if (drained) {
+                ++d->pfifo.budget_resume_drained;
+            }
         }
         d->pfifo.budget_resume_event = NV2A_BUDGET_NO_RESUME;
     }
@@ -2327,6 +2350,7 @@ done:
         /* Resume quality. Appended last, so every earlier reader's field
          * offsets are unchanged. */
         ss->budget_resume_stalled = d->pfifo.budget_resume_stalled;
+        ss->budget_resume_drained = d->pfifo.budget_resume_drained;
         ss->get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
         ss->put = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
         if (ok) {
