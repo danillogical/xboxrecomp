@@ -577,15 +577,14 @@ static DWORD WINAPI ptimer_service_thread(void *opaque)
             nv2a->ptimer.clock_ns(nv2a->ptimer.clock_opaque) :
             (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         frame_ns = nv2a_display_frame_ns(nv2a);
-        if (next_vblank_ns == 0 || now_ns >= next_vblank_ns + frame_ns * 4) {
-            /* First frame, or the loop was away for several frames: re-arm
-             * from now rather than emitting a catch-up burst, which would
-             * present as a storm of interrupts the guest never saw. */
-            next_vblank_ns = now_ns + frame_ns;
-        } else if (now_ns >= next_vblank_ns) {
-            nv2a_vblank_pulse(nv2a);
-            next_vblank_ns += frame_ns;
-            if (next_vblank_ns <= now_ns) next_vblank_ns = now_ns + frame_ns;
+        /* The scheduling decision is a pure function so it can be tested
+         * without a live service thread -- see nv2a_vblank_advance. */
+        {
+            int pulse = 0;
+            next_vblank_ns = nv2a_vblank_advance(next_vblank_ns, now_ns, frame_ns,
+                                                 &pulse);
+            if (pulse)
+                nv2a_vblank_pulse(nv2a);
         }
 
         nv2a_ptimer_service(nv2a);
@@ -595,6 +594,12 @@ static DWORD WINAPI ptimer_service_thread(void *opaque)
                                   ? next_vblank_ns - now_ns : 0;
             if (until_vblank < delay_ns) delay_ns = until_vblank;
         }
+        /* Never sleep for more than a few frames on the vblank account: a
+         * deadline computed from a clock that is about to step is not a reason
+         * to stop servicing the display. Without this a bad `until_vblank`
+         * turns into a multi-day sleep, which is how the clock wrap presented
+         * (the guest simply never received another vertical blank). */
+        if (delay_ns > frame_ns * 4) delay_ns = frame_ns * 4;
 
         /* A rejected walk is sticky: GET stays put and D3D's ring-space wait
          * only polls, it never kicks again. Re-walk at most every 100 ms so a

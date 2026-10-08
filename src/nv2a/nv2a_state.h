@@ -82,6 +82,55 @@ enum {
     NV2A_HOLD_FLIP_STALL = 2,
 };
 
+/* What triggered a walk. A budget stop's meaning depends on which of these
+ * ran: a PUT kick means the guest submitted more work, a hold resume continues
+ * a trapped packet, and a stalled retry is the model re-walking on its own
+ * 100 ms cadence. Only the last one is a "retry" in the continuation sense. */
+enum {
+    NV2A_WALK_PUT_WRITE = 1,
+    NV2A_WALK_HOLD_RESUME = 2,
+    NV2A_WALK_STALLED_RETRY = 3,
+    NV2A_WALK_OTHER = 4,
+};
+
+/* How many budget stops are kept for the continuation audit. A ring, so a long
+ * run keeps the most recent events; `budget_events_total` is uncapped. 64 is
+ * chosen to exceed the largest count any archived run has produced (12) by a
+ * wide margin while staying trivial in size. */
+#define NV2A_BUDGET_EVENT_MAX 64
+
+/* One budget stop and, once it happens, the walk that resumed it.
+ *
+ * This exists because the FIRST-only latch cannot answer the continuation
+ * question: "did the same submission resume at the right cursor" is a property
+ * of the PAIR (stop, resume), and the interesting stop is usually not the
+ * first. Every field is written at the event by the code that performs it. */
+typedef struct NV2ABudgetEvent {
+    uint32_t seq;            /* 1-based stop number within the run */
+    uint32_t walk_serial;    /* the walk that stopped */
+    uint32_t trigger;        /* NV2A_WALK_* of the walk that stopped */
+    uint32_t limit_packets;  /* 1 = the 1024-packet cap, 0 = the word cap */
+    uint32_t in_param;       /* 1 = mid-packet, 0 = at a header */
+    uint32_t start_get;      /* where the stopping walk began */
+    uint32_t committed_get;  /* GET published by its last committed unit */
+    uint32_t put;            /* the walk's PUT at the stop */
+    uint32_t local_pc;       /* where the limit fired */
+    uint32_t words, packets; /* consumed by the stopping walk */
+    uint32_t units;          /* units that walk committed before stopping */
+    uint32_t count, method, ret;
+    uint32_t tail_words;     /* local_pc - committed_get, in words (rolled back) */
+    /* Filled by the NEXT walk that runs while this stop is outstanding. */
+    uint32_t resume_walk_serial;
+    uint32_t resume_trigger;
+    uint32_t resume_start_get;   /* must equal committed_get for correct resume */
+    uint32_t resume_end_get;
+    uint32_t resume_put;
+    uint32_t resume_ok;
+    uint32_t resume_units;
+    uint32_t resumed;            /* 1 once a walk has consumed this stop */
+    uint32_t start_was_committed;/* 1 = resume began exactly at committed_get */
+} NV2ABudgetEvent;
+
 /* ============================================================
  * NV2AState - Main GPU state
  * Adapted from xemu's nv2a_int.h
@@ -237,6 +286,84 @@ typedef struct NV2AState {
         uint32_t budget_trace_va[64];
         uint32_t budget_trace_word[64];
         uint32_t budget_trace_count;
+
+        /* ── Every budget stop, not just the first ──────────────────────────
+         *
+         * The latched transcript above records the FIRST stop only, which is
+         * the right choice for "why did the walk stop" but useless for "does
+         * the same submission resume correctly", where the LATER stops are the
+         * evidence. A run can stop dozens of times (witness-0298 stopped 12),
+         * so the question "is this benign chunking or broken continuation"
+         * cannot be answered from a first-only latch.
+         *
+         * This ring is written by the walk itself, at the event, with no
+         * sampling: `committed_get` is the GET the last committed unit
+         * published, and `tail_words` is what the stop rolled back. The
+         * resume check below pairs each stop with the walk that consumes it.
+         */
+        NV2ABudgetEvent budget_events[NV2A_BUDGET_EVENT_MAX];
+        uint32_t budget_events_total;      /* every stop, ring or not */
+        uint32_t budget_event_next;        /* ring write cursor */
+        /* The GET the NEXT walk is expected to start from, i.e. the last
+         * committed unit's boundary of a stop that has not yet been resumed.
+         * Zero when no stop is outstanding. */
+        uint32_t budget_expected_get;
+        uint32_t budget_expected_put;
+        uint32_t budget_outstanding;       /* a stop is awaiting its resume */
+        /* Resume outcomes. `matched` counts resumptions that began exactly at
+         * the previous stop's committed boundary -- the definition of correct
+         * continuation. `mismatched` is the Case C signature. */
+        uint32_t budget_resume_matched;
+        uint32_t budget_resume_mismatched;
+        uint32_t budget_resume_end_get;    /* where the most recent resume got to */
+        uint32_t budget_resume_ok;         /* that resume's success flag */
+        /* Words the stops rolled back and the retries re-walked. A resumable
+         * chunking scheme re-walks a tail once per stop; a replay bug shows as
+         * this growing without GET advancing. */
+        uint32_t budget_rewalked_words;
+        uint32_t budget_rewalked_packets;
+        /* Global walk serial and the trigger of the most recent walk, so a
+         * stop can be attributed to a PUT kick, a hold resume, or the stalled
+         * retry cadence rather than being assumed to be one of them. */
+        uint32_t walk_serial;
+        uint32_t walk_trigger;             /* NV2A_WALK_* */
+        uint32_t walk_retry_count;
+        /* Packets-per-walk histogram, log2 bins. The 1024 cap is only
+         * near-binding if walks actually reach these bins; a run whose walks
+         * all sit in the low bins is not being paced by the cap at all. */
+        uint32_t walk_packet_hist[12];     /* bin i: packets in [2^i, 2^(i+1)) */
+        uint32_t walk_packet_max;
+        uint32_t walk_words_max;
+        /* ── vblank delivery audit ───────────────────────────────────────────
+         *
+         * Why this exists: the ADX middleware's vsync/file threads in the
+         * failing runs are frozen in KeWaitForSingleObject on one event, and
+         * the run that made progress is the one whose archived register state
+         * shows NV_PCRTC_INTR_0 pending (the guest had not acknowledged). The
+         * question is whether the display keeps PULSING and the guest stops
+         * acknowledging, or the pulse/edge stops being delivered at all --
+         * and the IRQ delivery log cannot say, because it prints only the
+         * first three deliveries by construction.
+         *
+         * These are COUNTERS, incremented in the hot path with no formatting
+         * and no allocation: a vblank fires 60 times a second and a print per
+         * pulse would itself perturb the timing under investigation. */
+        uint32_t vblank_pulses;            /* nv2a_vblank_pulse calls */
+        uint32_t vblank_already_pending;   /* pulses where the bit was ALREADY set
+                                            * => the guest is not acknowledging */
+        uint32_t vblank_guest_acks;        /* W1C writes that cleared the bit */
+        uint32_t vblank_enable_writes;     /* writes to NV_PCRTC_INTR_EN_0 */
+        uint32_t vblank_enable_last;       /* the value the guest last wrote */
+        uint32_t vblank_enable_cleared;    /* enable writes that cleared VBLANK */
+        uint32_t vblank_irq_asserted;      /* update_irq transitions to asserted */
+        uint32_t vblank_irq_deasserted;    /* transitions to deasserted */
+        uint32_t vblank_irq_level_low;     /* update_irq saw nothing pending */
+        uint32_t vblank_irq_enabled_off;   /* pending but enabled mask is 0 */
+        /* The last W1C value the guest wrote and the pending bits it left. */
+        uint32_t vblank_last_ack_value;
+        uint32_t vblank_pending_last;
+        uint32_t submit_walk_start_get;
+        uint32_t submit_walk_units;
     } pfifo;
 
     struct {
@@ -325,6 +452,12 @@ int nv2a_irq_line_asserted(NV2AState *d);
  * hardware's job; clearing it is the guest's, through its write-1-to-clear to
  * NV_PCRTC_INTR_0. Nothing here touches the guest's enables. */
 void nv2a_vblank_pulse(NV2AState *d);
+
+/* One service-loop pass's vblank scheduling decision, as a pure function so
+ * the rule can be tested without a device, a clock or a live thread.
+ * Returns the new deadline and sets `*pulse` when a pulse is due. */
+uint64_t nv2a_vblank_advance(uint64_t next, uint64_t now, uint64_t frame,
+                             int *pulse);
 
 /* Frame period in nanoseconds, from the guest-programmed video timing.
  *
@@ -450,6 +583,58 @@ typedef struct NV2ASubmitState {
      * count (pushbuffer_size / 4). NOT a budget -- the unit budget is still
      * NV2A_SUBMIT_MAX_WORDS. See the walk for why it is not a raised limit. */
     uint32_t loop_bound;
+    /* ── Continuation audit (appended after loop_bound, for the same
+     *    forward-compatibility reason the unit fields are appended) ────────
+     *
+     * These answer "does the same submission resume at the right cursor",
+     * which the first-stop latch cannot: the interesting stop is usually not
+     * the first. `resume_matched` counts resumptions that began exactly at the
+     * previous stop's committed boundary; `resume_mismatched` is the Case C
+     * signature and must stay zero for benign chunking. */
+    uint32_t budget_events_total;   /* every stop, uncapped */
+    uint32_t budget_resume_matched;
+    uint32_t budget_resume_mismatched;
+    uint32_t budget_rewalked_words; /* tail words re-walked by retries */
+    uint32_t budget_rewalked_packets;
+    uint32_t walk_serial;
+    uint32_t walk_retry_count;
+    uint32_t walk_packet_max;
+    uint32_t walk_words_max;
+    /* log2 histogram of packets consumed per walk. The 1024 cap is only
+     * near-binding if real walks land in the top bins; if every walk sits
+     * below, the cap is not what paces the run. */
+    uint32_t walk_packet_hist[12];
+    /* The most recent budget stop's own record, so a dump taken after the run
+     * can be paired with the walk that resumed it without parsing the log. */
+    uint32_t budget_last_seq;
+    uint32_t budget_last_start_get;
+    uint32_t budget_last_committed_get;
+    uint32_t budget_last_put;
+    uint32_t budget_last_local_pc;
+    uint32_t budget_last_tail_words;
+    uint32_t budget_last_units;
+    uint32_t budget_last_resume_start_get;
+    uint32_t budget_last_resume_end_get;
+    uint32_t budget_last_resume_ok;
+    uint32_t budget_last_resumed;
+    /* ── vblank delivery audit (appended, same forward-compat rule) ────────
+     *
+     * The ADX middleware's vsync/file threads are frozen in a dispatcher wait
+     * on one event in the runs that stall on "Now Loading", and the run that
+     * progressed is the one whose register state showed NV_PCRTC_INTR_0
+     * pending. These counters separate the three ways vblank delivery can
+     * stop: the display stops pulsing, the guest stops acknowledging, or the
+     * line is left asserted and never re-delivered. */
+    uint32_t vblank_pulses;
+    uint32_t vblank_already_pending;
+    uint32_t vblank_guest_acks;
+    uint32_t vblank_enable_writes;
+    uint32_t vblank_enable_last;
+    uint32_t vblank_enable_cleared;
+    uint32_t vblank_irq_asserted;
+    uint32_t vblank_irq_deasserted;
+    uint32_t vblank_last_ack_value;
+    uint32_t vblank_pending_last;
 } NV2ASubmitState;
 /* Exported on Windows so a dump and the linker map name it, like g_nv2a_mmio_snapshot. */
 #ifdef _WIN32
@@ -463,6 +648,21 @@ extern NV2ASubmitState g_nv2a_submit_state;
 void nv2a_admit_unknown_override(int value);
 bool nv2a_admit_unknown_enabled(void);
 const char *nv2a_submit_diagnostic(uint32_t code);
+
+/* RECOMP_NV2A_PACKET_CAP: DIAGNOSTIC ONLY, default 1024.
+ *
+ * The 1024-packet cap is deliberately a STOP, not a yield (compatibility
+ * ledger L40), so it must not be changed to make a run "work". This override
+ * exists to make the cap an EXPERIMENTAL VARIABLE: varying it on ONE binary is
+ * the controlled test of whether the cap is benign chunking (the workload
+ * still completes, landmarks unchanged) or artificial starvation (it does
+ * not). A run with it set is exploratory, exactly like every other switch that
+ * changes the walk's behaviour.
+ *
+ * The value is the packet count; 0 or absent means the default. It is read
+ * once, like the admit switch, so a run cannot change it mid-flight. */
+void nv2a_packet_cap_override(int value);
+uint32_t nv2a_packet_cap(void);
 
 /* Committed-method consumer (a host renderer/observer). This is the ONLY way
  * the model hands committed methods to anything outside the GPU core: the core

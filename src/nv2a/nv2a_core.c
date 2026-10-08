@@ -57,6 +57,28 @@ bool nv2a_admit_unknown_enabled(void)
     return g_admit_unknown != 0;
 }
 
+/* RECOMP_NV2A_PACKET_CAP: DIAGNOSTIC ONLY. Default 1024, which is the cap L40
+ * keeps as a STOP. This makes it an experimental variable so the cap can be
+ * varied on ONE binary -- the controlled test of benign chunking vs
+ * starvation -- without changing the default behaviour any run sees. */
+#define NV2A_DEFAULT_PACKET_CAP 1024u
+static int g_packet_cap = -1;
+
+void nv2a_packet_cap_override(int value)
+{
+    g_packet_cap = value <= 0 ? -1 : value;
+}
+
+uint32_t nv2a_packet_cap(void)
+{
+    if (g_packet_cap < 0) {
+        const char *v = getenv("RECOMP_NV2A_PACKET_CAP");
+        unsigned long parsed = v ? strtoul(v, NULL, 0) : 0;
+        g_packet_cap = parsed ? (int)parsed : (int)NV2A_DEFAULT_PACKET_CAP;
+    }
+    return (uint32_t)g_packet_cap;
+}
+
 static bool instance_binding_valid(uint32_t guest_base, const uint8_t *host_ptr,
                                    uint32_t size)
 {
@@ -202,6 +224,20 @@ void nv2a_update_irq(NV2AState *d)
     } else {
         pci_irq_deassert(PCI_DEVICE(d));
     }
+    /* Delivery accounting. `asserted` is the level the line carries now; the
+     * counters below separate the three ways vblank delivery can stop:
+     * the line never rises (nothing pending / enable off), the line rises but
+     * never falls again (the guest stopped acknowledging), or the line falls
+     * and never rises again. */
+    if (asserted) {
+        ++d->pfifo.vblank_irq_asserted;
+        if (!d->pcrtc.pending_interrupts)
+            ++d->pfifo.vblank_irq_level_low;
+    } else {
+        ++d->pfifo.vblank_irq_deasserted;
+        if (d->pcrtc.pending_interrupts && !d->pcrtc.enabled_interrupts)
+            ++d->pfifo.vblank_irq_enabled_off;
+    }
     /* Edge-report the level. `nv2a_update_irq` runs on every register write
      * that touches a block's interrupt state, so reporting unconditionally
      * would re-enter the guest's ISR for a line the guest has not cleared
@@ -224,12 +260,68 @@ void nv2a_update_irq(NV2AState *d)
  * PCRTC interrupt.
  * ============================================================ */
 
+/* Advance the vblank deadline for one service-loop pass, and say whether this
+ * pass should emit a pulse.
+ *
+ * Split out from the service loop as a PURE function so the scheduling rule can
+ * be tested without a live service thread, a device or a clock: the loop's job
+ * is only to read the clock and call this.
+ *
+ * The rule, and why each clause exists:
+ *
+ *  - `next == 0` is the first pass: arm one frame out, do not pulse.
+ *  - A clock that moved BACKWARD (`now + 4*frame < next`) means the deadline
+ *    belongs to a different time base and can never be reached by waiting.
+ *    Re-arm from now. This is the clause that matters: without it a host clock
+ *    wrap leaves `next` about 2^63 while `now` restarts near 0, so NO pulse is
+ *    emitted for as long as it takes the clock to climb back, and every thread
+ *    waiting on a vertical blank blocks forever. Measured: run 507's ADX vsync
+ *    workers died at t~286 s with the wrap instant 290 s into the run.
+ *  - `now >= next + 4*frame` means the loop was away for several frames: re-arm
+ *    from now rather than emitting a catch-up burst, which would present as a
+ *    storm of interrupts the guest never saw.
+ *  - `now >= next` is the normal case: pulse once and advance by one frame.
+ *
+ * Returns the new deadline; `*pulse` is set to 1 when a pulse is due. */
+uint64_t nv2a_vblank_advance(uint64_t next, uint64_t now, uint64_t frame,
+                             int *pulse)
+{
+    if (pulse)
+        *pulse = 0;
+    if (frame == 0)
+        return next;
+    if (next == 0 || now + frame * 4 < next) {
+        return now + frame;
+    }
+    if (now >= next + frame * 4) {
+        return now + frame;
+    }
+    if (now >= next) {
+        if (pulse)
+            *pulse = 1;
+        next += frame;
+        if (next <= now)
+            next = now + frame;
+        return next;
+    }
+    return next;
+}
+
 void nv2a_vblank_pulse(NV2AState *d)
 {
     if (!d) return;
     /* The pending bit is set by the display, unconditionally: the enable
      * masks gate delivery, never the source. */
+    ++d->pfifo.vblank_pulses;
+    if (d->pcrtc.pending_interrupts & NV_PCRTC_INTR_0_VBLANK) {
+        /* The guest had not acknowledged the previous frame's vblank. This is
+         * the counter that distinguishes "the display stopped pulsing" from
+         * "the guest stopped acknowledging": the pulse count keeps climbing
+         * either way, but this one climbs only in the second case. */
+        ++d->pfifo.vblank_already_pending;
+    }
     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
+    d->pfifo.vblank_pending_last = d->pcrtc.pending_interrupts;
     nv2a_update_irq(d);
 }
 
@@ -674,10 +766,21 @@ void pcrtc_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
 
     switch (addr) {
     case NV_PCRTC_INTR_0:
+        /* The guest's write-1-to-clear. Counting the acknowledgements (and
+         * latching what it wrote) is what separates "the guest stopped
+         * acknowledging" from "the display stopped pulsing": the pulse counter
+         * climbs either way, this one does not. */
+        ++d->pfifo.vblank_guest_acks;
+        d->pfifo.vblank_last_ack_value = (uint32_t)val;
         d->pcrtc.pending_interrupts &= ~val;
+        d->pfifo.vblank_pending_last = d->pcrtc.pending_interrupts;
         nv2a_update_irq(d);
         break;
     case NV_PCRTC_INTR_EN_0:
+        ++d->pfifo.vblank_enable_writes;
+        d->pfifo.vblank_enable_last = (uint32_t)val;
+        if (!(val & NV_PCRTC_INTR_EN_0_VBLANK))
+            ++d->pfifo.vblank_enable_cleared;
         d->pcrtc.enabled_interrupts = val;
         nv2a_update_irq(d);
         break;
@@ -848,8 +951,10 @@ uint64_t pgraph_read(void *opaque, hwaddr addr, unsigned int size)
  * release it, and nv2a_submit_pending decides whether it has. */
 static void pgraph_resume_walk(NV2AState *d)
 {
-    if (d->pfifo.hold != NV2A_HOLD_NONE)
+    if (d->pfifo.hold != NV2A_HOLD_NONE) {
+        d->pfifo.walk_trigger = NV2A_WALK_HOLD_RESUME;
         nv2a_submit_pending(d);
+    }
 }
 
 void pgraph_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
@@ -1525,6 +1630,55 @@ static void submit_budget_stop(NV2AState *d, uint32_t get, uint32_t put,
 {
     bool first = d->pfifo.budget_stops == 0;
     ++d->pfifo.budget_stops;
+
+    /* ── Record EVERY stop in the continuation ring ─────────────────────────
+     *
+     * This runs on both budget paths and is the only place the walk's own
+     * start/committed/rollback cursors are still in scope, so it is where a
+     * "did the tail resume correctly" record has to be built. It is written
+     * before the first-only latch returns, so later stops are recorded even
+     * though only the first is printed in full. */
+    {
+        NV2ABudgetEvent *ev;
+        uint32_t committed = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
+        uint32_t idx = d->pfifo.budget_event_next % NV2A_BUDGET_EVENT_MAX;
+
+        ++d->pfifo.budget_events_total;
+        d->pfifo.budget_event_next = idx + 1u;
+        ev = &d->pfifo.budget_events[idx];
+        memset(ev, 0, sizeof(*ev));
+        ev->seq = d->pfifo.budget_events_total;
+        ev->walk_serial = d->pfifo.walk_serial;
+        ev->trigger = d->pfifo.walk_trigger;
+        ev->limit_packets = at_packet_limit ? 1u : 0u;
+        ev->in_param = in_param ? 1u : 0u;
+        ev->start_get = d->pfifo.submit_walk_start_get;
+        ev->committed_get = committed;
+        ev->put = put;
+        ev->local_pc = local_pc;
+        ev->words = words;
+        ev->packets = packets;
+        ev->units = d->pfifo.submit_walk_units;
+        ev->count = count;
+        ev->method = method;
+        ev->ret = ret;
+        /* The rolled-back tail: what this stop did NOT consume. `local_pc` is
+         * normally at or after `committed_get` within one walk, but a jump can
+         * move it backwards, so handle both directions rather than masking --
+         * the ring size is not guaranteed to be a power of two. */
+        if (local_pc >= committed)
+            ev->tail_words = (local_pc - committed) / 4u;
+        else
+            ev->tail_words = (local_pc + (end - begin) - committed) / 4u;
+        /* The next walk must begin exactly here for the continuation to be
+         * correct. Recorded now so the resume can be checked against it. */
+        d->pfifo.budget_expected_get = committed;
+        d->pfifo.budget_expected_put = put;
+        d->pfifo.budget_outstanding = 1;
+        d->pfifo.budget_rewalked_words += ev->tail_words;
+        d->pfifo.budget_rewalked_packets += count ? 1u : 0u;
+    }
+
     if (!first) return;                       /* latch the FIRST stop only */
 
     d->pfifo.budget_local_pc = local_pc;
@@ -1675,6 +1829,36 @@ bool nv2a_submit_pending(NV2AState *d)
     if (get == end) get = begin;
     if (put == end) put = begin;
     pc = get;
+    /* Record this walk's origin and serial, and -- if the previous walk stopped
+     * on the budget -- CHECK THAT IT RESUMES WHERE THAT STOP LEFT OFF.
+     *
+     * This is the continuation audit. Benign chunking means the next walk
+     * begins exactly at the boundary the last committed unit published; a
+     * resume anywhere else (submission restart, a stale cursor, a skipped
+     * range) is the Case C signature. The check is observational: it records
+     * the comparison, it does not change the walk. */
+    ++d->pfifo.walk_serial;
+    d->pfifo.submit_walk_start_get = get;
+    d->pfifo.submit_walk_units = 0;
+    if (d->pfifo.budget_outstanding) {
+        uint32_t idx = (d->pfifo.budget_event_next + NV2A_BUDGET_EVENT_MAX - 1u)
+                     % NV2A_BUDGET_EVENT_MAX;
+        NV2ABudgetEvent *ev = &d->pfifo.budget_events[idx];
+        bool matched = (get == d->pfifo.budget_expected_get);
+        d->pfifo.budget_outstanding = 0;
+        if (!ev->resumed) {
+            ev->resumed = 1u;
+            ev->resume_walk_serial = d->pfifo.walk_serial;
+            ev->resume_trigger = d->pfifo.walk_trigger;
+            ev->resume_start_get = get;
+            ev->resume_put = put;
+            ev->start_was_committed = matched ? 1u : 0u;
+            if (matched)
+                ++d->pfifo.budget_resume_matched;
+            else
+                ++d->pfifo.budget_resume_mismatched;
+        }
+    }
     /* The packet being walked. A walk normally starts at a header; after a
      * hold it resumes inside the packet the hold interrupted. */
     uint32_t count = 0, method = 0, subchannel = 0, address = pc;
@@ -1821,7 +2005,7 @@ bool nv2a_submit_pending(NV2AState *d)
          * under the word budget and would otherwise accept).
          * tests/test_nv2a_contract.c pins that case. Evaluated before the yield
          * so a packet-bound stream terminates on the same walk. */
-        if (packets >= 1024) {
+        if (packets >= nv2a_packet_cap()) {
             d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false;
             submit_budget_stop(d, get, put, begin, end, pc, words, packets,
                                count, method, ret, address, false, true);
@@ -1984,6 +2168,7 @@ bool nv2a_submit_pending(NV2AState *d)
         /* This unit is committed. Account for it, then either continue with
          * the next unit or stop. */
         ++units;
+        d->pfifo.submit_walk_units = units;
         unit_words_total += unit_words;
         /* The structural cycle backstop. The unit loop replaces the old
          * "one walk <= 4096 words" cap, which also bounded a cycling ring; a
@@ -2015,6 +2200,29 @@ bool nv2a_submit_pending(NV2AState *d)
 done:
     d->pfifo.submit_words += words;
     d->pfifo.submit_packets += packets;
+    /* Record how this walk ended for the continuation audit: a walk that
+     * consumed an outstanding stop's tail closes that stop's record with the
+     * GET it actually reached. */
+    if (d->pfifo.budget_event_next) {
+        uint32_t idx = (d->pfifo.budget_event_next + NV2A_BUDGET_EVENT_MAX - 1u)
+                     % NV2A_BUDGET_EVENT_MAX;
+        NV2ABudgetEvent *ev = &d->pfifo.budget_events[idx];
+        if (ev->resumed && !ev->resume_end_get) {
+            ev->resume_end_get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
+            ev->resume_ok = ok ? 1u : 0u;
+            ev->resume_units = units;
+        }
+    }
+    /* Packets-per-walk histogram. This is what says whether the 1024 cap is
+     * anywhere near binding for a normal run: if every walk lands in the low
+     * bins, the cap is not what paces it, whatever its value. */
+    {
+        uint32_t bin = 0, p = packets;
+        while (p > 1u && bin < 11u) { p >>= 1; ++bin; }
+        ++d->pfifo.walk_packet_hist[bin];
+        if (packets > d->pfifo.walk_packet_max) d->pfifo.walk_packet_max = packets;
+        if (words > d->pfifo.walk_words_max) d->pfifo.walk_words_max = words;
+    }
     d->pfifo.submit_diag_get = (d->pfifo.submit_diag == NV2A_SUBMIT_OK) ? pc : d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
     {
         /* Published once per walk under the generation protocol, so a reader
@@ -2042,6 +2250,48 @@ done:
         ss->units = units;
         ss->units_total += units;
         ss->loop_bound = unit_limit;
+        /* Continuation audit. These are appended after loop_bound so a reader
+         * that knows only the older field set stops before them and never
+         * misreads a budget field. */
+        ss->budget_events_total = d->pfifo.budget_events_total;
+        ss->budget_resume_matched = d->pfifo.budget_resume_matched;
+        ss->budget_resume_mismatched = d->pfifo.budget_resume_mismatched;
+        ss->budget_rewalked_words = d->pfifo.budget_rewalked_words;
+        ss->budget_rewalked_packets = d->pfifo.budget_rewalked_packets;
+        ss->walk_serial = d->pfifo.walk_serial;
+        ss->walk_retry_count = d->pfifo.walk_retry_count;
+        ss->walk_packet_max = d->pfifo.walk_packet_max;
+        ss->walk_words_max = d->pfifo.walk_words_max;
+        memcpy(ss->walk_packet_hist, d->pfifo.walk_packet_hist,
+               sizeof(ss->walk_packet_hist));
+        if (d->pfifo.budget_event_next) {
+            uint32_t bi = (d->pfifo.budget_event_next + NV2A_BUDGET_EVENT_MAX - 1u)
+                        % NV2A_BUDGET_EVENT_MAX;
+            const NV2ABudgetEvent *ev = &d->pfifo.budget_events[bi];
+            ss->budget_last_seq = ev->seq;
+            ss->budget_last_start_get = ev->start_get;
+            ss->budget_last_committed_get = ev->committed_get;
+            ss->budget_last_put = ev->put;
+            ss->budget_last_local_pc = ev->local_pc;
+            ss->budget_last_tail_words = ev->tail_words;
+            ss->budget_last_units = ev->units;
+            ss->budget_last_resume_start_get = ev->resume_start_get;
+            ss->budget_last_resume_end_get = ev->resume_end_get;
+            ss->budget_last_resume_ok = ev->resume_ok;
+            ss->budget_last_resumed = ev->resumed;
+        }
+        /* vblank delivery audit. Appended after the continuation fields so a
+         * reader that knows the older set stops before them. */
+        ss->vblank_pulses = d->pfifo.vblank_pulses;
+        ss->vblank_already_pending = d->pfifo.vblank_already_pending;
+        ss->vblank_guest_acks = d->pfifo.vblank_guest_acks;
+        ss->vblank_enable_writes = d->pfifo.vblank_enable_writes;
+        ss->vblank_enable_last = d->pfifo.vblank_enable_last;
+        ss->vblank_enable_cleared = d->pfifo.vblank_enable_cleared;
+        ss->vblank_irq_asserted = d->pfifo.vblank_irq_asserted;
+        ss->vblank_irq_deasserted = d->pfifo.vblank_irq_deasserted;
+        ss->vblank_last_ack_value = d->pfifo.vblank_last_ack_value;
+        ss->vblank_pending_last = d->pfifo.vblank_pending_last;
         ss->get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
         ss->put = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
         if (ok) {
@@ -2173,6 +2423,7 @@ static void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int siz
         d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = (uint32_t)val;
         qemu_mutex_unlock(&d->pfifo.lock);
         kick_observer_notify(NV2A_KICK);
+        d->pfifo.walk_trigger = NV2A_WALK_PUT_WRITE;
         nv2a_submit_pending(d);
         log_kicked_walk(d);
     }
@@ -2187,6 +2438,8 @@ bool nv2a_retry_stalled_walk(NV2AState *d)
     stalled = g_nv2a_submit_state.consecutive_rejections;
     qemu_mutex_unlock(&d->pfifo.lock);
     if (!stalled) return false;
+    d->pfifo.walk_trigger = NV2A_WALK_STALLED_RETRY;
+    ++d->pfifo.walk_retry_count;
     committed = nv2a_submit_pending(d);
     log_kicked_walk(d);
     return committed;
@@ -2261,6 +2514,7 @@ void pfifo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         qemu_mutex_lock(&d->pfifo.lock);
         d->pfifo.regs[addr] = (uint32_t)val;
         qemu_mutex_unlock(&d->pfifo.lock);
+        d->pfifo.walk_trigger = NV2A_WALK_PUT_WRITE;
         nv2a_submit_pending(d);
         break;
     default:

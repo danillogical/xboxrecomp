@@ -71,4 +71,40 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME nv2a_submit_diag COMMAND nv2a_submit_diag_test)
     set_tests_properties(nv2a_submit_diag PROPERTIES TIMEOUT 20)
+
+    # The host clock must not jump backward at the QPC product wrap.
+    #
+    # A pure-arithmetic test with no project dependencies: it reproduces the
+    # shim's own expression (old and current) over the wrap boundary, so it
+    # needs no device and no kernel. That is deliberate -- the defect is in a
+    # formula, and a test that called the function through the shim could not
+    # observe the overflowing intermediate.
+    add_executable(host_clock_wrap_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/host_clock_wrap_test.c
+    )
+    if(NOT MSVC)
+        target_compile_options(host_clock_wrap_test PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME host_clock_wrap COMMAND host_clock_wrap_test)
+    set_tests_properties(host_clock_wrap PROPERTIES TIMEOUT 20)
+
+    # The vblank service loop's scheduling rule must survive a clock that steps
+    # backward. `nv2a_vblank_advance` is the rule as a pure function, so this
+    # compiles only nv2a_core.c (like the submit tests) and needs no device,
+    # no thread and no D3D11 backend.
+    add_executable(vblank_clock_step_test
+        nv2a_core.c
+        nv2a_method_table.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/vblank_clock_step_test.c
+    )
+    target_include_directories(vblank_clock_step_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(NOT MSVC)
+        target_compile_options(vblank_clock_step_test PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+    target_link_libraries(vblank_clock_step_test PRIVATE platform)
+    if(WIN32)
+        target_link_libraries(vblank_clock_step_test PRIVATE kernel32)
+    endif()
+    add_test(NAME vblank_clock_step COMMAND vblank_clock_step_test)
+    set_tests_properties(vblank_clock_step PROPERTIES TIMEOUT 20)
 endif()

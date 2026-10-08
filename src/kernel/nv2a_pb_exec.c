@@ -295,6 +295,12 @@ static struct {
      * identical on screen and want opposite fixes: the batch carried no
      * texture coordinates, or it did and the stage was not usable. */
     uint32_t batches_textured, batches_no_uv, batches_no_tex;
+    /* And WHY a texcoord-carrying batch had no usable stage. These sum to
+     * batches_no_tex, and they separate the case the guest asked for (an
+     * explicit CONTROL0 stage disable) from the cases where state was never
+     * bound or was lost -- which have opposite fixes. */
+    uint32_t batches_stage_disabled, batches_no_offset, batches_no_dims,
+             batches_no_format, batches_other_invalid;
     uint32_t blend_enable, blend_sfactor, blend_dfactor;
     Texture  tex;
     /* Fixed-function transform: the composite matrix (world*view*projection
@@ -1032,6 +1038,11 @@ typedef struct PbTraceBatch {
     uint32_t tris;          /* triangles this batch actually rasterised */
     uint32_t pixels;        /* pixel writes this batch made */
     uint8_t  tex_valid, textured, screen_space, ffp, refused;
+    /* WHY the stage was unusable for this batch. `tex_valid == 0` alone cannot
+     * distinguish a stage the guest disabled from state that was never bound,
+     * and the ring is the only per-batch record a run carries -- so the
+     * discriminator has to live here, not only in the cumulative counters. */
+    uint8_t  stage_disabled;   /* the guest's CONTROL0 clear was in force */
 } PbTraceBatch;
 
 static PbTraceBatch s_tbatch[PB_TRACE_BATCHES];
@@ -1056,6 +1067,7 @@ static void trace_batch(uint32_t target, uint32_t tris, uint32_t pixels,
     b->screen_space = (uint8_t)screen_space;
     b->ffp         = (uint8_t)ffp;
     b->refused     = (uint8_t)refused;
+    b->stage_disabled = (uint8_t)(s_tex0_enabled ? 0 : 1);
     s_tbatch_head = (s_tbatch_head + 1) % PB_TRACE_BATCHES;
     if (s_tbatch_count < PB_TRACE_BATCHES)
         s_tbatch_count++;
@@ -2541,6 +2553,27 @@ static void raster_batch(void)
             note_texture_use();
         }
     }
+    /* WHICH term of the validity predicate failed. `batches_no_tex` alone
+     * cannot distinguish a stage the guest explicitly DISABLED from one whose
+     * offset/geometry was never bound -- and those have opposite fixes. The
+     * step change to ~94% untexturable batches at the disclaimer-to-backdrop
+     * boundary is measured; this is what says whether the guest asked for it
+     * (an explicit CONTROL0 disable, which the executor must honour) or
+     * whether state was lost (a reset or a missing method). Counted once per
+     * batch, in the same place as the counters above, so the two always sum. */
+    if (!s_gpu.tex.valid) {
+        if (!s_tex0_enabled) {
+            ++s_gpu.batches_stage_disabled;
+        } else if (!s_gpu.tex.offset) {
+            ++s_gpu.batches_no_offset;
+        } else if (!s_gpu.tex.width || !s_gpu.tex.height) {
+            ++s_gpu.batches_no_dims;
+        } else if (!(tex_size_from_format(s_gpu.tex.color) || s_gpu.tex.pitch)) {
+            ++s_gpu.batches_no_format;
+        } else {
+            ++s_gpu.batches_other_invalid;
+        }
+    }
 
     for_each_triangle(raster_tri, NULL);
 
@@ -3567,6 +3600,15 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] batches: %u textured, %u with no texcoords,"
                     " %u with texcoords but no usable stage\n",
             s_gpu.batches_textured, s_gpu.batches_no_uv, s_gpu.batches_no_tex);
+    /* The stage-validity split. This is what distinguishes a stage the guest
+     * DISABLED (honour it) from state that was never bound or was lost (a
+     * defect) -- they look identical in the line above. */
+    fprintf(stderr, "[GPU]   no-stage cause: %u stage disabled by the guest,"
+                    " %u no offset, %u no dimensions, %u unusable format,"
+                    " %u other\n",
+            s_gpu.batches_stage_disabled, s_gpu.batches_no_offset,
+            s_gpu.batches_no_dims, s_gpu.batches_no_format,
+            s_gpu.batches_other_invalid);
     /* The swap split, which the draw/clear counters above cannot show: a title
      * that flips by advancing the write pointer and one that stalls on the read
      * pointer are different D3D paths, and only one of them increments flips. */

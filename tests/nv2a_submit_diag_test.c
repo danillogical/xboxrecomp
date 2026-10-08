@@ -169,6 +169,12 @@ static void mmio_w(NV2AState *d, uint32_t addr, uint32_t v)
 }
 
 #define USER(r) (0x800000u + (r))
+/* PCRTC's block-local offsets. The block is reached by calling pcrtc_write
+ * directly (it is declared by DEFINE_PROTO in nv2a_state.h) rather than through
+ * nv2a_mmio_write, because the MMIO hook routes the PFIFO/USER aperture the
+ * submit tests use and does not dispatch the PCRTC window. */
+#define PCRTC_INTR_0     0x100u
+#define PCRTC_INTR_EN_0  0x140u
 
 static uint32_t get_ptr(NV2AState *d)
 {
@@ -945,7 +951,389 @@ static void test_budget_stop_transcript(void)
     }
 }
 
-/* ── bounded prefix commit: units at whole-packet boundaries ─────────────── */
+/* ── the budget stop's CONTINUATION: does the same submission resume at the
+ *    boundary the last committed unit published? ────────────────────────────
+ *
+ * The latched first-stop transcript answers "why did the walk stop". It cannot
+ * answer "did the work resume correctly", because that is a property of the
+ * PAIR (stop, resume) and the interesting stop is usually not the first. This
+ * is the measurement that turns "benign resumable chunking" from an assumption
+ * into an observation, and it is the one that must FAIL if a stop ever resumes
+ * from the submission's start instead of its committed boundary -- the Case C
+ * signature.
+ *
+ * The stream is built so a unit COMMITS before the packet cap fires, which is
+ * what makes committed_get != start_get. That distinction is the whole point:
+ * if nothing committed, "resumes at the committed boundary" and "restarts the
+ * submission" name the same address and the test cannot discriminate. The
+ * construction is therefore packets of 5 words (count 4, non-incrementing):
+ * 819 of them fill a unit to 4095 words, the yield fires, that unit commits,
+ * and the cap then fires in unit 2 at 1024 packets total.
+ *
+ * (The sibling test test_packet_cap_can_pin_get_without_a_commit records the
+ * case where NO unit commits -- a packet-dense stream -- which is a genuine
+ * structural property of the cap's scope, not a mistake in this one.) */
+static void test_budget_stop_resumes_at_committed_boundary(void)
+{
+    NV2AState *d = fresh();
+    Pb pb;
+    uint32_t i, committed_get, start_get;
+    uint32_t matched_before, mismatched_before;
+
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);                 /* bind NV097 */
+    for (i = 0; i < 1030u; ++i) {
+        /* non-incrementing count 4 = 1 header + 4 params = 5 words */
+        pb_word(&pb, 0x40000000u | (4u << 18) | 0x1760u);
+        pb_word(&pb, 0x55550000u + i);
+        pb_word(&pb, 0x55550001u + i);
+        pb_word(&pb, 0x55550002u + i);
+        pb_word(&pb, 0x55550003u + i);
+    }
+    cap_begin();
+    kick(d, pb.start, pb.at);
+    cap_end();
+
+    start_get = pb.start;
+    CHECK(strcmp(diag(d), "budget_exhausted") == 0,
+          "expected budget_exhausted, got %s", diag(d));
+    CHECK(d->pfifo.budget_events_total == 1,
+          "budget_events_total=%u, want 1", d->pfifo.budget_events_total);
+
+    {
+        uint32_t idx = (d->pfifo.budget_event_next + NV2A_BUDGET_EVENT_MAX - 1u)
+                     % NV2A_BUDGET_EVENT_MAX;
+        const NV2ABudgetEvent *ev = &d->pfifo.budget_events[idx];
+        CHECK(ev->seq == 1, "event seq=%u, want 1", ev->seq);
+        CHECK(ev->limit_packets == 1,
+              "the PACKET cap fired, so limit_packets must be 1 (got %u)",
+              ev->limit_packets);
+        CHECK(ev->start_get == start_get,
+              "event start_get=%08X, want the walk origin %08X",
+              ev->start_get, start_get);
+        CHECK(ev->packets == 1024u,
+              "event packets=%u, want exactly the cap (1024)", ev->packets);
+        /* A unit must have committed: that is what makes the resume boundary
+         * a different address from the submission origin. */
+        committed_get = ev->committed_get;
+        CHECK(ev->units >= 1u,
+              "no unit committed before the stop (units=%u): the word yield "
+              "should have fired at 819 five-word packets", ev->units);
+        CHECK(committed_get != start_get,
+              "nothing committed before the stop (committed_get=%08X == start=%08X): "
+              "this construction cannot test the resume boundary",
+              committed_get, start_get);
+        CHECK(ev->local_pc != committed_get,
+              "the frontier equals the committed boundary (%08X): nothing was rolled back",
+              ev->local_pc);
+        CHECK(ev->tail_words > 0,
+              "tail_words=%u, want > 0 (a rolled-back tail is the whole point)",
+              ev->tail_words);
+        CHECK(d->pfifo.budget_expected_get == committed_get,
+              "the outstanding stop expects a resume at %08X, want the committed "
+              "boundary %08X", d->pfifo.budget_expected_get, committed_get);
+        /* GET must have ADVANCED to the committed boundary, not stayed at the
+         * submission origin: that is what "resumable" means. */
+        CHECK(get_ptr(d) == committed_get,
+              "GET is %08X but the committed boundary is %08X: the committed unit "
+              "did not publish its GET", get_ptr(d), committed_get);
+    }
+
+    /* ── the resume: walk again, and check WHERE it started ──────────────
+     *
+     * The next walk must start at the committed boundary, because that is
+     * where GET now is. The audit must therefore record a MATCH; a mismatch
+     * here would mean the walk restarted the submission instead of resuming
+     * its tail -- the Case C signature.
+     *
+     * The resume is driven with kick_put, NOT kick: `kick` writes GET as well
+     * as PUT, and writing GET back to the submission origin is precisely the
+     * "restart the submission" action this test is trying to detect. Using it
+     * here would make the test manufacture its own mismatch (measured: it did,
+     * reporting mismatched=1 at committed_get=00004FF0). The real guest
+     * advances PUT and leaves GET to the model, so kick_put is the faithful
+     * driver. */
+    matched_before = d->pfifo.budget_resume_matched;
+    mismatched_before = d->pfifo.budget_resume_mismatched;
+
+    cap_begin();
+    kick_put(d, pb.at);
+    cap_end();
+    {
+        uint32_t m = d->pfifo.budget_resume_matched;
+        uint32_t x = d->pfifo.budget_resume_mismatched;
+        CHECK(m + x == matched_before + mismatched_before + 1u,
+              "the resume was not audited at all (matched %u->%u, mismatched %u->%u)",
+              matched_before, m, mismatched_before, x);
+        CHECK(m == matched_before + 1u,
+              "the resume did not begin at the committed boundary (%08X): "
+              "matched=%u mismatched=%u (a mismatch means the submission was "
+              "restarted, not resumed)", committed_get, m, x);
+        CHECK(x == mismatched_before,
+              "a resume was counted as a mismatch (%u -> %u) although GET was at "
+              "the committed boundary %08X", mismatched_before, x, committed_get);
+    }
+}
+
+/* A packet-dense stream CANNOT commit anything before the cap fires, so GET is
+ * pinned and every retry repeats the same rejected walk.
+ *
+ * This is a real structural property of the cap's SCOPE, and it is recorded
+ * rather than papered over. The word budget is per-UNIT (`unit_words` resets at
+ * each unit commit) while the packet counter is WALK-CUMULATIVE (`packets` is
+ * never reset). For a stream whose packets are small, the word yield
+ * (`unit_words + 1 + count > NV2A_SUBMIT_MAX_WORDS`) never fires before the
+ * packet cap does -- so the walk reaches the cap having committed NOTHING, and
+ * `regs[NV_PFIFO_CACHE1_DMA_GET] = pc` (which is inside `if (ok)`) never runs.
+ * GET therefore does not move, and `nv2a_retry_stalled_walk` re-walks the
+ * identical stream to the identical stop.
+ *
+ * 1025 two-word packets is 2050 words -- half the word budget -- so this is not
+ * a "too much work" case; it is the packet term binding at a scope the word
+ * term does not share.
+ *
+ * WHY THIS IS A TEST AND NOT A FIX: the packet cap is deliberately a STOP
+ * (compatibility ledger L40) so that 1025 one-word packets rejects rather than
+ * being accepted. Changing the scope is a behaviour change with its own
+ * evidence requirement. This test exists so the property is measured and
+ * cannot be lost, and so that any future change to the scope has to state what
+ * it did to this case. */
+static void test_packet_cap_can_pin_get_without_a_commit(void)
+{
+    NV2AState *d = fresh();
+    Pb pb;
+    uint32_t i;
+    uint32_t get_after_first, get_after_many;
+
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);                 /* bind NV097 */
+    for (i = 0; i < 1025u; ++i) {                        /* count 1 = 2 words */
+        pb_word(&pb, (1u << 18) | 0x1760u);
+        pb_word(&pb, 0x66660000u + i);
+    }
+    cap_begin();
+    kick(d, pb.start, pb.at);
+    cap_end();
+
+    CHECK(strcmp(diag(d), "budget_exhausted") == 0,
+          "expected budget_exhausted, got %s", diag(d));
+    get_after_first = get_ptr(d);
+    CHECK(get_after_first == pb.start,
+          "GET moved to %08X although no unit could have committed (want the "
+          "origin %08X)", get_after_first, pb.start);
+
+    {
+        uint32_t idx = (d->pfifo.budget_event_next + NV2A_BUDGET_EVENT_MAX - 1u)
+                     % NV2A_BUDGET_EVENT_MAX;
+        const NV2ABudgetEvent *ev = &d->pfifo.budget_events[idx];
+        CHECK(ev->units == 0u,
+              "units=%u, want 0: the packet cap must have fired before any unit "
+              "commit for a 2-word-packet stream", ev->units);
+        CHECK(ev->committed_get == ev->start_get,
+              "committed_get=%08X != start_get=%08X, so a unit DID commit and "
+              "this stream no longer demonstrates the zero-commit case",
+              ev->committed_get, ev->start_get);
+        CHECK(ev->packets == 1024u,
+              "packets=%u, want 1024 (the cap)", ev->packets);
+        CHECK(ev->words < NV2A_SUBMIT_MAX_WORDS,
+              "words=%u reached the word budget, so this is not isolating the "
+              "packet term", ev->words);
+    }
+
+    /* The retry cannot make progress: GET is pinned, so the same walk stops at
+     * the same place. This is the livelock the scope asymmetry permits, and it
+     * is asserted rather than described so a future change to the cap's scope
+     * must consciously update it.
+     *
+     * ONE capture window around the whole loop: cap_begin opens a tmpfile and
+     * cap_end closes it, so nesting them per iteration would leak five file
+     * handles and their buffers for no benefit -- the walk's own output is what
+     * matters, not which retry produced it. */
+    cap_begin();
+    for (i = 0; i < 5u; ++i)
+        nv2a_retry_stalled_walk(d);
+    cap_end();
+    get_after_many = get_ptr(d);
+    CHECK(get_after_many == get_after_first,
+          "GET advanced from %08X to %08X across retries of a stream that "
+          "commits nothing: the zero-commit case is no longer a livelock",
+          get_after_first, get_after_many);
+    CHECK(d->pfifo.budget_events_total >= 6u,
+          "budget_events_total=%u, want >= 6 (the first stop plus five retries "
+          "that stopped again)", d->pfifo.budget_events_total);
+}
+
+
+/* The packet cap must be a real EXPERIMENTAL VARIABLE, and lowering it must
+ * actually change the walk's behaviour.
+ *
+ * Why this test exists: the cap experiment ("does a smaller cap starve the
+ * guest, or does continuation just chunk more?") is only evidence if the
+ * override actually takes effect. An override that silently did nothing would
+ * make three identical runs look like a clean invariance result and would
+ * "prove" benign chunking for the wrong reason. So this asserts the negative
+ * direction too: a stream that DRAINS at the default cap must STOP at a low
+ * cap, and the stop must be the packet limit rather than the word limit.
+ */
+static void test_packet_cap_override_is_effective(void)
+{
+    NV2AState *d;
+    Pb pb;
+    uint32_t i;
+
+    /* 100 packets of count 1 = 200 words: far below BOTH the default packet
+     * cap and the word budget, so it drains cleanly. */
+    nv2a_packet_cap_override(0);
+    CHECK(nv2a_packet_cap() == 1024u,
+          "the default packet cap is %u, want 1024", nv2a_packet_cap());
+
+    d = fresh();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    for (i = 0; i < 100u; ++i) {
+        pb_word(&pb, (1u << 18) | 0x1760u);
+        pb_word(&pb, 0x44440000u + i);
+    }
+    cap_begin();
+    kick(d, pb.start, pb.at);
+    cap_end();
+    {
+        uint32_t gv = get_ptr(d);
+        CHECK(gv == pb.at,
+              "100 packets did not drain at the default cap (get=%08X, want %08X, diag=%s)",
+              gv, pb.at, diag(d));
+    }
+    CHECK(d->pfifo.budget_events_total == 0,
+          "the default-cap walk recorded %u budget event(s), want 0",
+          d->pfifo.budget_events_total);
+
+    /* Now the same stream with a cap BELOW its packet count. This is the
+     * assertion that would fail if the override were inert.
+     *
+     * 40 packets rather than 100: the cap under test is 32, so the stream only
+     * has to exceed it, and a smaller stream keeps the capture window well
+     * inside cap_end()'s static 64 KB buffer. (The transcript is a fixed
+     * buffer, so a test that fills stderr past it truncates rather than
+     * crashing -- but a smaller stream keeps the assertions readable.) */
+    nv2a_packet_cap_override(32);
+    CHECK(nv2a_packet_cap() == 32u,
+          "the override did not take effect (cap=%u)", nv2a_packet_cap());
+
+    d = fresh();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    for (i = 0; i < 40u; ++i) {
+        pb_word(&pb, (1u << 18) | 0x1760u);
+        pb_word(&pb, 0x44440000u + i);
+    }
+    cap_begin();
+    kick(d, pb.start, pb.at);
+    cap_end();
+    CHECK(strcmp(diag(d), "budget_exhausted") == 0,
+          "a cap of 32 did not stop a 40-packet stream (diag=%s)", diag(d));
+    CHECK(d->pfifo.budget_events_total == 1,
+          "budget_events_total=%u, want 1 at cap 32", d->pfifo.budget_events_total);
+    CHECK(g_nv2a_submit_state.budget_packets == 32u,
+          "the walk consumed %u packets, want exactly the cap (32)",
+          g_nv2a_submit_state.budget_packets);
+    CHECK(g_nv2a_submit_state.budget_at_packet_limit == 1,
+          "the PACKET cap fired, so at_packet_limit must be 1 (got %u)",
+          g_nv2a_submit_state.budget_at_packet_limit);
+    /* The word budget is nowhere near: this is the packet term, not the word
+     * term, which is what the experiment varies. */
+    CHECK(g_nv2a_submit_state.budget_words < NV2A_SUBMIT_MAX_WORDS,
+          "the word budget was reached (%u) at cap 32, so this test is not "
+          "isolating the packet term", g_nv2a_submit_state.budget_words);
+
+    /* Restore the contract default for every later test. */
+    nv2a_packet_cap_override(0);
+    CHECK(nv2a_packet_cap() == 1024u,
+          "the cap did not return to the default (got %u)", nv2a_packet_cap());
+}
+
+/* The vblank delivery audit must be capable of FAILING, i.e. it must
+ * distinguish "the display stopped pulsing" from "the guest stopped
+ * acknowledging". The whole point of the counters is that a run stalled on a
+ * vblank-dependent wait can be classified from its dump; an audit that reports
+ * the same thing in both cases would prove nothing.
+ *
+ * This drives the three regimes directly:
+ *   1. pulse + guest W1C each frame  -> pulses == acks, already_pending == 0
+ *   2. pulse, never acknowledge      -> already_pending climbs, acks stay 0
+ *   3. enable cleared                -> no further line assertion, and the
+ *                                       enable-cleared counter moves
+ */
+static void test_vblank_delivery_audit(void)
+{
+    NV2AState *d = fresh();
+    uint32_t pulses0, acks0, stale0, cleared0, enable0;
+    unsigned i;
+
+    /* Regime 1: acknowledge every frame. */
+    pcrtc_write(d, PCRTC_INTR_EN_0, NV_PCRTC_INTR_EN_0_VBLANK, 4);
+    pulses0 = d->pfifo.vblank_pulses;
+    acks0 = d->pfifo.vblank_guest_acks;
+    stale0 = d->pfifo.vblank_already_pending;
+    for (i = 0; i < 5; ++i) {
+        nv2a_vblank_pulse(d);
+        pcrtc_write(d, PCRTC_INTR_0, NV_PCRTC_INTR_0_VBLANK, 4);
+    }
+    CHECK(d->pfifo.vblank_pulses == pulses0 + 5u,
+          "pulses %u, want %u", d->pfifo.vblank_pulses, pulses0 + 5u);
+    CHECK(d->pfifo.vblank_guest_acks == acks0 + 5u,
+          "acks %u, want %u", d->pfifo.vblank_guest_acks, acks0 + 5u);
+    CHECK(d->pfifo.vblank_already_pending == stale0,
+          "an acknowledged stream reported %u stale pulse(s); the audit cannot "
+          "distinguish 'guest stopped acknowledging' from 'display stopped pulsing'",
+          d->pfifo.vblank_already_pending - stale0);
+    CHECK(d->pcrtc.pending_interrupts == 0u,
+          "pending bits left %08X after acknowledgement",
+          d->pcrtc.pending_interrupts);
+
+    /* Regime 2: stop acknowledging. Every pulse AFTER the first must be counted
+     * as finding the bit already set. The first is not: it is the one that SETS
+     * the bit, so 4 unacknowledged pulses produce 3 stale counts -- the
+     * arithmetic is asserted explicitly rather than rounded, because getting it
+     * wrong by one is exactly how an audit silently misclassifies. */
+    {
+        uint32_t before = d->pfifo.vblank_already_pending;
+        for (i = 0; i < 4; ++i)
+            nv2a_vblank_pulse(d);
+        CHECK(d->pfifo.vblank_already_pending == before + 3u,
+              "4 unacknowledged pulses produced %u stale count(s), want 3 (the "
+              "first sets the bit; only the later three find it set)",
+              d->pfifo.vblank_already_pending - before);
+        CHECK(d->pcrtc.pending_interrupts & NV_PCRTC_INTR_0_VBLANK,
+              "the pending bit must stay set when the guest never acknowledges");
+    }
+
+    /* Regime 3: the guest clears its enable. The audit must record that the
+     * enable was cleared, which is the third way delivery stops. */
+    cleared0 = d->pfifo.vblank_enable_cleared;
+    enable0 = d->pfifo.vblank_enable_writes;
+    pcrtc_write(d, PCRTC_INTR_EN_0, 0u, 4);
+    CHECK(d->pfifo.vblank_enable_writes == enable0 + 1u,
+          "enable writes %u, want %u", d->pfifo.vblank_enable_writes, enable0 + 1u);
+    CHECK(d->pfifo.vblank_enable_cleared == cleared0 + 1u,
+          "clearing the vblank enable was not recorded (%u -> %u)",
+          cleared0, d->pfifo.vblank_enable_cleared);
+    CHECK(d->pfifo.vblank_enable_last == 0u,
+          "enable_last=%08X, want 0", d->pfifo.vblank_enable_last);
+    /* With the enable clear the PMC summary bit must drop, even though the
+     * PCRTC source bit is still pending: the enable gates delivery, never the
+     * source. That asymmetry is what makes the two counters independent. */
+    CHECK((d->pmc.pending_interrupts & NV_PMC_INTR_0_PCRTC) == 0u,
+          "PMC PCRTC bit is still set (%08X) although the guest cleared the "
+          "vblank enable", d->pmc.pending_interrupts);
+    CHECK(d->pcrtc.pending_interrupts & NV_PCRTC_INTR_0_VBLANK,
+          "the SOURCE bit must survive a delivery-enable clear");
+
+    /* And the last W1C value is latched, so a dump says what the guest wrote. */
+    pcrtc_write(d, PCRTC_INTR_0, NV_PCRTC_INTR_0_VBLANK, 4);
+    CHECK(d->pfifo.vblank_last_ack_value == NV_PCRTC_INTR_0_VBLANK,
+          "last ack value %08X, want %08X", d->pfifo.vblank_last_ack_value,
+          (uint32_t)NV_PCRTC_INTR_0_VBLANK);
+}
 
 /* Record what the commit consumer was handed, in order, so a test can prove
  * that a multi-unit walk delivers every method exactly once and in stream
@@ -1188,6 +1576,11 @@ int main(void)
 {
     /* Start from a known environment whatever the caller exported. */
     set_env("RECOMP_NV2A_ADMIT_UNKNOWN", NULL);
+    /* The packet cap is a DIAGNOSTIC variable: a caller who exported it would
+     * otherwise change what these contract tests measure, and the default is
+     * the contract. */
+    set_env("RECOMP_NV2A_PACKET_CAP", NULL);
+    nv2a_packet_cap_override(0);
 
     test_rejection_logging_and_recovery();
     test_diag_change_logs_again();
@@ -1201,6 +1594,10 @@ int main(void)
     test_retry_recovers_after_ramht_write();
     test_retry_recovers_after_pushbuffer_patch();
     test_budget_stop_transcript();
+    test_budget_stop_resumes_at_committed_boundary();
+    test_packet_cap_can_pin_get_without_a_commit();
+    test_packet_cap_override_is_effective();
+    test_vblank_delivery_audit();
     test_unit_split_preserves_order();
     test_unit_rollback_and_retry();
     test_multi_unit_admission_accounting();

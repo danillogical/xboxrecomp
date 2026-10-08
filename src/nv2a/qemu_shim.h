@@ -374,7 +374,30 @@ static inline int64_t qemu_clock_get_ns(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    return (int64_t)(count.QuadPart * 1000000000LL / freq.QuadPart);
+    /* OVERFLOW-SAFE. The naive `count.QuadPart * 1000000000LL / freq.QuadPart`
+     * forms the product in a SIGNED 64-bit temporary, which overflows once per
+     * 2^64/1e9 counts -- 1844.67 s of host uptime at this host's 10 MHz QPC --
+     * and the quotient then jumps BACKWARD from ~+9.2e18 to ~-9.2e18.
+     *
+     * That is not a cosmetic clock bug. `ptimer_service_thread` uses this value
+     * as `now_ns` and compares it against `next_vblank_ns`, which is still near
+     * +9.2e18. After the wrap `now_ns >= next_vblank_ns` is false and the
+     * re-arm test is false too, so NO vblank pulse is ever emitted again until
+     * now_ns climbs back (~30 min). With no pulse there is no ISR, no DPC and
+     * no KeSetEvent for the ADX middleware's vsync event, so its worker threads
+     * block forever, `title.adx` is opened and never read, and the guest holds
+     * on the loading screen. Measured: run 507's workers died at t~286 s and
+     * its wrap instant was 290 s into the run; every archived run whose window
+     * contained a wrap lost its vsync workers, and every run whose window did
+     * not, kept them.
+     *
+     * Splitting the division keeps every intermediate inside int64: the whole
+     * seconds contribute exactly, and the sub-second remainder is scaled
+     * separately. The result is monotonic for any uptime below 292 years, which
+     * is the representable range of the return type itself. */
+    return (int64_t)((count.QuadPart / freq.QuadPart) * 1000000000LL
+                     + ((count.QuadPart % freq.QuadPart) * 1000000000LL)
+                       / freq.QuadPart);
 }
 #define QEMU_CLOCK_VIRTUAL 0
 
