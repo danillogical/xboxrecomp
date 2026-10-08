@@ -584,7 +584,20 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
     bridge_run_thread_inline(fn, ctx1, ctx2, XBOX_GM_THREAD);
 
-    fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
+    /* Worker termination, with the identity and time needed to pair it against
+     * the other telemetry. `t_ms=` shares the process-start-relative epoch used
+     * by the per-thread `[KERNEL] summary` heartbeat and by the vblank and
+     * owner-lock stamps, so "this worker returned at T" can be compared with
+     * "vblank delivery stopped at T" without converting between clocks.
+     *
+     * The distinction this line makes is the one the archived analysis could not
+     * make: a worker whose routine RETURNS prints here, whereas a worker parked
+     * forever in a wait prints nothing further -- so an unexplained silence is
+     * a block, not an exit, and the two must not be conflated. */
+    fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X, ctx=0x%08X,"
+                    " tid=%lu t_ms=%u)\n",
+            g_eax, ctx1, (unsigned long)GetCurrentThreadId(),
+            nv2a_mono_now_ms());
     fflush(stderr);
     /* The routine returned instead of calling PsTerminateSystemThread; the
      * stack is still ours to give back. */
@@ -720,9 +733,25 @@ static void bridge_PsCreateSystemThreadEx(void)
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
                                                     start_context2, stack_top);
+                    /* The WORKER's tid, not this thread's. The distinction
+                     * matters: this line is the only place a reader can learn
+                     * which native thread a guest worker runs on, and
+                     * `GetCurrentThreadId()` here would name the SPAWNER, so
+                     * every worker would appear to share the main thread's id.
+                     * `GetThreadId(th)` reads it off the handle instead.
+                     *
+                     * WHY IT IS NEEDED. Without a tid, per-thread liveness has
+                     * to be inferred from `esp=`, and that is unsound in two
+                     * measured ways: the main thread's esp varies across 16
+                     * values in one run, and one worker appears at SIX
+                     * (0x01220EA8..0x01220F50). An exact-esp worker set
+                     * therefore drops most of a thread's samples and can
+                     * report the MAIN thread as a dead worker. */
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
-                            "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
-                            start_routine, start_context1, stack_top);
+                            "worker 0x%08X (ctx=0x%08X, stack top 0x%08X, "
+                            "tid=%lu)\n",
+                            start_routine, start_context1, stack_top,
+                            th ? (unsigned long)GetThreadId(th) : 0ul);
                     fflush(stderr);
                     if (xbox_handle_ptr && th) {
                         bridge_write_handle(xbox_handle_ptr, th);
@@ -1635,6 +1664,56 @@ static int bridge_alertable_probe_result(NTSTATUS probe)
     return 0;
 }
 
+/* ── long-wait telemetry (title-010) ──────────────────────────────────────
+ *
+ * THE QUESTION. The ADX vsync/file workers are observed to stop making kernel
+ * calls. That silence has two very different meanings and the archive could not
+ * tell them apart:
+ *
+ *   (a) the worker's routine RETURNED -- an exit, printed by
+ *       `bridge_thread_main`; or
+ *   (b) the worker is parked in a wait -- a block, which prints nothing.
+ *
+ * A block is the benign explanation (these workers idle on a vsync/file event
+ * between requests), but "idle briefly" and "parked forever" look identical
+ * from a heartbeat that has stopped. So the discriminator has to be the WAIT
+ * itself: how long it took, and whether it was even capable of ending.
+ *
+ * WHAT IS LOGGED, AND WHY IT IS BOUNDED. Only waits that exceed a threshold are
+ * printed, because the interesting case is a long block and a line per wait
+ * would perturb the scheduling under investigation (these are the same threads
+ * whose timing is the subject). A `INFINITE` timeout is named explicitly: a
+ * wait with no timeout that never returns is the only shape that can hang a
+ * worker permanently, and it must be distinguishable from a bounded poll that
+ * merely took a while.
+ *
+ * The stamps use `nv2a_mono_now_ms`, the same process-start-relative epoch as
+ * the worker heartbeat and the vblank/lock telemetry, so a long wait can be
+ * placed on one timeline with everything else. */
+#define BRIDGE_LONG_WAIT_MS 250u
+
+static void bridge_log_long_wait(const char *where, uint32_t object,
+                                 uint32_t timeout_ptr, uint64_t start_ms,
+                                 uint32_t waited_ms)
+{
+    static volatile LONG logged;
+    LONG n;
+
+    if (waited_ms < BRIDGE_LONG_WAIT_MS)
+        return;
+    /* Bounded so a pathological run cannot turn this into a log storm: the
+     * first 256 long waits are the ones that describe the onset. */
+    n = InterlockedIncrement(&logged);
+    if (n > 256)
+        return;
+    fprintf(stderr, "  [WAIT] %s obj=0x%08X tid=%lu waited=%ums timeout=%s"
+            " start_ms=%llu caller=0x%08X\n",
+            where, object, (unsigned long)GetCurrentThreadId(), waited_ms,
+            timeout_ptr ? "finite" : "INFINITE",
+            (unsigned long long)start_ms, g_xbox_kernel_caller);
+    fflush(stderr);
+}
+
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
 static void bridge_KeWaitForSingleObject(void)
 {
@@ -1647,6 +1726,7 @@ static void bridge_KeWaitForSingleObject(void)
     uint32_t timeout_ptr = STACK_ARG(4);
     LARGE_INTEGER zero = {0};
     HANDLE h;
+    uint64_t wait_start_ms = nv2a_mono_now_ms();
 
     if (guest_va_is_inplace_kevent(object)) {
         if (!(alertable && bridge_alertable_probe_result(xbox_KeWaitInplaceEvent(
@@ -1671,6 +1751,9 @@ static void bridge_KeWaitForSingleObject(void)
     }
 
     recomp_diag_record(9, diag_object, g_xbox_kernel_caller, g_eax);
+    bridge_log_long_wait("KeWaitForSingleObject", object, timeout_ptr,
+                         wait_start_ms,
+                         nv2a_mono_now_ms() - (uint32_t)wait_start_ms);
 }
 
 /* ── NtWaitForSingleObject (ordinal 233) ─────────────────── */
@@ -9943,8 +10026,28 @@ static void kernel_thunk_dispatch(void)
         DWORD now = GetTickCount();
         if (last_summary_tick == 0) last_summary_tick = now;
         if (now - last_summary_tick >= 2000 && g_kernel_call_count > 200) {
-            fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X\n",
-                    g_kernel_call_count, ordinal, slot, g_esp);
+            /* `tid=` and `t_ms=` are appended LAST so the existing prefix stays
+             * byte-identical for readers that match it.
+             *
+             * `tid=` is the per-thread LIVENESS key: the counters below are
+             * RECOMP_TLS (per-thread), so this line is one thread's own
+             * heartbeat, and a worker that stops printing it has stopped making
+             * kernel calls. Attributing that by `esp=` is unsound -- measured,
+             * the main thread prints from 16 distinct esp values and one worker
+             * from 6 -- so the tid is what makes "this worker went quiet at T" a
+             * fact rather than an inference.
+             *
+             * `t_ms=` is a PROCESS-START-RELATIVE monotonic millisecond stamp
+             * (`nv2a_mono_now_ms`, via nv2a_state.h -> qemu_shim.h ->
+             * nv2a_mono_clock.h). It exists because the log's only other
+             * timeline, `[FBPRESENT] t=Ns`, is relative to the FIRST PRESENT,
+             * and a whole 1800 s run carries just three `[CHECKPOINT]` lines --
+             * so before this there was no per-event clock a worker-liveness
+             * observation and a vblank or lock observation could be compared
+             * on. Every event instrumented this turn carries this same epoch. */
+            fprintf(stderr, "  [KERNEL] summary: %lld total calls, latest ordinal %u (slot %d) esp=0x%08X tid=%lu t_ms=%u\n",
+                    g_kernel_call_count, ordinal, slot, g_esp,
+                    (unsigned long)GetCurrentThreadId(), nv2a_mono_now_ms());
             /* And which ones, ranked. "Latest" names whatever the sample
              * happened to land on; the question behind this line is what a
              * title sitting still is actually asking the kernel for, and

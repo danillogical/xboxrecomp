@@ -22,6 +22,7 @@
  * from <windows.h>; on POSIX it comes from win32_compat (via xbox_winnt.h). */
 #include "platform/xbox_winnt.h"
 #include "nv2a/host_clock.h"
+#include "nv2a/nv2a_mono_clock.h"
 
 /* ============================================================
  * Basic QEMU types

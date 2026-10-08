@@ -551,6 +551,54 @@ static DWORD ptimer_wait_ms(uint64_t delay_ns)
     return delay_ms >= INFINITE ? INFINITE - 1 : (DWORD)delay_ms;
 }
 
+/* ── owner-lock hold/wait telemetry (title-010) ───────────────────────────
+ *
+ * `g_mmio_owner_lock` is held across the entire pushbuffer walk and the ptimer
+ * thread needs it to pulse vblank, so "a long hold delayed the pulser" is a
+ * live hypothesis. Measuring it needs the HOLD and the WAIT separately: a
+ * thread that waits 300 ms has been starved, while a thread that holds 300 ms
+ * has starved others, and the two have opposite remedies.
+ *
+ * `nv2a_mono_now_ns` (host_clock.h) is process-start relative, so these stamps
+ * share an epoch with the vblank stamps below. It reads QPC rather than
+ * GetTickCount64 because the latter is coarse (15.6 ms on many hosts) and the
+ * holds under investigation are shorter than that at the low end.
+ *
+ * Cost per acquisition is two QPC reads and no lock, formatting or allocation,
+ * which is what keeps the instrument non-perturbing on a path the guest hits
+ * for every MMIO access.
+ *
+ * The state pointer is passed in rather than reached through a global: the
+ * lock is file-static but the device is a parameter of every caller, and an
+ * extra global would be one more thing that can be NULL at the wrong moment. */
+static void lock_note_acquired(NV2AState *d)
+{
+    if (!d) return;
+    d->pfifo.lock_owner_tid = (uint32_t)GetCurrentThreadId();
+    d->pfifo.lock_acquisitions++;
+}
+
+static void lock_note_released(NV2AState *d, uint64_t held_ns)
+{
+    uint32_t ms;
+    if (!d) return;
+    ms = (uint32_t)(held_ns / 1000000ull);
+    if (ms > d->pfifo.lock_hold_max_ms) {
+        d->pfifo.lock_hold_max_ms = ms;
+        d->pfifo.lock_hold_last_tid = (uint32_t)GetCurrentThreadId();
+    }
+    d->pfifo.lock_owner_tid = 0;
+}
+
+static void lock_note_waited(NV2AState *d, uint64_t waited_ns)
+{
+    uint32_t ms;
+    if (!d) return;
+    ms = (uint32_t)(waited_ns / 1000000ull);
+    if (ms > d->pfifo.lock_wait_max_ms)
+        d->pfifo.lock_wait_max_ms = ms;
+}
+
 static DWORD WINAPI ptimer_service_thread(void *opaque)
 {
     NV2AState *nv2a = (NV2AState *)opaque;
@@ -562,8 +610,15 @@ static DWORD WINAPI ptimer_service_thread(void *opaque)
         uint64_t delay_ns, now_ns;
         uint32_t pending_before, pmc_before;
         bool retried = false, stalled;
+        uint64_t lock_wait_start_ns, lock_hold_start_ns;
+        lock_wait_start_ns = (uint64_t)nv2a_mono_now_ns();
         AcquireSRWLockExclusive(&g_mmio_owner_lock);
+        lock_hold_start_ns = (uint64_t)nv2a_mono_now_ns();
+        lock_note_waited(nv2a, lock_hold_start_ns - lock_wait_start_ns);
+        lock_note_acquired(nv2a);
         if (InterlockedCompareExchange(&g_ptimer_stopping, 0, 0)) {
+            lock_note_released(nv2a,
+                               (uint64_t)nv2a_mono_now_ns() - lock_hold_start_ns);
             ReleaseSRWLockExclusive(&g_mmio_owner_lock);
             break;
         }
@@ -581,10 +636,42 @@ static DWORD WINAPI ptimer_service_thread(void *opaque)
          * without a live service thread -- see nv2a_vblank_advance. */
         {
             int pulse = 0;
+            uint64_t deadline_before = next_vblank_ns;
             next_vblank_ns = nv2a_vblank_advance(next_vblank_ns, now_ns, frame_ns,
                                                  &pulse);
-            if (pulse)
+            /* Telemetry for the 30-80x pulse shortfall. `pulse == 0` with a
+             * deadline already in the past means this pass took the LATE
+             * branch, which re-arms without pulsing; if every pass does that,
+             * delivery stops entirely. Counting it is what makes "delivery is
+             * slow because the loop keeps re-arming late" falsifiable.
+             *
+             * Both fields are plain stores into device state the walk already
+             * publishes, so this adds no lock, no allocation and no I/O. */
+            ++nv2a->pfifo.vblank_passes;
+            nv2a->pfifo.vblank_frame_ns = (uint32_t)(frame_ns / 1000ull);
+            nv2a->pfifo.vblank_last_pass_ms = nv2a_mono_now_ms();
+            if (!pulse && deadline_before && now_ns > deadline_before) {
+                uint32_t late_ms =
+                    (uint32_t)((now_ns - deadline_before) / 1000000ull);
+                ++nv2a->pfifo.vblank_rearm_late;
+                if (late_ms > nv2a->pfifo.vblank_rearm_late_max_ms)
+                    nv2a->pfifo.vblank_rearm_late_max_ms = late_ms;
+            }
+            if (pulse) {
+                uint32_t pulse_ms = nv2a_mono_now_ms();
+                /* The gap a vblank WAITER would actually experience: the
+                 * interval between two consecutive pulses. This is the
+                 * quantity that matters to the ADX worker parked on the
+                 * vertical-blank event, and it is not derivable from a pulse
+                 * count alone. */
+                if (nv2a->pfifo.vblank_last_pulse_ms) {
+                    uint32_t gap_ms = pulse_ms - nv2a->pfifo.vblank_last_pulse_ms;
+                    if (gap_ms > nv2a->pfifo.vblank_max_gap_ms)
+                        nv2a->pfifo.vblank_max_gap_ms = gap_ms;
+                }
+                nv2a->pfifo.vblank_last_pulse_ms = pulse_ms;
                 nv2a_vblank_pulse(nv2a);
+            }
         }
 
         nv2a_ptimer_service(nv2a);
@@ -625,6 +712,49 @@ static DWORD WINAPI ptimer_service_thread(void *opaque)
              pmc_before != nv2a->pmc.pending_interrupts)) {
             publish_diagnostic_state(nv2a, false, 0, 0);
         }
+        /* PUBLISH THE VBLANK/LOCK TELEMETRY FROM THIS THREAD, ONCE PER PASS.
+         *
+         * This is not a detail. The rest of `NV2ASubmitState` is published from
+         * inside `nv2a_submit_pending` (`nv2a_core.c`), i.e. once per completed
+         * WALK -- so a run whose walk stops exports a FROZEN state, and a
+         * frozen pulse count is exactly what the archived "0.75 pulses/s"
+         * figures cannot distinguish from a genuinely slow display. Since the
+         * question this instrument exists to answer is "did delivery slow down
+         * or stop", the counter must be published by the thread that produces
+         * it, on its own cadence, whether or not any walk ever completes.
+         *
+         * The same applies to the owner-lock maxima: a walk that deadlocks
+         * against the lock never publishes, and the hold that caused it would
+         * be the one fact lost. Publishing here is a handful of plain stores
+         * under a lock this thread already holds, so it neither allocates nor
+         * blocks and cannot perturb the scheduling it measures.
+         *
+         * TORN READS. This publish does not take part in the `generation`
+         * protocol, which exists to tell a collector that froze the process
+         * mid-walk that it caught a partially written snapshot. It does not
+         * need to: every field written here is a MONOTONE counter or maximum,
+         * and both this thread and the walk publish under `g_mmio_owner_lock`,
+         * so the two never interleave. A reader that catches this sequence
+         * half-written therefore sees a mix of two adjacent snapshots in which
+         * every field is still a valid lower bound, never a stale value
+         * presented as current. */
+        {
+            NV2ASubmitState *ss = &g_nv2a_submit_state;
+            ss->vblank_rearm_late = nv2a->pfifo.vblank_rearm_late;
+            ss->vblank_passes = nv2a->pfifo.vblank_passes;
+            ss->vblank_frame_ns = nv2a->pfifo.vblank_frame_ns;
+            ss->vblank_rearm_late_max_ms = nv2a->pfifo.vblank_rearm_late_max_ms;
+            ss->vblank_max_gap_ms = nv2a->pfifo.vblank_max_gap_ms;
+            ss->vblank_last_pass_ms = nv2a->pfifo.vblank_last_pass_ms;
+            ss->vblank_last_pulse_ms = nv2a->pfifo.vblank_last_pulse_ms;
+            ss->lock_hold_max_ms = nv2a->pfifo.lock_hold_max_ms;
+            ss->lock_wait_max_ms = nv2a->pfifo.lock_wait_max_ms;
+            ss->lock_hold_last_tid = nv2a->pfifo.lock_hold_last_tid;
+            ss->lock_owner_tid = nv2a->pfifo.lock_owner_tid;
+            ss->lock_acquisitions = nv2a->pfifo.lock_acquisitions;
+        }
+        lock_note_released(nv2a,
+                           (uint64_t)nv2a_mono_now_ns() - lock_hold_start_ns);
         ReleaseSRWLockExclusive(&g_mmio_owner_lock);
         WaitForSingleObject(wake, ptimer_wait_ms(delay_ns));
     }
@@ -969,6 +1099,7 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     /* Compute MMIO offset within NV2A register space */
     uint32_t mmio_offset = fault_xbox_va - NV2A_MMIO_BASE;
     NV2AState *nv2a = nv2a_get_state();
+    uint64_t lock_wait_start_ns, lock_hold_start_ns;
     if (!nv2a || !InterlockedCompareExchange(&g_mmio_owner_active, 0, 0) ||
         !g_mmio_aperture || fault_addr < (uintptr_t)g_mmio_aperture ||
         fault_addr >= (uintptr_t)g_mmio_aperture + NV2A_MMIO_SIZE)
@@ -976,13 +1107,26 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 
     mmio_trace_record(mmio_offset, ctx->Rip, is_write);
 
+    /* Sampled BEFORE the acquire so the wait is measured, not assumed: a guest
+     * MMIO access that queues behind a long walk is the mechanism by which the
+     * walk could delay the guest, and it is invisible without this stamp. */
+    lock_wait_start_ns = (uint64_t)nv2a_mono_now_ns();
     AcquireSRWLockExclusive(&g_mmio_owner_lock);
+    lock_hold_start_ns = (uint64_t)nv2a_mono_now_ns();
+    lock_note_waited(nv2a, lock_hold_start_ns - lock_wait_start_ns);
+    lock_note_acquired(nv2a);
     if (!InterlockedCompareExchange(&g_mmio_owner_active, 0, 0)) {
+        lock_note_released(nv2a,
+                           (uint64_t)nv2a_mono_now_ns() - lock_hold_start_ns);
         ReleaseSRWLockExclusive(&g_mmio_owner_lock);
         return false;
     }
     uint32_t ptimer_pending_before = nv2a->ptimer.pending_interrupts;
     uint32_t pmc_pending_before = nv2a->pmc.pending_interrupts;
+    /* This call is the ENTIRE pushbuffer submission walk when the guest writes
+     * NV_USER_DMA_PUT, and it runs inside the owner-lock region that the ptimer
+     * thread needs in order to pulse vblank -- so the hold measured below is
+     * the quantity that decides whether a long walk can starve the display. */
     bool handled = decode_and_handle(ctx, mmio_offset, is_write);
     if (handled && (is_write ||
         ptimer_pending_before != nv2a->ptimer.pending_interrupts ||
@@ -991,6 +1135,8 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
         uint32_t value = (uint32_t)owner_read(nv2a, aligned, 4);
         publish_diagnostic_state(nv2a, true, aligned, value);
     }
+    lock_note_released(nv2a,
+                       (uint64_t)nv2a_mono_now_ns() - lock_hold_start_ns);
     ReleaseSRWLockExclusive(&g_mmio_owner_lock);
     return handled;
 }

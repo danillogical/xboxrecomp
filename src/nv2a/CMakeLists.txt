@@ -110,4 +110,28 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME vblank_clock_step COMMAND vblank_clock_step_test)
     set_tests_properties(vblank_clock_step PROPERTIES TIMEOUT 20)
+
+    # The late-rearm counter must be able to FAIL. Archived runs pulse 30-80x
+    # below nominal, and `nv2a_vblank_advance` re-arms WITHOUT pulsing on a late
+    # wake -- so if every pass is late the loop never pulses. This drives the
+    # real rule through a simulated service loop and requires the counter to
+    # separate a punctual loop (zero late, pulses) from a persistently late one
+    # (all late, no pulses), with a positive control so a stuck-at-zero counter
+    # cannot pass. Like the clock-step test it compiles only nv2a_core.c and
+    # needs no device, thread or backend.
+    add_executable(vblank_sched_telemetry_test
+        nv2a_core.c
+        nv2a_method_table.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/vblank_sched_telemetry_test.c
+    )
+    target_include_directories(vblank_sched_telemetry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(NOT MSVC)
+        target_compile_options(vblank_sched_telemetry_test PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+    target_link_libraries(vblank_sched_telemetry_test PRIVATE platform)
+    if(WIN32)
+        target_link_libraries(vblank_sched_telemetry_test PRIVATE kernel32)
+    endif()
+    add_test(NAME vblank_sched_telemetry COMMAND vblank_sched_telemetry_test)
+    set_tests_properties(vblank_sched_telemetry PROPERTIES TIMEOUT 20)
 endif()

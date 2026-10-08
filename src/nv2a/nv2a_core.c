@@ -2356,6 +2356,21 @@ done:
          * offsets are unchanged. */
         ss->budget_resume_stalled = d->pfifo.budget_resume_stalled;
         ss->budget_resume_drained = d->pfifo.budget_resume_drained;
+        /* vblank scheduling / re-arm and owner-lock telemetry (title-010).
+         * Appended after the resume-quality fields for the same reason: an
+         * older reader stops before them rather than misreading them. */
+        ss->vblank_rearm_late = d->pfifo.vblank_rearm_late;
+        ss->vblank_passes = d->pfifo.vblank_passes;
+        ss->vblank_frame_ns = d->pfifo.vblank_frame_ns;
+        ss->vblank_rearm_late_max_ms = d->pfifo.vblank_rearm_late_max_ms;
+        ss->vblank_max_gap_ms = d->pfifo.vblank_max_gap_ms;
+        ss->vblank_last_pass_ms = d->pfifo.vblank_last_pass_ms;
+        ss->vblank_last_pulse_ms = d->pfifo.vblank_last_pulse_ms;
+        ss->lock_hold_max_ms = d->pfifo.lock_hold_max_ms;
+        ss->lock_wait_max_ms = d->pfifo.lock_wait_max_ms;
+        ss->lock_hold_last_tid = d->pfifo.lock_hold_last_tid;
+        ss->lock_owner_tid = d->pfifo.lock_owner_tid;
+        ss->lock_acquisitions = d->pfifo.lock_acquisitions;
         ss->get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
         ss->put = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
         if (ok) {

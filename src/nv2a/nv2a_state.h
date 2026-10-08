@@ -388,6 +388,51 @@ typedef struct NV2AState {
         /* The last W1C value the guest wrote and the pending bits it left. */
         uint32_t vblank_last_ack_value;
         uint32_t vblank_pending_last;
+        /* ── vblank scheduling / re-arm telemetry (title-010) ───────────────
+         *
+         * WHY THESE EXIST. `vblank_pulses` alone is a scalar with no timestamp
+         * and no denominator, so it cannot separate "the display is pulsing
+         * slowly" from "the display stopped pulsing at t=X" -- and it is only
+         * refreshed when a submit walk completes, so a run that stops walking
+         * exports a frozen count. Measured, archived runs report 0.75-1.23
+         * pulses/s against a model nominal of at least 40 Hz: a 30-80x
+         * shortfall nobody has explained.
+         *
+         * `nv2a_vblank_advance` re-arms WITHOUT pulsing on a late wake
+         * (`now >= next + 4*frame`). If passes are consistently >= 5 frames
+         * apart that branch is a self-reproducing fixed point that never
+         * pulses. `vblank_rearm_late` counts exactly those passes, so the
+         * hypothesis "delivery is slow because the loop keeps taking the late
+         * branch" becomes falsifiable rather than assumed.
+         *
+         * `vblank_max_gap_ms` is the largest interval actually observed between
+         * two pulses, which is the quantity a worker waiting on a vertical
+         * blank would experience. */
+        uint32_t vblank_rearm_late;        /* late-wake re-arms (no pulse) */
+        uint32_t vblank_passes;            /* service-loop passes */
+        uint32_t vblank_frame_ns;          /* last frame period used */
+        uint32_t vblank_rearm_late_max_ms; /* max lateness past the deadline */
+        uint32_t vblank_max_gap_ms;        /* max observed pulse-to-pulse gap */
+        /* Process-start-relative monotonic stamps (host_clock.h
+         * `nv2a_mono_now_ns`). Milliseconds, truncated to 32 bits: these are
+         * compared as differences within one run, and a 32-bit ms field wraps
+         * every ~49.7 days, which exceeds any run. */
+        uint32_t vblank_last_pass_ms;
+        uint32_t vblank_last_pulse_ms;
+        /* ── owner-lock telemetry ───────────────────────────────────────────
+         *
+         * The owner lock is held across the ENTIRE pushbuffer submission walk
+         * (`nv2a_mmio_hook.c` acquire 979 / release 994 -> `nv2a_submit_pending`
+         * at `nv2a_core.c:2491`), and the ptimer thread needs that same lock to
+         * reach `nv2a_vblank_pulse`. So a long walk delays vblank delivery, and
+         * the thread that must pulse is also the thread that runs retry walks.
+         * That is a structural coupling; whether it CAUSES anything is a
+         * separate question these counters are meant to answer. */
+        uint32_t lock_hold_max_ms;         /* max time the lock was held */
+        uint32_t lock_wait_max_ms;         /* max time spent waiting for it */
+        uint32_t lock_hold_last_tid;       /* thread that last held it */
+        uint32_t lock_owner_tid;           /* current holder, 0 when free */
+        uint32_t lock_acquisitions;
         uint32_t submit_walk_start_get;
         uint32_t submit_walk_units;
     } pfifo;
@@ -673,6 +718,36 @@ typedef struct NV2ASubmitState {
      * unchanged. */
     uint32_t budget_resume_stalled;
     uint32_t budget_resume_drained;
+    /* ── vblank scheduling / re-arm telemetry (appended, title-010) ────────
+     *
+     * The question these answer: `vblank_pulses` is 30-80x below nominal in
+     * every archived run, and a bare scalar cannot say whether delivery is slow
+     * or stopped. `vblank_rearm_late` counts the service loop's late-wake
+     * branch (which re-arms WITHOUT pulsing), `vblank_passes` is the
+     * denominator that turns the pulse count into a real rate, and the two
+     * `_ms` stamps are process-start-relative so they share an epoch with the
+     * lock telemetry below. Appended last so every earlier reader's field
+     * offsets are unchanged. */
+    uint32_t vblank_rearm_late;
+    uint32_t vblank_passes;
+    uint32_t vblank_frame_ns;
+    uint32_t vblank_rearm_late_max_ms;
+    uint32_t vblank_max_gap_ms;
+    uint32_t vblank_last_pass_ms;
+    uint32_t vblank_last_pulse_ms;
+    /* ── owner-lock telemetry (appended, title-010) ────────────────────────
+     *
+     * The owner lock serializes the guest's PUT writes with the whole
+     * submission walk, and the ptimer thread needs it to pulse vblank. These
+     * separate "a long hold blocked the pulser" from "the pulser was never
+     * scheduled": `lock_hold_max_ms` is the worst hold, `lock_wait_max_ms` the
+     * worst wait, and the two tids name the holder so a wait can be attributed
+     * to a thread rather than to the lock in the abstract. */
+    uint32_t lock_hold_max_ms;
+    uint32_t lock_wait_max_ms;
+    uint32_t lock_hold_last_tid;
+    uint32_t lock_owner_tid;
+    uint32_t lock_acquisitions;
 } NV2ASubmitState;
 /* Exported on Windows so a dump and the linker map name it, like g_nv2a_mmio_snapshot. */
 #ifdef _WIN32
