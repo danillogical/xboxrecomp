@@ -1,46 +1,49 @@
-/* Regression: the host clock must not jump backward at the QPC product wrap.
+/* Regression: the host clock conversion must not jump BACKWARD at either wrap.
  *
- * THE DEFECT THIS PINS. `qemu_clock_get_ns` in src/nv2a/qemu_shim.h used to
- * compute
+ * THE DEFECT THIS PINS. `qemu_clock_get_ns` used to compute
  *
  *     (int64_t)(count.QuadPart * 1000000000LL / freq.QuadPart)
  *
- * The product is formed in a SIGNED 64-bit temporary, so it overflows once per
- * 2^64/1e9 QPC counts -- 1844.67 s of host uptime at this host's 10 MHz
- * counter -- and the quotient then jumps BACKWARD from about +9.2e18 to about
- * -9.2e18.
+ * forming the product in a SIGNED 64-bit temporary. At this host's 10 MHz
+ * counter that product exceeds int64 once per 2^63/1e9 counts -- 922.337 s of
+ * host uptime -- and the quotient goes negative. The consumer holds the result
+ * in a `uint64_t`, so the negative value becomes a huge positive one: the
+ * reading jumps FORWARD to near 2^64. It then climbs until the product wraps
+ * the full 2^64 at 2^64/1e9 counts = **1844.674 s**, where the reading jumps
+ * BACKWARD to near zero.
  *
- * WHY IT MATTERED. `ptimer_service_thread` uses that value as `now_ns` and
- * compares it with `next_vblank_ns`, which is still near +9.2e18. After the
- * wrap neither `now_ns >= next_vblank_ns` nor the re-arm test
- * `now_ns >= next_vblank_ns + 4*frame_ns` is true, so NO vblank pulse is
- * emitted again until the clock climbs back (about 30 minutes). With no pulse
- * there is no ISR, no DPC and no KeSetEvent for the ADX middleware's vsync
- * event: its worker threads block forever, `title.adx` is opened and never
- * read, and the guest holds on the loading screen.
+ * The backward jump is the harmful one. `ptimer_service_thread` keeps its
+ * vblank deadline (`next_vblank_ns`) in the same units, so a reading that
+ * restarts near zero while the deadline sits near 2^64 satisfies neither the
+ * pulse test nor the re-arm test: NO vblank pulse is emitted until the reading
+ * climbs back, and the computed wait becomes enormous. No pulse means no PCRTC
+ * interrupt, no ISR, no DPC and no `KeSetEvent` for a vblank waiter.
  *
- * MEASURED, per archived run: run 507 lost its vsync workers at t~286 s and its
- * wrap instant was 290 s into the run; every archived run whose window
- * contained a wrap lost those workers, and every run whose window did not,
- * kept them (including the two clean `title009-cap1024` controls).
+ * WHAT THIS TEST CALLS. `nv2a_qpc_to_ns` / `nv2a_qpc_to_us` from
+ * `src/nv2a/host_clock.h` are the REAL shipped conversions -- the same
+ * functions `qemu_clock_get_ns` and `qemu_clock_get_us` return. An earlier
+ * version of this test duplicated the expression instead, which pinned a copy
+ * of the formula rather than the shipped code: reverting the shim would have
+ * left it green. The pre-fix expression is also in that header, as
+ * `nv2a_qpc_to_ns_overflowing`, so the control arm exercises the same
+ * arithmetic the runtime used to run rather than a re-typed copy.
  *
- * WHAT THIS TEST DOES. It cannot call QueryPerformanceCounter at a chosen
- * value, so it reproduces the SHIM'S OWN EXPRESSION -- both the old form and
- * the current one -- over the wrap boundary in signed 64-bit modular
- * arithmetic, and asserts the properties that matter:
+ * `count` is passed through a `volatile` read in the helpers below. Without it
+ * MSVC constant-folds the literal arguments in 128-bit precision and HIDES the
+ * overflow -- which is how an earlier version of this test passed the wrong way
+ * round.
  *
- *   1. the old expression really does jump backward (so the test would fail if
- *      the arithmetic were not the defect -- a test that cannot fail proves
- *      nothing);
- *   2. the current expression is strictly monotonic across that boundary;
- *   3. the current expression equals the exact uptime in nanoseconds.
- *
- * The expressions are duplicated here deliberately. This is a test OF the
- * formula, so it must not call the function under test through a shim that
- * hides the intermediate -- the overflow is in the intermediate.
+ * WHAT IT ASSERTS:
+ *   1. the pre-fix expression really does jump backward (so the test would
+ *      fail if the arithmetic were not the defect);
+ *   2. the shipped conversion is monotonic across BOTH wrap points;
+ *   3. the shipped conversion equals exact uptime;
+ *   4. the forward (signed) wrap, which the old form also produced, is NOT
+ *      backward -- recorded so the two wrap points are not conflated.
  */
 #include <stdint.h>
 #include <stdio.h>
+#include "host_clock.h"
 
 static int g_failures;
 
@@ -54,117 +57,174 @@ static int g_failures;
         }                                                                   \
     } while (0)
 
-/* The old, overflowing form: the product is truncated to signed 64-bit.
+#define FREQ 10000000LL                      /* this host's QPC frequency */
+
+/* The two wrap counts, as exact literals.
  *
- * `count` is passed through a `volatile` read on purpose. Without it MSVC
- * constant-folds the whole expression for the literal arguments this test
- * uses, evaluating the product in 128-bit precision -- which HIDES the
- * overflow and made an earlier version of this test pass the "old form is
- * harmless" way round. The production shim reads `count` from an opaque Win32
- * call, so it always computes at run time; the volatile reproduces that. */
-static int64_t shim_ns_overflowing(int64_t count, int64_t freq)
+ * These cannot be written as `(1ULL << 63) / 1000000000ULL` in a macro: the
+ * shift itself is the value whose product overflows, and folding it through
+ * integer division at compile time silently yields a different count (measured:
+ * it produced 1 for the unsigned wrap, which made the test pass vacuously).
+ * The literals are 2^63/1e9 and 2^64/1e9 rounded up, and they are asserted
+ * against the arithmetic below rather than trusted. */
+#define SIGNED_WRAP   9223372037LL            /* 922.337 s uptime */
+#define UNSIGNED_WRAP 18446744074LL           /* 1844.674 s uptime */
+
+/* The pre-fix expression, evaluated opaquely so the optimizer cannot fold it. */
+static int64_t old_ns(int64_t count)
 {
     volatile int64_t c = count;
-    uint64_t product = (uint64_t)c * 1000000000ull;
-    volatile int64_t signed_product = (int64_t)product;
-    return signed_product / freq;
+    return nv2a_qpc_to_ns_overflowing(c, FREQ);
 }
 
-/* The current, overflow-safe form, likewise opaque to the optimizer. */
-static int64_t shim_ns_safe(int64_t count, int64_t freq)
+/* The shipped conversion, likewise opaque. */
+static int64_t new_ns(int64_t count)
 {
     volatile int64_t c = count;
-    return (c / freq) * 1000000000ll
-         + ((c % freq) * 1000000000ll) / freq;
+    return nv2a_qpc_to_ns(c, FREQ);
 }
 
-/* The wrap count: the smallest `count` whose product with 1e9 leaves the
- * signed 64-bit range. 2^63/1e9 is 9223372036.85, so the first count that
- * overflows is 9223372037 -- NOT 2^64/1e9, which is where the UNSIGNED range
- * would wrap. The distinction matters: the shim's product is formed in a
- * SIGNED temporary, so it goes negative at half that uptime. */
-static int64_t wrap_count(int64_t freq)
-{
-    (void)freq;
-    return 9223372037ll;
-}
+/* What the CONSUMER sees. `ptimer_service_thread` assigns the returned int64 to
+ * a `uint64_t now_ns`, so a negative result becomes a huge positive one. The
+ * distinction is the whole point: the signed wrap is a FORWARD jump in this
+ * view and the unsigned wrap is the BACKWARD one. */
+static uint64_t old_u64(int64_t count) { return (uint64_t)old_ns(count); }
+static uint64_t new_u64(int64_t count) { return (uint64_t)new_ns(count); }
 
 int main(void)
 {
-    const int64_t freq = 10000000ll;   /* this host's QPC frequency */
-    const int64_t wc = wrap_count(freq);
-    int64_t prev, cur;
     int i;
 
-    /* The wrap instant in host uptime, for the record. */
-    fprintf(stderr, "qpc freq=%lld wrap count=%lld (%.1f s uptime)\n",
-            (long long)freq, (long long)wc, (double)wc / (double)freq);
+    /* The literals must be the first counts whose products leave range, or the
+     * test would be measuring the wrong instant. Checked, not assumed.
+     *
+     * The product is computed modulo 2^64 (which is what the machine does), so
+     * the test is that the UNSIGNED wrap is where that product turns over from
+     * "near 2^64" to "near 0". */
+    {
+        uint64_t s = (uint64_t)SIGNED_WRAP;
+        uint64_t u = (uint64_t)UNSIGNED_WRAP;
+        CHECK(s * 1000000000ULL > (1ULL << 63),
+              "SIGNED_WRAP (%lld) is not past the signed overflow point",
+              (long long)SIGNED_WRAP);
+        CHECK((s - 1) * 1000000000ULL <= (1ULL << 63),
+              "SIGNED_WRAP (%lld) is not the FIRST count past the signed point",
+              (long long)SIGNED_WRAP);
+        /* Just below the unsigned wrap the product is near 2^64; at it, near 0. */
+        CHECK((u - 1) * 1000000000ULL > (1ULL << 63),
+              "the count before UNSIGNED_WRAP (%lld) is not near the top of the "
+              "64-bit range", (long long)UNSIGNED_WRAP);
+        CHECK(u * 1000000000ULL < 1000000000ULL,
+              "UNSIGNED_WRAP (%lld) is not the count where the product turns "
+              "over to near zero", (long long)UNSIGNED_WRAP);
+    }
 
-    /* 1. The OLD expression must actually jump backward across the wrap.
-     *    Asserting this is what makes the test able to fail: if the arithmetic
-     *    were harmless, there would be nothing to fix and this test would be
-     *    measuring nothing. */
+    fprintf(stderr, "qpc freq=%lld signed wrap=%lld (%.3f s) "
+            "unsigned wrap=%lld (%.3f s)\n",
+            (long long)FREQ, (long long)SIGNED_WRAP, (double)SIGNED_WRAP / FREQ,
+            (long long)UNSIGNED_WRAP, (double)UNSIGNED_WRAP / FREQ);
+
+    /* 1. The pre-fix form must actually be harmful across the UNSIGNED wrap, in
+     *    the view the consumer has. Asserting this is what makes the test able
+     *    to fail. */
     {
         int backward = 0;
-        prev = shim_ns_overflowing(wc - freq, freq);
+        uint64_t prev = old_u64(UNSIGNED_WRAP - FREQ);
         for (i = 0; i < 3; ++i) {
-            cur = shim_ns_overflowing(wc + (int64_t)i * freq, freq);
+            uint64_t cur = old_u64(UNSIGNED_WRAP + (int64_t)i * FREQ);
             if (cur < prev)
                 ++backward;
             prev = cur;
         }
         CHECK(backward > 0,
-              "the OLD expression did not jump backward across the wrap "
-              "(count=%lld): this test is not exercising the defect",
-              (long long)wc);
+              "the PRE-FIX expression did not jump backward across the unsigned "
+              "wrap (count=%lld) in the consumer's uint64 view: this test is not "
+              "exercising the defect", (long long)UNSIGNED_WRAP);
     }
 
-    /* 2. The SAFE expression must be strictly increasing across the same
-     *    boundary, with no backward step and no stall. */
+    /* 1b. Across the SIGNED wrap the same expression jumps FORWARD in the
+     *     consumer's view (the negative int64 becomes a huge uint64), which is
+     *     harmless because it satisfies `now >= next` and re-arms. Recorded
+     *     because the two wrap points are easy to conflate -- and an earlier
+     *     version of this test did conflate them. */
     {
-        int backward = 0, stalled = 0;
-        prev = shim_ns_safe(wc - 8 * freq, freq);
-        for (i = -7; i <= 8; ++i) {
-            cur = shim_ns_safe(wc + (int64_t)i * freq, freq);
+        uint64_t before = old_u64(SIGNED_WRAP - FREQ);
+        uint64_t after = old_u64(SIGNED_WRAP + FREQ);
+        CHECK(after > before,
+              "the PRE-FIX expression did not jump FORWARD across the signed "
+              "wrap in the consumer's view (%llu -> %llu); the two wrap points "
+              "are being conflated",
+              (unsigned long long)before, (unsigned long long)after);
+        CHECK(old_ns(SIGNED_WRAP + FREQ) < 0,
+              "the PRE-FIX expression is not negative past the signed wrap, so "
+              "the consumer's forward jump is not being exercised");
+    }
+
+    /* 2. The SHIPPED conversion must be monotonic across both wrap points, in
+     *    the consumer's view. */
+    {
+        const int64_t wraps[2] = { SIGNED_WRAP, UNSIGNED_WRAP };
+        int w;
+        for (w = 0; w < 2; ++w) {
+            int backward = 0, stalled = 0;
+            uint64_t prev = new_u64(wraps[w] - 8 * FREQ);
+            for (i = -7; i <= 8; ++i) {
+                uint64_t cur = new_u64(wraps[w] + (int64_t)i * FREQ);
+                if (cur < prev)
+                    ++backward;
+                if (cur == prev)
+                    ++stalled;
+                prev = cur;
+            }
+            CHECK(backward == 0,
+                  "the SHIPPED conversion moved backward %d time(s) across the "
+                  "%s wrap (count=%lld)", backward,
+                  w == 0 ? "signed" : "unsigned", (long long)wraps[w]);
+            CHECK(stalled == 0,
+                  "the SHIPPED conversion stalled %d time(s) across the %s wrap",
+                  stalled, w == 0 ? "signed" : "unsigned");
+        }
+    }
+
+    /* 3. The SHIPPED conversion must equal exact uptime. */
+    {
+        int64_t count = UNSIGNED_WRAP + 12345LL * FREQ;
+        int64_t exact = (count / FREQ) * 1000000000LL
+                      + ((count % FREQ) * 1000000000LL) / FREQ;
+        CHECK(new_ns(count) == exact,
+              "the SHIPPED conversion (%lld) disagrees with exact uptime (%lld)",
+              (long long)new_ns(count), (long long)exact);
+        CHECK(exact > 0,
+              "exact uptime at the wrap is not positive (%lld)", (long long)exact);
+    }
+
+    /* 4. The microseconds conversion must be monotonic at ITS wrap, which is
+     *    2^63/1e6 counts = 10.68 days of uptime -- a different instant from
+     *    the ns one, so a single test of the ns path would not cover it. */
+    {
+        const int64_t us_wrap = (int64_t)((1ULL << 63) / 1000000ULL) + 1;
+        int backward = 0;
+        int64_t prev = nv2a_qpc_to_us(us_wrap - 4 * FREQ, FREQ);
+        for (i = -3; i <= 4; ++i) {
+            int64_t cur = nv2a_qpc_to_us(us_wrap + (int64_t)i * FREQ, FREQ);
             if (cur < prev)
                 ++backward;
-            if (cur == prev)
-                ++stalled;
             prev = cur;
         }
         CHECK(backward == 0,
-              "the SAFE expression moved backward %d time(s) across the wrap",
-              backward);
-        CHECK(stalled == 0,
-              "the SAFE expression stalled %d time(s) across the wrap", stalled);
+              "the SHIPPED microsecond conversion moved backward %d time(s) "
+              "across its wrap (count=%lld)", backward, (long long)us_wrap);
     }
 
-    /* 3. The SAFE expression must equal the exact uptime. The old one does
-     *    not, which is the same defect seen from the other side. */
+    /* 5. A sub-second offset must not be lost, and a zero frequency must not
+     *    divide by zero. */
     {
-        int64_t count = wc + 12345ll * freq;
-        int64_t exact = (count / freq) * 1000000000ll
-                      + ((count % freq) * 1000000000ll) / freq;
-        CHECK(shim_ns_safe(count, freq) == exact,
-              "the SAFE expression (%lld) disagrees with exact uptime (%lld)",
-              (long long)shim_ns_safe(count, freq), (long long)exact);
-        /* The exact value must be positive and on the order of the host's real
-         * uptime (~1.8e12 ns), not the wrapped ~-9.2e18. */
-        CHECK(exact > 0,
-              "exact uptime at the wrap is not positive (%lld)",
-              (long long)exact);
-    }
-
-    /* 4. A sub-second count must not be lost: the split division keeps the
-     *    remainder, so a counter offset smaller than one frequency tick still
-     *    advances the result by its exact nanosecond share. */
-    {
-        int64_t base = 1000ll * freq;          /* 1000 s uptime */
-        int64_t half = base + freq / 2;        /* + 0.5 s */
-        CHECK(shim_ns_safe(half, freq) - shim_ns_safe(base, freq)
-                  == 500000000ll,
+        int64_t base = 1000LL * FREQ;
+        CHECK(new_ns(base + FREQ / 2) - new_ns(base) == 500000000LL,
               "a half-second offset produced %lld ns, want 500000000",
-              (long long)(shim_ns_safe(half, freq) - shim_ns_safe(base, freq)));
+              (long long)(new_ns(base + FREQ / 2) - new_ns(base)));
+        CHECK(nv2a_qpc_to_ns(12345, 0) == 0,
+              "a zero frequency did not return 0");
     }
 
     if (g_failures) {

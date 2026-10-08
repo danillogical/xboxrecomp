@@ -99,6 +99,10 @@ enum {
  * wide margin while staying trivial in size. */
 #define NV2A_BUDGET_EVENT_MAX 64
 
+/* Sentinel for "no resume is currently being classified". 0 is a valid ring
+ * index, so it cannot be used as the absent value. */
+#define NV2A_BUDGET_NO_RESUME 0xFFFFFFFFu
+
 /* One budget stop and, once it happens, the walk that resumed it.
  *
  * This exists because the FIRST-only latch cannot answer the continuation
@@ -129,6 +133,7 @@ typedef struct NV2ABudgetEvent {
     uint32_t resume_units;
     uint32_t resumed;            /* 1 once a walk has consumed this stop */
     uint32_t start_was_committed;/* 1 = resume began exactly at committed_get */
+    uint32_t resume_stalled;     /* 1 = right boundary, but no progress */
 } NV2ABudgetEvent;
 
 /* ============================================================
@@ -310,11 +315,27 @@ typedef struct NV2AState {
         uint32_t budget_expected_get;
         uint32_t budget_expected_put;
         uint32_t budget_outstanding;       /* a stop is awaiting its resume */
-        /* Resume outcomes. `matched` counts resumptions that began exactly at
-         * the previous stop's committed boundary -- the definition of correct
-         * continuation. `mismatched` is the Case C signature. */
+        /* Resume outcomes.
+         *
+         * `matched` counts resumptions that began exactly at the previous
+         * stop's committed boundary AND MADE PROGRESS. `mismatched` is the
+         * Case C signature (the walk began somewhere else, e.g. it restarted
+         * the submission). `stalled` is the third outcome: the right boundary,
+         * but no progress -- which is what the zero-commit livelock produces.
+         *
+         * WHY PROGRESS IS PART OF `matched`. The boundary comparison alone is
+         * near-vacuous: `budget_expected_get` is captured from GET at the stop
+         * and compared against the same register at the next walk, and GET
+         * only advances on a commit -- so "matched" is the DEFAULT outcome,
+         * including for a retry that makes no progress at all. Without the
+         * progress term the counter cannot distinguish resumption from a
+         * repeated stall. */
         uint32_t budget_resume_matched;
         uint32_t budget_resume_mismatched;
+        uint32_t budget_resume_stalled;
+        /* The ring index of the event whose resume is being classified, so the
+         * walk's end can decide whether that resume progressed. */
+        uint32_t budget_resume_event;
         uint32_t budget_resume_end_get;    /* where the most recent resume got to */
         uint32_t budget_resume_ok;         /* that resume's success flag */
         /* Words the stops rolled back and the retries re-walked. A resumable
@@ -635,6 +656,15 @@ typedef struct NV2ASubmitState {
     uint32_t vblank_irq_deasserted;
     uint32_t vblank_last_ack_value;
     uint32_t vblank_pending_last;
+    /* ── resume-quality audit (appended, same forward-compat rule) ─────────
+     *
+     * `resume_stalled` counts resumptions that began at the correct committed
+     * boundary but made NO progress -- the zero-commit livelock, and the case
+     * the boundary comparison alone cannot name. A run with stops but zero
+     * stalls and zero mismatches is genuinely resuming; a run with stalls is
+     * re-walking the same rejected stream. Appended last so every earlier
+     * reader's field offsets are unchanged. */
+    uint32_t budget_resume_stalled;
 } NV2ASubmitState;
 /* Exported on Windows so a dump and the linker map name it, like g_nv2a_mmio_snapshot. */
 #ifdef _WIN32

@@ -72,16 +72,19 @@ if(BUILD_TESTING)
     add_test(NAME nv2a_submit_diag COMMAND nv2a_submit_diag_test)
     set_tests_properties(nv2a_submit_diag PROPERTIES TIMEOUT 20)
 
-    # The host clock must not jump backward at the QPC product wrap.
+    # The host clock must not jump backward at either QPC product wrap.
     #
-    # A pure-arithmetic test with no project dependencies: it reproduces the
-    # shim's own expression (old and current) over the wrap boundary, so it
-    # needs no device and no kernel. That is deliberate -- the defect is in a
-    # formula, and a test that called the function through the shim could not
-    # observe the overflowing intermediate.
+    # This calls the REAL shipped conversions (`nv2a_qpc_to_ns` /
+    # `nv2a_qpc_to_us` in src/nv2a/host_clock.h), which is what
+    # `qemu_clock_get_ns` and `qemu_clock_get_us` return. An earlier version
+    # duplicated the formula instead, so reverting the shim left it green; the
+    # pre-fix expression is now also in that header, as
+    # `nv2a_qpc_to_ns_overflowing`, so the control arm runs the same arithmetic
+    # the runtime used to.
     add_executable(host_clock_wrap_test
         ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/host_clock_wrap_test.c
     )
+    target_include_directories(host_clock_wrap_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     if(NOT MSVC)
         target_compile_options(host_clock_wrap_test PRIVATE -Wall -Wextra)
     endif()

@@ -1145,14 +1145,38 @@ static void test_packet_cap_can_pin_get_without_a_commit(void)
      * is asserted rather than described so a future change to the cap's scope
      * must consciously update it.
      *
+     * AND IT IS THE CONTROL FOR THE AUDIT'S DISCRIMINATING POWER. A resume
+     * audit that only compared the next walk's start GET against the previous
+     * stop's committed boundary would score every one of these retries as a
+     * MATCH, because GET is exactly where it was -- the default outcome. The
+     * audit must instead record them as STALLS. If this ever reports matched,
+     * the audit has gone vacuous again.
+     *
      * ONE capture window around the whole loop: cap_begin opens a tmpfile and
      * cap_end closes it, so nesting them per iteration would leak five file
      * handles and their buffers for no benefit -- the walk's own output is what
      * matters, not which retry produced it. */
-    cap_begin();
-    for (i = 0; i < 5u; ++i)
-        nv2a_retry_stalled_walk(d);
-    cap_end();
+    {
+        uint32_t matched_before = d->pfifo.budget_resume_matched;
+        uint32_t stalled_before = d->pfifo.budget_resume_stalled;
+        cap_begin();
+        for (i = 0; i < 5u; ++i)
+            nv2a_retry_stalled_walk(d);
+        cap_end();
+        CHECK(d->pfifo.budget_resume_stalled == stalled_before + 5u,
+              "five retries of a zero-commit stream produced %u stall(s), want 5: "
+              "a boundary-only audit would score these as matches and cannot "
+              "distinguish resumption from a repeated stall",
+              d->pfifo.budget_resume_stalled - stalled_before);
+        CHECK(d->pfifo.budget_resume_matched == matched_before,
+              "a zero-progress retry was counted as a MATCH (%u -> %u): the "
+              "audit is vacuous again",
+              matched_before, d->pfifo.budget_resume_matched);
+        CHECK(d->pfifo.budget_resume_mismatched == 0u,
+              "a zero-progress retry at the CORRECT boundary was counted as a "
+              "boundary MISMATCH (%u); the two failure modes are being conflated",
+              d->pfifo.budget_resume_mismatched);
+    }
     get_after_many = get_ptr(d);
     CHECK(get_after_many == get_after_first,
           "GET advanced from %08X to %08X across retries of a stream that "

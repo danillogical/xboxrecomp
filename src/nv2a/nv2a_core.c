@@ -1813,6 +1813,10 @@ bool nv2a_submit_pending(NV2AState *d)
      * the retries that follow a rejection -- otherwise an external reader (a
      * test, or the run report) would find the fields already wiped. */
     if (d->pfifo.budget_stops == 0) d->pfifo.budget_trace_count = 0;
+    /* No resume is being classified until the outstanding-stop check below
+     * finds one. Reset per walk: a walk that resumes nothing must not inherit
+     * the previous walk's pending classification. */
+    d->pfifo.budget_resume_event = NV2A_BUDGET_NO_RESUME;
     memcpy(staged_class, d->pfifo.binding_class, sizeof(staged_class));
     memcpy(staged_object, d->pfifo.binding_object, sizeof(staged_object));
     get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
@@ -1853,10 +1857,16 @@ bool nv2a_submit_pending(NV2AState *d)
             ev->resume_start_get = get;
             ev->resume_put = put;
             ev->start_was_committed = matched ? 1u : 0u;
-            if (matched)
+            if (matched) {
                 ++d->pfifo.budget_resume_matched;
-            else
+            } else {
                 ++d->pfifo.budget_resume_mismatched;
+            }
+            /* Whether this resume MADE PROGRESS is decided at `done`, where the
+             * walk's outcome and final GET are known; `matched` alone is the
+             * default outcome and cannot distinguish resumption from a repeated
+             * stall. The index is remembered here for that classification. */
+            d->pfifo.budget_resume_event = idx;
         }
     }
     /* The packet being walked. A walk normally starts at a header; after a
@@ -2213,6 +2223,28 @@ done:
             ev->resume_units = units;
         }
     }
+    /* Classify the resume this walk was performing, if any: a resume that began
+     * at the right boundary but made NO progress is a STALL, not a successful
+     * continuation. This is the distinction `matched` alone cannot make -- see
+     * the field comment in nv2a_state.h. Progress means the walk advanced GET
+     * past where it started, or committed at least one unit, or reached PUT.
+     *
+     * The check runs once, at the walk's end, where the outcome is known; it is
+     * observational and changes nothing about the walk. */
+    if (d->pfifo.budget_resume_event != NV2A_BUDGET_NO_RESUME) {
+        uint32_t idx = d->pfifo.budget_resume_event;
+        NV2ABudgetEvent *ev = &d->pfifo.budget_events[idx];
+        uint32_t end_get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
+        bool progressed = (units > 0) || (end_get != ev->resume_start_get) || ok;
+        if (ev->start_was_committed && !progressed) {
+            /* Right boundary, no progress: move it out of `matched`. */
+            if (d->pfifo.budget_resume_matched)
+                --d->pfifo.budget_resume_matched;
+            ++d->pfifo.budget_resume_stalled;
+            ev->resume_stalled = 1u;
+        }
+        d->pfifo.budget_resume_event = NV2A_BUDGET_NO_RESUME;
+    }
     /* Packets-per-walk histogram. This is what says whether the 1024 cap is
      * anywhere near binding for a normal run: if every walk lands in the low
      * bins, the cap is not what paces it, whatever its value. */
@@ -2292,6 +2324,9 @@ done:
         ss->vblank_irq_deasserted = d->pfifo.vblank_irq_deasserted;
         ss->vblank_last_ack_value = d->pfifo.vblank_last_ack_value;
         ss->vblank_pending_last = d->pfifo.vblank_pending_last;
+        /* Resume quality. Appended last, so every earlier reader's field
+         * offsets are unchanged. */
+        ss->budget_resume_stalled = d->pfifo.budget_resume_stalled;
         ss->get = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
         ss->put = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT];
         if (ok) {

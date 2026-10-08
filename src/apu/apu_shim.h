@@ -116,14 +116,11 @@ static inline int64_t qemu_clock_get_us(int type) {
     LARGE_INTEGER freq, count;
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&count);
-    /* OVERFLOW-SAFE, for the same reason as qemu_clock_get_ns in
-     * src/nv2a/qemu_shim.h: forming `count * 1000000` in a signed 64-bit
-     * temporary overflows once per 2^64/1e6 counts of host uptime (about 51
-     * hours at 10 MHz) and the quotient then jumps backward. Splitting the
-     * division keeps every intermediate in range. */
-    return (int64_t)((count.QuadPart / freq.QuadPart) * 1000000LL
-                     + ((count.QuadPart % freq.QuadPart) * 1000000LL)
-                       / freq.QuadPart);
+    /* Overflow-safe, and shared with the ns conversion so the two cannot
+     * drift: see src/nv2a/host_clock.h. The naive `count * 1000000` form
+     * overflows in a signed 64-bit temporary at 2^63/1e6 counts -- 10.68 days
+     * of host uptime at 10 MHz, not the "~51 hours" an earlier comment said. */
+    return nv2a_qpc_to_us(count.QuadPart, freq.QuadPart);
 }
 #endif
 
