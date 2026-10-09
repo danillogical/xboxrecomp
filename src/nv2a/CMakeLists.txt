@@ -116,6 +116,27 @@ if(BUILD_TESTING)
     add_test(NAME host_clock_wrap COMMAND host_clock_wrap_test)
     set_tests_properties(host_clock_wrap PROPERTIES TIMEOUT 20)
 
+    # The monotonic telemetry clock must share one zero across translation units.
+    # Two files are needed: an anchor held per file (a function-local static in
+    # the inline reader) gives each .c file its own epoch, which one file cannot show.
+    add_executable(nv2a_mono_clock_test
+        nv2a_core.c
+        nv2a_method_table.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/nv2a_mono_clock_test.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/nv2a_mono_clock_test_b.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/nv2a_mono_clock_backend_stub.c
+    )
+    target_include_directories(nv2a_mono_clock_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    if(NOT MSVC)
+        target_compile_options(nv2a_mono_clock_test PRIVATE -Wall -Wextra)
+    endif()
+    target_link_libraries(nv2a_mono_clock_test PRIVATE platform)
+    if(WIN32)
+        target_link_libraries(nv2a_mono_clock_test PRIVATE kernel32)
+    endif()
+    add_test(NAME nv2a_mono_clock COMMAND nv2a_mono_clock_test)
+    set_tests_properties(nv2a_mono_clock PROPERTIES TIMEOUT 20)
+
     # The vblank service loop's scheduling rule must survive a clock that steps
     # backward. `nv2a_vblank_advance` is the rule as a pure function, so this
     # compiles only nv2a_core.c (like the submit tests) and needs no device,

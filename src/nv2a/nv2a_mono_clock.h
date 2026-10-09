@@ -31,7 +31,10 @@
  * The anchor is captured lazily because the first caller may be a worker thread
  * or the ptimer thread, and a static initializer cannot portably call
  * QueryPerformanceCounter. Whichever thread arrives first fixes the zero; that
- * moment is "process start" for telemetry purposes. */
+ * moment is "process start" for telemetry purposes. The anchor is a single
+ * process-wide variable defined once in nv2a_core.c, not a function-local
+ * static: a static inline function would give each .c file its own copy and
+ * its own zero. */
 #ifndef NV2A_MONO_CLOCK_H
 #define NV2A_MONO_CLOCK_H
 
@@ -40,14 +43,16 @@
 #include "platform/xbox_winnt.h"
 #include "nv2a/host_clock.h"
 
+/* The anchor QPC count; 0 means not yet anchored. One definition in
+ * nv2a_core.c, so every file that includes this header shares one zero. */
+extern volatile LONGLONG g_nv2a_mono_anchor_count;
+
 /* Nanoseconds since the first call to this function anywhere in the process.
  * Never negative: a reading taken before the anchor was fixed clamps to 0.
  * Returns 0 if the host reports a non-positive frequency (no supported host
  * does). */
 static inline int64_t nv2a_mono_now_ns(void)
 {
-    /* The anchor QPC count; 0 means not yet anchored. */
-    static volatile LONGLONG s_anchor_count;
     LARGE_INTEGER freq, count;
     LONGLONG anchor, delta;
 
@@ -60,9 +65,9 @@ static inline int64_t nv2a_mono_now_ns(void)
      * lock here would sit inside the owner-lock telemetry that measures lock
      * contention, the perturbation this instrument must avoid. A losing
      * thread reads back the winner's anchor, so every thread shares one zero. */
-    anchor = InterlockedCompareExchange64(&s_anchor_count, 0, 0);
+    anchor = InterlockedCompareExchange64(&g_nv2a_mono_anchor_count, 0, 0);
     if (anchor == 0) {
-        LONGLONG prior = InterlockedCompareExchange64(&s_anchor_count,
+        LONGLONG prior = InterlockedCompareExchange64(&g_nv2a_mono_anchor_count,
                                                       count.QuadPart, 0);
         anchor = prior ? prior : count.QuadPart;
     }

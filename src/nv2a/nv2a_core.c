@@ -11,6 +11,9 @@
 #include "nv2a_state.h"
 #include "nv2a_pgraph_d3d11.h"
 
+/* The one process-wide telemetry anchor (see nv2a_mono_clock.h), defined here because every nv2a consumer links this file. */
+volatile LONGLONG g_nv2a_mono_anchor_count;
+
 /* ============================================================
  * Global state
  * ============================================================ */
