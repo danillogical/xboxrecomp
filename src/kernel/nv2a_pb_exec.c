@@ -43,6 +43,7 @@
 #include "nv2a_combiner.h"
 #include "nv2a_backend.h"
 #include "nv2a_present_track.h"
+#include "nv2a/nv2a_mono_clock.h"   /* QPC, host_clock.h, the process-wide epoch */
 #if defined(_WIN32)
 #include <windows.h>
 #define NV_TLS __declspec(thread)
@@ -396,6 +397,39 @@ static uint8_t  s_tex_set[(NV_TEX_LAST - NV_TEX_FIRST) / 4 + 1];
 #define NV097_SET_TEXTURE_CONTROL0        0x1B0C
 #define NV097_SET_TEXTURE_CONTROL0_ENABLE (1u << 30)
 static int s_tex0_enabled = 1;
+
+/* What the guest wrote to stage 0's CONTROL0, as opposed to the sticky flag
+ * above: a write count, how many of them cleared ENABLE, and the last value.
+ * Zero writes means the model never received the register at all. */
+static uint32_t s_tex0_ctl_writes;
+static uint32_t s_tex0_ctl_disables;
+static uint32_t s_tex0_ctl_last;
+
+/* Where executor time goes, as RAW QPC counts converted to ns only on export.
+ * Every counter is touched by the executor thread alone: the raster pool
+ * workers inside xf_rows_parallel never read the clock or these statics.
+ * The buckets nest -- fill sits inside tri, and vsh + tri + ffp sit inside
+ * exec -- so a reader can subtract without double counting. */
+static uint64_t s_t_exec, s_t_vsh, s_t_tri, s_t_fill, s_t_ffp;
+
+static uint64_t pb_qpc_now(void)
+{
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (uint64_t)c.QuadPart;
+}
+
+/* The QPC frequency is fixed for the life of the process, so ask once. */
+static uint64_t pb_qpc_to_ns(uint64_t count)
+{
+    static int64_t freq;
+    if (!freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = f.QuadPart;
+    }
+    return freq > 0 ? (uint64_t)nv2a_qpc_to_ns((int64_t)count, freq) : 0;
+}
 
 /* Formats whose dimensions come from the format word and whose coordinates
  * arrive normalised, rather than from a pitch and SET_TEXTURE_IMAGE_RECT with
@@ -1192,6 +1226,27 @@ void nv2a_pb_exec_counters(Nv2aPbExecCounters *out)
     out->unhandled    = s_gpu.unhandled_total;
 }
 
+/* Timing buckets in ns; see nv2a_backend.h for the contract and the nesting. */
+void nv2a_pb_exec_timing(Nv2aPbExecTiming *out)
+{
+    if (!out) return;
+    out->exec_ns = pb_qpc_to_ns(s_t_exec);
+    out->vsh_ns  = pb_qpc_to_ns(s_t_vsh);
+    out->tri_ns  = pb_qpc_to_ns(s_t_tri);
+    out->fill_ns = pb_qpc_to_ns(s_t_fill);
+    out->ffp_ns  = pb_qpc_to_ns(s_t_ffp);
+}
+
+/* Stage 0's CONTROL0 latch; same contract as nv2a_pb_exec_counters. */
+void nv2a_pb_exec_tex0_control(Nv2aPbExecTex0 *out)
+{
+    if (!out) return;
+    out->writes   = s_tex0_ctl_writes;
+    out->disables = s_tex0_ctl_disables;
+    out->last     = s_tex0_ctl_last;
+    out->enabled  = (uint32_t)s_tex0_enabled;
+}
+
 /* Bridge from the GPU core's commit seam to this executor. The core knows only
  * the function pointer; it never learns that the consumer is the kernel-side
  * executor. Registered once at bring-up when RECOMP_PB_EXEC is set.
@@ -1273,12 +1328,19 @@ static void pb_note_skipped_class(uint32_t class_id, uint32_t method)
 static void pb_exec_commit_consumer(uint32_t subchannel, uint32_t class_id,
                                     uint32_t method, uint32_t param)
 {
+    uint64_t t0;
+
     if (class_id != NV097_CLASS) {
         ++s_consumer_non_nv097;
         pb_note_skipped_class(class_id, method);
         return;
     }
+    t0 = pb_qpc_now();
     nv2a_pb_exec_method(subchannel, method, param);
+    /* Closed before report_tick: the report prints from inside this call, and
+     * must see this method's vsh/tri/ffp time already inside exec. The report
+     * itself is not executor work. */
+    s_t_exec += pb_qpc_now() - t0;
     report_tick();
 }
 
@@ -2405,7 +2467,9 @@ static void count_texture_stage(void)
      * is 0" from "the flag is 1 but offset/dimensions/format are missing". It
      * CANNOT distinguish "the guest disabled stage 0" from "the model cleared or
      * never received the enable bit"; the printed label is an interpretation of
-     * a bit the model holds, not an observation of guest intent. */
+     * a bit the model holds, not an observation of guest intent. The CONTROL0
+     * latch (nv2a_pb_exec_tex0_control) now separates "never written" from
+     * "written with ENABLE clear", which this counter alone cannot. */
     if (!s_gpu.texs[0].valid) {
         if (!s_tex0_enabled) {
             ++s_gpu.batches_stage_disabled;
@@ -3111,7 +3175,12 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     s_gpu.xf_drawn++;
     T.inv_area = 1.0f / area;
 
-    xf_rows_parallel(&T, &cnt);
+    {
+        /* Wall time on this thread, pool wait included. */
+        uint64_t t_fill = pb_qpc_now();
+        xf_rows_parallel(&T, &cnt);
+        s_t_fill += pb_qpc_now() - t_fill;
+    }
     s_gpu.xf_depth_fail += cnt.depth_fail;
     s_gpu.xf_pixels += cnt.pixels;
     s_gpu.zpass_count += cnt.zpass;
@@ -3286,9 +3355,11 @@ static void raster_batch_program(void)
     uint32_t i, n = s_gpu.idx_count;
     uint32_t tris_before = s_gpu.tris_drawn;
     uint64_t px_before = s_gpu.xf_pixels;
+    uint64_t t_vsh = pb_qpc_now(), t_tri;
 
     for (i = 0; i < n; i++)
         if (!transform_vertex(s_gpu.idx[i], &s_xf[i])) {
+            s_t_vsh += pb_qpc_now() - t_vsh;
             /* No program loaded: nothing can place these vertices, so the
              * batch is counted with the ones the screen-space path cannot
              * place either. */
@@ -3298,6 +3369,7 @@ static void raster_batch_program(void)
             trace_batch(s_gpu.color_offset, 0, 0, s_gpu.texs[0].valid, 0, 0, 0, 0);
             return;
         }
+    s_t_vsh += pb_qpc_now() - t_vsh;
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
     if (s_gpu.blend_enable) {
@@ -3365,6 +3437,7 @@ static void raster_batch_program(void)
         return;
     }
 
+    t_tri = pb_qpc_now();
     switch (s_gpu.prim) {
     case NV_PRIM_TRIANGLES:
         for (i = 0; i + 2 < n; i += 3)
@@ -3394,6 +3467,7 @@ static void raster_batch_program(void)
     default:
         break;
     }
+    s_t_tri += pb_qpc_now() - t_tri;
 
     /* The same per-batch record the screen-space path keeps, so the flip
      * trace names program batches too. Pixels come from the program path's
@@ -3413,21 +3487,12 @@ static void raster_batch_program(void)
     }
 }
 
-static void raster_batch(void)
+/* The screen-space / fixed-function half of raster_batch. Split out so the
+ * ffp bucket can wrap every return with one pair of clock reads. */
+static void raster_batch_screen(uint32_t before, uint32_t px_before)
 {
-    uint32_t before = s_gpu.tris_drawn;
-    uint32_t px_before = (uint32_t)s_gpu.pixels;
     int screen_space;
-    static int no_vsh = -1;
 
-    if (s_gpu.idx_count < 3)
-        return;
-    if (no_vsh < 0)
-        no_vsh = getenv("RECOMP_NO_VSH") != NULL;
-    if ((s_gpu.xf_mode & 3) == NV_XFORM_MODE_PROGRAM && !no_vsh) {
-        raster_batch_program();
-        return;
-    }
     screen_space = batch_is_screen_space();
     if (!screen_space) {
         s_gpu.batches_untransformed++;
@@ -3510,6 +3575,26 @@ static void raster_batch(void)
         s_drawn_dumps++;
         dump_surface_bmp();
     }
+}
+
+static void raster_batch(void)
+{
+    uint32_t before = s_gpu.tris_drawn;
+    uint32_t px_before = (uint32_t)s_gpu.pixels;
+    uint64_t t_ffp;
+    static int no_vsh = -1;
+
+    if (s_gpu.idx_count < 3)
+        return;
+    if (no_vsh < 0)
+        no_vsh = getenv("RECOMP_NO_VSH") != NULL;
+    if ((s_gpu.xf_mode & 3) == NV_XFORM_MODE_PROGRAM && !no_vsh) {
+        raster_batch_program();
+        return;
+    }
+    t_ffp = pb_qpc_now();
+    raster_batch_screen(before, px_before);
+    s_t_ffp += pb_qpc_now() - t_ffp;
 }
 
 /* RECOMP_FRAME_TRACE=<flag file>: once the file exists, log every batch of
@@ -4124,8 +4209,12 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         /* Stage 0's enable bit gates its sampling (tex_update_valid).
          * Default 1 so a title that never writes CONTROL0 keeps the
          * behaviour it had: only an explicit disable turns sampling off. */
-        if (stage == 0)
+        if (stage == 0) {
             s_tex0_enabled = (param & NV097_SET_TEXTURE_CONTROL0_ENABLE) ? 1 : 0;
+            ++s_tex0_ctl_writes;
+            if (!s_tex0_enabled) ++s_tex0_ctl_disables;
+            s_tex0_ctl_last = param;
+        }
         break;
     default:
         break;
@@ -4876,6 +4965,31 @@ void nv2a_pb_exec_report(void)
             s_gpu.batches_stage_disabled, s_gpu.batches_no_offset,
             s_gpu.batches_no_dims, s_gpu.batches_no_format,
             s_gpu.batches_other_invalid);
+    /* Whether the guest ever wrote stage 0's CONTROL0 at all, which the
+     * counts above cannot tell from a write that cleared ENABLE. */
+    if (!s_tex0_ctl_writes)
+        fprintf(stderr, "[GPU]   CONTROL0 stage 0: never written\n");
+    else
+        fprintf(stderr, "[GPU]   CONTROL0 stage 0: %u writes (%u disabling),"
+                        " last 0x%08X\n",
+                s_tex0_ctl_writes, s_tex0_ctl_disables, s_tex0_ctl_last);
+    /* Where executor time goes, cumulative. Triangle setup is the triangle
+     * bucket less the pixel fill nested inside it. */
+    {
+        uint64_t exec_ms = pb_qpc_to_ns(s_t_exec) / 1000000ull;
+        uint64_t vsh_ms  = pb_qpc_to_ns(s_t_vsh) / 1000000ull;
+        uint64_t tri_ns  = pb_qpc_to_ns(s_t_tri);
+        uint64_t fill_ns = pb_qpc_to_ns(s_t_fill);
+        uint64_t setup_ms = (tri_ns > fill_ns ? tri_ns - fill_ns : 0) / 1000000ull;
+        uint64_t ffp_ms  = pb_qpc_to_ns(s_t_ffp) / 1000000ull;
+        fprintf(stderr, "[GPU] executor time: busy %llu ms (vertex programs %llu,"
+                        " triangle setup %llu, pixel fill %llu, screen-space/FFP %llu)"
+                        " at t_ms=%u\n",
+                (unsigned long long)exec_ms, (unsigned long long)vsh_ms,
+                (unsigned long long)setup_ms,
+                (unsigned long long)(fill_ns / 1000000ull),
+                (unsigned long long)ffp_ms, nv2a_mono_now_ms());
+    }
     /* The swap split, which the draw/clear counters above cannot show: a title
      * that flips by advancing the write pointer and one that stalls on the read
      * pointer are different D3D paths, and only one of them increments flips. */

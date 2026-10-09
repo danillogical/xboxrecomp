@@ -130,6 +130,20 @@ typedef struct {
 
 void nv2a_pb_exec_counters(Nv2aPbExecCounters *out);
 
+/* Where executor time goes, in ns, cumulative since start. The buckets nest:
+ * fill <= tri, and vsh + tri + ffp <= exec. exec is the whole commit-consumer
+ * callback; vsh the vertex-program transform loop; tri the triangle loop of a
+ * program batch (fill is the pixel-fill share inside it); ffp the screen-space
+ * and fixed-function path. Same THREADING CONTRACT as nv2a_pb_exec_counters. */
+typedef struct { uint64_t exec_ns, vsh_ns, tri_ns, fill_ns, ffp_ns; } Nv2aPbExecTiming;
+void nv2a_pb_exec_timing(Nv2aPbExecTiming *out);
+
+/* What the guest wrote to stage 0's SET_TEXTURE_CONTROL0: write count, how many
+ * cleared ENABLE, the last value, and the model's current enable flag. writes==0
+ * means the register never arrived. Same THREADING CONTRACT as above. */
+typedef struct { uint32_t writes, disables, last, enabled; } Nv2aPbExecTex0;   /* enabled = current s_tex0_enabled */
+void nv2a_pb_exec_tex0_control(Nv2aPbExecTex0 *out);
+
 /* Register the executor as the GPU core's committed-method consumer. Called
  * once at bring-up (before the guest runs) and gated on RECOMP_PB_EXEC by
  * presence, exactly like the legacy scan path. Idempotent.
