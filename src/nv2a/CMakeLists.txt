@@ -72,6 +72,31 @@ if(BUILD_TESTING)
     add_test(NAME nv2a_submit_diag COMMAND nv2a_submit_diag_test)
     set_tests_properties(nv2a_submit_diag PROPERTIES TIMEOUT 20)
 
+    # The per-walk page-validation cache must not weaken the read guard.
+    #
+    # `submit_read_word` used to call `VirtualQuery` per word; caching the
+    # validated span is worth ~1.5 s per 8144-word walk on this host, but a cache
+    # that validated too wide a span would let the walk read a PAGE_GUARD page
+    # and fault on a bad ring instead of refusing it. This drives the real
+    # `nv2a_submit_pending` against a window with a REAL guard page in the middle
+    # and requires the refusal to survive repetition, with a positive control so
+    # a guard that refused everything could not pass.
+    add_executable(nv2a_read_guard_test
+        nv2a_core.c
+        nv2a_method_table.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/nv2a_read_guard_test.c
+    )
+    target_include_directories(nv2a_read_guard_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(NOT MSVC)
+        target_compile_options(nv2a_read_guard_test PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+    target_link_libraries(nv2a_read_guard_test PRIVATE platform)
+    if(WIN32)
+        target_link_libraries(nv2a_read_guard_test PRIVATE kernel32)
+    endif()
+    add_test(NAME nv2a_read_guard COMMAND nv2a_read_guard_test)
+    set_tests_properties(nv2a_read_guard PROPERTIES TIMEOUT 20)
+
     # The host clock must not jump backward at either QPC product wrap.
     #
     # This calls the REAL shipped conversions (`nv2a_qpc_to_ns` /
