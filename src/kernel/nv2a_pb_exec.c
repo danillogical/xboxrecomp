@@ -1367,11 +1367,59 @@ static void report_tick(void)
     nv2a_pb_exec_report();
 }
 
+/* Which NON-NV097 classes reached the consumer and were dropped.
+ *
+ * WHY A CENSUS RATHER THAN A COUNT. The executor executes only NV097; every
+ * other class is counted and skipped. A single total cannot answer the question
+ * that matters for the present path: whether a SURFACE-TO-SURFACE copy or a flip
+ * was among the dropped methods. `NV_IMAGE_BLIT` is class 0x9F and IS in the
+ * method table, so a hardware blit that moved the drawn surface into the scanout
+ * buffer would be silently dropped -- and a total of "14 skipped" is compatible
+ * with both "14 harmless" and "1 blit plus 13 harmless".
+ *
+ * The census is bounded and allocation-free: a fixed table of distinct class
+ * ids with a count and a first-method sample each. Nothing here formats or
+ * allocates on the hot path; the table is only read when the report prints. */
+#define PB_NON_NV097_CLASSES 8
+/* The one non-NV097 class that could perform a surface-to-surface copy. Defined
+ * here rather than included: `nv2a_method_table.c` and `nv2a_core.c` each define
+ * their own copy of this constant, and neither header is on this file's include
+ * path. Kept identical to theirs and named after the same class. */
+#define PB_NV_IMAGEBLIT_CLASS 0x9Fu
+typedef struct {
+    uint32_t class_id;
+    uint32_t count;
+    uint32_t first_method;
+} PbSkippedClass;
+static PbSkippedClass s_skipped_class[PB_NON_NV097_CLASSES];
+static uint32_t s_skipped_class_overflow;   /* distinct classes past the table */
+
+static void pb_note_skipped_class(uint32_t class_id, uint32_t method)
+{
+    uint32_t i;
+    for (i = 0; i < PB_NON_NV097_CLASSES; ++i) {
+        if (s_skipped_class[i].class_id == class_id) {
+            ++s_skipped_class[i].count;
+            return;
+        }
+        if (s_skipped_class[i].class_id == 0) {
+            s_skipped_class[i].class_id = class_id;
+            s_skipped_class[i].count = 1;
+            s_skipped_class[i].first_method = method;
+            return;
+        }
+    }
+    /* Table full: keep counting so the total stays honest, and say how many
+     * distinct classes went unrecorded rather than pretending there were none. */
+    ++s_skipped_class_overflow;
+}
+
 static void pb_exec_commit_consumer(uint32_t subchannel, uint32_t class_id,
                                     uint32_t method, uint32_t param)
 {
     if (class_id != NV097_CLASS) {
         ++s_consumer_non_nv097;
+        pb_note_skipped_class(class_id, method);
         return;
     }
     nv2a_pb_exec_method(subchannel, method, param);
@@ -1381,6 +1429,29 @@ static void pb_exec_commit_consumer(uint32_t subchannel, uint32_t class_id,
 uint32_t nv2a_pb_exec_skipped_non_nv097(void)
 {
     return s_consumer_non_nv097;
+}
+
+/* Emit the census. Called from the report only, so it costs nothing per method.
+ * `NV_IMAGEBLIT_CLASS` (0x9F) is named explicitly because it is the one class in
+ * this table that could perform a surface-to-surface copy, which is exactly the
+ * operation the draw-versus-present question needs. */
+static void pb_report_skipped_classes(void)
+{
+    uint32_t i;
+    for (i = 0; i < PB_NON_NV097_CLASSES; ++i) {
+        if (!s_skipped_class[i].class_id)
+            continue;
+        fprintf(stderr, "  [GPU]   skipped class 0x%02X: %u method(s), first 0x%04X%s\n",
+                s_skipped_class[i].class_id, s_skipped_class[i].count,
+                s_skipped_class[i].first_method,
+                s_skipped_class[i].class_id == PB_NV_IMAGEBLIT_CLASS
+                    ? "  <-- NV_IMAGE_BLIT: a surface blit would be DROPPED here"
+                    : "");
+    }
+    if (s_skipped_class_overflow)
+        fprintf(stderr, "  [GPU]   skipped: %u further method(s) on classes past "
+                        "the %d-entry census table\n",
+                s_skipped_class_overflow, PB_NON_NV097_CLASSES);
 }
 
 /* Whether the commit-consumer registration happened, and how it is gated. */
@@ -3629,6 +3700,10 @@ void nv2a_pb_exec_report(void)
             s_gpu.flips, s_gpu.flip_stalls,
             s_consumer_registered ? "submission walk" : "none",
             s_consumer_non_nv097);
+    /* Which classes those were. A bare total cannot distinguish "14 harmless
+     * methods" from "1 surface blit plus 13 harmless", and a dropped blit is a
+     * candidate explanation for a drawn-but-not-presented surface. */
+    pb_report_skipped_classes();
     for (i = 0; i < s_tex_use_count; i++)
         fprintf(stderr, "  [TEXUSE] 0x%08X %ux%u fmt 0x%02X%s: %u batches\n",
                 s_tex_use[i].offset, s_tex_use[i].width, s_tex_use[i].height,
