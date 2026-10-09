@@ -275,6 +275,28 @@ static void fb_present_observe(void)
  * seen a frame late is indistinguishable from one made a frame later. */
 static volatile unsigned char s_key_down[256];
 
+/* Title bar, the way ps3recomp's window shows it. Written by the flip,
+ * read once a second by the window thread; a torn read shows one stale
+ * number for a second, which nobody can tell apart from a real one. */
+static wchar_t       s_title[48] = L"Xbox Recomp";
+static volatile LONG s_flips;
+static volatile LONG s_frame_draws;
+
+void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
+{
+    int i;
+    for (i = 0; i < max_chars && i < 47 && name[i]; i++)
+        s_title[i] = (wchar_t)name[i];
+    if (i)
+        s_title[i] = 0;
+}
+
+void xbox_FramebufferWindowFrameStats(uint32_t draws)
+{
+    InterlockedIncrement(&s_flips);
+    InterlockedExchange(&s_frame_draws, (LONG)draws);
+}
+
 int xbox_FramebufferKeyDown(int vk)
 {
     if ((unsigned)vk > 255)
@@ -501,6 +523,21 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             }
         }
         fb_present_observe();
+        {
+            static DWORD t0;
+            static LONG f0;
+            DWORD now = GetTickCount();
+            if (now - t0 >= 1000) {
+                LONG f = s_flips;
+                wchar_t tb[128];
+                _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
+                           t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
+                           (long)s_frame_draws);
+                tb[127] = 0;
+                SetWindowTextW(hwnd, tb);
+                t0 = now; f0 = f;
+            }
+        }
         Sleep(16);
     }
 
@@ -533,4 +570,6 @@ void xbox_FramebufferWindowStart(void) {}
 int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 uint32_t xbox_FramebufferPresentSerial(void) { return 0; }
 unsigned long long xbox_FramebufferPresentHash(void) { return 0; }
+void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
+void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 #endif

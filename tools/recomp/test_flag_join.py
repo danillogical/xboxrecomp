@@ -37,3 +37,36 @@ def test_mixed_widths_are_not_guessed():
     wide = [Operand(type='reg', reg='eax'), Operand(type='reg', reg='edx')]
     narrow = [Operand(type='reg', reg='al'), Operand(type='reg', reg='dl')]
     assert _merge_flag_states([('cmp', wide), ('cmp', narrow)]) is None
+
+
+def translate(image):
+    config._install([config.Section('.text', BASE, len(image), 0, len(image), True)],
+                    entry_point=BASE, kernel_thunk_addr=BASE, origin='flag-join-test')
+    db = {BASE: {'start': hex(BASE), 'end': BASE + len(image), '_addr': BASE, 'size': len(image)}}
+    return FunctionTranslator(image, db).translate_function(BASE, db[BASE])
+
+
+def test_float_compares_with_swapped_operands_join():
+    # A clamp whose direction depends on a sign (T()NY, 0x001CE755):
+    # test cl,cl; jle alt; comiss xmm3,xmm0; jmp join;
+    # alt: comiss xmm0,xmm3; join: jbe skip; movaps xmm0,xmm3; skip: ret
+    code = translate(bytes.fromhex('84c97e050f2fd8eb030f2fc376030f28c3c3'))
+    assert 'if ((_fca <= _fcb || (_fca != _fca || _fcb != _fcb)))' in code, code
+    assert 'if (_flags' not in code, code
+
+
+def test_fcomi_family_joins():
+    # fld st0; fcomip st1 on one edge, fucomip st1 on the other, then ja.
+    # test cl,cl; jle alt; fcomip st(1); jmp join; alt: fucomip st(1); join: ja skip; nop; skip: ret
+    code = translate(bytes.fromhex('84c97e04dff1eb02dfe97701' + '90c3'))
+    assert 'if ((g_fp_cmp == 1)' in code, code
+    assert 'if (_flags' not in code, code
+
+
+def test_float_and_integer_compares_are_not_merged():
+    a = Operand(type='reg', reg='eax')
+    b = Operand(type='reg', reg='edx')
+    x = Operand(type='reg', reg='xmm0')
+    y = Operand(type='reg', reg='xmm1')
+    assert _merge_flag_states([('comiss', [x, y]), ('cmp', [a, b])]) is None
+    assert _merge_flag_states([('comiss', [x, y]), ('fcomip', [])]) is None

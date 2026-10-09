@@ -1207,7 +1207,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                     /* Periodic, because what the title submits at init is not
                      * what it submits once it is drawing a menu, and the
                      * question the survey answers is about the latter. */
-                    if (s_nv2a_trace && now_ms - last_report > 10000) {
+                    /* RECOMP_PB_REPORT_MS shortens it: the report is also
+                     * when RECOMP_FB_DUMP writes a frame, and stepping a
+                     * scripted pad through a menu needs a picture per
+                     * press rather than one every ten seconds. */
+                    static long report_ms = -1;
+                    if (report_ms < 0) {
+                        const char *e = getenv("RECOMP_PB_REPORT_MS");
+                        report_ms = e ? atol(e) : 10000;
+                        if (report_ms < 100) report_ms = 100;
+                    }
+                    if (s_nv2a_trace && now_ms - last_report > (uint64_t)report_ms) {
                         last_report = now_ms;
                         nv2a_pb_scan_report();
                     }
@@ -2352,7 +2362,18 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * them sit inside the 4 GB __PAGEZERO segment and none can. */
         /* Reserve base + mirrors as one range, and map the base at its head.
          * VirtualFree releases just the slice about to be used, so each view
-         * replaces our own reservation rather than racing for free space. */
+         * replaces our own reservation rather than racing for free space.
+         *
+         * POSIX only. Win32 VirtualFree cannot release part of a reservation:
+         * MEM_RELEASE with a nonzero size is ERROR_INVALID_PARAMETER, so both
+         * frees below fail, the base view never maps, and the whole span stays
+         * reserved. At a 64 MB map that is 1.8 GB the OS tends to place at
+         * 0x80000000 -- exactly the host range the contiguous window (guest
+         * 0x80000000) needs, which then fails with error 487 and the first
+         * touch of the kernel page faults. Larger map sizes push the span
+         * above 4 GB, which is why Half-Life 2 (768 MB) never saw it. Doing
+         * this on Windows needs placeholder reservations (VirtualAlloc2). */
+#ifndef _WIN32
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
         g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
         if (g_span_base) {
@@ -2366,6 +2387,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 g_span_size = 0;
             }
         }
+#endif
 
         const size_t n_bases = sizeof(try_bases) / sizeof(try_bases[0]);
         for (size_t i = 0; !g_memory_base && i < n_bases; i++) {
@@ -2514,6 +2536,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         DWORD sect_headers_va = *(const DWORD *)(xbe + XBE_SECTION_HEADERS_OFFSET);
         DWORD sect_headers_off = sect_headers_va - base_addr;
         int sections_loaded = 0;
+        /* The certificate's title name (UTF-16, 40 chars at +0x0C), for
+         * the framebuffer window's title bar. */
+        DWORD cert_off = *(const DWORD *)(xbe + 0x118) - base_addr;
+        if (cert_off + 0x0C + 80 <= xbe_size) {
+            extern void xbox_FramebufferWindowSetTitle(const uint16_t *, int);
+            xbox_FramebufferWindowSetTitle(
+                (const uint16_t *)(xbe + cert_off + 0x0C), 40);
+        }
         int sections_short = 0;
         size_t total_bytes = 0;
 

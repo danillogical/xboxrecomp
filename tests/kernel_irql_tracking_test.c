@@ -8,8 +8,13 @@
  * Run with RECOMP_GUEST_SERIAL=1 so the device-level count is kept too. */
 #include "kernel.h"
 #include "guest_meter.h"
+#include "xbox_memory_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
+
+/* The guest stack the IRQL holders record; esp 0 means no guest frame is read. */
+RECOMP_TLS uint32_t g_esp;
+ptrdiff_t g_xbox_mem_offset;
 
 /* kernel_hal.c's other dependencies, inert here. */
 bool nv2a_hook_pci_config_read(uint32_t offset, void *buffer, uint32_t length)

@@ -1041,6 +1041,7 @@ static void voice_process(MCPXAPUState *d,
             memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
         }
     } else {
+        int empty = 0;
         for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
             int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
                                         NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
@@ -1048,6 +1049,11 @@ static void voice_process(MCPXAPUState *d,
             int count = voice_resample(d, v, &samples[sample_count],
                                        NUM_SAMPLES_PER_FRAME - sample_count, rate);
             if (count < 0) break;
+            /* An active voice that keeps producing nothing is an underrun,
+             * not a reason to spin. Asking it again at once cannot change the
+             * answer, and this loop holds d->lock: Burnout 3's vehicle select
+             * sat here indefinitely while the title waited in voice_lock. */
+            if (count == 0 && ++empty > 4) break;
             sample_count += count;
         }
     }

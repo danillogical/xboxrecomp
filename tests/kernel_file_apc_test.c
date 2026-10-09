@@ -54,6 +54,8 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (v
 void xbox_FramebufferWindowPresent(void) {}
 uint32_t xbox_FramebufferPresentSerial(void) { return 0; }
 unsigned long long xbox_FramebufferPresentHash(void) { return 0; }
+void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars) { (void)name; (void)max_chars; }
+void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 IDirect3DDevice8 *xbox_GetD3DDevice(void) { return NULL; }
 
 extern ptrdiff_t g_xbox_mem_offset;

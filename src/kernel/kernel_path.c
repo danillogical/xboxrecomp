@@ -17,6 +17,10 @@
 #include <string.h>
 #include <ctype.h>
 
+/* A project may set this to watch every guest path the kernel translates (for
+ * example to print who opened a file). NULL by default. */
+void (*g_xbox_path_hook)(const char *xbox_path) = NULL;
+
 /*
  * Helper: check if an ANSI string starts with a prefix (case-insensitive).
  * Returns the number of chars consumed from the prefix, or 0 if no match.
@@ -301,6 +305,18 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
     if (len > 0 && s_save_dir[len - 1] == L'\\')
         s_save_dir[len - 1] = L'\0';
 
+    /* Absolute, because SHCreateDirectoryExW below only accepts a fully
+     * qualified path: handed the relative "saves" a host passes, it fails with
+     * ERROR_BAD_PATHNAME and creates nothing. The partition images then cannot
+     * be created either, and a title that opens \Device\Harddisk0\Partition1\
+     * at boot gets STATUS_OBJECT_PATH_NOT_FOUND and quits to the dashboard.
+     * It only ever worked where someone had made the directory by hand. */
+    {
+        WCHAR full[MAX_PATH];
+        if (GetFullPathNameW(s_save_dir, MAX_PATH, full, NULL))
+            wcscpy_s(s_save_dir, MAX_PATH, full);
+    }
+
     /* Create the save-side directories. T:/U:/Z: map into subdirectories of
      * save_dir, and a title that opens a file there with a create disposition
      * fails if the parent does not exist -- which reads as "cannot create save
@@ -418,6 +434,8 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     return TRUE;
 
 translate:
+    if (g_xbox_path_hook)
+        g_xbox_path_hook(xbox_path);
     fprintf(stderr, "  [PATH] %s\n", xbox_path);
     fflush(stderr);
     {

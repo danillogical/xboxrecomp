@@ -485,7 +485,7 @@ extern RECOMP_TLS uint32_t g_fs_base;
 /**
  * Allocate from the Xbox heap. Returns an Xbox VA, or 0 on failure.
  * Alignment must be a power of 2 (minimum 4).
- * Thread-safe: no (single-threaded recompiled code).
+ * Thread-safe: yes; a lock guards the block table.
  */
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment);
 

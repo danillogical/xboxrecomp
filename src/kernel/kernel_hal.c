@@ -14,6 +14,7 @@
 #include "kernel.h"
 #include "guest_meter.h"
 #include "nv2a/nv2a_mmio_hook.h"
+#include "xbox_memory_layout.h"   /* RECOMP_TLS */
 #include <stdio.h>
 #include <stdlib.h>
 #if defined(_WIN32)
@@ -242,7 +243,14 @@ int xbox_IrqlTransitions(void)
  * name: these are host addresses inside the recompiled image, so nm resolves
  * them to the generated function, which is the guest function. */
 #define IRQL_HOLDERS 8
-static struct { volatile LONG tid; void *ra; } s_holders[IRQL_HOLDERS];
+static struct {
+    volatile LONG tid;
+    void *ra;
+    uint32_t guest_ra, guest_esp;   /* the host ra only ever names the bridge */
+} s_holders[IRQL_HOLDERS];
+extern RECOMP_TLS uint32_t g_esp;
+/* The offset lifted code adds to every guest address. */
+extern ptrdiff_t g_xbox_mem_offset;
 
 static void irql_holder_add(void *ra)
 {
@@ -252,6 +260,9 @@ static void irql_holder_add(void *ra)
     for (i = 0; i < IRQL_HOLDERS; i++)
         if (InterlockedCompareExchange(&s_holders[i].tid, me, 0) == 0) {
             s_holders[i].ra = ra;
+            s_holders[i].guest_esp = g_esp;
+            s_holders[i].guest_ra = g_esp
+                ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
             return;
         }
 }
@@ -275,8 +286,10 @@ void xbox_IrqlDumpHolders(void)
     for (i = 0; i < IRQL_HOLDERS; i++) {
         LONG t = InterlockedCompareExchange(&s_holders[i].tid, 0, 0);
         if (t)
-            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p\n",
-                    (unsigned long)t, s_holders[i].ra);
+            fprintf(stderr, "  [IRQLHOLD]   tid %lu raised from host %p, "
+                    "guest ret %08X (esp %08X)\n",
+                    (unsigned long)t, s_holders[i].ra,
+                    s_holders[i].guest_ra, s_holders[i].guest_esp);
     }
     fflush(stderr);
 }
@@ -555,6 +568,7 @@ VOID __stdcall xbox_KeBugCheck(ULONG BugCheckCode)
 {
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
         "*** KeBugCheck: code=0x%08X ***", BugCheckCode);
+    fprintf(stderr, "[EXIT] KeBugCheck 0x%08X\n", (unsigned)BugCheckCode);
 
 #ifdef _DEBUG
     DebugBreak();
@@ -573,6 +587,7 @@ VOID __stdcall xbox_KeBugCheckEx(
     xbox_log(XBOX_LOG_ERROR, XBOX_LOG_HAL,
         "*** KeBugCheckEx: code=0x%08X, params=(0x%p, 0x%p, 0x%p, 0x%p) ***",
         BugCheckCode, (void*)Param1, (void*)Param2, (void*)Param3, (void*)Param4);
+    fprintf(stderr, "[EXIT] KeBugCheckEx 0x%08X\n", (unsigned)BugCheckCode);
 
 #ifdef _DEBUG
     DebugBreak();
@@ -623,12 +638,16 @@ VOID __stdcall xbox_HalReturnToFirmware(ULONG Routine)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL,
         "HalReturnToFirmware: routine=%u (exiting)", Routine);
+    /* stderr too: the kernel log file is rewritten on every run, so a title
+     * that ends itself otherwise leaves no trace in the run's own log. */
+    fprintf(stderr, "[EXIT] HalReturnToFirmware routine=%u\n", (unsigned)Routine);
     ExitProcess(0);
 }
 
 VOID __stdcall xbox_HalInitiateShutdown(void)
 {
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_HAL, "HalInitiateShutdown (exiting)");
+    fprintf(stderr, "[EXIT] HalInitiateShutdown\n");
     ExitProcess(0);
 }
 
