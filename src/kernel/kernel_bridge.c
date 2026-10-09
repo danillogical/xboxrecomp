@@ -1692,18 +1692,32 @@ static int bridge_alertable_probe_result(NTSTATUS probe)
  * placed on one timeline with everything else. */
 #define BRIDGE_LONG_WAIT_MS 250u
 
+/* Counters for the whole run. `logged` bounds the PRINTS; `total` and `max_ms`
+ * keep counting past that bound, so "no long waits later" can never be inferred
+ * from silence. See the note in bridge_log_long_wait. */
+static volatile LONG g_long_wait_logged;
+static volatile LONG g_long_wait_total;
+static volatile LONG g_long_wait_max_ms;
+
 static void bridge_log_long_wait(const char *where, uint32_t object,
                                  uint32_t timeout_ptr, uint64_t start_ms,
                                  uint32_t waited_ms)
 {
-    static volatile LONG logged;
-    LONG n;
+    LONG n, t;
 
     if (waited_ms < BRIDGE_LONG_WAIT_MS)
         return;
-    /* Bounded so a pathological run cannot turn this into a log storm: the
-     * first 256 long waits are the ones that describe the onset. */
-    n = InterlockedIncrement(&logged);
+    InterlockedIncrement(&g_long_wait_total);
+    /* Lock-free maximum: read, compare, conditionally store. A lost update
+     * undercounts by at most one sample and never overcounts, which is the
+     * safe direction for a bound. */
+    t = g_long_wait_max_ms;
+    while ((LONG)waited_ms > t &&
+           InterlockedCompareExchange(&g_long_wait_max_ms, (LONG)waited_ms,
+                                      t) != t)
+        t = g_long_wait_max_ms;
+
+    n = InterlockedIncrement(&g_long_wait_logged);
     if (n > 256)
         return;
     fprintf(stderr, "  [WAIT] %s obj=0x%08X tid=%lu waited=%ums timeout=%s"
@@ -1712,6 +1726,18 @@ static void bridge_log_long_wait(const char *where, uint32_t object,
             timeout_ptr ? "finite" : "INFINITE",
             (unsigned long long)start_ms, g_xbox_kernel_caller);
     fflush(stderr);
+}
+
+/* Totals for the whole run, so the bounded print above cannot be mistaken for
+ * the whole population. */
+uint32_t bridge_long_wait_total(void)
+{
+    return (uint32_t)InterlockedCompareExchange(&g_long_wait_total, 0, 0);
+}
+
+uint32_t bridge_long_wait_max_ms(void)
+{
+    return (uint32_t)InterlockedCompareExchange(&g_long_wait_max_ms, 0, 0);
 }
 
 /* ── KeWaitForSingleObject (ordinal 159) ─────────────────── */
@@ -10073,6 +10099,17 @@ static void kernel_thunk_dispatch(void)
             xbox_KmemLogSummary();
             fflush(stderr);
             xbox_GuestMeterSummary();
+            /* The whole-run wait totals, so the bounded `[WAIT]` print cannot be
+             * mistaken for the whole population. Measured on a 904 s run, the
+             * 256-line cap went quiet after 10.4 % of the run, leaving the heavy
+             * phase -- where the long lock waits actually are -- entirely
+             * unrepresented in the log. These two numbers keep counting past the
+             * cap, so "no long waits later" is never inferred from silence. */
+            fprintf(stderr, "  [WAIT] totals: %u long wait(s) >= %ums, "
+                            "max %u ms, t_ms=%u\n",
+                    bridge_long_wait_total(), BRIDGE_LONG_WAIT_MS,
+                    bridge_long_wait_max_ms(), nv2a_mono_now_ms());
+            fflush(stderr);
             last_summary_tick = now;
         }
     }
