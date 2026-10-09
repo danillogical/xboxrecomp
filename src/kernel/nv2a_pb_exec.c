@@ -922,7 +922,7 @@ static void trace_batch(uint32_t target, uint32_t tris, uint32_t pixels,
 /* Counts over the whole traced window, so "the composite never ran" and "the
  * composite ran and produced black" are distinguishable without reading every
  * ring line. */
-static uint32_t s_tb_total, s_tb_self_sample, s_tb_refused,
+static uint32_t s_tb_total, s_tb_self_sample,
                 s_tb_untransformed, s_tb_textured, s_tb_drew;
 
 extern uint32_t xbox_FramebufferPresentSerial(void);

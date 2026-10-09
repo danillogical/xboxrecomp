@@ -16,7 +16,7 @@
  *
  * Fixed-function, pre-transformed and vertex-program batches all arrive the
  * same way: the executor transforms fixed-function vertices itself and runs
- * vertex programs on the CPU (vp_run), so a back end only ever sees surface
+ * vertex programs on the CPU (nv2a_vsh_interp.c), so a back end only ever sees surface
  * pixels. Blend, depth and alpha state arrive in Nv2aRenderState.
  *
  * ponytail: register-combiner state is not passed on. Extend Nv2aBatch when
@@ -177,7 +177,7 @@ uint32_t nv2a_pb_exec_skipped_non_nv097(void);
 typedef struct {
     uint32_t const_load;         /* the load cursor after the last write */
     uint32_t const_count;        /* constants copied out (clamped to 192) */
-    float    consts[192][4];     /* s_vp.c[0..const_count-1] */
+    float    consts[192][4];     /* nv2a_vsh_interp.c s_const[0..const_count-1] */
     uint32_t attr_offset[16];    /* s_gpu.attr[i].offset, post-dma_resolve */
 } Nv2aPbExecVpView;
 

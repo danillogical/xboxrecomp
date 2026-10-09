@@ -613,11 +613,6 @@ void nv2a_ptimer_set_clock(NV2AState *d, uint64_t (*clock_ns)(void *),
     d->ptimer.clock_opaque = opaque;
 }
 
-static uint64_t ptimer_get_clock(NV2AState *d)
-{
-    return ptimer_internal_clock(d);
-}
-
 uint64_t ptimer_read(void *opaque, hwaddr addr, unsigned int size)
 {
     NV2AState *d = (NV2AState *)opaque;

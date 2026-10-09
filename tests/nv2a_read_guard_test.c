@@ -80,7 +80,6 @@ static uint8_t *g_ring;
 static uint8_t g_vram[1 << 16];
 static uint8_t g_ramin[1 << 12];
 
-static uint32_t rd32(uint32_t off) { uint32_t v; memcpy(&v, g_ring + off, 4); return v; }
 static void wr32(uint32_t off, uint32_t v) { memcpy(g_ring + off, &v, 4); }
 
 /* A packet header: count in bits 18+, subchannel 13+, method low 13. */

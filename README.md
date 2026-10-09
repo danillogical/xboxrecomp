@@ -424,8 +424,9 @@ Several unit tests compile the lifter's own output and sweep it against x86's
 definitions — they are the real proof for the shift, flag and x87 work, and
 each is paired with a negative control that feeds the harness the pre-fix
 expression and requires it to fail. They need a C compiler on `PATH`, and
-**skip rather than fail without one**, so check the skip count: a clean run is
-641 passed / 0 skipped. If clang is installed but not on `PATH`:
+**skip rather than fail without one**, so check the skip count: a clean run has
+none. (At the time of the v0.13.1 merge, this fork's `tools/posix_check.py python`
+reported 714 passed, 2 skipped, 1 known failure.) If clang is installed but not on `PATH`:
 
 ```bash
 export PATH="/c/Program Files/LLVM/bin:$PATH"   # Git Bash
