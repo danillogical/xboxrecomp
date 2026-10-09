@@ -639,18 +639,18 @@ static DWORD WINAPI ptimer_service_thread(void *opaque)
             uint64_t deadline_before = next_vblank_ns;
             next_vblank_ns = nv2a_vblank_advance(next_vblank_ns, now_ns, frame_ns,
                                                  &pulse);
-            /* Telemetry for the 30-80x pulse shortfall. `pulse == 0` with a
-             * deadline already in the past means this pass took the LATE
-             * branch, which re-arms without pulsing; if every pass does that,
-             * delivery stops entirely. Counting it is what makes "delivery is
-             * slow because the loop keeps re-arming late" falsifiable.
+            /* Telemetry for the 30-80x pulse shortfall. A wake at least four
+             * frames past the deadline is the LATE branch, which pulses once
+             * and re-arms from now, so the pulse does not separate it from a
+             * punctual pass; the lateness does. Counting it is what makes
+             * "delivery is slow because the loop keeps waking late" falsifiable.
              *
              * Both fields are plain stores into device state the walk already
              * publishes, so this adds no lock, no allocation and no I/O. */
             ++nv2a->pfifo.vblank_passes;
             nv2a->pfifo.vblank_frame_ns = (uint32_t)(frame_ns / 1000ull);
             nv2a->pfifo.vblank_last_pass_ms = nv2a_mono_now_ms();
-            if (!pulse && deadline_before && now_ns > deadline_before) {
+            if (deadline_before && now_ns >= deadline_before + frame_ns * 4) {
                 uint32_t late_ms =
                     (uint32_t)((now_ns - deadline_before) / 1000000ull);
                 ++nv2a->pfifo.vblank_rearm_late;
@@ -731,13 +731,16 @@ static DWORD WINAPI ptimer_service_thread(void *opaque)
          *
          * TORN READS. This publish does not take part in the `generation`
          * protocol, which exists to tell a collector that froze the process
-         * mid-walk that it caught a partially written snapshot. It does not
-         * need to: every field written here is a MONOTONE counter or maximum,
-         * and both this thread and the walk publish under `g_mmio_owner_lock`,
-         * so the two never interleave. A reader that catches this sequence
-         * half-written therefore sees a mix of two adjacent snapshots in which
-         * every field is still a valid lower bound, never a stale value
-         * presented as current. */
+         * mid-walk that it caught a partially written snapshot. Both this
+         * thread and the walk publish under `g_mmio_owner_lock`, so the two
+         * never interleave; only a collector that freezes the process inside
+         * this sequence can see it half-written. Most fields here are
+         * monotone counters, maxima or stamps, and a half-written mix of two
+         * adjacent passes leaves each of them a valid lower bound. Not all
+         * are: `lock_owner_tid`, `lock_hold_last_tid` and `vblank_frame_ns`
+         * are last-value fields, so in a torn read each is from this pass or
+         * the previous one, and must not be paired with the counters as one
+         * consistent sample. */
         {
             NV2ASubmitState *ss = &g_nv2a_submit_state;
             ss->vblank_rearm_late = nv2a->pfifo.vblank_rearm_late;

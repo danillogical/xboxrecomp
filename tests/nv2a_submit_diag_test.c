@@ -606,17 +606,20 @@ static void test_override_minus_one_reads_environment(void)
 
 /* ── kick observer and stalled-walk retry ────────────────────────────── */
 
-static unsigned g_kicks, g_commits;
+static unsigned g_kicks, g_commits, g_partials;
+static uint32_t g_partial_value, g_commit_value, g_kick_value;
 
-static void observer(int event)
+static void observer(int event, uint32_t value)
 {
-    if (event == NV2A_KICK) ++g_kicks;
-    else if (event == NV2A_COMMIT) ++g_commits;
+    if (event == NV2A_KICK) { ++g_kicks; g_kick_value = value; }
+    else if (event == NV2A_COMMIT) { ++g_commits; g_commit_value = value; }
+    else if (event == NV2A_COMMIT_PARTIAL) { ++g_partials; g_partial_value = value; }
 }
 
 static void observer_reset(void)
 {
-    g_kicks = g_commits = 0;
+    g_kicks = g_commits = g_partials = 0;
+    g_partial_value = g_commit_value = g_kick_value = 0;
     nv2a_set_kick_observer(observer);
 }
 
@@ -1609,6 +1612,253 @@ static void test_multi_unit_admission_accounting(void)
     nv2a_set_kick_observer(NULL);
 }
 
+/* ── subroutine return across unit commits ───────────────────────────── */
+
+#define SUB_BASE 0x8000u
+
+/* SET_OBJECT, CALL into a subroutine of two 2047-parameter packets (the second
+ * overflows the first unit, so a unit commits with GET inside the subroutine),
+ * then an unimplemented method, then RETURN. The main stream continues after
+ * the call. `bad_at` receives the unimplemented method's address. */
+static void build_long_subroutine(Pb *main_pb, uint32_t *bad_at, uint32_t *sub_end)
+{
+    Pb sub;
+    uint32_t i, k;
+
+    pb_begin(main_pb, PB_BASE);
+    pb_method(main_pb, 0, 0x0000, H_KELVIN);
+    pb_word(main_pb, SUB_BASE | 2u);                    /* CALL */
+    pb_method(main_pb, 0, 0x0300, 0);                   /* after the return */
+
+    pb_begin(&sub, SUB_BASE);
+    for (k = 0; k < 2; ++k) {
+        pb_word(&sub, 0x40000000u | hdr(0, 0x0300, 2047));
+        for (i = 0; i < 2047; ++i) pb_word(&sub, 0);
+    }
+    *bad_at = sub.at;
+    pb_method(&sub, 0, UNKNOWN_NV097, 0);
+    pb_word(&sub, 0x00020000u);                         /* RETURN */
+    *sub_end = sub.at;
+}
+
+static void test_return_survives_unit_commits(void)
+{
+    int via_retry;
+
+    for (via_retry = 0; via_retry < 2; ++via_retry) {
+        NV2AState *d = fresh();
+        Pb pb;
+        uint32_t bad_at, sub_end;
+        const char *log;
+
+        build_long_subroutine(&pb, &bad_at, &sub_end);
+        cap_begin();
+        kick(d, pb.start, pb.at);
+        log = cap_end();
+        CHECK(strcmp(diag(d), "unsupported_method") == 0, "mode %d: first walk diag %s",
+              via_retry, diag(d));
+        CHECK(get_ptr(d) > SUB_BASE && get_ptr(d) < sub_end,
+              "mode %d: a unit did not commit inside the subroutine (get=%08X)",
+              via_retry, get_ptr(d));
+        CHECK(g_nv2a_submit_state.units >= 1, "mode %d: units %u", via_retry,
+              g_nv2a_submit_state.units);
+        (void)log;
+
+        /* Clear the stop, then resume by a fresh PUT write or by the retry. */
+        wr32(g_window, bad_at, hdr(0, 0x0300, 1));
+        cap_begin();
+        if (via_retry)
+            CHECK(nv2a_retry_stalled_walk(d), "retry did not commit (%s)", diag(d));
+        else
+            kick_put(d, pb.at);
+        log = cap_end();
+        CHECK(strcmp(diag(d), "ok") == 0, "mode %d: resumed walk diag %s", via_retry, diag(d));
+        CHECK(strstr(log, "invalid_target") == NULL,
+              "mode %d: the return address was lost across the unit commit:\n%s", via_retry, log);
+        CHECK(get_ptr(d) == pb.at, "mode %d: GET %08X, want PUT %08X", via_retry,
+              get_ptr(d), pb.at);
+        CHECK(g_nv2a_submit_state.consecutive_rejections == 0, "mode %d: consecutive %u",
+              via_retry, g_nv2a_submit_state.consecutive_rejections);
+    }
+}
+
+/* ── partial-commit fence ─────────────────────────────────────────────── */
+
+#define RELEASE_METHOD 0x1D70u   /* NV097 BACK_END_WRITE_SEMAPHORE_RELEASE */
+
+/* Unit 1: bind, optional releases, filler (4095 words with two releases; the
+ * next packet cannot join it). Unit 2: a third filler packet. */
+static void pb_filler(Pb *pb, uint32_t params)
+{
+    uint32_t i;
+    pb_word(pb, 0x40000000u | hdr(0, 0x0300, params));
+    for (i = 0; i < params; ++i) pb_word(pb, 0);
+}
+
+static void test_full_success_commits_without_partial(void)
+{
+    NV2AState *d = fresh();
+    Pb pb;
+
+    observer_reset();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    pb_method(&pb, 0, RELEASE_METHOD, 0x10);
+    pb_method(&pb, 0, 0x1760u, 0x00002042u);
+    kick(d, pb.start, pb.at);
+    CHECK(get_ptr(d) == pb.at, "stream did not drain (%s)", diag(d));
+    CHECK(g_commits == 1 && g_partials == 0, "commits %u partials %u, want 1 and 0",
+          g_commits, g_partials);
+    CHECK(g_commit_value == 0, "COMMIT carried value %08X, want 0", g_commit_value);
+    CHECK(g_kick_value == 0, "KICK carried value %08X, want 0", g_kick_value);
+    nv2a_set_kick_observer(NULL);
+}
+
+static void test_partial_commit_reports_the_last_release(void)
+{
+    NV2AState *d = fresh();
+    Pb pb;
+    uint32_t unit1_end;
+
+    observer_reset();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    pb_method(&pb, 0, RELEASE_METHOD, 0x10);
+    pb_method(&pb, 0, RELEASE_METHOD, 0x12);
+    pb_filler(&pb, 2047);
+    pb_filler(&pb, 2040);
+    unit1_end = pb.at;
+    /* Unit 2: a release the rejection must keep from being reported. */
+    pb_filler(&pb, 2047);
+    pb_method(&pb, 0, RELEASE_METHOD, 0x99);
+    pb_method(&pb, 0, UNKNOWN_NV097, 0);
+    kick(d, pb.start, pb.at);
+
+    CHECK(strcmp(diag(d), "unsupported_method") == 0, "diag %s", diag(d));
+    CHECK(get_ptr(d) == unit1_end, "GET %08X, want the unit boundary %08X", get_ptr(d), unit1_end);
+    CHECK(g_nv2a_submit_state.units == 1, "units %u, want 1", g_nv2a_submit_state.units);
+    CHECK(g_kicks == 1, "kicks %u", g_kicks);
+    CHECK(g_commits == 0, "a stopped walk reported COMMIT (%u)", g_commits);
+    CHECK(g_partials == 1, "partials %u, want 1", g_partials);
+    CHECK(g_partial_value == 0x12, "PARTIAL carried %08X, want the last committed release 00000012",
+          g_partial_value);
+    nv2a_set_kick_observer(NULL);
+}
+
+static void test_partial_commit_without_a_release_reports_nothing(void)
+{
+    NV2AState *d = fresh();
+    Pb pb;
+
+    observer_reset();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    pb_filler(&pb, 2047);
+    pb_filler(&pb, 2040);
+    pb_filler(&pb, 2047);
+    pb_method(&pb, 0, RELEASE_METHOD, 0x99);          /* in the uncommitted unit */
+    pb_method(&pb, 0, UNKNOWN_NV097, 0);
+    kick(d, pb.start, pb.at);
+
+    CHECK(g_nv2a_submit_state.units == 1, "units %u, want 1", g_nv2a_submit_state.units);
+    CHECK(g_kicks == 1 && g_commits == 0 && g_partials == 0,
+          "kicks %u commits %u partials %u, want 1/0/0", g_kicks, g_commits, g_partials);
+
+    /* A rejection that committed no unit at all reports nothing either. */
+    {
+        Pb p2;
+        pb_begin(&p2, PB_BASE + 0x4000u);
+        pb_method(&p2, 0, RELEASE_METHOD, 0x55);
+        pb_method(&p2, 0, UNKNOWN_NV097, 0);
+        g_kicks = g_commits = g_partials = 0;
+        kick(d, p2.start, p2.at);
+        CHECK(g_commits == 0 && g_partials == 0, "commits %u partials %u after a zero-unit stop",
+              g_commits, g_partials);
+    }
+    nv2a_set_kick_observer(NULL);
+}
+
+/* ── late vblank pulse ────────────���───────────────────────────────────── */
+
+static void test_late_vblank_wake_pulses_once(void)
+{
+    const uint64_t frame = 16666667ull;
+    const uint64_t next = 1000000000ull;
+    int pulse = 7;
+    uint64_t r;
+
+    /* Exactly at the late threshold: one pulse, re-armed one frame ahead. */
+    r = nv2a_vblank_advance(next, next + 4 * frame, frame, &pulse);
+    CHECK(pulse == 1, "a wake 4 frames late pulsed %d times, want 1", pulse);
+    CHECK(r == next + 4 * frame + frame, "re-armed at %llu, want now+frame",
+          (unsigned long long)r);
+
+    /* Far past it: still one pulse, no burst. */
+    pulse = 7;
+    r = nv2a_vblank_advance(next, next + 1000 * frame, frame, &pulse);
+    CHECK(pulse == 1, "a wake 1000 frames late pulsed %d times, want 1", pulse);
+    CHECK(r == next + 1000 * frame + frame, "re-armed at %llu, want now+frame",
+          (unsigned long long)r);
+
+    /* The neighbouring cases keep their rule. */
+    pulse = 7;
+    r = nv2a_vblank_advance(next, next + 4 * frame - 1, frame, &pulse);
+    CHECK(pulse == 1 && r > next + 4 * frame - 1, "just under the threshold: pulse %d", pulse);
+    pulse = 7;
+    r = nv2a_vblank_advance(0, next, frame, &pulse);
+    CHECK(pulse == 0 && r == next + frame, "arming pass: pulse %d next %llu", pulse,
+          (unsigned long long)r);
+    pulse = 7;
+    r = nv2a_vblank_advance(next, next - 1, frame, &pulse);
+    CHECK(pulse == 0 && r == next, "early wake: pulse %d", pulse);
+    pulse = 7;
+    r = nv2a_vblank_advance(next, next + 4 * frame, 0, &pulse);
+    CHECK(pulse == 0 && r == next, "zero frame: pulse %d", pulse);
+}
+
+/* ── PFIFO-alias PUT write ────────────────────────────────────────────── */
+
+#define PFIFO_ALIAS_PUT (0x2000u + NV_PFIFO_CACHE1_DMA_PUT)
+
+static void test_pfifo_alias_put_reports_kick_and_rejection(void)
+{
+    NV2AState *d = fresh();
+    Pb pb;
+    const char *log;
+
+    observer_reset();
+    pb_begin(&pb, PB_BASE);
+    pb_method(&pb, 0, 0x0000, H_KELVIN);
+    pb_method(&pb, 0, 0x1760u, 0x00002042u);
+    mmio_w(d, 0x2000u + NV_PFIFO_CACHE1_DMA_GET, pb.start);
+    cap_begin();
+    mmio_w(d, PFIFO_ALIAS_PUT, pb.at);
+    log = cap_end();
+    CHECK(get_ptr(d) == pb.at, "alias write did not drain (%s)", diag(d));
+    CHECK(g_kicks == 1, "alias PUT write reported %u kicks, want 1", g_kicks);
+    CHECK(g_commits == 1, "alias PUT write reported %u commits, want 1", g_commits);
+
+    pb_method(&pb, 0, UNKNOWN_NV097, 0);
+    cap_begin();
+    mmio_w(d, PFIFO_ALIAS_PUT, pb.at);
+    log = cap_end();
+    CHECK(g_kicks == 2 && g_commits == 1, "kicks %u commits %u after a rejection", g_kicks, g_commits);
+    CHECK(count_of(log, "[PFIFO] reject diag=unsupported_method ") == 1,
+          "alias rejection printed %u reject lines:\n%s",
+          count_of(log, "[PFIFO] reject diag=unsupported_method "), log);
+    CHECK(g_nv2a_submit_state.rejections == 1, "rejections %u", g_nv2a_submit_state.rejections);
+    nv2a_set_kick_observer(NULL);
+}
+
+/* ── exported state size ──────────────────────────────────────────────── */
+
+static void test_exported_state_size(void)
+{
+    CHECK(g_nv2a_submit_state_size == (uint32_t)sizeof(NV2ASubmitState),
+          "g_nv2a_submit_state_size %u != sizeof(NV2ASubmitState) %u",
+          g_nv2a_submit_state_size, (unsigned)sizeof(NV2ASubmitState));
+}
+
 int main(void)
 {
     /* Start from a known environment whatever the caller exported. */
@@ -1638,6 +1888,13 @@ int main(void)
     test_unit_split_preserves_order();
     test_unit_rollback_and_retry();
     test_multi_unit_admission_accounting();
+    test_return_survives_unit_commits();
+    test_full_success_commits_without_partial();
+    test_partial_commit_reports_the_last_release();
+    test_partial_commit_without_a_release_reports_nothing();
+    test_late_vblank_wake_pulses_once();
+    test_pfifo_alias_put_reports_kick_and_rejection();
+    test_exported_state_size();
 
     if (g_failures) {
         fprintf(stderr, "nv2a_submit_diag_test: %d failure(s)\n", g_failures);

@@ -41,32 +41,37 @@
 #include "nv2a/host_clock.h"
 
 /* Nanoseconds since the first call to this function anywhere in the process.
- * Monotonic; never goes backward, because it is a difference of QPC readings
- * converted by the overflow-safe split division. Returns 0 if the host reports
- * a non-positive frequency (no supported host does). */
+ * Never negative: a reading taken before the anchor was fixed clamps to 0.
+ * Returns 0 if the host reports a non-positive frequency (no supported host
+ * does). */
 static inline int64_t nv2a_mono_now_ns(void)
 {
-    static int64_t s_anchor_count;
-    static int64_t s_freq;
-    static volatile long s_anchored;   /* 0 = unanchored, 1 = anchored */
+    /* The anchor QPC count; 0 means not yet anchored. */
+    static volatile LONGLONG s_anchor_count;
     LARGE_INTEGER freq, count;
+    LONGLONG anchor, delta;
 
     QueryPerformanceFrequency(&freq);
     if (freq.QuadPart <= 0)
         return 0;
     QueryPerformanceCounter(&count);
 
-    if (!s_anchored) {
-        /* Benign race. Two threads may both store the anchor, and the
-         * difference between the two candidates is one QPC read. Taking a lock
-         * here would put a lock acquisition inside the owner-lock telemetry
-         * that measures lock contention, which is exactly the perturbation the
-         * instrument must avoid. */
-        s_freq = freq.QuadPart;
-        s_anchor_count = count.QuadPart;
-        s_anchored = 1;
+    /* First writer wins, through one compare-exchange rather than a lock: a
+     * lock here would sit inside the owner-lock telemetry that measures lock
+     * contention, the perturbation this instrument must avoid. A losing
+     * thread reads back the winner's anchor, so every thread shares one zero. */
+    anchor = InterlockedCompareExchange64(&s_anchor_count, 0, 0);
+    if (anchor == 0) {
+        LONGLONG prior = InterlockedCompareExchange64(&s_anchor_count,
+                                                      count.QuadPart, 0);
+        anchor = prior ? prior : count.QuadPart;
     }
-    return nv2a_qpc_to_ns(count.QuadPart - s_anchor_count, s_freq);
+    /* This thread's QPC read can predate the winner's anchor; a negative
+     * delta would become a huge unsigned value in the callers' maxima. */
+    delta = count.QuadPart - anchor;
+    if (delta < 0)
+        delta = 0;
+    return nv2a_qpc_to_ns(delta, freq.QuadPart);
 }
 
 /* Milliseconds, for the exported 32-bit telemetry fields. Truncating a

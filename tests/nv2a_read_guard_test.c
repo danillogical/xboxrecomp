@@ -29,7 +29,9 @@
  *      still refuses, which is the case a cache that wrongly validated once
  *      would break;
  *   4. a readable word BEFORE the guard page is still consumed, so the guard
- *      refuses at the right address rather than refusing the whole ring.
+ *      refuses at the right address rather than refusing the whole ring;
+ *   5. a page validated during one walk and revoked before the next is
+ *      refused by the next, so the validation cache does not outlive a walk.
  *
  * The window is built with VirtualAlloc so the guard page is a real one: this
  * test is Windows-only by construction, and it says so rather than silently
@@ -143,11 +145,13 @@ int main(void)
         uint32_t get_after_first = 0;
         int attempt;
 
-        /* A packet starting in the readable first page whose PARAMETER lands in
-         * the guarded middle page: header at 0x0FFC, param at 0x1000. */
+        /* A one-parameter packet wholly in the readable first page: header at
+         * 0x0FF8, parameter at 0x0FFC. PUT is 0x1004, so after the packet the
+         * walk looks at 0x1000 for the next header (the yield peek), and that
+         * word is in the guarded middle page. It is the peek that must be
+         * refused, not the packet. The guard page cannot be written, so
+         * nothing is planted there. */
         wr32(0x0FF8, hdr(0, 0x0100, 1));
-        /* The guard page is not writable, so the parameter cannot be planted;
-         * that is the point -- the walk must not read it. */
         d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = 0x0FF8;
         d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = 0x1004;
 
@@ -185,6 +189,47 @@ int main(void)
               "a packet ending exactly at the guard boundary was NOT consumed "
               "(get 0x%X -> 0x%X); the guard is refusing readable memory too",
               before, after);
+    }
+
+    /* 5. The validated-page cache is per walk. Walk N reads page 0 and
+     *    validates it; page 0 then loses its access; walk N+1 over the same
+     *    words must refuse. A cache that outlived the walk would still call the
+     *    page readable and fault on it. */
+    {
+        NV2AState *d = fresh();
+        DWORD old_protect;
+        uint32_t get_after;
+
+        wr32(0x0100, hdr(0, 0x0100, 1));
+        wr32(0x0104, 0x12345678u);
+        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = 0x0100;
+        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = 0x0108;
+        (void)nv2a_submit_pending(d);
+        CHECK(d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] == 0x0108,
+              "walk N did not consume the packet (get 0x%X, %s); the arm would "
+              "prove nothing", d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET],
+              nv2a_submit_diagnostic(d->pfifo.submit_diag));
+
+        CHECK(VirtualProtect(g_ring, 0x1000, PAGE_NOACCESS, &old_protect) != 0,
+              "could not revoke access to page 0");
+        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = 0x0100;
+        d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = 0x0108;
+        (void)nv2a_submit_pending(d);
+        get_after = d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET];
+        CHECK(strcmp(nv2a_submit_diagnostic(d->pfifo.submit_diag),
+                     "unreadable_pushbuffer") == 0,
+              "walk N+1 over a page revoked since walk N gave diag %s; the "
+              "validation cache outlived its walk",
+              nv2a_submit_diagnostic(d->pfifo.submit_diag));
+        CHECK(get_after == 0x0100, "walk N+1 moved GET to 0x%X", get_after);
+
+        /* Control: with access restored the same walk succeeds again. */
+        CHECK(VirtualProtect(g_ring, 0x1000, PAGE_READWRITE, &old_protect) != 0,
+              "could not restore page 0");
+        (void)nv2a_submit_pending(d);
+        CHECK(d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] == 0x0108,
+              "walk after restoring access did not consume the packet (%s)",
+              nv2a_submit_diagnostic(d->pfifo.submit_diag));
     }
 
     VirtualFree(g_ring, 0, MEM_RELEASE);

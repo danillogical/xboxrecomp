@@ -242,7 +242,11 @@ typedef struct NV2AState {
         uint32_t semaphore_releases;
         /* A walk held by a software-method trap or FLIP_STALL (action methods
          * only), and the rest of the packet it stopped in, which the walk
-         * that resumes after the hold continues from. */
+         * that resumes after the hold continues from. carry_ret is different:
+         * it is the subroutine return (hardware's DMA_SUBROUTINE state), saved
+         * at every unit commit and restored at every walk start, with or
+         * without action methods, because GET can be committed inside a
+         * subroutine. */
         uint32_t hold;
         uint32_t carry_count, carry_method, carry_subchannel, carry_ret;
         bool carry_non_inc;
@@ -398,17 +402,17 @@ typedef struct NV2AState {
          * pulses/s against a model nominal of at least 40 Hz: a 30-80x
          * shortfall nobody has explained.
          *
-         * `nv2a_vblank_advance` re-arms WITHOUT pulsing on a late wake
-         * (`now >= next + 4*frame`). If passes are consistently >= 5 frames
-         * apart that branch is a self-reproducing fixed point that never
-         * pulses. `vblank_rearm_late` counts exactly those passes, so the
+         * `nv2a_vblank_advance` pulses once and re-arms from now on a late
+         * wake (`now >= next + 4*frame`); it used to re-arm without pulsing,
+         * which made consistently late passes a fixed point that never
+         * pulsed. `vblank_rearm_late` counts exactly those passes, so the
          * hypothesis "delivery is slow because the loop keeps taking the late
          * branch" becomes falsifiable rather than assumed.
          *
          * `vblank_max_gap_ms` is the largest interval actually observed between
          * two pulses, which is the quantity a worker waiting on a vertical
          * blank would experience. */
-        uint32_t vblank_rearm_late;        /* late-wake re-arms (no pulse) */
+        uint32_t vblank_rearm_late;        /* late-wake re-arms (>= 4 frames late) */
         uint32_t vblank_passes;            /* service-loop passes */
         uint32_t vblank_frame_ns;          /* last frame period used */
         uint32_t vblank_rearm_late_max_ms; /* max lateness past the deadline */
@@ -740,7 +744,7 @@ typedef struct NV2ASubmitState {
      * The question these answer: `vblank_pulses` is 30-80x below nominal in
      * every archived run, and a bare scalar cannot say whether delivery is slow
      * or stopped. `vblank_rearm_late` counts the service loop's late-wake
-     * branch (which re-arms WITHOUT pulsing), `vblank_passes` is the
+     * branch (four or more frames late; it pulses once), `vblank_passes` is the
      * denominator that turns the pulse count into a real rate, and the two
      * `_ms` stamps are process-start-relative so they share an epoch with the
      * lock telemetry below. Appended last so every earlier reader's field
@@ -771,6 +775,13 @@ typedef struct NV2ASubmitState {
 __declspec(dllexport)
 #endif
 extern NV2ASubmitState g_nv2a_submit_state;
+/* sizeof(NV2ASubmitState), so an archive's reader learns the real struct size
+ * rather than inferring it from the distance to the next symbol in the linker
+ * map, which includes padding. */
+#ifdef _WIN32
+__declspec(dllexport)
+#endif
+extern const uint32_t g_nv2a_submit_state_size;
 
 /* RECOMP_NV2A_ADMIT_UNKNOWN switch: -1 re-reads the environment on next use,
  * 0 forces off, 1 forces on. Exploratory; unknown methods on known classes are
@@ -819,19 +830,23 @@ void nv2a_set_commit_consumer(nv2a_commit_consumer_fn fn);
 
 /* Kick observer: told when the guest writes PUT and when a walk consumes it.
  *
- *  - NV2A_KICK: every NV_USER_DMA_PUT write, after PUT is stored and before
- *    the walk it triggers.
- *  - NV2A_COMMIT: after every walk that committed and reached PUT, from any
- *    caller (a PUT write, a resumed hold, nv2a_retry_stalled_walk). A rejected
- *    walk, a walk that stops at a hold, and a hold that is not yet released
- *    report nothing.
+ *  - NV2A_KICK (value 0): every PUT write, through NV_USER_DMA_PUT or the
+ *    PFIFO alias, after PUT is stored and before the walk it triggers.
+ *  - NV2A_COMMIT (value 0): after every walk that committed and reached PUT,
+ *    from any caller (a PUT write, a resumed hold, nv2a_retry_stalled_walk).
+ *  - NV2A_COMMIT_PARTIAL (value = release parameter): after a walk that did
+ *    not reach PUT (rejected after committing units, or stopped at a hold)
+ *    when one of the units it committed carried an NV097
+ *    BACK_END_WRITE_SEMAPHORE_RELEASE; the value is the last such parameter.
+ *  - A walk that committed nothing, or committed no release short of PUT, and
+ *    a hold that is not yet released, report nothing.
  *
  * Called on the walking thread with the PFIFO lock released (in the runtime
  * the MMIO owner lock is held), so the observer must be lock-free and must not
  * call back into the model. Same registration rule as the commit consumer:
  * set it before the guest can submit; NULL clears it. */
-enum { NV2A_KICK = 1, NV2A_COMMIT = 2 };
-typedef void (*nv2a_kick_observer_fn)(int event);
+enum { NV2A_KICK = 1, NV2A_COMMIT = 2, NV2A_COMMIT_PARTIAL = 3 };
+typedef void (*nv2a_kick_observer_fn)(int event, uint32_t value);
 void nv2a_set_kick_observer(nv2a_kick_observer_fn fn);
 
 /* Re-walk a stalled ring without a PUT write. Only when the last walk was

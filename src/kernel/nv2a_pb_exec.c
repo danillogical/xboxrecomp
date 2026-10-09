@@ -969,23 +969,28 @@ static void trace_note_surface(uint32_t color_offset)
         s_trace_surface[s_trace_surface_count++] = color_offset;
 }
 
-/* FNV-1a-64 over a surface converted exactly the way fb_present.c converts the
- * frame it publishes, so a hash here is comparable with an [FBPRESENT] line and
- * with the archived surface hashes. Raw 16-bit words would not be. */
-static unsigned long long trace_hash_surface(uint32_t resolved_va, uint32_t bpp)
+/* FNV-1a-64 over a w x ht rectangle converted exactly the way fb_present.c
+ * converts the frame it publishes, so a hash here is comparable with an
+ * [FBPRESENT] line and with the archived surface hashes. Raw 16-bit words would
+ * not be. */
+static unsigned long long trace_hash_rect(uint32_t resolved_va, uint32_t w,
+                                          uint32_t ht, uint32_t pitch, uint32_t bpp)
 {
     unsigned long long h = 14695981039346656037ull;
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-    uint32_t w = s_gpu.clip_w, ht = s_gpu.clip_h, y, x;
+    uint32_t y, x;
 
-    if (!w || !ht || !s_gpu.pitch)
+    if (!w || !ht || !pitch)
+        return 0;
+    /* A row reads w * bpp bytes; past the pitch it would leave the checked span. */
+    if ((uint64_t)w * bpp > pitch)
         return 0;
     if (resolved_va < XBOX_CONTIG_BASE
-        || resolved_va + (uint64_t)ht * s_gpu.pitch
+        || resolved_va + (uint64_t)ht * pitch
            > (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
         return 0;                          /* outside the window: do not read */
     for (y = 0; y < ht; y++) {
-        const uint8_t *row = mem + resolved_va + (size_t)y * s_gpu.pitch;
+        const uint8_t *row = mem + resolved_va + (size_t)y * pitch;
         for (x = 0; x < w; x++) {
             uint32_t v;
             if (bpp == 2) {
@@ -1005,6 +1010,12 @@ static unsigned long long trace_hash_surface(uint32_t resolved_va, uint32_t bpp)
         }
     }
     return h;
+}
+
+/* The current colour surface's geometry, applied to a candidate surface. */
+static unsigned long long trace_hash_surface(uint32_t resolved_va, uint32_t bpp)
+{
+    return trace_hash_rect(resolved_va, s_gpu.clip_w, s_gpu.clip_h, s_gpu.pitch, bpp);
 }
 
 /* Why present_track_flip returned what it did. The classifier lives in
@@ -1182,10 +1193,11 @@ static void trace_flip(uint32_t selected, int used_targeted,
                 " hash=%016llx\n",
                 s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
                 s_gpu.tex.color,
-                trace_hash_surface(s_gpu.tex.offset,
-                                   s_gpu.tex.pitch ? s_gpu.tex.pitch
-                                                   / (s_gpu.tex.width ? s_gpu.tex.width : 1)
-                                                   : 2));
+                trace_hash_rect(s_gpu.tex.offset, s_gpu.tex.width, s_gpu.tex.height,
+                                s_gpu.tex.pitch,
+                                s_gpu.tex.pitch ? s_gpu.tex.pitch
+                                                / (s_gpu.tex.width ? s_gpu.tex.width : 1)
+                                                : 2));
 
     /* The batches that produced this frame, newest last, and the frame's own
      * totals. The ring is what connects the published surface to the pass that

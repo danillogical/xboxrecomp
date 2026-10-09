@@ -2,9 +2,10 @@
  *
  * WHY THIS TEST EXISTS. Archived runs report 0.75-1.23 vblank pulses per second
  * against a model nominal of at least 40 Hz -- a 30-80x shortfall nobody has
- * explained. `nv2a_vblank_advance` re-arms WITHOUT pulsing when the service loop
- * wakes late (`now >= next + 4*frame`), and if every pass takes that branch the
- * loop is in a self-reproducing fixed point that never pulses at all.
+ * explained. `nv2a_vblank_advance` used to re-arm WITHOUT pulsing when the
+ * service loop woke late (`now >= next + 4*frame`), so a loop that took that
+ * branch every pass never pulsed. It now pulses once on a late wake and re-arms
+ * from now; the late count is still the measure of how often it happens.
  *
  * That hypothesis is only testable if the instrument that counts the late
  * branch can actually observe it. This test drives the real rule through a
@@ -13,9 +14,8 @@
  *   1. POSITIVE CONTROL -- a punctual loop pulses once per frame and records
  *      ZERO late re-arms. Without this arm, a counter stuck at zero would look
  *      like "no problem" and the test would be vacuous.
- *   2. A loop that consistently wakes late records late re-arms AND produces
- *      zero pulses -- i.e. the counter distinguishes the fixed point from
- *      healthy delivery.
+ *   2. A loop that consistently wakes late records late re-arms AND pulses once
+ *      per pass, never a burst.
  *   3. The late count is the exact number of passes, so the counter is not
  *      merely non-zero but correct.
  *   4. A single late wake is counted once and delivery recovers, so the counter
@@ -75,7 +75,9 @@ static void sim_pass(LoopSim *s, uint64_t now)
     uint64_t deadline_before = s->next;
     s->next = nv2a_vblank_advance(s->next, now, FRAME_NS, &pulse);
     ++s->passes;
-    if (!pulse && deadline_before && now > deadline_before)
+    /* Late means the wake was at least four frames past the deadline; the
+     * rule pulses once on such a wake, so the pulse no longer separates them. */
+    if (deadline_before && now >= deadline_before + 4 * FRAME_NS)
         ++s->late;
     if (pulse)
         ++s->pulses;
@@ -106,7 +108,7 @@ int main(void)
 
     /* 2 + 3. The fixed point: every pass wakes 10 frames late, which is past
      *        the `now >= next + 4*frame` threshold. The rule must re-arm
-     *        without pulsing EVERY pass, so delivery must stop entirely and the
+     *        and pulse once on EVERY late pass (no catch-up burst), and the
      *        counter must fire on all but the first pass. This is the signature
      *        the archived 30-80x shortfall would produce.
      *
@@ -127,9 +129,10 @@ int main(void)
             sim_pass(&s, now);
             now += FRAME_NS * 10;          /* 10 frames between passes */
         }
-        CHECK(s.pulses == 0,
-              "a persistently late loop still emitted %d pulse(s); the "
-              "late-wake branch is not the no-pulse branch", s.pulses);
+        CHECK(s.pulses == 99,
+              "a persistently late loop emitted %d pulse(s), want exactly one "
+              "per late pass (99): delivery must not stop, and must not burst",
+              s.pulses);
         CHECK(s.late == s.passes - 1,
               "late re-arms (%d) != passes-1 (%d) on a persistently late loop; "
               "the counter does not measure what it claims",

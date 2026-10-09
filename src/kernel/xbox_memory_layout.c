@@ -717,10 +717,10 @@ static volatile LONG g_fence_mirror_count = 0;
 
 /* The GPU core's kick-observer seam, declared here rather than by including
  * nv2a_state.h, which the kernel does not depend on. The event values are
- * NV2A_KICK and NV2A_COMMIT in src/nv2a/nv2a_state.h. */
-typedef void (*nv2a_kick_observer_fn)(int event);
+ * NV2A_KICK, NV2A_COMMIT and NV2A_COMMIT_PARTIAL in src/nv2a/nv2a_state.h. */
+typedef void (*nv2a_kick_observer_fn)(int event, uint32_t value);
 extern void nv2a_set_kick_observer(nv2a_kick_observer_fn fn);
-enum { FENCE_EVENT_KICK = 1, FENCE_EVENT_COMMIT = 2 };
+enum { FENCE_EVENT_KICK = 1, FENCE_EVENT_COMMIT = 2, FENCE_EVENT_COMMIT_PARTIAL = 3 };
 
 static uint32_t fence_word(uint32_t va)
 {
@@ -740,7 +740,7 @@ static int fence_mirror_device(int i, uint32_t *dev)
 /* Runs on the thread that wrote PUT or walked the ring, with the MMIO owner
  * lock held, which serializes every kick and commit; the worker tick reads
  * the snapshots concurrently through fence_snapshot_value. Lock-free. */
-static void fence_mirror_observe(int event)
+static void fence_mirror_observe(int event, uint32_t value)
 {
     LONG n = InterlockedCompareExchange(&g_fence_mirror_count, 0, 0);
     for (LONG i = 0; i < n; i++) {
@@ -753,6 +753,9 @@ static void fence_mirror_observe(int event)
                                     fence_word(dev + g_fence_mirrors[i].src_off));
         } else if (event == FENCE_EVENT_COMMIT) {
             fence_snapshot_commit(&g_fence_mirrors[i].snap);
+        } else if (event == FENCE_EVENT_COMMIT_PARTIAL) {
+            /* value is the last semaphore release the stopped walk committed. */
+            fence_snapshot_partial(&g_fence_mirrors[i].snap, value);
         }
     }
 }

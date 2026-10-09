@@ -22,6 +22,7 @@ static uint8_t *g_pending_instance_host_ptr;
 static uint32_t g_pending_instance_size;
 
 NV2ASubmitState g_nv2a_submit_state;
+const uint32_t g_nv2a_submit_state_size = (uint32_t)sizeof(NV2ASubmitState);
 
 /* Log bookkeeping for the submit diagnostics; cleared with the state above. */
 /* One capacity for both the dedupe log and the pending witness queue, so the
@@ -290,9 +291,11 @@ void nv2a_update_irq(NV2AState *d)
  *    explained by this at all. (Timing comparisons here must align the three
  *    clocks: the QPC product, GetTickCount64, and `[FBPRESENT] t=`, which is
  *    relative to the FIRST PRESENT, not process start.)
- *  - `now >= next + 4*frame` means the loop was away for several frames: re-arm
- *    from now rather than emitting a catch-up burst, which would present as a
- *    storm of interrupts the guest never saw.
+ *  - `now >= next + 4*frame` means the loop was away for several frames: pulse
+ *    once and re-arm from now. One pulse, because a frame did end while the
+ *    loop was away and a loop that is late on every pass must still deliver;
+ *    not a catch-up burst, which would present as a storm of interrupts the
+ *    guest never saw.
  *  - `now >= next` is the normal case: pulse once and advance by one frame.
  *
  * Returns the new deadline; `*pulse` is set to 1 when a pulse is due. */
@@ -307,6 +310,8 @@ uint64_t nv2a_vblank_advance(uint64_t next, uint64_t now, uint64_t frame,
         return now + frame;
     }
     if (now >= next + frame * 4) {
+        if (pulse)
+            *pulse = 1;
         return now + frame;
     }
     if (now >= next) {
@@ -1164,10 +1169,10 @@ void nv2a_set_kick_observer(nv2a_kick_observer_fn fn)
     g_kick_observer = fn;
 }
 
-static void kick_observer_notify(int event)
+static void kick_observer_notify(int event, uint32_t value)
 {
     nv2a_kick_observer_fn fn = g_kick_observer;
-    if (fn) fn(event);
+    if (fn) fn(event, value);
 }
 
 /* Both capacities must hold a whole submission's word budget: a submission is
@@ -1271,11 +1276,13 @@ bool nv2a_set_fixture_execution(NV2AState *d, bool enabled)
  *
  * WHY CACHING PER WALK IS SEMANTICS-PRESERVING. The check exists to refuse a
  * word that lives in an unmapped, guard or non-readable page, so the walk does
- * not fault on a bad ring. A page's protection cannot change *while we hold the
- * owner lock and are walking*, and the cache lives only for one walk: it is
- * reset when the walk starts. So the guard still runs against the same mapping
- * state it always did; it simply stops re-asking the same question up to 1024
- * times for the 1024 words that share one 4 KB page.
+ * not fault on a bad ring. The owner lock does NOT freeze page protection:
+ * NtProtectVirtualMemory and MmSetAddressProtect do not take it, so another
+ * thread can change a page mid-walk. The cache lives only for one walk (it is
+ * reset when the walk starts), so its exposure is a time-of-check window of
+ * one walk -- the same kind the old per-word query had, which could also be
+ * invalidated between the query and the read. It simply stops re-asking the
+ * same question up to 1024 times for the 1024 words that share one 4 KB page.
  *
  * WHAT IS DELIBERATELY UNCHANGED. The address bounds, the alignment test, the
  * full protection predicate (including PAGE_NOACCESS/PAGE_GUARD) and the
@@ -1834,6 +1841,10 @@ bool nv2a_submit_pending(NV2AState *d)
     uint32_t admitted_count = 0, admitted_total = 0;
     /* Units committed by this walk, and the structural per-call word bound. */
     uint32_t units = 0, unit_words_total = 0, unit_limit = 0;
+    /* The last NV097 semaphore release this walk COMMITTED (in a committed
+     * unit), for NV2A_COMMIT_PARTIAL when the walk stops short of PUT. */
+    uint32_t committed_release = 0;
+    bool have_committed_release = false;
     ActionStage st;
     if (!d) return false;
     qemu_mutex_lock(&d->pfifo.lock);
@@ -1921,15 +1932,17 @@ bool nv2a_submit_pending(NV2AState *d)
         }
     }
     /* The packet being walked. A walk normally starts at a header; after a
-     * hold it resumes inside the packet the hold interrupted. */
+     * hold it resumes inside the packet the hold interrupted. The subroutine
+     * return is restored on every walk: the last committed unit may have left
+     * GET inside a subroutine, and its RETURN needs the address. */
     uint32_t count = 0, method = 0, subchannel = 0, address = pc;
     bool non_inc = false;
-    if (actions && (d->pfifo.carry_count || d->pfifo.carry_ret)) {
+    ret = d->pfifo.carry_ret;
+    if (actions && d->pfifo.carry_count) {
         count = d->pfifo.carry_count;
         method = d->pfifo.carry_method;
         subchannel = d->pfifo.carry_subchannel;
         non_inc = d->pfifo.carry_non_inc;
-        ret = d->pfifo.carry_ret;
         if (count > NV2A_SUBMIT_MAX_WORDS) { d->pfifo.submit_diag = NV2A_SUBMIT_SINK_FULL; ok = false; goto done; }
     }
     /* ── Unit loop: bounded prefix commit at WHOLE-PACKET boundaries ────────
@@ -1960,9 +1973,10 @@ bool nv2a_submit_pending(NV2AState *d)
      * call-free walk can only exceed the ring size by cycling. */
     unit_limit = d->pfifo.pushbuffer_size / 4u;
     if (!unit_limit) unit_limit = NV2A_SUBMIT_MAX_WORDS;
-    /* The per-walk page-validation cache is walk-scoped: a mapping cannot change
-     * while we hold the owner lock and walk, but it must not be assumed stable
-     * across walks. Cleared here so every walk re-validates at least once. */
+    /* The per-walk page-validation cache is walk-scoped: a mapping validated
+     * here may still change during the walk (the owner lock does not stop a
+     * protection change), and it must not be assumed stable across walks.
+     * Cleared here so every walk re-validates at least once. */
     d->pfifo.page_ok_base = NULL;
     d->pfifo.page_ok_end = NULL;
     for (;;) {
@@ -2186,7 +2200,17 @@ bool nv2a_submit_pending(NV2AState *d)
             d->pfifo.submit_last_method = d->pfifo.staged[staged_count - 1].method;
             d->pfifo.submit_last_param = d->pfifo.staged[staged_count - 1].param;
         }
+        for (uint32_t i = 0; i < staged_count; ++i) {
+            if (d->pfifo.staged[i].class_id == NV097_CLASS &&
+                d->pfifo.staged[i].method == NV097_BACK_END_WRITE_SEMAPHORE_RELEASE) {
+                committed_release = d->pfifo.staged[i].param;
+                have_committed_release = true;
+            }
+        }
         d->pfifo.regs[NV_PFIFO_CACHE1_DMA_GET] = pc;
+        /* GET and the subroutine return are committed together, so a later
+         * walk that starts at this GET can still take the RETURN. */
+        d->pfifo.carry_ret = ret;
         pfifo_trace("submit_commit", NV_PFIFO_CACHE1_DMA_GET, pc);
         ++d->pfifo.submit_successes;
         d->pfifo.submit_diag = NV2A_SUBMIT_OK;
@@ -2210,14 +2234,14 @@ bool nv2a_submit_pending(NV2AState *d)
             g_admit_pending[g_admit_pending_count++] = admitted[i];
         }
         if (actions) {
-            /* A hold keeps the rest of the interrupted packet, and the
-             * subroutine return, for the walk that resumes after it. */
+            /* A hold keeps the rest of the interrupted packet for the walk
+             * that resumes after it (the subroutine return is carried above,
+             * at every unit commit). */
             bool held = stop != NV2A_SUBMIT_OK;
             d->pfifo.carry_count = held ? count : 0;
             d->pfifo.carry_method = held ? method : 0;
             d->pfifo.carry_subchannel = held ? subchannel : 0;
             d->pfifo.carry_non_inc = held && non_inc;
-            d->pfifo.carry_ret = held ? ret : 0;
             if (stop == NV2A_SUBMIT_SOFTWARE_METHOD) {
                 action_raise_trap(d, &st);
                 d->pfifo.hold = NV2A_HOLD_SOFTWARE_METHOD;
@@ -2427,10 +2451,13 @@ done:
         InterlockedIncrement(&ss->generation);
     }
     qemu_mutex_unlock(&d->pfifo.lock);
-    /* Outside the PFIFO lock. A walk that stopped at a hold has not consumed
-     * the kick yet; the walk that resumes it to PUT reports the commit. */
+    /* Outside the PFIFO lock. Only a walk that reached PUT consumed the kick;
+     * one that stopped short of it (a rejection after committed units, or a
+     * hold) reports the last release it committed, if any. */
     if (ok && stop == NV2A_SUBMIT_OK)
-        kick_observer_notify(NV2A_COMMIT);
+        kick_observer_notify(NV2A_COMMIT, 0);
+    else if (have_committed_release)
+        kick_observer_notify(NV2A_COMMIT_PARTIAL, committed_release);
     if (ok && stop == NV2A_SUBMIT_SOFTWARE_METHOD)
         nv2a_update_irq(d);
     return ok;
@@ -2544,7 +2571,7 @@ static void user_write(void *opaque, hwaddr addr, uint64_t val, unsigned int siz
         qemu_mutex_lock(&d->pfifo.lock);
         d->pfifo.regs[NV_PFIFO_CACHE1_DMA_PUT] = (uint32_t)val;
         qemu_mutex_unlock(&d->pfifo.lock);
-        kick_observer_notify(NV2A_KICK);
+        kick_observer_notify(NV2A_KICK, 0);
         d->pfifo.walk_trigger = NV2A_WALK_PUT_WRITE;
         nv2a_submit_pending(d);
         log_kicked_walk(d);
@@ -2636,8 +2663,11 @@ void pfifo_write(void *opaque, hwaddr addr, uint64_t val, unsigned int size)
         qemu_mutex_lock(&d->pfifo.lock);
         d->pfifo.regs[addr] = (uint32_t)val;
         qemu_mutex_unlock(&d->pfifo.lock);
+        /* A kick like the USER alias: observed, walked and logged the same. */
+        kick_observer_notify(NV2A_KICK, 0);
         d->pfifo.walk_trigger = NV2A_WALK_PUT_WRITE;
         nv2a_submit_pending(d);
+        log_kicked_walk(d);
         break;
     default:
         d->pfifo.regs[addr] = val;

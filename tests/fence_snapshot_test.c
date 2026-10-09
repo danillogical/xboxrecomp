@@ -91,6 +91,71 @@ static void test_live_mode_always_reads_live(void)
     CHECK(fence_snapshot_value(&s, 14, 0) == 10);
 }
 
+static void test_partial_publishes_a_release_within_pending(void)
+{
+    FenceSnapshot s;
+
+    memset(&s, 0, sizeof(s));
+    fence_snapshot_kick(&s, 20);
+    fence_snapshot_partial(&s, 18);
+    CHECK(fence_snapshot_value(&s, 25, 0) == 18);
+
+    fence_snapshot_partial(&s, 16);                  /* older than published */
+    CHECK(fence_snapshot_value(&s, 25, 0) == 18);
+
+    fence_snapshot_partial(&s, 22);                  /* past pending */
+    CHECK(fence_snapshot_value(&s, 25, 0) == 18);
+
+    fence_snapshot_commit(&s);
+    CHECK(fence_snapshot_value(&s, 25, 0) == 20);
+
+    /* A release equal to the published value is not newer. */
+    fence_snapshot_kick(&s, 30);
+    fence_snapshot_partial(&s, 20);
+    CHECK(fence_snapshot_value(&s, 99, 0) == 20);
+    fence_snapshot_partial(&s, 30);                  /* equal to pending is allowed */
+    CHECK(fence_snapshot_value(&s, 99, 0) == 30);
+}
+
+static void test_partial_is_ignored_without_a_kick(void)
+{
+    FenceSnapshot s;
+
+    memset(&s, 0, sizeof(s));
+    fence_snapshot_partial(&s, 18);
+    CHECK(fence_snapshot_value(&s, 7, 0) == 7);      /* still the live value */
+    CHECK(s.have_published == 0);
+
+    /* Nor after a commit that had nothing pending. */
+    fence_snapshot_commit(&s);
+    fence_snapshot_partial(&s, 18);
+    CHECK(fence_snapshot_value(&s, 7, 0) == 7);
+}
+
+static void test_partial_wraps(void)
+{
+    FenceSnapshot s;
+
+    memset(&s, 0, sizeof(s));
+    fence_snapshot_kick(&s, 0xFFFFFFF0u);
+    fence_snapshot_commit(&s);                       /* published 0xFFFFFFF0 */
+    fence_snapshot_kick(&s, 0x10u);
+    fence_snapshot_partial(&s, 0x4u);                /* newer across the wrap, within pending */
+    CHECK(fence_snapshot_value(&s, 0x20u, 0) == 0x4u);
+    fence_snapshot_partial(&s, 0xFFFFFFF8u);         /* older than 0x4 */
+    CHECK(fence_snapshot_value(&s, 0x20u, 0) == 0x4u);
+}
+
+static void test_partial_in_live_mode_still_reads_live(void)
+{
+    FenceSnapshot s;
+
+    memset(&s, 0, sizeof(s));
+    fence_snapshot_kick(&s, 20);
+    fence_snapshot_partial(&s, 18);
+    CHECK(fence_snapshot_value(&s, 25, 1) == 25);
+}
+
 int main(void)
 {
     test_fresh_reads_live();
@@ -98,6 +163,10 @@ int main(void)
     test_uncommitted_kicks_do_not_publish();
     test_commit_without_a_new_kick_changes_nothing();
     test_live_mode_always_reads_live();
+    test_partial_publishes_a_release_within_pending();
+    test_partial_is_ignored_without_a_kick();
+    test_partial_wraps();
+    test_partial_in_live_mode_still_reads_live();
 
     printf("fence_snapshot_test: %d checks, %d failed\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
