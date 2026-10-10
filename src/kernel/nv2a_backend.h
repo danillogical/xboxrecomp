@@ -19,13 +19,17 @@
  * vertex programs on the CPU (nv2a_vsh_interp.c), so a back end only ever sees surface
  * pixels. Blend, depth and alpha state arrive in Nv2aRenderState.
  *
- * ponytail: register-combiner state is not passed on. Extend Nv2aBatch when
- * it lands rather than adding callbacks.
+ * Register-combiner state, all four texture stages and the per-vertex values
+ * the combiners read (specular, fog, four texture coordinates) arrive in
+ * Nv2aBatch too, for a back end that runs the combiners itself; one that does
+ * not can keep using the stage-0 fields alone.
  */
 #ifndef NV2A_BACKEND_H
 #define NV2A_BACKEND_H
 
 #include <stdint.h>
+
+#include "nv2a_combiner.h"   /* Nv2aCombiner */
 
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
@@ -48,6 +52,9 @@ typedef struct {
     uint32_t color;             /* NV097 colour-format code */
     uint32_t addr_u, addr_v;    /* NV097 wrap mode per axis (1 wrap, 3 clamp) */
     uint32_t filter;            /* raw SET_TEXTURE_FILTER: MIN bits 16-23, MAG bits 24-27 */
+    uint32_t linear;            /* 1: a linear format, addressed in texels; 0: swizzled
+                                 * or DXT, addressed in [0,1] (applies to Nv2aVertexExtra) */
+    uint32_t cube;              /* 1: a cube map (six faces from offset) */
 } Nv2aTexture;
 
 typedef struct {
@@ -71,11 +78,31 @@ typedef struct {
     float    depth_min, depth_max;                       /* SET_CLIP_MIN/MAX */
 } Nv2aRenderState;
 
+/* What the register combiners read per vertex beyond Nv2aVertex, one entry
+ * per vertex of the batch, in the same order. */
+typedef struct {
+    uint32_t specular;          /* oD1, 0xAARRGGBB */
+    float    fog;               /* fog factor after the fog unit, 0..1; 1 is no fog */
+    float    tex[4][4];         /* stages 0-3: s, t, r, q exactly as the title produced
+                                 * them -- texels or [0,1] per Nv2aTexture.linear, not
+                                 * divided by q, and NOT scaled like Nv2aVertex.u/v */
+} Nv2aVertexExtra;
+
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
-    const Nv2aTexture *texture;     /* NULL: untextured */
+    const Nv2aTexture *texture;     /* stage 0; NULL: untextured */
     const Nv2aRenderState *state;
+    /* Everything below is for running the register combiners. */
+    const Nv2aVertexExtra *extra;   /* `count` entries, or NULL */
+    const Nv2aTexture *textures[4]; /* per stage; NULL: no usable texture (samples white) */
+    /* NULL: combiners inactive (never programmed, or RECOMP_NO_COMBINERS), so
+     * draw stage 0 modulated by diffuse. Otherwise every pixel is
+     * nv2a_rc_eval(combiner, diffuse, specular, fog, stage results). */
+    const Nv2aCombiner *combiner;
+    uint32_t fog_color;             /* 0xAARRGGBB; the combiners' fog register is
+                                     * (fog_color.rgb, vertex fog factor) */
+    uint32_t clip_plane_mode;       /* SET_SHADER_CLIP_PLANE_MODE, for CLIPPLANE stages */
 } Nv2aBatch;
 
 typedef struct {

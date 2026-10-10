@@ -2543,6 +2543,48 @@ static void raster_tri(uint32_t p0, uint32_t p1, uint32_t p2, void *ctx)
  * same topology rules as the CPU path below. */
 #define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
 static Nv2aVertex s_bverts[NV_BACKEND_MAX_VERTS];
+/* The combiner inputs for each of s_bverts, allocated on the first batch that
+ * runs the combiners so a CPU-only run does not carry 14 MB it never uses. */
+static Nv2aVertexExtra *s_bextra;
+
+static uint32_t pack_color(const float c[4]);
+
+/* Do batches run the register combiners? The same rule as the CPU program
+ * path: once the title has programmed them, unless RECOMP_NO_COMBINERS. */
+static int backend_rc_active(void)
+{
+    static int no_rc = -1;
+
+    if (no_rc < 0)
+        no_rc = getenv("RECOMP_NO_COMBINERS") != NULL;
+    if (!s_gpu.rc_seen || no_rc)
+        return 0;
+    if (!s_bextra)
+        s_bextra = (Nv2aVertexExtra *)malloc(sizeof(Nv2aVertexExtra) * NV_BACKEND_MAX_VERTS);
+    return s_bextra != NULL;
+}
+
+/* Stage st's texture coordinates on the fixed-function path: stage 0 from the
+ * attribute the CPU path uses, the others from their own slots (9 + stage). */
+static const VertexAttr *texcoord_attr_stage(int st)
+{
+    return st == 0 ? texcoord_attr() : &s_gpu.attr[9 + st];
+}
+
+/* The combiner inputs of one fixed-function vertex, as raw as the title gave
+ * them. ponytail: no specular lighting and no fog (factor 1) on this path, as
+ * on the CPU path, which does not compute either. */
+static void backend_vertex_extra(uint32_t index, Nv2aVertexExtra *out)
+{
+    float c[4];
+    int st;
+
+    fetch_attr(&s_gpu.attr[4], index, c);         /* absent reads (0,0,0,1) */
+    out->specular = pack_color(c);
+    out->fog = 1.0f;
+    for (st = 0; st < 4; st++)
+        fetch_attr(texcoord_attr_stage(st), index, out->tex[st]);
+}
 
 static int backend_vertex(uint32_t index, Nv2aVertex *out)
 {
@@ -2570,11 +2612,12 @@ static int backend_vertex(uint32_t index, Nv2aVertex *out)
  * bits of the index, tagged with the full index and the batch generation.
  * ponytail: indices 64K apart that collide just recompute. */
 #define NV_VCACHE 65536
-typedef struct { uint32_t gen, index; int ok; Nv2aVertex v; } VCacheEntry;
+typedef struct { uint32_t gen, index; int ok, has_x; Nv2aVertex v; Nv2aVertexExtra x; } VCacheEntry;
 static VCacheEntry s_vcache[NV_VCACHE];
 static uint32_t s_vcache_gen;
 
-static int backend_vertex_cached(uint32_t index, Nv2aVertex *out)
+/* `x` NULL: the batch does not run the combiners, so no extra inputs. */
+static int backend_vertex_cached(uint32_t index, Nv2aVertex *out, Nv2aVertexExtra *x)
 {
     VCacheEntry *e = &s_vcache[index & (NV_VCACHE - 1)];
 
@@ -2582,36 +2625,79 @@ static int backend_vertex_cached(uint32_t index, Nv2aVertex *out)
         e->gen = s_vcache_gen;
         e->index = index;
         e->ok = backend_vertex(index, &e->v);
+        e->has_x = 0;
     }
-    if (e->ok)
+    if (e->ok && x && !e->has_x) {
+        backend_vertex_extra(index, &e->x);
+        e->has_x = 1;
+    }
+    if (e->ok) {
         *out = e->v;
+        if (x)
+            *x = e->x;
+    }
     return e->ok;
 }
+
+typedef struct { uint32_t n; int rc; } BackendTriCtx;
 
 static void backend_tri(uint32_t p0, uint32_t p1, uint32_t p2, void *ctx)
 {
     const uint32_t *x = s_gpu.idx;
-    uint32_t *n = (uint32_t *)ctx;
+    BackendTriCtx *c = (BackendTriCtx *)ctx;
+    uint32_t n = c->n;
 
-    if (*n + 3 > NV_BACKEND_MAX_VERTS)
+    if (n + 3 > NV_BACKEND_MAX_VERTS)
         return;
-    if (backend_vertex_cached(x[p0], &s_bverts[*n])
-     && backend_vertex_cached(x[p1], &s_bverts[*n + 1])
-     && backend_vertex_cached(x[p2], &s_bverts[*n + 2]))
-        *n += 3;
+    if (backend_vertex_cached(x[p0], &s_bverts[n], c->rc ? &s_bextra[n] : NULL)
+     && backend_vertex_cached(x[p1], &s_bverts[n + 1], c->rc ? &s_bextra[n + 1] : NULL)
+     && backend_vertex_cached(x[p2], &s_bverts[n + 2], c->rc ? &s_bextra[n + 2] : NULL))
+        c->n += 3;
 }
 
-/* Stage 0 as a back end sees it. */
-static void backend_texture(Nv2aTexture *tex)
+/* Stage st as a back end sees it. */
+static void backend_texture(int st, Nv2aTexture *tex)
 {
-    tex->offset = s_gpu.texs[0].offset;
-    tex->width  = s_gpu.texs[0].width;
-    tex->height = s_gpu.texs[0].height;
-    tex->pitch  = s_gpu.texs[0].pitch;
-    tex->color  = s_gpu.texs[0].color;
-    tex->addr_u = s_gpu.texs[0].addr_u;
-    tex->addr_v = s_gpu.texs[0].addr_v;
-    tex->filter = s_gpu.texs[0].filter;
+    const Texture *t = &s_gpu.texs[st];
+
+    tex->offset = t->offset;
+    tex->width  = t->width;
+    tex->height = t->height;
+    tex->pitch  = t->pitch;
+    tex->color  = t->color;
+    tex->addr_u = t->addr_u;
+    tex->addr_v = t->addr_v;
+    tex->filter = t->filter;
+    tex->linear = tex_size_from_format(t->color) ? 0u : 1u;
+    tex->cube   = t->cube ? 1u : 0u;
+}
+
+/* The combiner half of a batch: per-stage textures, the register block, fog
+ * colour and clip-plane mode. `usable` says which stages may be sampled. */
+static Nv2aTexture s_btex[4];
+
+static void backend_fill_rc(Nv2aBatch *batch, int rc, const int usable[4])
+{
+    int st;
+
+    batch->extra = NULL;
+    batch->combiner = NULL;
+    for (st = 0; st < 4; st++)
+        batch->textures[st] = NULL;
+    /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
+    batch->fog_color = (s_gpu.fog_color & 0xFF00FF00u) | ((s_gpu.fog_color & 0xFFu) << 16)
+                     | ((s_gpu.fog_color >> 16) & 0xFFu);
+    batch->clip_plane_mode = s_gpu.clip_plane_mode;
+    if (!rc)
+        return;
+    batch->extra = s_bextra;
+    batch->combiner = &s_gpu.rc;
+    for (st = 0; st < 4; st++) {
+        if (!usable[st])
+            continue;
+        backend_texture(st, &s_btex[st]);
+        batch->textures[st] = &s_btex[st];
+    }
 }
 
 static void backend_batch(void)
@@ -2619,31 +2705,36 @@ static void backend_batch(void)
     Nv2aSurface surf;
     Nv2aTexture tex;
     Nv2aBatch batch;
-    uint32_t n = 0;
+    BackendTriCtx c = {0, 0};
+    int usable[4], st;
 
     if (++s_vcache_gen == 0) {               /* wrapped: old tags could match */
         memset(s_vcache, 0, sizeof s_vcache);
         s_vcache_gen = 1;
     }
 
-    for_each_triangle(backend_tri, &n);
-    if (!n)
+    c.rc = backend_rc_active();
+    for_each_triangle(backend_tri, &c);
+    if (!c.n)
         return;
 
     current_surface(&surf);
+    memset(&batch, 0, sizeof batch);
     batch.vertices = s_bverts;
-    batch.count = n;
+    batch.count = c.n;
     batch.texture = NULL;
     batch.state = &s_gpu.rs;
-    {
-        const VertexAttr *tc = texcoord_attr();
-        if (s_gpu.texs[0].valid && tc->offset && tc->stride) {
-            backend_texture(&tex);
-            batch.texture = &tex;
-        }
+    for (st = 0; st < 4; st++) {
+        const VertexAttr *tc = texcoord_attr_stage(st);
+        usable[st] = s_gpu.texs[st].valid && tc->offset && tc->stride;
     }
+    if (usable[0]) {
+        backend_texture(0, &tex);
+        batch.texture = &tex;
+    }
+    backend_fill_rc(&batch, c.rc, usable);
     s_backend->draw(&surf, &batch);
-    s_gpu.tris_drawn += n / 3;
+    s_gpu.tris_drawn += c.n / 3;
 }
 
 /* ---- 3D: vertex programs and depth -------------------------------------
@@ -3314,10 +3405,10 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
  * back end gets surface pixels like every other batch.
  * ponytail: no near-plane clipping on this path -- a triangle with a vertex at
  * w <= NV_CLIP_W is dropped, as the CPU path did before it clipped. */
-typedef struct { uint32_t n; float su, sv; } BackendXfCtx;
+typedef struct { uint32_t n; float su, sv; int rc; } BackendXfCtx;
 
 static int backend_xf_vertex(const Nv2aVshOutput *v, const BackendXfCtx *c,
-                             Nv2aVertex *out)
+                             Nv2aVertex *out, Nv2aVertexExtra *x)
 {
     if (!(v->pos[3] > NV_CLIP_W))
         return 0;
@@ -3328,18 +3419,25 @@ static int backend_xf_vertex(const Nv2aVshOutput *v, const BackendXfCtx *c,
     out->diffuse = pack_color(v->d0);
     out->u = v->tex[0][0] * c->su;
     out->v = v->tex[0][1] * c->sv;
+    if (x) {
+        /* What the CPU combiner path reads: oD1, the fog unit's factor, oT0-oT3. */
+        x->specular = pack_color(v->d1);
+        x->fog = fog_factor(v->fog[0]);
+        memcpy(x->tex, v->tex, sizeof x->tex);
+    }
     return 1;
 }
 
 static void backend_xf_tri(uint32_t p0, uint32_t p1, uint32_t p2, void *ctx)
 {
     BackendXfCtx *c = (BackendXfCtx *)ctx;
+    uint32_t n = c->n;
 
-    if (c->n + 3 > NV_BACKEND_MAX_VERTS)
+    if (n + 3 > NV_BACKEND_MAX_VERTS)
         return;
-    if (backend_xf_vertex(&s_xf[p0], c, &s_bverts[c->n])
-     && backend_xf_vertex(&s_xf[p1], c, &s_bverts[c->n + 1])
-     && backend_xf_vertex(&s_xf[p2], c, &s_bverts[c->n + 2]))
+    if (backend_xf_vertex(&s_xf[p0], c, &s_bverts[n], c->rc ? &s_bextra[n] : NULL)
+     && backend_xf_vertex(&s_xf[p1], c, &s_bverts[n + 1], c->rc ? &s_bextra[n + 1] : NULL)
+     && backend_xf_vertex(&s_xf[p2], c, &s_bverts[n + 2], c->rc ? &s_bextra[n + 2] : NULL))
         c->n += 3;
     else
         s_gpu.tris_behind++;
@@ -3347,27 +3445,33 @@ static void backend_xf_tri(uint32_t p0, uint32_t p1, uint32_t p2, void *ctx)
 
 static void backend_program_batch(void)
 {
-    BackendXfCtx c = {0, 1.0f, 1.0f};
+    BackendXfCtx c = {0, 1.0f, 1.0f, 0};
     Nv2aSurface surf;
     Nv2aTexture tex;
     Nv2aBatch batch;
+    int usable[4], st;
 
     if (tex_size_from_format(s_gpu.texs[0].color)) {
         c.su = (float)s_gpu.texs[0].width;
         c.sv = (float)s_gpu.texs[0].height;
     }
+    c.rc = backend_rc_active();
     for_each_triangle(backend_xf_tri, &c);
     if (!c.n)
         return;
     current_surface(&surf);
+    memset(&batch, 0, sizeof batch);
     batch.vertices = s_bverts;
     batch.count = c.n;
     batch.texture = NULL;
     batch.state = &s_gpu.rs;
-    if (s_gpu.texs[0].valid) {
-        backend_texture(&tex);
+    for (st = 0; st < 4; st++)
+        usable[st] = s_gpu.texs[st].valid;
+    if (usable[0]) {
+        backend_texture(0, &tex);
         batch.texture = &tex;
     }
+    backend_fill_rc(&batch, c.rc, usable);
     s_backend->draw(&surf, &batch);
     s_gpu.tris_drawn += c.n / 3;
 }
