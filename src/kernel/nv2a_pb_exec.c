@@ -1428,6 +1428,8 @@ static void current_surface(Nv2aSurface *out)
     out->bytes_per_pixel = surface_bpp();
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+    out->clip_x          = s_gpu.clip_x;
+    out->clip_y          = s_gpu.clip_y;
 }
 
 static int sample_tex(const Texture *t, uint32_t face_offset,
@@ -1452,6 +1454,25 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
             if (!sample_tex(&t, 0, x, y, &argb_out[(size_t)y * tex->width + x]))
                 return 0;
     return 1;
+}
+
+static uint32_t tex_texel_bytes(uint32_t fmt);
+
+uint32_t nv2a_backend_texture_span(const Nv2aTexture *tex)
+{
+    uint32_t block = d3d8_format_dxt_block_bytes(tex->color);
+    uint32_t tb = tex_texel_bytes(tex->color);
+
+    if (!tex->width || !tex->height)
+        return 0;
+    if (block)
+        return ((tex->width + 3) / 4) * ((tex->height + 3) / 4) * block;
+    if (d3d8_format_is_swizzled(tex->color))
+        return tex->width * tex->height * tb;
+    if (!tex->pitch)
+        return 0;
+    /* Linear: the last row is read only as far as the image is wide. */
+    return tex->pitch * (tex->height - 1) + tex->width * tb;
 }
 
 static void clear_surface(uint32_t param)
@@ -2590,6 +2611,7 @@ static void backend_texture(Nv2aTexture *tex)
     tex->color  = s_gpu.texs[0].color;
     tex->addr_u = s_gpu.texs[0].addr_u;
     tex->addr_v = s_gpu.texs[0].addr_v;
+    tex->filter = s_gpu.texs[0].filter;
 }
 
 static void backend_batch(void)
@@ -4246,6 +4268,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         int i;
         inited = 1;
         s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
+        s_gpu.rs.color_mask = 0x01010101u;        /* the back end's copy too */
         for (i = 0; i < NV_VERTEX_ATTRS; i++)
             s_gpu.imm_attr[i][3] = 1.0f;
         s_gpu.min_x = s_gpu.min_y = 1e30f;
@@ -4496,6 +4519,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_FLIP_STALL: {
         uint32_t presented = 0;
 
+        /* First, so a back end has written its frame into guest memory before
+         * the window copies it and the frame dumps below read it. */
+        if (s_backend && s_backend->flip)
+            s_backend->flip();
+
         if (s_ftrace == 2)
             fprintf(stderr, "[FTRACE] FLIP_STALL presenting %08X (color now %08X)%c",
                     s_gpu.drawn_offset, s_gpu.color_offset, 10);
@@ -4586,8 +4614,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                         : s_gpu.color_offset);
             }
         }
-        if (s_backend && s_backend->flip)
-            s_backend->flip();
         if (pb_verbose()) {
             static unsigned n;
             if (n++ < 8) {

@@ -36,6 +36,8 @@ typedef struct {
     uint32_t pitch;             /* bytes per row */
     uint32_t bytes_per_pixel;   /* 2 or 4 */
     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
+    uint32_t clip_x, clip_y;    /* clip rectangle origin, real pixels; vertices are
+                                 * relative to (0,0), not to this origin */
 } Nv2aSurface;
 
 /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
@@ -45,6 +47,7 @@ typedef struct {
     uint32_t pitch;             /* linear formats only */
     uint32_t color;             /* NV097 colour-format code */
     uint32_t addr_u, addr_v;    /* NV097 wrap mode per axis (1 wrap, 3 clamp) */
+    uint32_t filter;            /* raw SET_TEXTURE_FILTER: MIN bits 16-23, MAG bits 24-27 */
 } Nv2aTexture;
 
 typedef struct {
@@ -92,6 +95,12 @@ void nv2a_backend_register(const Nv2aBackend *backend);
  * Handles every format the executor can sample (swizzled, linear, DXT).
  * Returns 0 if the format is not supported. */
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+
+/* Bytes of guest memory the texture's level 0 occupies from tex->offset, as the
+ * decoder above reads them; 0 if the format is not one it decodes. A back end
+ * uses it to hash a texture for change detection and to find render targets it
+ * overlaps. */
+uint32_t nv2a_backend_texture_span(const Nv2aTexture *tex);
 
 /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
  * of the semaphore the title reads GPU progress from (for XDK D3D, the
