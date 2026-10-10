@@ -20,6 +20,7 @@
  */
 
 #include "apu_state.h"
+#include "apu_lock_handoff.h"
 #include "apu.h"
 #include "apu_xaudio2.h"
 #include "apu_watch.h"
@@ -559,6 +560,9 @@ static void *mcpx_apu_frame_thread(void *arg)
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
         }
+
+        /* Behind schedule throttle() never waits, so hand the lock to queued threads here. */
+        apu_lock_handoff(&d->lock, &d->lock_waiters);
     }
 
     qemu_mutex_unlock(&d->lock);
@@ -635,6 +639,7 @@ MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr)
     d->pause_requested = true;
 
     qemu_mutex_init(&d->lock);
+    d->lock_waiters = 0;
     qemu_mutex_lock(&d->lock);
     qemu_cond_init(&d->cond);
     qemu_cond_init(&d->idle_cond);
@@ -675,7 +680,7 @@ void mcpx_apu_shutdown(MCPXAPUState *d)
 
     fprintf(stderr, "[APU] Shutting down MCPX APU...\n");
 
-    qemu_mutex_lock(&d->lock);
+    apu_lock_contended(&d->lock, &d->lock_waiters);
     mcpx_apu_wait_for_idle(d);
     qatomic_set(&d->exiting, true);
     qemu_cond_signal(&d->cond);
@@ -713,10 +718,14 @@ void mcpx_apu_dispatch_mmio(MCPXAPUState *d, hwaddr addr, uint64_t val,
         /* VP reads handled by caller if needed */
     } else if (addr >= 0x30000 && addr < 0x40000) {
         /* A4b1 step 3: the GP block (0x30000..0x3FFFF) is routed to the pinned
-         * gp_ops. The pinned gp_write takes its own lock, so this does not hold
-         * d->lock here. GP reads go through mcpx_apu_mmio_read_quiet below. */
+         * gp_ops. GP reads go through mcpx_apu_mmio_read_quiet below. */
         if (is_write) {
+            /* The pinned gp_write re-takes d->lock; holding it first, as a
+             * handoff waiter, keeps the frame thread from starving this write
+             * without editing the vendored file. The lock is recursive. */
+            apu_lock_contended(&d->lock, &d->lock_waiters);
             gp_ops.write(d, addr - 0x30000, val, size);
+            qemu_mutex_unlock(&d->lock);
         }
     } else if (addr < 0x20000) {
         /* Main APU registers */
@@ -846,7 +855,7 @@ void mcpx_apu_play_test_tone(MCPXAPUState *d)
     g_test_tone.active = true;
 
     /* Make sure waveOut is running - enable SECTL and resume APU thread */
-    qemu_mutex_lock(&d->lock);
+    apu_lock_contended(&d->lock, &d->lock_waiters);
     d->regs[NV_PAPU_SECTL] = NV_PAPU_SECTL_XCNTMODE & ~NV_PAPU_SECTL_XCNTMODE_OFF;
     d->regs[NV_PAPU_FECTL] = NV_PAPU_FECTL_FEMETHMODE_FREE_RUNNING;
     /* Initialize empty voice lists so VP frame doesn't crash */
@@ -965,7 +974,7 @@ void apu_mixer_play(int slot, int looping)
     /* The frame thread takes the APU lock before the mixer lock. */
     extern MCPXAPUState *g_state;
     if (g_state) {
-        qemu_mutex_lock(&g_state->lock);
+        apu_lock_contended(&g_state->lock, &g_state->lock_waiters);
         g_state->pause_requested = false;
         qemu_cond_signal(&g_state->cond);
         qemu_mutex_unlock(&g_state->lock);

@@ -97,3 +97,22 @@ else()
     find_package(SDL2 REQUIRED)
     target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
 endif()
+
+# Header-only lock handoff; needs only the platform layer. The test uses pthreads, so POSIX hosts only.
+if(BUILD_TESTING AND NOT WIN32)
+    find_package(Threads REQUIRED)
+    add_executable(apu_lock_handoff_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/apu_lock_handoff_test.c
+    )
+    target_include_directories(apu_lock_handoff_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_SOURCE_DIR}/../nv2a
+    )
+    if(NOT MSVC)
+        target_compile_options(apu_lock_handoff_test PRIVATE -Wall -Wextra)
+    endif()
+    target_link_libraries(apu_lock_handoff_test PRIVATE platform Threads::Threads)
+    add_test(NAME apu_lock_handoff COMMAND apu_lock_handoff_test)
+    set_tests_properties(apu_lock_handoff PROPERTIES TIMEOUT 60)
+endif()

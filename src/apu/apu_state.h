@@ -398,6 +398,8 @@ struct MCPXAPUState {
 
     QemuThread apu_thread;
     QemuMutex lock;
+    /* Threads queued on lock via apu_lock_contended (apu_lock_handoff.h). */
+    volatile LONG lock_waiters;
     QemuCond cond;
     QemuCond idle_cond;
     bool pause_requested;

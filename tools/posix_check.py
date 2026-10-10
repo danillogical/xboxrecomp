@@ -63,6 +63,8 @@ NATIVE_TESTS = [
                          'tests/nv2a_mono_clock_backend_stub.c', 'src/nv2a/nv2a_core.c',
                          'src/nv2a/nv2a_method_table.c', PLATFORM], [],
      [('nv2a_mono_clock', {})]),
+    ('apu_lock_handoff', ['tests/apu_lock_handoff_test.c', PLATFORM], [],
+     [('apu_lock_handoff', {})]),
     ('fence_snapshot', ['tests/fence_snapshot_test.c'], [], [('fence_snapshot', {})]),
     ('nv2a_present_track', ['tests/nv2a_present_track_test.c'], [],
      [('nv2a_present_track', {})]),
