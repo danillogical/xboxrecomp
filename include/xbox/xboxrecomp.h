@@ -50,6 +50,15 @@
 #include "xinput_xbox.h"        /* XInput compatibility */
 #include "apu.h"                /* MCPX APU public API */
 
+/* The MCPX OHCI host controllers and the Xbox controller on the other end.
+ *
+ * Reachable through the umbrella because a title's own XAPI drives the
+ * registers directly: without these, no guest controller read can be answered
+ * and the pad path is dead however the host side is wired. The game repo used
+ * to reach them only by an explicit path into src/usb. */
+#include "ohci.h"               /* OHCI register model + xbox_OhciInit */
+#include "usb_gamepad.h"        /* the controller device model */
+
 /* NV2A headers */
 #include "nv2a_state.h"         /* NV2A GPU state */
 #include "nv2a_regs.h"          /* NV2A register definitions */

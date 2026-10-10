@@ -21,6 +21,16 @@
 /* The runtime maps guest memory at a fixed host offset. */
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
+#if defined(_WIN32)
+/* Defined beside xbox_OhciHandleMmio, registered by xbox_OhciInit. */
+static LONG CALLBACK ohci_veh(PEXCEPTION_POINTERS info);
+#endif
+
+/* The register-programmed DMA range; defined beside bus_resolve. ohci_write
+ * records into it, so the declarations come first. */
+static void ohci_note_dma(uint32_t addr);
+static void ohci_clear_dma(void);
+
 /* Calling the title's interrupt service routine.
  *
  * A recompiled function reads its arguments off the guest stack and keeps its
@@ -249,6 +259,9 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
             hc->reg[HcControl / 4] &= ~0xC0u;    /* back to UsbReset state  */
             hc->reg[HcInterruptStatus / 4] = 0;
             hc->reg[HcInterruptEnable / 4] = 0;
+            /* The register-programmed DMA range goes with the reset: the
+             * driver re-programs it during the bring-up that follows. */
+            ohci_clear_dma();
         }
         return;
 
@@ -283,6 +296,17 @@ static void ohci_write(void *dev, uint32_t off, uint64_t val, int size)
     case HcFmNumber:
     case HcFmRemaining:
         return;                         /* driven by the controller         */
+
+    case HcHCCA:
+    case HcControlHeadED:
+    case HcBulkHeadED:
+        /* These name the memory the controller is allowed to walk. Recording
+         * the range is what makes bus_resolve exact; see ohci_note_dma.
+         * ED_PTR_MASK is defined below this function, so the literal is used
+         * here rather than moving the definition up. */
+        ohci_note_dma(v & 0xFFFFFFF0u);
+        *r = v;
+        return;
 
     case HcRhDescriptorA:
         /* NumberDownstreamPorts is ours; the driver may set the power and
@@ -485,23 +509,66 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * (DDS9's driver writes window addresses directly, which guest_ok already
  * accepts, so it never needed this.)
  *
- * Resolved the way the pushbuffer executor resolves surface offsets
- * (dma_resolve in nv2a_pb_exec.c): below the contiguous allocator's
- * high-water mark an address is memory some MmAllocateContiguousMemory call
- * returned, and its bytes live in the window.
+ * Resolved through the range the driver programmed into the controller's
+ * registers: see ohci_note_dma below for why an address test cannot decide it. */
+/* The physical DMA window the driver has programmed into this controller.
  *
- * Except inside the loaded image. A driver also points transfers at its own
- * statics -- Burnout 3's first GET_DESCRIPTOR reads into 0x0041A904, in .data
- * -- and MmGetPhysicalAddress passes those through unchanged. A real kernel
- * never hands out contiguous memory that overlaps the image, so an address
- * inside it is the image. Sending that one to the window delivered the
- * descriptor where the driver never looked, and it reset the port and asked
- * again, forever. */
+ * A bus master only touches memory the driver told it about: it reads HcHCCA,
+ * walks HcControlHeadED/HcBulkHeadED, and follows the ED and TD links it finds
+ * there. So the only addresses that can legitimately name window memory are
+ * those inside the contiguous allocation one of those programmed registers
+ * points at.
+ *
+ * That is the discriminator, and it has to be this rather than an address test.
+ * JSRF's descriptors are at physical 0x00081000/0x000819A0 and the driver's own
+ * .data descriptor buffer is at 0x002648DC, and BOTH have a window form that
+ * lands inside some live allocation -- 0x802648DC is inside the 1200K surface
+ * block. Deciding by "is the window form allocated" therefore redirected the
+ * driver's static into that surface, so the descriptor never reached the buffer
+ * the driver read, and it re-requested GET_DESCRIPTOR(DEVICE) until it gave up.
+ * Measured: run 20261010-021943-631, 0x002648DC read back all zeros while
+ * 0x802648DC held `01100112 08000000` -- the device descriptor, little-endian.
+ *
+ * Neither the image test nor the allocator high-water mark separates the two
+ * cases, so neither is used: a register-programmed range is exact, and it
+ * covers a driver that writes window addresses (DDS9) and one that writes
+ * MmGetPhysicalAddress results (JSRF, Burnout 3) alike. */
+static uint32_t s_dma_lo, s_dma_hi;
+
+/* Remember a base the driver programmed, expanded to its whole allocation. */
+static void ohci_note_dma(uint32_t addr)
+{
+    uint32_t win, phys, size;
+
+    if (!addr)
+        return;
+    /* A driver writes either the window address or its physical form; both
+     * name the same bytes. */
+    win  = (addr >= OHCI_CONTIG_BASE) ? addr : OHCI_CONTIG_BASE + addr;
+    if (win < OHCI_CONTIG_BASE
+            || win >= OHCI_CONTIG_BASE + OHCI_CONTIG_SIZE)
+        return;
+    phys = win - OHCI_CONTIG_BASE;
+    /* The allocation's extent, not a guessed bound: a descriptor list may run
+     * past the base the register named, and reading a live block's tail is
+     * still reading the driver's own memory. */
+    size = xbox_ContiguousBlockSize(win);
+    if (!size)
+        return;
+    if (!s_dma_lo || phys < s_dma_lo)
+        s_dma_lo = phys;
+    if (phys + size > s_dma_hi)
+        s_dma_hi = phys + size;
+}
+
+static void ohci_clear_dma(void)
+{
+    s_dma_lo = s_dma_hi = 0;
+}
+
 static uint32_t bus_resolve(uint32_t addr)
 {
-    if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
-        return addr;
-    if (addr && addr < xbox_ContiguousAllocatedBytes())
+    if (addr >= s_dma_lo && addr < s_dma_hi)
         return OHCI_CONTIG_BASE + addr;
     return addr;
 }
@@ -1313,6 +1380,9 @@ void xbox_OhciInit(void)
             }
         }
     }
+    /* Only once both blocks really are inaccessible, so the handler is never
+     * registered for faults it cannot own. */
+    AddVectoredExceptionHandler(1, ohci_veh);
 #endif
 
     fprintf(stderr, "  OHCI: two controllers at 0x%08X and 0x%08X, "
@@ -1340,6 +1410,46 @@ static OhciController *hc_for(uint32_t va)
             return &s_hc[i];
     return NULL;
 }
+
+#if defined(_WIN32)
+/* The trap's other half.
+ *
+ * Unmapping the two blocks only makes the guest fault; something has to answer
+ * the fault or every USB register access kills the process. That used to be the
+ * embedder's job -- ohci.h said "the title's VEH routes the faults back to
+ * xbox_OhciHandleMmio" and left the wiring to whoever called xbox_OhciInit --
+ * and an embedder that missed the sentence got a crash on the first register
+ * read, from inside a model it had already switched on.
+ *
+ * Registering it here makes the model self-contained: one call, and the
+ * registers are answered. FIRST = 1 so it runs before the embedder's own
+ * handler, which is installed before this one and would otherwise print the
+ * access violation as a crash before it could be serviced.
+ *
+ * The VA is derived the same way every other toolkit handler derives it: the
+ * fault is a host address, and the runtime maps guest memory at one offset. */
+static LONG CALLBACK ohci_veh(PEXCEPTION_POINTERS info)
+{
+    DWORD code = info->ExceptionRecord->ExceptionCode;
+    uintptr_t fault, off;
+    uint32_t guest_va;
+
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != STATUS_GUARD_PAGE_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    fault = (uintptr_t)info->ExceptionRecord->ExceptionInformation[1];
+    off   = (uintptr_t)xbox_GetMemoryOffset();
+    if (!off || fault < off)
+        return EXCEPTION_CONTINUE_SEARCH;
+    guest_va = (uint32_t)(fault - off);
+    if (!xbox_OhciOwnsAddress(guest_va))
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    if (xbox_OhciHandleMmio(info->ContextRecord, guest_va))
+        return EXCEPTION_CONTINUE_EXECUTION;
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
 
 int xbox_OhciOwnsAddress(uint32_t xbox_va)
 {
