@@ -64,6 +64,7 @@ int nv2a_d3d11_backend_install(void)
 #include <string.h>
 
 #include "kernel/nv2a_backend.h"
+#include "d3d/d3d8_swizzle.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -962,30 +963,44 @@ static void gb_tex_release(GbTex *e)
     GB_RELEASE(e->tex);
 }
 
-/* Decode a texture into the entry; a format the decoder rejects leaves srv NULL. */
+/* Upload a texture into the entry: DXT whose size is a multiple of 4 goes up as BC data,
+ * anything else is decoded; a format the decoder rejects leaves srv NULL. */
 static void gb_tex_upload(GbTex *e, const Nv2aTexture *tx)
 {
     D3D11_TEXTURE2D_DESC td;
     D3D11_SUBRESOURCE_DATA init;
-    uint32_t *buf = gb_scratch((size_t)tx->width * tx->height);
+    uint32_t block = d3d8_format_dxt_block_bytes(tx->color);
+    int native = block && tx->width && tx->height && !(tx->width & 3) && !(tx->height & 3);
+    uint32_t *buf = NULL;
     HRESULT hr;
 
     gb_tex_release(e);
-    if (!buf || !nv2a_backend_decode_texture(tx, buf)) {
-        g.st.tex_undecodable++;
-        return;
+    if (!native) {
+        buf = gb_scratch((size_t)tx->width * tx->height);
+        if (!buf || !nv2a_backend_decode_texture(tx, buf)) {
+            g.st.tex_undecodable++;
+            return;
+        }
     }
     memset(&td, 0, sizeof td);
     td.Width = tx->width;
     td.Height = tx->height;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;    /* 0xAARRGGBB words, as decoded */
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_IMMUTABLE;
     td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    init.pSysMem = buf;
-    init.SysMemPitch = tx->width * 4;
+    if (native) {
+        /* Xbox DXT is linear 4x4 blocks in row-major order, which is the BC layout. */
+        td.Format = tx->color == 0x0C ? DXGI_FORMAT_BC1_UNORM
+                  : tx->color == 0x0E ? DXGI_FORMAT_BC2_UNORM : DXGI_FORMAT_BC3_UNORM;
+        init.pSysMem = gb_guest(tx->offset);
+        init.SysMemPitch = (tx->width / 4) * block;
+    } else {
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;    /* 0xAARRGGBB words, as decoded */
+        init.pSysMem = buf;
+        init.SysMemPitch = tx->width * 4;
+    }
     init.SysMemSlicePitch = 0;
     hr = ID3D11Device_CreateTexture2D(g.dev, &td, &init, &e->tex);
     if (SUCCEEDED(hr))

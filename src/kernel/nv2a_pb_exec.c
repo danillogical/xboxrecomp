@@ -1449,6 +1449,23 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
     t.addr_u = 3;
     t.addr_v = 3;
     t.valid  = 1;
+    if (d3d8_format_dxt_block_bytes(tex->color)) {
+        /* Decode each 4x4 block once, clipped at the right and bottom edges. */
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        for (y = 0; y < tex->height; y += 4)
+            for (x = 0; x < tex->width; x += 4) {
+                uint32_t i;
+                for (i = 0; i < 16; i++) {
+                    uint32_t px = x + (i & 3), py = y + (i >> 2), argb;
+                    if (!d3d8_dxt_decode_texel(mem + tex->offset, tex->color, px, py,
+                                               tex->width, &argb))
+                        return 0;
+                    if (px < tex->width && py < tex->height)
+                        argb_out[(size_t)py * tex->width + px] = argb;
+                }
+            }
+        return 1;
+    }
     for (y = 0; y < tex->height; y++)
         for (x = 0; x < tex->width; x++)
             if (!sample_tex(&t, 0, x, y, &argb_out[(size_t)y * tex->width + x]))
