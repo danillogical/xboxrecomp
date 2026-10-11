@@ -130,6 +130,25 @@ if(BUILD_TESTING AND WIN32)
              COMMAND xbox_dir_context_release_test bridge)
     set_tests_properties(xbox_dir_context_release_bridge PROPERTIES TIMEOUT 60)
 
+    # A guest range's host protection must not outlive its allocation: a block
+    # made read-only, then released or decommitted, has to come back committed,
+    # writable and zeroed. Drives the REAL layout and xbox_VmAllocate/xbox_VmFree.
+    # One process per case, because a fault inside the allocate call can leave
+    # the allocator's locks held.
+    add_executable(xbox_vm_reuse_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/vm_reuse_test.c
+    )
+    target_include_directories(xbox_vm_reuse_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${XBOXRECOMP_SRC_DIR}
+    )
+    target_link_libraries(xbox_vm_reuse_test PRIVATE
+        xbox_kernel platform kernel32)
+    add_test(NAME xbox_vm_reuse_release COMMAND xbox_vm_reuse_test release)
+    set_tests_properties(xbox_vm_reuse_release PROPERTIES TIMEOUT 60)
+    add_test(NAME xbox_vm_reuse_decommit COMMAND xbox_vm_reuse_test decommit)
+    set_tests_properties(xbox_vm_reuse_decommit PROPERTIES TIMEOUT 60)
+
     # A file APC must still be pending when NtReadFile's completion returns,
     # and an alertable zero-interval delay must be what runs it. Inline
     # delivery fails the first assertion.

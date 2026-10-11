@@ -10,6 +10,7 @@
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "kmem.h"
+#include "nv2a_guest_mem.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -18,6 +19,29 @@ extern ptrdiff_t g_xbox_mem_offset;
 
 static struct kmem_vm g_vm;
 static SRWLOCK g_vm_lock = SRWLOCK_INIT;
+
+/* Put [va, va+len) back to PAGE_READWRITE on the host. NtProtectVirtualMemory
+ * applies guest protection to the host pages, and a released or decommitted
+ * range keeps it; the next owner's zero-fill then faults on a read-only page. */
+static void vm_make_writable(uint32_t va, uint32_t len, const char *why)
+{
+    static int logged;
+    DWORD old = PAGE_READWRITE;
+
+    if (!VirtualProtect((void *)((uintptr_t)va + g_xbox_mem_offset), len,
+                        PAGE_READWRITE, &old))
+        return;
+    nv2a_guest_mem_changed();
+    /* The first page's old protection, as observation: a non-RW value here
+     * is a page that would have faulted. */
+    if (old != PAGE_READWRITE && logged < 8) {
+        logged++;
+        fprintf(stderr, "  [KMEM] %s 0x%08X+0x%X: host protection 0x%X"
+                        " restored to PAGE_READWRITE\n", why, va, len,
+                (unsigned)old);
+        fflush(stderr);
+    }
+}
 
 /* Base 0: the heap first, 64 KB-aligned. A pure reservation the heap cannot
  * back goes above RAM, then is clamped, exactly as the bridge always did; the
@@ -67,9 +91,11 @@ static int vm_reserve_at(void *ctx, uint32_t base, uint32_t size)
 static void vm_release(void *ctx, uint32_t base, uint32_t size, uint8_t backing)
 {
     (void)ctx;
-    (void)size;
-    if (backing == KMEM_BACK_HEAP)
+    if (backing == KMEM_BACK_HEAP) {
+        /* Before the block is free: the heap zero-fills whatever reuses it. */
+        vm_make_writable(base, size, "release");
         xbox_HeapFree(base);
+    }
 }
 
 static uint32_t vm_heap_block_bytes(void *ctx, uint32_t va)
@@ -78,9 +104,12 @@ static uint32_t vm_heap_block_bytes(void *ctx, uint32_t va)
     return xbox_HeapBlockSize(va);
 }
 
+/* Called for pages being committed: a fresh commit is writable, whatever the
+ * pages were protected to before a decommit. */
 static void vm_zero(void *ctx, uint32_t va, uint32_t len)
 {
     (void)ctx;
+    vm_make_writable(va, len, "commit");
     memset((void *)((uintptr_t)va + g_xbox_mem_offset), 0, len);
 }
 
