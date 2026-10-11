@@ -1439,6 +1439,137 @@ static void test_return_survives_unit_commits(void)
     }
 }
 
+/* ── a full unit that ends at a control-flow word ─────────────────────── */
+
+/* A non-incrementing packet of `params` parameters on method 0x0300. */
+static void pb_nop_packet(Pb *pb, uint32_t params)
+{
+    uint32_t i;
+    pb_word(pb, 0x40000000u | hdr(0, 0x0300, params));
+    for (i = 0; i < params; ++i) pb_word(pb, 0);
+}
+
+enum { FULL_JUMP_OLD, FULL_JUMP_NEW, FULL_CALL, FULL_RETURN };
+
+#define MARK_A 0xCAFE0001u
+#define MARK_B 0xCAFE0002u
+
+/* REGRESSION: a unit whose packets total exactly NV2A_SUBMIT_MAX_WORDS, with a
+ * jump, call or return as the next word, still commits and the walk continues.
+ *
+ * The walk yields at a PACKET header that would overflow the unit. A unit that
+ * is exactly full has no packet to overflow it: the next word is control flow,
+ * so the packet-header yield never fired, the word-cap guard stopped the walk
+ * as budget_exhausted with nothing committed, and GET stayed pinned at the
+ * unit's start while PUT moved on. The contract is that a full unit ends at the
+ * next header whatever its kind.
+ *
+ * Streams (W = 4096). `shave` 0 makes the unit exactly W words before the
+ * control-flow word; 1 makes it W-1, the control that shows the boundary is
+ * what matters, not jumps.
+ *   JUMP_OLD/NEW: SET_OBJECT 2 + packets of 2048 and 2046-shave words, then
+ *                 a jump to [packet A].
+ *   CALL:         the same, then a call to [packet A, return]; packet B
+ *                 follows the call.
+ *   RETURN:       SET_OBJECT 2, call 1, then in the subroutine packets of
+ *                 2048 and 2045-shave words (W-shave in all), then return;
+ *                 packet B follows the call.
+ * Every case is two units: the full (or W-1) unit, then the control-flow word
+ * and the small remainder. */
+static void run_full_unit_case(int kind, uint32_t shave)
+{
+    NV2AState *d = fresh();
+    Pb main_pb, sub;
+    uint32_t put, want_methods;
+    const char *log;
+    char what[64];
+
+    snprintf(what, sizeof(what), "kind %d shave %u", kind, shave);
+    consumer_reset();
+    pb_begin(&main_pb, PB_BASE);
+    pb_method(&main_pb, 0, 0x0000, H_KELVIN);               /* 2 words */
+    pb_begin(&sub, SUB_BASE);
+
+    if (kind == FULL_RETURN) {
+        pb_word(&main_pb, SUB_BASE | 2u);
+        pb_method(&main_pb, 0, 0x0300, MARK_B);             /* after the return */
+        pb_nop_packet(&sub, 2047u);
+        pb_nop_packet(&sub, 2044u - shave);
+        pb_word(&sub, 0x00020000u);
+        put = main_pb.at;
+        want_methods = 1u + 2047u + (2044u - shave) + 1u;
+    } else {
+        pb_nop_packet(&main_pb, 2047u);
+        pb_nop_packet(&main_pb, 2045u - shave);
+        if (kind == FULL_JUMP_OLD)
+            pb_word(&main_pb, 0x20000000u | SUB_BASE);
+        else if (kind == FULL_JUMP_NEW)
+            pb_word(&main_pb, SUB_BASE | 1u);
+        else
+            pb_word(&main_pb, SUB_BASE | 2u);
+        pb_method(&sub, 0, 0x0300, MARK_A);
+        if (kind == FULL_CALL) {
+            pb_word(&sub, 0x00020000u);
+            pb_method(&main_pb, 0, 0x0300, MARK_B);         /* after the return */
+            put = main_pb.at;
+            want_methods = 1u + 2047u + (2045u - shave) + 2u;
+        } else {
+            put = sub.at;
+            want_methods = 1u + 2047u + (2045u - shave) + 1u;
+        }
+    }
+
+    cap_begin();
+    kick(d, main_pb.start, put);
+    log = cap_end();
+
+    CHECK(strcmp(diag(d), "ok") == 0, "%s: walk rejected (diag=%s)", what, diag(d));
+    check_no_budget_stop(d, log, what);
+    CHECK(get_ptr(d) == put,
+          "%s: GET %08X, want PUT %08X (pinned at the unit start %08X?)",
+          what, get_ptr(d), put, main_pb.start);
+    CHECK(d->pfifo.submit_walk_units == 2u,
+          "%s: submit_walk_units=%u, want 2 (the full unit, then the control-flow word and the rest)",
+          what, d->pfifo.submit_walk_units);
+    CHECK(g_cons_count == want_methods, "%s: consumer saw %u methods, want %u",
+          what, g_cons_count, want_methods);
+    if (g_cons_count == want_methods) {
+        uint32_t last = (kind == FULL_JUMP_OLD || kind == FULL_JUMP_NEW) ? MARK_A : MARK_B;
+        CHECK(g_cons_param[g_cons_count - 1u] == last,
+              "%s: last committed param %08X, want %08X (the post-boundary packet)",
+              what, g_cons_param[g_cons_count - 1u], last);
+        if (kind == FULL_CALL)
+            CHECK(g_cons_param[g_cons_count - 2u] == MARK_A,
+                  "%s: the subroutine packet was not committed before the return", what);
+    }
+    nv2a_set_commit_consumer(NULL);
+}
+
+static void test_full_unit_ending_at_jump_yields(void)
+{
+    run_full_unit_case(FULL_JUMP_OLD, 0u);
+}
+
+static void test_full_unit_ending_at_new_jump_yields(void)
+{
+    run_full_unit_case(FULL_JUMP_NEW, 0u);
+}
+
+static void test_full_unit_ending_at_call_and_return_yields(void)
+{
+    run_full_unit_case(FULL_CALL, 0u);
+    run_full_unit_case(FULL_RETURN, 0u);
+}
+
+/* Control: one word short of a full unit must drain the same way, so the tests
+ * above are about the exact boundary and not about jumps in general. */
+static void test_unit_one_word_short_of_full_before_jump_drains(void)
+{
+    int kind;
+    for (kind = FULL_JUMP_OLD; kind <= FULL_RETURN; ++kind)
+        run_full_unit_case(kind, 1u);
+}
+
 /* ── partial-commit fence ─────────────────────────────────────────────── */
 
 #define RELEASE_METHOD 0x1D70u   /* NV097 BACK_END_WRITE_SEMAPHORE_RELEASE */
@@ -1646,6 +1777,10 @@ int main(void)
     test_unit_rollback_and_retry();
     test_multi_unit_admission_accounting();
     test_return_survives_unit_commits();
+    test_full_unit_ending_at_jump_yields();
+    test_full_unit_ending_at_new_jump_yields();
+    test_full_unit_ending_at_call_and_return_yields();
+    test_unit_one_word_short_of_full_before_jump_drains();
     test_full_success_commits_without_partial();
     test_partial_commit_reports_the_last_release();
     test_partial_commit_without_a_release_reports_nothing();

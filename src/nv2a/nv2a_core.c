@@ -2137,11 +2137,15 @@ bool nv2a_submit_pending(NV2AState *d)
                     yielded = true;
                     break;
                 }
+            } else if (unit_words >= NV2A_SUBMIT_MAX_WORDS) {
+                /* A full unit ending at a jump, call or return yields there too, so the unit commits. */
+                yielded = true;
+                break;
             }
         }
-        /* Defensive and expected-unreachable: the yield above keeps a unit at or
-         * under the budget, so the word cap cannot be reached at a header. Kept
-         * as a fail-closed guard rather than deleted. */
+        /* Defensive and expected-unreachable: the yields above keep a unit at or
+         * under the budget and end a full unit at any header, so the word cap
+         * cannot be reached here. Kept as a fail-closed guard rather than deleted. */
         if (unit_words >= NV2A_SUBMIT_MAX_WORDS) {
             d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false;
             submit_budget_stop(d, get, put, begin, end, pc, words, packets,
