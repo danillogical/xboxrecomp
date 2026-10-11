@@ -14,6 +14,7 @@
 
 #include "xbox_memory_layout.h"
 #include "kernel.h"
+#include "nv2a_guest_mem.h"
 #include "recomp_diagnostics.h"   /* jsrf_slot_watch_alias_* prototypes (A2h alias census) */
 #include "kmem.h"
 #include "fence_snapshot.h"
@@ -2474,7 +2475,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     "is %ld bytes, so trapping guest page zero would also trap "
                     "the TIB at 0x%08X\n", host_page, XBOX_TIB_MAIN);
         } else {
-            if (VirtualProtect(g_memory_base, 0x1000, PAGE_NOACCESS, &old_protect)) {
+            BOOL trapped = VirtualProtect(g_memory_base, 0x1000, PAGE_NOACCESS, &old_protect);
+            nv2a_guest_mem_changed();
+            if (trapped) {
                 fprintf(stderr, "  guest page 0 is PAGE_NOACCESS"
                                 " (null dereferences fault)\n");
             }
@@ -3056,6 +3059,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 if (VirtualProtect((char *)g_mcpx_memory, 0x00080000u,
                                    PAGE_NOACCESS, &old_protect))
                     g_apu_mmio_trapped = 1;
+                nv2a_guest_mem_changed();
                 if (g_apu_mmio_trapped)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO\n",
                             XBOX_MCPX_BASE, XBOX_MCPX_BASE + 0x00080000u);
@@ -3329,6 +3333,7 @@ void xbox_ProtectMirrorsForDebug(void)
             n++;
         }
     }
+    nv2a_guest_mem_changed();
     fprintf(stderr, "  Mirrors: %d/%d made read-only (debug)\n",
             n, XBOX_NUM_MIRRORS);
 }
@@ -5467,6 +5472,7 @@ void xbox_MemoryLayoutShutdown(void)
         g_span_base = NULL;
         g_span_size = 0;
     }
+    nv2a_guest_mem_changed();
     fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
 }
 

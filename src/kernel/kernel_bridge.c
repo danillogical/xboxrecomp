@@ -30,6 +30,7 @@
 #include "xbox_memory_layout.h"
 #include "nv2a_state.h"
 #include "nv2a_mmio_hook.h"
+#include "nv2a_guest_mem.h"
 #include "recomp_icall_feedback.h"
 #include "guest_meter.h"
 #include <stdio.h>
@@ -941,6 +942,7 @@ static void bridge_MmFreeContiguousMemory(void)
         xbox_HeapFree(addr);
     else
         xbox_ContiguousFree(addr);
+    nv2a_guest_mem_changed();
     g_eax = 0;
 }
 
@@ -1219,6 +1221,7 @@ static void bridge_NtFreeVirtualMemory(void)
             fflush(stderr);
         }
         g_eax = xbox_VmFree(&b, &s, free_type);
+        nv2a_guest_mem_changed();
         if (g_eax == STATUS_SUCCESS) {
             BRIDGE_MEM32(base_ptr) = b;
             BRIDGE_MEM32(size_ptr) = s;
@@ -1228,6 +1231,7 @@ static void bridge_NtFreeVirtualMemory(void)
 
     g_eax = (uint32_t)xbox_NtFreeVirtualMemory(
         XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
+    nv2a_guest_mem_changed();
 }
 
 /* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─
@@ -4993,6 +4997,7 @@ static void bridge_ExSaveNonVolatileSetting(void)
 static void bridge_MmUnmapIoSpace(void)
 {
     xbox_HeapFree(STACK_ARG(0));
+    nv2a_guest_mem_changed();
     g_eax = 0;
 }
 
@@ -5492,6 +5497,7 @@ static void bridge_MmLockUnlockPhysicalPage(void)
 static void bridge_MmFreeSystemMemory(void)
 {
     xbox_HeapFree(STACK_ARG(0));
+    nv2a_guest_mem_changed();
     g_eax = 0;
 }
 
@@ -7997,7 +8003,9 @@ static void bridge_NtProtectVirtualMemory(void)
     uint32_t size    = size_ptr ? BRIDGE_MEM32(size_ptr) : 0;
     DWORD old = 0;
 
-    if (VirtualProtect(XBOX_TO_NATIVE(base_va), size, (DWORD)new_prot, &old)) {
+    BOOL protected_ok = VirtualProtect(XBOX_TO_NATIVE(base_va), size, (DWORD)new_prot, &old);
+    nv2a_guest_mem_changed();
+    if (protected_ok) {
         if (old_ptr)
             BRIDGE_MEM32(old_ptr) = (uint32_t)old;
         g_eax = 0;  /* STATUS_SUCCESS */

@@ -439,23 +439,24 @@ typedef struct NV2AState {
         uint32_t lock_acquisitions;
         uint32_t submit_walk_start_get;
         uint32_t submit_walk_units;
-        /* Per-walk page-validation cache for `submit_read_word`.
+        /* Page-validation cache for `submit_read_word`.
          *
-         * `submit_read_word` used to call `VirtualQuery` for every word it read
-         * -- once per 4 bytes, under the owner lock -- and on this host that
-         * costs 12 us untouched but **378 us** once the pages are resident
-         * (measured; see `logs/workers/title010/orch/vq_bench.py`). An
-         * 8144-word walk therefore spent ~1.5 s in pure validity checking,
-         * matching R1's measured 1636 ms maximum lock hold to within 8 %.
+         * `VirtualQuery` costs 12 us untouched but **378 us** once the pages
+         * are resident on this host, so querying once per 4-byte word would
+         * spend ~1.5 s on an 8144-word walk under the owner lock.
          *
-         * These two pointers describe a host-address span whose mapping has
-         * already been validated in THIS walk, so words inside it skip the
-         * query. Reset at the start of every walk. The span is clamped to the
-         * ring, and a page that fails validation is never cached, so the guard
-         * still refuses unmapped, guard and non-readable pages exactly as
-         * before -- only the repetition is removed. */
+         * These fields describe a host-address span whose mapping has already
+         * been validated, so words inside it skip the query. The cache is kept
+         * across walks and is dropped when the pushbuffer mapping changes or
+         * the guest memory generation moves. The span is clamped to the ring,
+         * and a page that fails validation is never cached, so the guard still
+         * refuses unmapped, guard and non-readable pages exactly as before. */
         uint8_t *page_ok_base;
         uint8_t *page_ok_end;
+        uint8_t *page_ok_pushbuffer;
+        uint32_t page_ok_pb_base;
+        uint32_t page_ok_pb_size;
+        uint32_t page_ok_gen;
     } pfifo;
 
     struct {

@@ -46,6 +46,7 @@
 #include "nv2a/nv2a_mono_clock.h"   /* QPC, host_clock.h, the process-wide epoch */
 #if defined(_WIN32)
 #include <windows.h>
+#include <intrin.h>   /* __rdtsc */
 #define NV_TLS __declspec(thread)
 #else
 #define NV_TLS __thread
@@ -405,13 +406,52 @@ static uint32_t s_tex0_ctl_writes;
 static uint32_t s_tex0_ctl_disables;
 static uint32_t s_tex0_ctl_last;
 
-/* Where executor time goes, as RAW QPC counts converted to ns only on export.
+/* Where executor time goes, as RAW TSC ticks (QPC counts off x86 Windows) converted to ns only on export.
  * Every counter is touched by the executor thread alone: the raster pool
  * workers inside xf_rows_parallel never read the clock or these statics.
  * The buckets nest -- fill sits inside tri, and vsh + tri + ffp sit inside
  * exec -- so a reader can subtract without double counting. */
 static uint64_t s_t_exec, s_t_vsh, s_t_tri, s_t_fill, s_t_ffp;
 
+#if defined(_WIN32) && (defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__))
+#define PB_USE_TSC 1
+#endif
+
+#if defined(PB_USE_TSC)
+/* The (QPC, TSC) pair taken at the first read; the TSC rate is derived against it at conversion time. */
+static uint64_t s_cal_qpc0, s_cal_tsc0;
+
+static uint64_t pb_qpc_now(void)
+{
+    uint64_t tsc = __rdtsc();
+    if (!s_cal_tsc0) {
+        LARGE_INTEGER c;
+        QueryPerformanceCounter(&c);
+        s_cal_qpc0 = (uint64_t)c.QuadPart;
+        s_cal_tsc0 = tsc;
+    }
+    return tsc;
+}
+
+/* Ticks to ns via the TSC rate measured against QPC since the first read; 0 until enough time has elapsed. */
+static uint64_t pb_qpc_to_ns(uint64_t count)
+{
+    static int64_t freq;
+    LARGE_INTEGER f, c;
+    uint64_t dq, dt;
+    if (!s_cal_tsc0) return 0;
+    if (!freq) {
+        QueryPerformanceFrequency(&f);
+        freq = f.QuadPart;
+    }
+    if (freq <= 0) return 0;
+    QueryPerformanceCounter(&c);
+    dq = (uint64_t)c.QuadPart - s_cal_qpc0;
+    dt = __rdtsc() - s_cal_tsc0;
+    if (dq < (uint64_t)freq / 100u || dt == 0) return 0;   /* under 10 ms: the rate is too noisy to trust */
+    return (uint64_t)((double)count * (double)nv2a_qpc_to_ns((int64_t)dq, freq) / (double)dt);
+}
+#else
 static uint64_t pb_qpc_now(void)
 {
     LARGE_INTEGER c;
@@ -430,6 +470,7 @@ static uint64_t pb_qpc_to_ns(uint64_t count)
     }
     return freq > 0 ? (uint64_t)nv2a_qpc_to_ns((int64_t)count, freq) : 0;
 }
+#endif
 
 /* Formats whose dimensions come from the format word and whose coordinates
  * arrive normalised, rather than from a pitch and SET_TEXTURE_IMAGE_RECT with

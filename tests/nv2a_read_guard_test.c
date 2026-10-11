@@ -31,7 +31,7 @@
  *   4. a readable word BEFORE the guard page is still consumed, so the guard
  *      refuses at the right address rather than refusing the whole ring;
  *   5. a page validated during one walk and revoked before the next is
- *      refused by the next, so the validation cache does not outlive a walk.
+ *      refused by the next walk.
  *
  * The window is built with VirtualAlloc so the guard page is a real one: this
  * test is Windows-only by construction, and it says so rather than silently

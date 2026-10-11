@@ -9,6 +9,7 @@
  */
 
 #include "nv2a_state.h"
+#include "nv2a_guest_mem.h"
 #include "nv2a_pgraph_d3d11.h"
 
 /* The one process-wide telemetry anchor (see nv2a_mono_clock.h), defined here because every nv2a consumer links this file. */
@@ -1261,32 +1262,39 @@ bool nv2a_set_fixture_execution(NV2AState *d, bool enabled)
     return true;
 }
 
-/* ── Per-walk page-validation cache for submit_read_word ───────────────────
+/* ── Page-validation cache for submit_read_word ────────────────────────────
  *
- * THE DEFECT THIS REMOVES. `submit_read_word` called `VirtualQuery` for EVERY
- * word it read -- once per 4 bytes of pushbuffer, under `g_mmio_owner_lock`.
- * Measured on this host at the base of a 64 MB mapped view (the shape of the
- * nv2a contiguous window): 12 us per call while untouched and **378 us** once
- * the pages are resident, because `VirtualQuery` walks the region's
- * page-descriptor chain. An 8144-word walk therefore cost ~1.5 s of pure
- * validity checking, and R1's measured maximum lock hold was 1636 ms -- within
- * 8 % of that figure, from two independent instruments.
+ * `VirtualQuery` costs 12 us untouched and up to **378 us** once the pages are
+ * resident, so querying once per pushbuffer word would spend ~1.5 s on an
+ * 8144-word walk under `g_mmio_owner_lock`.
  *
- * WHY CACHING PER WALK IS SEMANTICS-PRESERVING. The check exists to refuse a
- * word that lives in an unmapped, guard or non-readable page, so the walk does
- * not fault on a bad ring. The owner lock does NOT freeze page protection:
- * NtProtectVirtualMemory and MmSetAddressProtect do not take it, so another
- * thread can change a page mid-walk. The cache lives only for one walk (it is
- * reset when the walk starts), so its exposure is a time-of-check window of
- * one walk -- the same kind the old per-word query had, which could also be
- * invalidated between the query and the read. It simply stops re-asking the
- * same question up to 1024 times for the 1024 words that share one 4 KB page.
+ * The check refuses a word in an unmapped, guard or non-readable page, so the
+ * walk does not fault on a bad ring. The owner lock does not freeze page
+ * protection, so the validated span is cached together with the guest memory
+ * generation it was validated under.
  *
- * WHAT IS DELIBERATELY UNCHANGED. The address bounds, the alignment test, the
- * full protection predicate (including PAGE_NOACCESS/PAGE_GUARD) and the
- * region-end test all still gate acceptance. Only the REPETITION is removed.
- * A page that fails validation is not cached, so the next word in it re-checks
- * and also fails. */
+ * The cache survives across walks and is dropped when the pushbuffer pointer,
+ * base or size changes, or when `nv2a_guest_mem_changed` has moved the generation.
+ *
+ * The generation is read before the query, so a change racing the query leaves
+ * the cached entry stale and it is re-validated on the next word.
+ *
+ * The final read is SEH-guarded on Windows, so a page revoked by a path that does not bump the generation is still refused rather than faulting.
+ *
+ * The address bounds, the alignment test, the full protection predicate
+ * (including PAGE_NOACCESS/PAGE_GUARD) and the region-end test still gate
+ * acceptance, and a page that fails validation is never cached. */
+static volatile uint32_t s_guest_mem_gen;
+
+void nv2a_guest_mem_changed(void)
+{
+#if defined(_WIN32)
+    InterlockedIncrement((volatile LONG *)&s_guest_mem_gen);
+#else
+    __atomic_fetch_add(&s_guest_mem_gen, 1u, __ATOMIC_SEQ_CST);
+#endif
+}
+
 static bool submit_read_word(NV2AState *d, uint32_t address, uint32_t *word)
 {
     uint32_t end = d->pfifo.pushbuffer_base + d->pfifo.pushbuffer_size;
@@ -1295,9 +1303,14 @@ static bool submit_read_word(NV2AState *d, uint32_t address, uint32_t *word)
 #if defined(_WIN32)
     {
         uint8_t *host = d->pfifo.pushbuffer + (address - d->pfifo.pushbuffer_base);
-        /* Fast path: a previous word in this walk already validated a region
-         * covering this word. */
-        if (!(host >= d->pfifo.page_ok_base && host + sizeof(*word) <= d->pfifo.page_ok_end)) {
+        uint32_t gen = s_guest_mem_gen;
+        /* Fast path: an earlier word already validated a region covering this
+         * word under the same pushbuffer mapping and memory generation. */
+        if (!(d->pfifo.page_ok_gen == gen &&
+              d->pfifo.page_ok_pushbuffer == d->pfifo.pushbuffer &&
+              d->pfifo.page_ok_pb_base == d->pfifo.pushbuffer_base &&
+              d->pfifo.page_ok_pb_size == d->pfifo.pushbuffer_size &&
+              host >= d->pfifo.page_ok_base && host + sizeof(*word) <= d->pfifo.page_ok_end)) {
             MEMORY_BASIC_INFORMATION mbi;
             uint8_t *region_end;
             if (VirtualQuery(host, &mbi, sizeof(mbi)) != sizeof(mbi) ||
@@ -1317,10 +1330,22 @@ static bool submit_read_word(NV2AState *d, uint32_t address, uint32_t *word)
             d->pfifo.page_ok_end = region_end < (d->pfifo.pushbuffer + d->pfifo.pushbuffer_size)
                                  ? region_end
                                  : (d->pfifo.pushbuffer + d->pfifo.pushbuffer_size);
+            d->pfifo.page_ok_pushbuffer = d->pfifo.pushbuffer;
+            d->pfifo.page_ok_pb_base = d->pfifo.pushbuffer_base;
+            d->pfifo.page_ok_pb_size = d->pfifo.pushbuffer_size;
+            d->pfifo.page_ok_gen = gen;
         }
     }
-#endif
+    __try {
+        *word = *(const volatile uint32_t *)(d->pfifo.pushbuffer + (address - d->pfifo.pushbuffer_base));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        d->pfifo.page_ok_base = NULL;
+        d->pfifo.page_ok_end = NULL;
+        return false;
+    }
+#else
     memcpy(word, d->pfifo.pushbuffer + (address - d->pfifo.pushbuffer_base), 4);
+#endif
     return true;
 }
 
@@ -1971,12 +1996,8 @@ bool nv2a_submit_pending(NV2AState *d)
      * call-free walk can only exceed the ring size by cycling. */
     unit_limit = d->pfifo.pushbuffer_size / 4u;
     if (!unit_limit) unit_limit = NV2A_SUBMIT_MAX_WORDS;
-    /* The per-walk page-validation cache is walk-scoped: a mapping validated
-     * here may still change during the walk (the owner lock does not stop a
-     * protection change), and it must not be assumed stable across walks.
-     * Cleared here so every walk re-validates at least once. */
-    d->pfifo.page_ok_base = NULL;
-    d->pfifo.page_ok_end = NULL;
+    /* The page-validation cache is kept across walks; submit_read_word drops it
+     * when the pushbuffer mapping or the guest memory generation changes. */
     for (;;) {
     uint32_t unit_words = 0;
     bool yielded = false;

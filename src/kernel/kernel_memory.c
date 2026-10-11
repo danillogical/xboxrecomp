@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include "nv2a_guest_mem.h"
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -99,6 +100,7 @@ VOID __stdcall xbox_MmFreeContiguousMemory(PVOID BaseAddress)
     } else {
         _aligned_free(BaseAddress);
     }
+    nv2a_guest_mem_changed();
 }
 
 /* ============================================================================
@@ -118,6 +120,7 @@ VOID __stdcall xbox_MmFreeSystemMemory(PVOID BaseAddress, ULONG NumberOfBytes)
     XBOX_TRACE(XBOX_LOG_MEM, "MmFreeSystemMemory(%p, %u)", BaseAddress, NumberOfBytes);
     if (BaseAddress)
         VirtualFree(BaseAddress, 0, MEM_RELEASE);
+    nv2a_guest_mem_changed();
 }
 
 /* ============================================================================
@@ -161,6 +164,7 @@ VOID __stdcall xbox_MmUnmapIoSpace(PVOID BaseAddress, ULONG NumberOfBytes)
     XBOX_TRACE(XBOX_LOG_MEM, "MmUnmapIoSpace(%p, %u)", BaseAddress, NumberOfBytes);
     if (BaseAddress)
         VirtualFree(BaseAddress, 0, MEM_RELEASE);
+    nv2a_guest_mem_changed();
 }
 
 ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
@@ -204,6 +208,7 @@ VOID __stdcall xbox_MmSetAddressProtect(PVOID BaseAddress, ULONG NumberOfBytes, 
 {
     DWORD old_protect;
     VirtualProtect(BaseAddress, NumberOfBytes, xbox_protect_to_win32(NewProtect), &old_protect);
+    nv2a_guest_mem_changed();
     XBOX_TRACE(XBOX_LOG_MEM, "MmSetAddressProtect(%p, %u, 0x%X)", BaseAddress, NumberOfBytes, NewProtect);
 }
 
@@ -260,6 +265,7 @@ VOID __stdcall xbox_MmDeleteKernelStack(PVOID StackBase, PVOID StackLimit)
     XBOX_TRACE(XBOX_LOG_MEM, "MmDeleteKernelStack(base=%p, limit=%p)", StackBase, StackLimit);
     if (StackLimit)
         VirtualFree(StackLimit, 0, MEM_RELEASE);
+    nv2a_guest_mem_changed();
 }
 
 /* ============================================================================
@@ -301,7 +307,9 @@ NTSTATUS __stdcall xbox_NtFreeVirtualMemory(
 
     SIZE_T size = (FreeType & MEM_RELEASE) ? 0 : (RegionSize ? *RegionSize : 0);
 
-    if (!VirtualFree(*BaseAddress, size, FreeType)) {
+    BOOL freed = VirtualFree(*BaseAddress, size, FreeType);
+    nv2a_guest_mem_changed();
+    if (!freed) {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_MEM,
             "NtFreeVirtualMemory failed: base=%p type=0x%X err=%u",
             *BaseAddress, FreeType, GetLastError());
