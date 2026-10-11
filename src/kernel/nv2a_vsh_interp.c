@@ -51,6 +51,9 @@ typedef struct {
 static DecodedIns s_dec[NV2A_VSH_SLOTS];
 static uint32_t s_dec_start, s_dec_end;
 static int s_dec_dirty = 1;
+/* Facts about the decoded program, computed with the decode. */
+static uint32_t s_dec_hash, s_dec_inputs;
+static int s_dec_writes_c, s_dec_has_final;
 
 static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
 {
@@ -235,16 +238,57 @@ static void decode_ins(DecodedIns *d, const uint32_t *ins)
 static void decode_program(void)
 {
     uint32_t s = s_start_slot;
+    uint32_t hash = 2166136261u, inputs = 0;
+    int writes_c = 0, i;
 
     s_dec_start = s_start_slot;
     while (s < NV2A_VSH_SLOTS) {
+        const DecodedIns *d = &s_dec[s];
+        int uses[3];
+
         decode_ins(&s_dec[s], s_program[s]);
+        for (i = 0; i < 4; i++)
+            hash = (hash ^ s_program[s][i]) * 16777619u;
+        /* Sources an instruction reads: A for any MAC op, B for the two-operand
+         * ones, C for add/mad and every ILU op. Over-counting is safe. */
+        uses[0] = d->mac != 0;
+        uses[1] = d->mac >= 2 && d->mac <= 12 && d->mac != 3;
+        uses[2] = d->mac == 3 || d->mac == 4 || d->ilu != 0;
+        for (i = 0; i < 3; i++)
+            if (uses[i] && d->mux[i] == 2)
+                inputs |= 1u << d->in_idx;
+        if (d->omask && !d->out_o)
+            writes_c = 1;
         s++;
-        if (s_dec[s - 1].final)
+        if (d->final)
             break;
     }
     s_dec_end = s;
+    s_dec_has_final = s > s_start_slot && s_dec[s - 1].final;
+    s_dec_hash = hash;
+    s_dec_inputs = inputs;
+    s_dec_writes_c = writes_c;
     s_dec_dirty = 0;
+}
+
+int nv2a_vsh_program_info(const uint32_t (**words)[4], uint32_t *len, uint32_t *hash,
+                          uint32_t *input_mask, int *writes_constants)
+{
+    if (s_dec_dirty)
+        decode_program();
+    if (!s_dec_has_final)
+        return 0;
+    *words = (const uint32_t (*)[4])&s_program[s_dec_start];
+    *len = s_dec_end - s_dec_start;
+    *hash = s_dec_hash;
+    *input_mask = s_dec_inputs;
+    *writes_constants = s_dec_writes_c;
+    return 1;
+}
+
+const float (*nv2a_vsh_constants(void))[4]
+{
+    return (const float (*)[4])s_const;
 }
 
 static vec4 read_src(const DecodedIns *d, int which,

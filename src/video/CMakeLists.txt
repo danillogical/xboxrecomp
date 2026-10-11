@@ -4,6 +4,7 @@ add_library(xbox_video STATIC
     video_pump.c
     fb_present.c
     nv2a_d3d11_backend.c
+    nv2a_vsh_hlsl.c
 )
 target_include_directories(xbox_video PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

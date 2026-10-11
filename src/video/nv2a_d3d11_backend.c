@@ -31,6 +31,10 @@
  *     statement, with all four texture stages. Shaders are cached by the
  *     registers that shape the program; the per-stage constants, fog colour and
  *     texture scales live in a constant buffer, so a fade is not a new shader.
+ *   - A vertex-program batch can come untransformed (draw_program): its program
+ *     is translated to an HLSL vertex shader (nv2a_vsh_hlsl.c), cached by program,
+ *     and drawn with exactly the combiner path's target, state and pixel shader.
+ *     Anything that path cannot take goes back to the executor's CPU transform.
  *
  * Everything runs on the executor's thread, one call at a time, under the
  * NV2A owner lock; the only blocking wait is the readback Map at a flip (or at
@@ -65,6 +69,7 @@ int nv2a_d3d11_backend_install(void)
 
 #include "kernel/nv2a_backend.h"
 #include "d3d/d3d8_swizzle.h"
+#include "nv2a_vsh_hlsl.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -77,6 +82,10 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 #define GB_VB_BYTES      (8u << 20)       /* one full executor batch is 5.5 MB */
 #define GB_STATS_MS      10000
 #define GB_MAX_RC        256              /* cached combiner pixel shaders */
+#define GB_MAX_VSH       256              /* cached vertex-program shaders */
+#define GB_VSH_VB_BYTES  (16u << 20)      /* 65536 positions x 16 inputs x 16 bytes */
+#define GB_VSH_IB_COUNT  (1u << 20)       /* indices; a full strip batch is 196602 */
+#define GB_VSH_SRC_BYTES (128u << 10)     /* generated HLSL; a full 136-slot program is under 60 KB */
 
 /* The input layout below reads Nv2aVertex in place. */
 typedef char gb_vertex_is_28_bytes[sizeof(Nv2aVertex) == 28 ? 1 : -1];
@@ -119,14 +128,11 @@ static const char s_hlsl[] =
 
 typedef struct { float xf[4], tx[4]; } GbConstants;
 
-/* The combiner path's interpolants, shared by its vertex shader and every
- * generated pixel shader. Colours and fog interpolate linearly in screen space
- * and texture coordinates perspective-correct, as the CPU program path does. */
-#define GB_RC_VO \
-    "struct VO2 { float4 p : SV_Position; noperspective float4 d0 : COLOR0;\n" \
-    "  noperspective float4 d1 : COLOR1; noperspective float fog : TEXCOORD4;\n" \
-    "  float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1; float4 t2 : TEXCOORD2;\n" \
-    "  float4 t3 : TEXCOORD3; };\n"
+/* The combiner path's interpolants, shared by its vertex shader, every generated
+ * pixel shader and the vertex-program shaders (nv2a_vsh_hlsl.h). Colours and fog
+ * interpolate linearly in screen space and texture coordinates perspective-correct,
+ * as the CPU program path does. */
+#define GB_RC_VO "struct VO2 { " NV2A_VSH_HLSL_VO_FIELDS "};\n"
 
 static const char s_hlsl_rc_vs[] =
     "cbuffer C : register(b0) { float4 g_xf; float4 g_tx; };\n"
@@ -174,6 +180,16 @@ typedef struct {
     ID3D11PixelShader *ps;
 } GbRcShader;
 
+/* A vertex program's compiled shader, keyed by its hash, inputs and length. */
+typedef struct {
+    int used, failed;
+    uint32_t hash, mask, len;
+    uint32_t (*words)[4];               /* a copy, so a hash collision cannot pick the wrong shader */
+    uint64_t last_use;
+    ID3D11VertexShader *vs;
+    ID3D11InputLayout *il;              /* NULL when the program reads no inputs */
+} GbVsh;
+
 typedef struct {
     int used;
     uint32_t va, pitch, bpp, w, h;
@@ -219,6 +235,7 @@ typedef struct {
     uint64_t tex_uploads, tex_hits, tex_undecodable, rt_aliases, rt_copies;
     uint64_t rt_loads, readbacks, readback_ticks;
     uint64_t rc_draws, rc_shaders, rc_compile_fail, rc_fallback, rc_compile_ticks;
+    uint64_t vsh_draws, vsh_shaders, vsh_compile_fail, vsh_fallback, vsh_compile_ticks;
 } GbStats;
 
 static struct {
@@ -234,10 +251,16 @@ static struct {
     ID3D11InputLayout *il_rc;
     ID3D11Buffer *vb_rc, *cb_rc;
     UINT vb_rc_cap, vb_rc_pos;
-    int cur_kind;                       /* bound IA/VS: 0 none, 1 stage-0, 2 combiners */
+    int cur_kind;                       /* bound IA/VS: 0 none, 1 stage-0, 2 combiners, 3 program */
     ID3D11PixelShader *cur_ps;
     GbRcShader rc[GB_MAX_RC];
     unsigned rc_fail_said;
+    /* The vertex-program path: made on its first batch; vsh_state -1 if that failed. */
+    int vsh_state, vsh_dump;
+    ID3D11Buffer *vb_vsh, *ib_vsh, *cb_vsh_c, *cb_vsh_x;
+    UINT vb_vsh_pos, ib_vsh_pos;        /* bytes, indices */
+    GbVsh vsh[GB_MAX_VSH];
+    unsigned vsh_fail_said;
     ID3D11RasterizerState *rs;
     ID3D11SamplerState *samp[4][9];     /* [filter][addr_u*3 + addr_v], made on first use */
     ID3D11RenderTargetView *bound_rtv;
@@ -516,6 +539,14 @@ static int gb_create_pipeline(void)
     return 0;
 }
 
+static void gb_set_ps(ID3D11PixelShader *ps)
+{
+    if (g.cur_ps != ps) {
+        ID3D11DeviceContext_PSSetShader(g.ctx, ps, NULL, 0);
+        g.cur_ps = ps;
+    }
+}
+
 /* Bind the stage-0 pipeline (ps NULL) or the combiner pipeline with `ps`. */
 static void gb_pipeline(ID3D11PixelShader *ps)
 {
@@ -530,12 +561,7 @@ static void gb_pipeline(ID3D11PixelShader *ps)
         ID3D11DeviceContext_VSSetShader(g.ctx, kind == 2 ? g.vs_rc : g.vs, NULL, 0);
         g.cur_kind = kind;
     }
-    if (!ps)
-        ps = g.ps;
-    if (g.cur_ps != ps) {
-        ID3D11DeviceContext_PSSetShader(g.ctx, ps, NULL, 0);
-        g.cur_ps = ps;
-    }
+    gb_set_ps(ps ? ps : g.ps);
 }
 
 /* NV2A (GL) blend factor to D3D11; the alpha slot cannot take *_COLOR factors. */
@@ -1187,12 +1213,63 @@ static int gb_cb_write(ID3D11Buffer *cb, const void *data, size_t bytes)
     return 1;
 }
 
+/* Bind everything of `dr` a draw needs but its vertices: output, viewport,
+ * scissor, blend and depth state, the vertex stage, and the pixel shader with
+ * its textures. `vsh` NULL is the stage-0 or combiner vertex stage; otherwise
+ * that program's shader, input layout and index buffer, its inputs at byte
+ * `offset` of the program vertex buffer with `stride` bytes per position. */
+static void gb_bind(const GbDraw *dr, const GbVsh *vsh, UINT stride, UINT offset)
+{
+    ID3D11ShaderResourceView *none[4] = { NULL, NULL, NULL, NULL };
+    int rc = dr->rc_ps != NULL;
+
+    /* Unbind textures first, so a target last sampled is never bound twice. */
+    ID3D11DeviceContext_PSSetShaderResources(g.ctx, 0, 4, none);
+    {
+        ID3D11DepthStencilView *dsv = dr->d ? dr->d->dsv : NULL;
+        if (g.bound_rtv != dr->t->rtv || g.bound_dsv != dsv) {
+            D3D11_VIEWPORT vp;
+            ID3D11DeviceContext_OMSetRenderTargets(g.ctx, 1, &dr->t->rtv, dsv);
+            g.bound_rtv = dr->t->rtv;
+            g.bound_dsv = dsv;
+            vp.TopLeftX = 0.0f;
+            vp.TopLeftY = 0.0f;
+            vp.Width = (FLOAT)dr->t->w;
+            vp.Height = (FLOAT)dr->t->h;
+            vp.MinDepth = 0.0f;
+            vp.MaxDepth = 1.0f;
+            ID3D11DeviceContext_RSSetViewports(g.ctx, 1, &vp);
+        }
+    }
+    ID3D11DeviceContext_RSSetScissorRects(g.ctx, 1, &dr->scissor);
+    ID3D11DeviceContext_OMSetBlendState(g.ctx, dr->bs, dr->blend_factor, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(g.ctx, dr->dss, 0);
+    if (!vsh) {
+        gb_pipeline(dr->rc_ps);
+    } else {
+        /* Rebound every draw: the offset moves along the ring. */
+        ID3D11DeviceContext_IASetInputLayout(g.ctx, vsh->il);
+        if (vsh->il)
+            ID3D11DeviceContext_IASetVertexBuffers(g.ctx, 0, 1, &g.vb_vsh, &stride, &offset);
+        ID3D11DeviceContext_IASetIndexBuffer(g.ctx, g.ib_vsh, DXGI_FORMAT_R32_UINT, 0);
+        ID3D11DeviceContext_VSSetShader(g.ctx, vsh->vs, NULL, 0);
+        g.cur_kind = 3;
+        gb_set_ps(dr->rc_ps);
+    }
+    if (rc) {
+        ID3D11DeviceContext_PSSetShaderResources(g.ctx, 0, 4, dr->srvs);
+        ID3D11DeviceContext_PSSetSamplers(g.ctx, 0, 4, dr->samps);
+    } else if (dr->srv) {
+        ID3D11DeviceContext_PSSetShaderResources(g.ctx, 0, 1, &dr->srv);
+        ID3D11DeviceContext_PSSetSamplers(g.ctx, 0, 1, &dr->samp);
+    }
+}
+
 /* Upload the usable triangles of `v` (with `x` on the combiner path) and draw
  * them; returns how many vertices were drawn. */
 static uint32_t gb_submit(const GbDraw *dr, const Nv2aVertex *v, const Nv2aVertexExtra *x,
                           uint32_t n)
 {
-    ID3D11ShaderResourceView *none[4] = { NULL, NULL, NULL, NULL };
     int rc = dr->rc_ps != NULL;
     UINT cap = rc ? g.vb_rc_cap : g.vb_cap, *pos = rc ? &g.vb_rc_pos : &g.vb_pos;
     uint8_t *dst;
@@ -1233,36 +1310,7 @@ static uint32_t gb_submit(const GbDraw *dr, const Nv2aVertex *v, const Nv2aVerte
         return 0;
     if (rc && !gb_cb_write(g.cb_rc, &dr->rck, sizeof dr->rck))
         return 0;
-
-    /* Unbind textures first, so a target last sampled is never bound twice. */
-    ID3D11DeviceContext_PSSetShaderResources(g.ctx, 0, 4, none);
-    {
-        ID3D11DepthStencilView *dsv = dr->d ? dr->d->dsv : NULL;
-        if (g.bound_rtv != dr->t->rtv || g.bound_dsv != dsv) {
-            D3D11_VIEWPORT vp;
-            ID3D11DeviceContext_OMSetRenderTargets(g.ctx, 1, &dr->t->rtv, dsv);
-            g.bound_rtv = dr->t->rtv;
-            g.bound_dsv = dsv;
-            vp.TopLeftX = 0.0f;
-            vp.TopLeftY = 0.0f;
-            vp.Width = (FLOAT)dr->t->w;
-            vp.Height = (FLOAT)dr->t->h;
-            vp.MinDepth = 0.0f;
-            vp.MaxDepth = 1.0f;
-            ID3D11DeviceContext_RSSetViewports(g.ctx, 1, &vp);
-        }
-    }
-    ID3D11DeviceContext_RSSetScissorRects(g.ctx, 1, &dr->scissor);
-    ID3D11DeviceContext_OMSetBlendState(g.ctx, dr->bs, dr->blend_factor, 0xFFFFFFFFu);
-    ID3D11DeviceContext_OMSetDepthStencilState(g.ctx, dr->dss, 0);
-    gb_pipeline(dr->rc_ps);
-    if (rc) {
-        ID3D11DeviceContext_PSSetShaderResources(g.ctx, 0, 4, dr->srvs);
-        ID3D11DeviceContext_PSSetSamplers(g.ctx, 0, 4, dr->samps);
-    } else if (dr->srv) {
-        ID3D11DeviceContext_PSSetShaderResources(g.ctx, 0, 1, &dr->srv);
-        ID3D11DeviceContext_PSSetSamplers(g.ctx, 0, 1, &dr->samp);
-    }
+    gb_bind(dr, NULL, 0, 0);
     ID3D11DeviceContext_Draw(g.ctx, out, *pos);
     *pos += out;
     return out;
@@ -1711,73 +1759,91 @@ static int gb_rc_prepare(GbDraw *dr, const Nv2aBatch *b)
     return 1;
 }
 
-static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
+/* Set up everything of a draw but its vertices: target, depth, transform and
+ * alpha constants, the combiners when `rc` (1: else stage 0; 2: or nothing),
+ * stage 0, blend and depth state. Returns 1 ready, 0 no target or an empty
+ * clip, -1 a state object failed or (rc 2) the combiners do not translate. */
+static int gb_setup(GbDraw *dr, const Nv2aSurface *s, const Nv2aBatch *b, int rc)
 {
     const Nv2aRenderState *rs = b->state;
-    GbDraw dr;
-    uint32_t drawn, bc = rs->blend_color;
+    uint32_t bc = rs->blend_color;
     float zs;
 
-    if (!g.ok || b->count < 3)
-        return;
-    memset(&dr, 0, sizeof dr);
-    dr.t = gb_target_for(s);
-    if (!dr.t || !gb_scissor(s, dr.t, &dr.scissor)) {
-        g.st.skipped++;
-        return;
-    }
-    gb_target_load(dr.t);
+    memset(dr, 0, sizeof *dr);
+    dr->t = gb_target_for(s);
+    if (!dr->t || !gb_scissor(s, dr->t, &dr->scissor))
+        return 0;
+    gb_target_load(dr->t);
     if (rs->zeta_va)
-        dr.d = gb_depth_for(rs->zeta_va, dr.t->w, dr.t->h);
+        dr->d = gb_depth_for(rs->zeta_va, dr->t->w, dr->t->h);
 
     zs = gb_z_scale(rs);
-    dr.k.xf[0] = 2.0f / (float)dr.t->w;
-    dr.k.xf[1] = 2.0f / (float)dr.t->h;
-    dr.k.xf[2] = 1.0f / zs;
-    dr.k.tx[2] = (rs->alpha_test_enable && rs->alpha_func >= 0x200 && rs->alpha_func < 0x207)
-               ? (float)(rs->alpha_func - 0x200) : -1.0f;
-    dr.k.tx[3] = (float)(rs->alpha_ref & 0xFF);
-    if (b->combiner && b->extra) {
-        if (gb_rc_prepare(&dr, b)) {
-            g.st.rc_draws++;
-        } else {
-            /* Not translatable: stage 0 modulated by diffuse, as before combiners. */
-            g.st.rc_fallback++;
-            dr.rc_ps = NULL;
-            memset(dr.srvs, 0, sizeof dr.srvs);
-            memset(dr.samps, 0, sizeof dr.samps);
-        }
+    dr->k.xf[0] = 2.0f / (float)dr->t->w;
+    dr->k.xf[1] = 2.0f / (float)dr->t->h;
+    dr->k.xf[2] = 1.0f / zs;
+    dr->k.tx[2] = (rs->alpha_test_enable && rs->alpha_func >= 0x200 && rs->alpha_func < 0x207)
+                ? (float)(rs->alpha_func - 0x200) : -1.0f;
+    dr->k.tx[3] = (float)(rs->alpha_ref & 0xFF);
+    if (rc && !gb_rc_prepare(dr, b)) {
+        /* Not translatable: stage 0 modulated by diffuse, as before combiners. */
+        dr->rc_ps = NULL;
+        memset(dr->srvs, 0, sizeof dr->srvs);
+        memset(dr->samps, 0, sizeof dr->samps);
+        if (rc == 2)
+            return -1;
     }
-    if (!dr.rc_ps && b->texture) {
-        dr.srv = gb_texture(b->texture, dr.t, &dr.k.tx[0], &dr.k.tx[1]);
-        dr.samp = gb_sampler(b->texture);
-        if (!dr.samp)
-            dr.srv = NULL;
+    if (!dr->rc_ps && b->texture) {
+        dr->srv = gb_texture(b->texture, dr->t, &dr->k.tx[0], &dr->k.tx[1]);
+        dr->samp = gb_sampler(b->texture);
+        if (!dr->samp)
+            dr->srv = NULL;
     }
-    dr.k.xf[3] = dr.srv ? 1.0f : 0.0f;
+    dr->k.xf[3] = dr->srv ? 1.0f : 0.0f;
 
-    dr.bs = gb_blend_state(rs->blend_enable ? 1u : 0u, rs->blend_src, rs->blend_dst,
-                           rs->blend_eq, gb_write_mask(rs->color_mask, dr.t->bpp));
+    dr->bs = gb_blend_state(rs->blend_enable ? 1u : 0u, rs->blend_src, rs->blend_dst,
+                            rs->blend_eq, gb_write_mask(rs->color_mask, dr->t->bpp));
     if (rs->blend_src == 0x8003 || rs->blend_src == 0x8004
         || rs->blend_dst == 0x8003 || rs->blend_dst == 0x8004) {
         /* D3D11 has no constant-alpha factor: every channel of the factor is the alpha. */
-        dr.blend_factor[0] = dr.blend_factor[1] = dr.blend_factor[2] =
-        dr.blend_factor[3] = (float)(bc >> 24) / 255.0f;
+        dr->blend_factor[0] = dr->blend_factor[1] = dr->blend_factor[2] =
+        dr->blend_factor[3] = (float)(bc >> 24) / 255.0f;
     } else {
-        dr.blend_factor[0] = (float)((bc >> 16) & 0xFF) / 255.0f;
-        dr.blend_factor[1] = (float)((bc >> 8) & 0xFF) / 255.0f;
-        dr.blend_factor[2] = (float)(bc & 0xFF) / 255.0f;
-        dr.blend_factor[3] = (float)(bc >> 24) / 255.0f;
+        dr->blend_factor[0] = (float)((bc >> 16) & 0xFF) / 255.0f;
+        dr->blend_factor[1] = (float)((bc >> 8) & 0xFF) / 255.0f;
+        dr->blend_factor[2] = (float)(bc & 0xFF) / 255.0f;
+        dr->blend_factor[3] = (float)(bc >> 24) / 255.0f;
     }
-    if (!dr.d)
-        dr.dss = gb_depth_state(0, 0x207, 0);
+    if (!dr->d)
+        dr->dss = gb_depth_state(0, 0x207, 0);
     else if (rs->depth_test_enable)
-        dr.dss = gb_depth_state(1, rs->depth_func, rs->depth_write ? 1u : 0u);
+        dr->dss = gb_depth_state(1, rs->depth_func, rs->depth_write ? 1u : 0u);
     else if (rs->depth_write)
-        dr.dss = gb_depth_state(1, 0x207, 1);    /* D3D11 cannot write depth with the test off */
+        dr->dss = gb_depth_state(1, 0x207, 1);    /* D3D11 cannot write depth with the test off */
     else
-        dr.dss = gb_depth_state(0, 0x207, 0);
-    if (!dr.bs || !dr.dss)
+        dr->dss = gb_depth_state(0, 0x207, 0);
+    return dr->bs && dr->dss ? 1 : -1;
+}
+
+static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
+{
+    GbDraw dr;
+    uint32_t drawn;
+    int rc = b->combiner && b->extra, st;
+
+    if (!g.ok || b->count < 3)
+        return;
+    st = gb_setup(&dr, s, b, rc);
+    if (!st) {
+        g.st.skipped++;
+        return;
+    }
+    if (rc) {
+        if (dr.rc_ps)
+            g.st.rc_draws++;
+        else
+            g.st.rc_fallback++;
+    }
+    if (st < 0)
         return;
 
     drawn = gb_submit(&dr, b->vertices, dr.rc_ps ? b->extra : NULL, b->count);
@@ -1786,6 +1852,241 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     gb_target_mark(dr.t, &dr.scissor);
     g.st.draws++;
     g.st.tris += drawn / 3;
+}
+
+/* ── Vertex programs ─────────────────────────────────────────────────────
+ *
+ * A vertex-program batch can arrive untransformed (draw_program): the program
+ * becomes an HLSL vertex shader (nv2a_vsh_hlsl.c) that ends in the combiner
+ * vertex shader's screen-to-clip transform, so the combiner pixel shaders and
+ * every other piece of state are exactly gb_draw's. */
+
+typedef char gb_vsh_cb_slots[NV2A_VSH_HLSL_CB_XF == NV2A_VSH_HLSL_CB_CONST + 1 ? 1 : -1];
+
+/* The program path's buffers, made on its first batch; 0 if it is available. */
+static int gb_vsh_init(void)
+{
+    D3D11_BUFFER_DESC bd;
+    ID3D11Buffer *cbs[2];
+    const char *dump;
+    HRESULT hr;
+
+    if (g.vsh_state)
+        return g.vsh_state > 0 ? 0 : -1;
+    g.vsh_state = -1;
+    memset(&bd, 0, sizeof bd);
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    bd.ByteWidth = GB_VSH_VB_BYTES;
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    hr = ID3D11Device_CreateBuffer(g.dev, &bd, NULL, &g.vb_vsh);
+    if (SUCCEEDED(hr)) {
+        bd.ByteWidth = GB_VSH_IB_COUNT * 4u;
+        bd.BindFlags = D3D11_BIND_INDEX_BUFFER;
+        hr = ID3D11Device_CreateBuffer(g.dev, &bd, NULL, &g.ib_vsh);
+    }
+    if (SUCCEEDED(hr)) {
+        bd.ByteWidth = 192u * 16u;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        hr = ID3D11Device_CreateBuffer(g.dev, &bd, NULL, &g.cb_vsh_c);
+    }
+    if (SUCCEEDED(hr)) {
+        bd.ByteWidth = sizeof(Nv2aVshHlslXf);
+        hr = ID3D11Device_CreateBuffer(g.dev, &bd, NULL, &g.cb_vsh_x);
+    }
+    if (FAILED(hr)) {
+        gb_fail("vertex-program buffers", hr);
+        GB_RELEASE(g.vb_vsh);
+        GB_RELEASE(g.ib_vsh);
+        GB_RELEASE(g.cb_vsh_c);
+        GB_RELEASE(g.cb_vsh_x);
+        return -1;
+    }
+    g.vb_vsh_pos = GB_VSH_VB_BYTES;         /* the first write discards */
+    g.ib_vsh_pos = GB_VSH_IB_COUNT;
+    /* The other vertex shaders read only b0, so these stay bound. */
+    cbs[0] = g.cb_vsh_c;
+    cbs[1] = g.cb_vsh_x;
+    ID3D11DeviceContext_VSSetConstantBuffers(g.ctx, NV2A_VSH_HLSL_CB_CONST, 2, cbs);
+    dump = getenv("RECOMP_VSH_HLSL_DUMP");
+    g.vsh_dump = dump && strcmp(dump, "1") == 0;
+    g.vsh_state = 1;
+    return 0;
+}
+
+/* The compiled shader for the batch's program, generated on first use; NULL if
+ * it failed, now or before. */
+static GbVsh *gb_vsh_shader(const Nv2aProgramBatch *p)
+{
+    static char src[GB_VSH_SRC_BYTES];
+    D3D11_INPUT_ELEMENT_DESC el[16];
+    size_t bytes = (size_t)p->program_len * sizeof *p->program;
+    GbVsh *e = NULL, *lru = NULL;
+    LARGE_INTEGER t0, t1;
+    ID3DBlob *code;
+    UINT nel = 0;
+    unsigned i;
+    HRESULT hr;
+    int len;
+
+    for (i = 0; i < GB_MAX_VSH; i++) {
+        GbVsh *c = &g.vsh[i];
+        if (c->used && c->hash == p->program_hash && c->mask == p->input_mask
+            && c->len == p->program_len && memcmp(c->words, p->program, bytes) == 0) {
+            c->last_use = ++g.use_clock;
+            return c->failed ? NULL : c;
+        }
+        if (!c->used) {
+            if (!lru || lru->used)
+                lru = c;
+        } else if (!lru || (lru->used && c->last_use < lru->last_use)) {
+            lru = c;
+        }
+    }
+    e = lru;
+    GB_RELEASE(e->il);
+    GB_RELEASE(e->vs);
+    free(e->words);
+    memset(e, 0, sizeof *e);
+    e->words = (uint32_t (*)[4])malloc(bytes);
+    if (!e->words)
+        return NULL;
+    memcpy(e->words, p->program, bytes);
+    e->used = 1;
+    e->hash = p->program_hash;
+    e->mask = p->input_mask;
+    e->len = p->program_len;
+    e->last_use = ++g.use_clock;
+
+    QueryPerformanceCounter(&t0);
+    len = nv2a_vsh_hlsl(p->program, p->program_len, p->input_mask, src, sizeof src);
+    if (len > 0 && g.vsh_dump) {
+        fprintf(stderr, "[GPUBE] vertex program %08X (%u instructions, inputs %04X):\n%s\n",
+                p->program_hash, p->program_len, p->input_mask, src);
+        fflush(stderr);
+    }
+    code = len > 0 ? gb_compile_src((GbCompileFn)g.compile, src, (size_t)len,
+                                    NV2A_VSH_HLSL_ENTRY, "vs_4_0", 1) : NULL;
+    if (code) {
+        hr = ID3D11Device_CreateVertexShader(g.dev, ID3D10Blob_GetBufferPointer(code),
+                                             ID3D10Blob_GetBufferSize(code), NULL, &e->vs);
+        /* float4 ATTRn per input read, packed in ascending n. */
+        for (i = 0; i < 16; i++) {
+            if (!((p->input_mask >> i) & 1u))
+                continue;
+            el[nel].SemanticName = "ATTR";
+            el[nel].SemanticIndex = i;
+            el[nel].Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            el[nel].InputSlot = 0;
+            el[nel].AlignedByteOffset = 16u * nel;
+            el[nel].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+            el[nel].InstanceDataStepRate = 0;
+            nel++;
+        }
+        if (SUCCEEDED(hr) && nel)
+            hr = ID3D11Device_CreateInputLayout(g.dev, el, nel, ID3D10Blob_GetBufferPointer(code),
+                                                ID3D10Blob_GetBufferSize(code), &e->il);
+        GB_RELEASE(code);
+        if (FAILED(hr)) {
+            gb_fail("vertex-program shader", hr);
+            GB_RELEASE(e->il);
+            GB_RELEASE(e->vs);
+        }
+    }
+    QueryPerformanceCounter(&t1);
+    g.st.vsh_compile_ticks += (uint64_t)(t1.QuadPart - t0.QuadPart);
+    if (e->vs) {
+        g.st.vsh_shaders++;
+        return e;
+    }
+    e->failed = 1;
+    g.st.vsh_compile_fail++;
+    if (g.vsh_fail_said++ < 2) {
+        /* Recompile loudly once, so the error and the source are in the log. */
+        fprintf(stderr, "[GPUBE] vertex-program shader failed (program %08X, %u instructions,"
+                        " inputs %04X); source:\n%s\n", p->program_hash, p->program_len,
+                p->input_mask, len > 0 ? src : "(did not fit, or no FINAL)");
+        if (len > 0) {
+            code = gb_compile_src((GbCompileFn)g.compile, src, (size_t)len,
+                                  NV2A_VSH_HLSL_ENTRY, "vs_4_0", 0);
+            GB_RELEASE(code);
+        }
+        fflush(stderr);
+    }
+    return NULL;
+}
+
+static int gb_vsh_decline(void)
+{
+    g.st.vsh_fallback++;
+    return 0;
+}
+
+/* Draw a vertex-program batch by its translated program; 0 hands it back to the
+ * executor's CPU transform, which then draws it through gb_draw. */
+static int gb_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aProgramBatch *p)
+{
+    GbDraw dr;
+    GbVsh *vsh;
+    Nv2aVshHlslXf xf;
+    uint32_t nin = 0, k, vbytes;
+    UINT stride, voff = 0, ioff;
+    uint8_t *dst;
+
+    if (!g.ok || !b->combiner || !p->program_len || !p->positions || !p->index_count
+        || p->index_count % 3)
+        return gb_vsh_decline();
+    for (k = 0; k < 16; k++)
+        nin += (p->input_mask >> k) & 1u;
+    stride = 16u * nin;
+    if ((uint64_t)p->positions * stride > GB_VSH_VB_BYTES || p->index_count > GB_VSH_IB_COUNT)
+        return gb_vsh_decline();
+    vbytes = p->positions * stride;
+    if (gb_vsh_init() != 0)
+        return gb_vsh_decline();
+    vsh = gb_vsh_shader(p);
+    if (!vsh)
+        return gb_vsh_decline();
+    /* The combiner path or nothing, so the pixel shaders get what they expect. */
+    if (gb_setup(&dr, s, b, 2) <= 0)
+        return gb_vsh_decline();
+
+    xf.xf[0] = dr.k.xf[0];
+    xf.xf[1] = dr.k.xf[1];
+    xf.xf[2] = dr.k.xf[2];
+    xf.xf[3] = 0.0f;
+    xf.fog[0] = p->fog_enable ? 1.0f : 0.0f;
+    xf.fog[1] = (float)p->fog_mode;
+    xf.fog[2] = p->fog_param[0];
+    xf.fog[3] = p->fog_param[1];
+    if (!gb_cb_write(g.cb_vsh_c, p->constants, 192u * sizeof *p->constants)
+        || !gb_cb_write(g.cb_vsh_x, &xf, sizeof xf)
+        || !gb_cb_write(g.cb_rc, &dr.rck, sizeof dr.rck))
+        return gb_vsh_decline();
+    if (nin) {
+        dst = (uint8_t *)gb_ring_map(g.vb_vsh, GB_VSH_VB_BYTES, &g.vb_vsh_pos, vbytes, 1);
+        if (!dst)
+            return gb_vsh_decline();
+        memcpy(dst, p->inputs, vbytes);
+        ID3D11DeviceContext_Unmap(g.ctx, (ID3D11Resource *)g.vb_vsh, 0);
+        voff = g.vb_vsh_pos;
+        g.vb_vsh_pos += vbytes;
+    }
+    dst = (uint8_t *)gb_ring_map(g.ib_vsh, GB_VSH_IB_COUNT, &g.ib_vsh_pos, p->index_count, 4);
+    if (!dst)
+        return gb_vsh_decline();
+    memcpy(dst, p->indices, (size_t)p->index_count * 4u);
+    ID3D11DeviceContext_Unmap(g.ctx, (ID3D11Resource *)g.ib_vsh, 0);
+    ioff = g.ib_vsh_pos;
+    g.ib_vsh_pos += p->index_count;
+
+    gb_bind(&dr, vsh, stride, voff);
+    ID3D11DeviceContext_DrawIndexed(g.ctx, p->index_count, ioff, 0);
+    gb_target_mark(dr.t, &dr.scissor);
+    g.st.draws++;
+    g.st.tris += p->index_count / 3;
+    g.st.vsh_draws++;
+    return 1;
 }
 
 static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t flags,
@@ -1872,7 +2173,8 @@ static void gb_stats(int force)
                     " tex_hits=%llu tex_undecodable=%llu rt_aliases=%llu rt_copies=%llu"
                     " rt_loads=%llu readbacks=%llu readback_ms=%.1f dropped_tris=%llu"
                     " skipped=%llu rc_draws=%llu rc_shaders=%llu rc_compile_fail=%llu"
-                    " rc_fallback=%llu rc_compile_ms=%.1f\n",
+                    " rc_fallback=%llu rc_compile_ms=%.1f vsh_draws=%llu vsh_shaders=%llu"
+                    " vsh_compile_fail=%llu vsh_fallback=%llu vsh_compile_ms=%.1f\n",
             g.frame, (unsigned long long)g.st.draws, (unsigned long long)g.st.tris,
             (unsigned long long)g.st.clears, (unsigned long long)g.st.tex_uploads,
             (unsigned long long)g.st.tex_hits, (unsigned long long)g.st.tex_undecodable,
@@ -1882,6 +2184,10 @@ static void gb_stats(int force)
             (unsigned long long)g.st.rc_draws, (unsigned long long)g.st.rc_shaders,
             (unsigned long long)g.st.rc_compile_fail, (unsigned long long)g.st.rc_fallback,
             g.qpf.QuadPart ? (double)g.st.rc_compile_ticks * 1000.0 / (double)g.qpf.QuadPart
+                           : 0.0,
+            (unsigned long long)g.st.vsh_draws, (unsigned long long)g.st.vsh_shaders,
+            (unsigned long long)g.st.vsh_compile_fail, (unsigned long long)g.st.vsh_fallback,
+            g.qpf.QuadPart ? (double)g.st.vsh_compile_ticks * 1000.0 / (double)g.qpf.QuadPart
                            : 0.0);
     fflush(stderr);
 }
@@ -1905,7 +2211,7 @@ static void gb_flip(void)
     g.stats_said = 1;
 }
 
-static const Nv2aBackend s_d3d11_backend = { gb_clear, gb_draw, gb_flip };
+static const Nv2aBackend s_d3d11_backend = { gb_clear, gb_draw, gb_flip, gb_draw_program };
 
 int nv2a_d3d11_backend_install(void)
 {

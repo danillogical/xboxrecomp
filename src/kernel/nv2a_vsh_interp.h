@@ -50,6 +50,11 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
 
+/* The current program as decoded for nv2a_vsh_run; 0 if there is no FINAL within program memory. */
+int nv2a_vsh_program_info(const uint32_t (**words)[4], uint32_t *len, uint32_t *hash,
+                          uint32_t *input_mask, int *writes_constants);
+const float (*nv2a_vsh_constants(void))[4];   /* all NV2A_VSH_CONSTANTS registers */
+
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
 const float *nv2a_vsh_constant(uint32_t index);   /* for traces */

@@ -349,6 +349,9 @@ static struct {
      * together are what a 3D scene needs and a 2D one never used. */
     uint32_t xf_mode;                   /* TRANSFORM_EXECUTION_MODE: 2 = program */
     uint32_t batches_program, verts_program, tris_behind;
+    /* Program batches a back end drew from the untransformed program, and the
+     * triangles in them; and those it declined. */
+    uint32_t batches_program_gpu, tris_program_gpu, batches_program_gpu_fallback;
     /* Where program-path triangles go, so "nothing drew" has a reason. */
     uint32_t xf_degenerate, xf_offscreen, xf_drawn;
     uint64_t xf_depth_fail, xf_pixels;
@@ -3534,12 +3537,129 @@ static void backend_program_batch(void)
     s_gpu.tris_drawn += c.n / 3;
 }
 
+/* Triangle list of batch positions, for a back end that runs the program. */
+static uint32_t *s_pidx;
+static uint32_t s_pidx_n, s_pidx_cap;
+static int s_pidx_short;    /* the list could not grow, so the batch is declined */
+/* The program's inputs for every position, packed. */
+static float (*s_pin)[4];
+static size_t s_pin_cap;
+
+static void program_tri(uint32_t p0, uint32_t p1, uint32_t p2, void *ctx)
+{
+    (void)ctx;
+    if (s_pidx_n + 3 > s_pidx_cap) {
+        uint32_t cap = s_pidx_cap ? s_pidx_cap * 2 : 3 * 4096;
+        uint32_t *g = (uint32_t *)realloc(s_pidx, cap * sizeof *g);
+        if (!g) {
+            s_pidx_short = 1;
+            return;
+        }
+        s_pidx = g;
+        s_pidx_cap = cap;
+    }
+    s_pidx[s_pidx_n++] = p0;
+    s_pidx[s_pidx_n++] = p1;
+    s_pidx[s_pidx_n++] = p2;
+}
+
+/* Offer a program batch to the back end untransformed. 1: it drew it; 0: it
+ * declined; -1: not offered (no support, disabled, or a program it cannot take). */
+static int backend_program_gpu(uint32_t n)
+{
+    static int enabled = -1;
+    const uint32_t (*words)[4];
+    uint32_t len, hash, mask, i, k, nin = 0;
+    int writes_c, usable[4], st;
+    Nv2aProgramBatch prog;
+    Nv2aSurface surf;
+    Nv2aTexture tex;
+    Nv2aBatch batch;
+
+    if (!s_backend || !s_backend->draw_program)
+        return -1;
+    if (enabled < 0) {
+        const char *e = getenv("RECOMP_GPU_VSH");
+        enabled = !(e && strcmp(e, "0") == 0);
+    }
+    if (!enabled || !backend_rc_active())
+        return -1;
+    if (!nv2a_vsh_program_info(&words, &len, &hash, &mask, &writes_c) || writes_c)
+        return -1;
+
+    for (k = 0; k < NV2A_VSH_INPUTS; k++)
+        nin += (mask >> k) & 1u;
+    if ((size_t)n * nin > s_pin_cap) {
+        size_t cap = (size_t)n * nin * 2;
+        float (*g)[4] = (float (*)[4])realloc(s_pin, cap * sizeof *g);
+        if (!g)
+            return 0;
+        s_pin = g;
+        s_pin_cap = cap;
+    }
+    for (i = 0; i < n; i++) {
+        float (*dst)[4] = s_pin + (size_t)i * nin;
+        for (k = 0; k < NV2A_VSH_INPUTS; k++)
+            if ((mask >> k) & 1u)
+                fetch_attr(&s_gpu.attr[k], s_gpu.idx[i], *dst++);
+    }
+    s_pidx_n = 0;
+    s_pidx_short = 0;
+    for_each_triangle(program_tri, NULL);
+    if (!s_pidx_n || s_pidx_short)
+        return 0;
+
+    current_surface(&surf);
+    memset(&batch, 0, sizeof batch);
+    batch.state = &s_gpu.rs;
+    for (st = 0; st < 4; st++)
+        usable[st] = s_gpu.texs[st].valid;
+    if (usable[0]) {
+        backend_texture(0, &tex);
+        batch.texture = &tex;
+    }
+    backend_fill_rc(&batch, 1, usable);
+    batch.extra = NULL;
+
+    memset(&prog, 0, sizeof prog);
+    prog.program = words;
+    prog.program_len = len;
+    prog.program_hash = hash;
+    prog.constants = nv2a_vsh_constants();
+    prog.input_mask = mask;
+    prog.inputs = s_pin;
+    prog.positions = n;
+    prog.indices = s_pidx;
+    prog.index_count = s_pidx_n;
+    prog.fog_enable = s_gpu.fog_enable;
+    prog.fog_mode = s_gpu.fog_mode;
+    prog.fog_param[0] = s_gpu.fog_param[0];
+    prog.fog_param[1] = s_gpu.fog_param[1];
+    return s_backend->draw_program(&surf, &batch, &prog) ? 1 : 0;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
     uint32_t tris_before = s_gpu.tris_drawn;
     uint64_t px_before = s_gpu.xf_pixels;
     uint64_t t_vsh = pb_qpc_now(), t_tri;
+    int gpu = backend_program_gpu(n);
+
+    if (gpu > 0) {
+        s_t_vsh += pb_qpc_now() - t_vsh;
+        s_gpu.batches_program++;
+        s_gpu.verts_program += n;
+        s_gpu.tris_drawn += s_pidx_n / 3;
+        s_gpu.batches_program_gpu++;
+        s_gpu.tris_program_gpu += s_pidx_n / 3;
+        count_texture_stage();
+        s_gpu.drawn_offset = s_gpu.color_offset;
+        present_track_drawn(&s_present, s_gpu.color_offset);
+        return;
+    }
+    if (gpu == 0)
+        s_gpu.batches_program_gpu_fallback++;
 
     for (i = 0; i < n; i++)
         if (!transform_vertex(s_gpu.idx[i], &s_xf[i])) {
@@ -5111,6 +5231,10 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                     " %u triangles dropped behind the eye\n",
             s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+    fprintf(stderr, "[GPU]   of those, %u batches (%u triangles) drawn by the back end"
+                    " from the program, %u declined to the CPU\n",
+            s_gpu.batches_program_gpu, s_gpu.tris_program_gpu,
+            s_gpu.batches_program_gpu_fallback);
     fprintf(stderr, "[GPU]   of the rest: %u degenerate/NaN, %u off-surface,"
                     " %u drawn; pixels %llu written, %llu depth-failed;"
                     " x %.0f..%.0f y %.0f..%.0f z %g..%g\n",

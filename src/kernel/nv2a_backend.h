@@ -17,7 +17,9 @@
  * Fixed-function, pre-transformed and vertex-program batches all arrive the
  * same way: the executor transforms fixed-function vertices itself and runs
  * vertex programs on the CPU (nv2a_vsh_interp.c), so a back end only ever sees surface
- * pixels. Blend, depth and alpha state arrive in Nv2aRenderState.
+ * pixels. Blend, depth and alpha state arrive in Nv2aRenderState. A back end
+ * that sets draw_program instead receives vertex-program batches untransformed,
+ * with the program and its inputs, and may decline to fall back to the CPU.
  *
  * Register-combiner state, all four texture stages and the per-vertex values
  * the combiners read (specular, fog, four texture coordinates) arrive in
@@ -105,6 +107,23 @@ typedef struct {
     uint32_t clip_plane_mode;       /* SET_SHADER_CLIP_PLANE_MODE, for CLIPPLANE stages */
 } Nv2aBatch;
 
+/* A vertex-program batch handed over untransformed, for a back end that runs the
+ * program itself. Nv2aBatch accompanies it with vertices NULL, count 0, extra NULL. */
+typedef struct {
+    const uint32_t (*program)[4];  /* program memory from the start slot to FINAL, inclusive */
+    uint32_t program_len;          /* instructions */
+    uint32_t program_hash;         /* FNV-1a over the program words */
+    const float (*constants)[4];   /* all 192 c[] registers at draw time */
+    uint32_t input_mask;           /* bit n set: the program reads vn */
+    const float (*inputs)[4];      /* positions x popcount(input_mask) float4s; per position the
+                                    * used inputs in ascending n, each as fetch_attr produced it */
+    uint32_t positions;            /* batch positions (vertices as submitted) */
+    const uint32_t *indices;       /* triangle list of batch positions, as for_each_triangle emits */
+    uint32_t index_count;          /* multiple of 3 */
+    uint32_t fog_enable, fog_mode; /* as the executor's fog unit uses them (see fog_factor) */
+    float fog_param[2];
+} Nv2aProgramBatch;
+
 typedef struct {
     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
      * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
@@ -112,6 +131,9 @@ typedef struct {
                   uint32_t flags, uint32_t argb, uint32_t zstencil);
     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
     void (*flip)(void);
+    /* Optional (NULL: unsupported). Draw a vertex-program batch from the program
+     * and raw inputs. Returns 1 if drawn, 0 to make the executor transform on the CPU. */
+    int (*draw_program)(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aProgramBatch *p);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
