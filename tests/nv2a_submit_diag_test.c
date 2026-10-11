@@ -750,238 +750,116 @@ static void test_retry_recovers_after_pushbuffer_patch(void)
     nv2a_set_kick_observer(NULL);
 }
 
-/* The budget transcript must be readable AFTER the run, and must say WHICH limit
- * fired and WHERE -- including the case that used to print nothing at all.
- *
- * Why this test exists: the walk can exhaust its budget at a packet HEADER or
- * inside a packet's PARAMETERS, and only the header path used to print. A
- * parameter-heavy stream therefore stopped SILENTLY, and the investigation could
- * only infer "inside a packet" from the absence of a dump. Worse, the submit log
- * stops after 64 walks and the old "last 32 visits" array was written only at
- * headers but indexed by total words, so its slots were sparse and out of order.
- *
- * This drives a single packet whose parameter count exceeds the word budget, so
- * the stop is deterministic and the transcript is the only record of it. */
-static void test_budget_stop_transcript(void)
+/* Assert that no budget-stop diagnostic of any kind was produced. The packet
+ * cap is a per-unit yield and the word-cap guards are fail-closed and
+ * unreachable for a header-driven stream, so a walk of well-formed packets
+ * must leave every budget field at zero. */
+static void check_no_budget_stop(NV2AState *d, const char *log, const char *what)
 {
-    NV2AState *d;
+    CHECK(strcmp(diag(d), "budget_exhausted") != 0,
+          "%s: diag is budget_exhausted", what);
+    CHECK(g_nv2a_submit_state.budget_stops == 0,
+          "%s: budget_stops=%u, want 0", what, g_nv2a_submit_state.budget_stops);
+    CHECK(g_nv2a_submit_state.budget_at_packet_limit == 0,
+          "%s: budget_at_packet_limit=%u, want 0 (nothing sets it any more)",
+          what, g_nv2a_submit_state.budget_at_packet_limit);
+    CHECK(d->pfifo.budget_events_total == 0,
+          "%s: budget_events_total=%u, want 0", what, d->pfifo.budget_events_total);
+    if (log) {
+        CHECK(count_of(log, "budget_exhausted") == 0,
+              "%s: a budget_exhausted line was logged:\n%s", what, log);
+        CHECK(count_of(log, "LIMIT=packets") == 0,
+              "%s: a packet-limit line was logged:\n%s", what, log);
+    }
+}
+
+/* A stream of many tiny packets is CONSUMED IN FULL, in units.
+ *
+ * Why this test exists: it used to build 1024 two-word packets to reach the
+ * packet cap, because the cap was a walk-cumulative STOP and that was the only
+ * way to provoke a budget stop, whose latched first-stop transcript (frontier,
+ * trajectory window, freeze-against-retry) it then asserted. The cap is now a
+ * per-unit YIELD: the unit commits and the walk continues from the same
+ * header. The word-cap guards that remain are fail-closed and unreachable for
+ * header-driven packets, so no stop can be provoked from a stream at all and
+ * the transcript is not testable here.
+ *
+ * What it checks instead, for the same stream: the walk drains (GET reaches
+ * PUT), the packet cap splits it into exactly two units (1024 packets, then
+ * the 1 left over: SET_OBJECT is packet 1 of the first unit), every unit
+ * stays under the word budget, and no budget-stop diagnostic is set -- also
+ * after a retry of the same ring with a parameter word changed, which must be
+ * walked as freshly as the first. */
+static void test_packet_dense_stream_is_consumed_in_units(void)
+{
+    NV2AState *d = fresh();
     Pb pb;
     const char *log;
     uint32_t i;
 
-    d = fresh();
     CHECK(g_nv2a_submit_state.budget_stops == 0,
           "reset left budget_stops=%u", g_nv2a_submit_state.budget_stops);
 
-    /* Build a stream that exhausts the WORD budget INSIDE a packet's parameters.
-     *
-     * The arithmetic is forced by the walk's own guards, so it is worth writing
-     * down, including the SET_OBJECT that opens the stream (1 header + 1 handle =
-     * 2 words, and it is NOT staged because SET_OBJECT is handled separately):
-     *
-     *   SET_OBJECT:              2 words                    words 2
-     *   packet 1: count 2047  -> 1 header + 2047 params  = 2048 words, words 2050
-     *   packet 2: count 2043  -> 1 header + 2043 params  = 2044 words, words 4094
-     *   packet 3: count    5  -> header passes the sink check (staged 4090 + 5 =
-     *                            4095 <= 4096), taking words to 4095; ONE parameter
-     *                            is then read (words 4096) and the next hits the
-     *                            cap with FOUR still unread.
-     *
-     * So the stop is INSIDE the packet with count == 4 -- not 1, which is what the
-     * earlier version of this comment claimed by leaving the SET_OBJECT out of its
-     * own account.
-     *
-     * Non-incrementing packets are used because an incrementing count that large
-     * would run the method past 0x1FFC and be rejected by the method-range check
-     * first -- a different diagnostic. 0x1760 is in the generated table. */
-    /* Build a stream that exhausts the PACKET budget.
-     *
-     * This test used to drive the WORD cap from inside a packet's parameters,
-     * with counts 2047/2043/5 chosen so the 4096-word cap fired four parameters
-     * into the third packet. That is no longer reachable, and the reason is
-     * structural rather than a changed constant: the walk now ends a UNIT at a
-     * packet header when the incoming packet would not fit
-     * (unit_words + 1 + count > NV2A_SUBMIT_MAX_WORDS). A packet is at most
-     * 1 + 2047 = 2048 words, so a unit that starts empty always fits at least
-     * one whole packet, and after that packet the unit is at most 4096 words.
-     * The in-parameter word cap therefore cannot fire for a header-driven
-     * packet; it survives only as a fail-closed guard.
-     *
-     * The 1024-PACKET cap is still reachable and still a STOP (it is
-     * deliberately not a yield: 1025 one-word packets is under the word budget,
-     * and treating it as a yield would make the contract case in
-     * tests/test_nv2a_contract.c accept). So the transcript's job -- proving
-     * that the FIRST stop is latched, readable from a dump, and frozen against
-     * a retry -- is tested through the packet cap instead. */
     cap_begin();
     pb_begin(&pb, PB_BASE);
-    pb_method(&pb, 0, 0x0000, H_KELVIN);                 /* bind NV097 */
-    /* 1024 packets of count 1 (2 words each: header + one parameter), so the
-     * stream reaches the packet cap at 2050 words -- well under the word
-     * budget, which is what makes the packet cap the limit under test.
-     *
-     * count 1 rather than 0 matters for the retry below: with a parameter
-     * present, a word inside the trajectory window can be corrupted WITHOUT
-     * changing control flow, which is what lets the retry reach the same cap
-     * and prove the latched transcript is not overwritten. Corrupting a
-     * one-word NOP header would instead reject as an unknown opcode and never
-     * reach the budget stop at all. */
-    for (i = 0; i < 1024u; ++i) {
+    pb_method(&pb, 0, 0x0000, H_KELVIN);                 /* bind NV097: packet 1 */
+    for (i = 0; i < 1024u; ++i) {                        /* packets 2..1025 */
         pb_word(&pb, (1u << 18) | 0x1760u);
         pb_word(&pb, 0x22220000u + i);
     }
     kick(d, pb.start, pb.at);
-
     log = cap_end();
-    CHECK(get_ptr(d) == pb.start,
-          "a rejected budget stream must not move GET (got %08X, want %08X)",
-          get_ptr(d), pb.start);
-    CHECK(strcmp(nv2a_submit_diagnostic(g_nv2a_submit_state.diag),
-                 "budget_exhausted") == 0,
-          "diag is %s, want budget_exhausted",
-          nv2a_submit_diagnostic(g_nv2a_submit_state.diag));
 
-    /* The latched transcript is what a dump reads later. */
-    CHECK(g_nv2a_submit_state.budget_stops == 1,
-          "budget_stops=%u, want 1", g_nv2a_submit_state.budget_stops);
-    CHECK(g_nv2a_submit_state.budget_at_packet_limit == 1,
-          "the PACKET cap fired, so at_packet_limit must be 1 (got %u)",
-          g_nv2a_submit_state.budget_at_packet_limit);
-    CHECK(g_nv2a_submit_state.budget_in_param == 0,
-          "a packet-cap stop is at a HEADER, so in_param must be 0 (got %u)",
-          g_nv2a_submit_state.budget_in_param);
-    CHECK(g_nv2a_submit_state.budget_packets == 1024u,
-          "budget_packets=%u, want 1024", g_nv2a_submit_state.budget_packets);
-    CHECK(g_nv2a_submit_state.budget_words < NV2A_SUBMIT_MAX_WORDS,
-          "the word budget must NOT be reached (words=%u)",
-          g_nv2a_submit_state.budget_words);
-    /* local_pc is where the walk was consuming, which is NOT the rollback
-     * origin `at`. Reporting `at` as the failure point is the trap this field
-     * exists to avoid, so they must differ here. */
-    CHECK(g_nv2a_submit_state.budget_local_pc != g_nv2a_submit_state.at,
-          "budget_local_pc (%08X) must not equal the rollback origin at (%08X)",
-          g_nv2a_submit_state.budget_local_pc, g_nv2a_submit_state.at);
-    /* The frontier is the header the walk refused to consume. It is exactly
-     * `budget_words` words past the start, because words counts every word
-     * consumed and the frontier is the next unconsumed one -- asserted
-     * self-consistently rather than with a hardcoded offset. */
-    CHECK(g_nv2a_submit_state.budget_local_pc ==
-              pb.start + g_nv2a_submit_state.budget_words * 4u,
-          "budget_local_pc=%08X is not budget_words (%u) past the start %08X",
-          g_nv2a_submit_state.budget_local_pc,
-          g_nv2a_submit_state.budget_words, pb.start);
+    CHECK(get_ptr(d) == pb.at,
+          "the walk did not drain: GET %08X, want PUT %08X (diag=%s)",
+          get_ptr(d), pb.at, diag(d));
+    CHECK(strcmp(diag(d), "ok") == 0, "the walk was rejected (diag=%s)", diag(d));
+    CHECK(g_nv2a_submit_state.consecutive_rejections == 0,
+          "consecutive_rejections=%u, want 0",
+          g_nv2a_submit_state.consecutive_rejections);
+    CHECK(d->pfifo.submit_walk_units == 2u,
+          "submit_walk_units=%u, want 2 (1024 packets, then 1)",
+          d->pfifo.submit_walk_units);
+    check_no_budget_stop(d, log, "first walk");
 
-    /* The trajectory must be DENSE and chronological: that is what makes it
-     * usable as a cyclic-walk discriminator, which the old header-only ring was
-     * not. */
-    CHECK(d->pfifo.budget_trace_count == 64u,
-          "budget_trace_count=%u, want a full 64-word window",
-          d->pfifo.budget_trace_count);
-    {
-        /* The window must be contiguous, so it is a real trajectory rather than a
-         * sparse ring of headers. */
-        CHECK(d->pfifo.budget_trace_va[63] - d->pfifo.budget_trace_va[62] == 4u,
-              "trajectory addresses are not contiguous: %08X then %08X",
-              d->pfifo.budget_trace_va[62], d->pfifo.budget_trace_va[63]);
-        CHECK(d->pfifo.budget_trace_va[63] == g_nv2a_submit_state.budget_local_pc - 4u,
-              "the newest trajectory entry (%08X) is not the word before the frontier (%08X)",
-              d->pfifo.budget_trace_va[63], g_nv2a_submit_state.budget_local_pc);
-    }
-
-    /* The transcript is ALSO printed, so a run whose dump is not read still
-     * shows which limit fired. */
-    CHECK(count_of(log, "budget_exhausted") >= 1,
-          "no budget_exhausted line in the log:\n%s", log);
-    CHECK(count_of(log, "LIMIT=packets(1024)") == 1,
-          "the log must name the packet cap:\n%s", log);
-
-    /* A later retry must NOT overwrite the latched first stop: the first is the
-     * event of interest, and a rejection is retried on every kick. The trajectory
-     * must freeze with it -- otherwise the array would describe the most recent
-     * walk while the scalars describe the first, and the two would contradict
-     * each other.
-     *
-     * The retry DELIBERATELY changes a word the walk will consume. Retrying the
-     * identical stream and comparing counts cannot detect the defect, because the
-     * counts are identical either way; only the CONTENTS differ. The whole 64-word
-     * window is compared, not a couple of entries: the corrupted word lands
-     * mid-window, so spot-checking the ends would miss it. */
-    {
-        uint32_t va_before[64], word_before[64];
-        uint32_t trace_before = d->pfifo.budget_trace_count;
-        uint32_t pc_before = g_nv2a_submit_state.budget_local_pc;
-        unsigned k, changed = 0;
-
-        memcpy(va_before, d->pfifo.budget_trace_va, sizeof(va_before));
-        memcpy(word_before, d->pfifo.budget_trace_word, sizeof(word_before));
-
-        /* Corrupt a word INSIDE the window the retry will consume -- mid-window,
-         * where a rolling trajectory would record the new value.
-         *
-         * The offset must land on a PARAMETER, not a header. Packets here are
-         * two words (header + one parameter), so an even offset from the
-         * frontier -- which is itself a header -- is another header, and
-         * corrupting a header changes control flow: the retry then rejects as
-         * an unknown opcode and never reaches the budget stop at all, so the
-         * latched-first-stop property would go untested. 31 words is odd, so it
-         * is a parameter, and it is still inside the 64-word window. */
-        wr32(g_window, g_nv2a_submit_state.budget_local_pc - 31u * 4u, 0xDEADBEEFu);
-
-        kick(d, pb.start, pb.at);
-
-        CHECK(g_nv2a_submit_state.budget_stops == 2,
-              "budget_stops=%u, want 2 after a retry", g_nv2a_submit_state.budget_stops);
-        CHECK(g_nv2a_submit_state.budget_local_pc == pc_before,
-              "the latched frontier was overwritten by a retry (%08X -> %08X)",
-              pc_before, g_nv2a_submit_state.budget_local_pc);
-        CHECK(d->pfifo.budget_trace_count == trace_before,
-              "the trajectory kept rolling after the first stop (%u -> %u)",
-              trace_before, d->pfifo.budget_trace_count);
-        for (k = 0; k < 64u; ++k) {
-            if (d->pfifo.budget_trace_word[k] != word_before[k] ||
-                d->pfifo.budget_trace_va[k] != va_before[k]) {
-                if (!changed) {
-                    fprintf(stderr, "FAIL trajectory[%u] changed after a retry: "
-                            "va %08X->%08X word %08X->%08X\n", k,
-                            va_before[k], d->pfifo.budget_trace_va[k],
-                            word_before[k], d->pfifo.budget_trace_word[k]);
-                }
-                ++changed;
-            }
-        }
-        CHECK(changed == 0,
-              "%u of 64 trajectory entries were replaced by a later walk", changed);
-    }
+    /* Walk the same ring again with a parameter word changed: still drains
+     * in two units, still no stop, and nothing is latched. */
+    wr32(g_window, pb.start + 100u * 8u + 4u, 0xDEADBEEFu);
+    cap_begin();
+    kick(d, pb.start, pb.at);
+    log = cap_end();
+    CHECK(get_ptr(d) == pb.at,
+          "the second walk did not drain: GET %08X, want %08X (diag=%s)",
+          get_ptr(d), pb.at, diag(d));
+    CHECK(d->pfifo.submit_walk_units == 2u,
+          "second walk: submit_walk_units=%u, want 2", d->pfifo.submit_walk_units);
+    check_no_budget_stop(d, log, "second walk");
 }
 
-/* ── the budget stop's CONTINUATION: does the same submission resume at the
- *    boundary the last committed unit published? ────────────────────────────
+/* ── a WORD-budget yield followed by a drain: does the walk commit the first
+ *    unit at the boundary and finish the rest, with the resume audit quiet? ──
  *
- * The latched first-stop transcript answers "why did the walk stop". It cannot
- * answer "did the work resume correctly", because that is a property of the
- * PAIR (stop, resume) and the interesting stop is usually not the first. This
- * is the measurement that turns "benign resumable chunking" from an assumption
- * into an observation, and it is the one that must FAIL if a stop ever resumes
- * from the submission's start instead of its committed boundary -- the Case C
- * signature.
+ * This used to build a stream whose cumulative packet count hit the cap in the
+ * second unit, so a unit had committed (committed_get != start_get) before the
+ * budget stop, and asserted that the next walk resumed at that committed
+ * boundary (the Case C signature check). With the cap now a per-unit yield
+ * there is no stop to resume from, and the resume audit only records
+ * resumptions of a STOP.
  *
- * The stream is built so a unit COMMITS before the packet cap fires, which is
- * what makes committed_get != start_get. That distinction is the whole point:
- * if nothing committed, "resumes at the committed boundary" and "restarts the
- * submission" name the same address and the test cannot discriminate. The
- * construction is therefore packets of 5 words (count 4, non-incrementing):
- * 819 of them fill a unit to 4095 words, the yield fires, that unit commits,
- * and the cap then fires in unit 2 at 1024 packets total.
- *
- * (The sibling test test_packet_cap_can_pin_get_without_a_commit records the
- * case where NO unit commits -- a packet-dense stream -- which is a genuine
- * structural property of the cap's scope, not a mistake in this one.) */
-static void test_budget_stop_resumes_at_committed_boundary(void)
+ * The same stream (a SET_OBJECT, then 1030 five-word packets = 5152 words) is
+ * what remains meaningful: it exceeds the 4096-word unit budget, so the WORD
+ * yield fires at a header (818 packets plus SET_OBJECT = 4092 words; a 5-word
+ * packet would reach 4097) and the walk commits that unit, then walks the rest
+ * as unit 2. Packets per unit stay under the cap, which isolates the word
+ * yield. Asserted: GET reaches PUT, exactly two units, no stop, and the resume
+ * audit counters are untouched because nothing stopped. */
+static void test_word_yield_commits_in_units(void)
 {
     NV2AState *d = fresh();
     Pb pb;
-    uint32_t i, committed_get, start_get;
-    uint32_t matched_before, mismatched_before;
+    uint32_t i;
+    uint32_t matched_before, mismatched_before, stalled_before, drained_before;
+    const char *log;
 
     pb_begin(&pb, PB_BASE);
     pb_method(&pb, 0, 0x0000, H_KELVIN);                 /* bind NV097 */
@@ -993,216 +871,103 @@ static void test_budget_stop_resumes_at_committed_boundary(void)
         pb_word(&pb, 0x55550002u + i);
         pb_word(&pb, 0x55550003u + i);
     }
-    cap_begin();
-    kick(d, pb.start, pb.at);
-    cap_end();
-
-    start_get = pb.start;
-    CHECK(strcmp(diag(d), "budget_exhausted") == 0,
-          "expected budget_exhausted, got %s", diag(d));
-    CHECK(d->pfifo.budget_events_total == 1,
-          "budget_events_total=%u, want 1", d->pfifo.budget_events_total);
-
-    {
-        uint32_t idx = (d->pfifo.budget_event_next + NV2A_BUDGET_EVENT_MAX - 1u)
-                     % NV2A_BUDGET_EVENT_MAX;
-        const NV2ABudgetEvent *ev = &d->pfifo.budget_events[idx];
-        CHECK(ev->seq == 1, "event seq=%u, want 1", ev->seq);
-        CHECK(ev->limit_packets == 1,
-              "the PACKET cap fired, so limit_packets must be 1 (got %u)",
-              ev->limit_packets);
-        CHECK(ev->start_get == start_get,
-              "event start_get=%08X, want the walk origin %08X",
-              ev->start_get, start_get);
-        CHECK(ev->packets == 1024u,
-              "event packets=%u, want exactly the cap (1024)", ev->packets);
-        /* A unit must have committed: that is what makes the resume boundary
-         * a different address from the submission origin. */
-        committed_get = ev->committed_get;
-        CHECK(ev->units >= 1u,
-              "no unit committed before the stop (units=%u): the word yield "
-              "should have fired at 819 five-word packets", ev->units);
-        CHECK(committed_get != start_get,
-              "nothing committed before the stop (committed_get=%08X == start=%08X): "
-              "this construction cannot test the resume boundary",
-              committed_get, start_get);
-        CHECK(ev->local_pc != committed_get,
-              "the frontier equals the committed boundary (%08X): nothing was rolled back",
-              ev->local_pc);
-        CHECK(ev->tail_words > 0,
-              "tail_words=%u, want > 0 (a rolled-back tail is the whole point)",
-              ev->tail_words);
-        CHECK(d->pfifo.budget_expected_get == committed_get,
-              "the outstanding stop expects a resume at %08X, want the committed "
-              "boundary %08X", d->pfifo.budget_expected_get, committed_get);
-        /* GET must have ADVANCED to the committed boundary, not stayed at the
-         * submission origin: that is what "resumable" means. */
-        CHECK(get_ptr(d) == committed_get,
-              "GET is %08X but the committed boundary is %08X: the committed unit "
-              "did not publish its GET", get_ptr(d), committed_get);
-    }
-
-    /* ── the resume: walk again, and check WHERE it started ──────────────
-     *
-     * The next walk must start at the committed boundary, because that is
-     * where GET now is. The audit must therefore record a MATCH; a mismatch
-     * here would mean the walk restarted the submission instead of resuming
-     * its tail -- the Case C signature.
-     *
-     * The resume is driven with kick_put, NOT kick: `kick` writes GET as well
-     * as PUT, and writing GET back to the submission origin is precisely the
-     * "restart the submission" action this test is trying to detect. Using it
-     * here would make the test manufacture its own mismatch (measured: it did,
-     * reporting mismatched=1 at committed_get=00004FF0). The real guest
-     * advances PUT and leaves GET to the model, so kick_put is the faithful
-     * driver. */
     matched_before = d->pfifo.budget_resume_matched;
     mismatched_before = d->pfifo.budget_resume_mismatched;
-    {
-        uint32_t stalled_before = d->pfifo.budget_resume_stalled;
-        uint32_t drained_before = d->pfifo.budget_resume_drained;
+    stalled_before = d->pfifo.budget_resume_stalled;
+    drained_before = d->pfifo.budget_resume_drained;
 
-        cap_begin();
-        kick_put(d, pb.at);
-        cap_end();
-        {
-            uint32_t m = d->pfifo.budget_resume_matched;
-            uint32_t x = d->pfifo.budget_resume_mismatched;
-            CHECK(m + x == matched_before + mismatched_before + 1u,
-                  "the resume was not audited at all (matched %u->%u, mismatched %u->%u)",
-                  matched_before, m, mismatched_before, x);
-            CHECK(m == matched_before + 1u,
-                  "the resume did not begin at the committed boundary (%08X): "
-                  "matched=%u mismatched=%u (a mismatch means the submission was "
-                  "restarted, not resumed)", committed_get, m, x);
-            CHECK(x == mismatched_before,
-                  "a resume was counted as a mismatch (%u -> %u) although GET was at "
-                  "the committed boundary %08X", mismatched_before, x, committed_get);
-            /* The positive arm must also show that the resume was NOT a stall,
-             * and that it DRAINED -- otherwise the new counters would only ever
-             * be exercised in the negative direction. */
-            CHECK(d->pfifo.budget_resume_stalled == stalled_before,
-                  "a resume that made progress was counted as a STALL (%u -> %u)",
-                  stalled_before, d->pfifo.budget_resume_stalled);
-            CHECK(d->pfifo.budget_resume_drained == drained_before + 1u,
-                  "a resume that reached PUT was not counted as drained "
-                  "(%u -> %u)", drained_before, d->pfifo.budget_resume_drained);
-        }
-    }
+    cap_begin();
+    kick(d, pb.start, pb.at);
+    log = cap_end();
+
+    CHECK(get_ptr(d) == pb.at,
+          "the walk did not drain: GET %08X, want PUT %08X (diag=%s)",
+          get_ptr(d), pb.at, diag(d));
+    CHECK(d->pfifo.submit_walk_units == 2u,
+          "submit_walk_units=%u, want 2 (word yield at 4092 words, then the rest)",
+          d->pfifo.submit_walk_units);
+    check_no_budget_stop(d, log, "word-yield walk");
+    CHECK(d->pfifo.budget_resume_matched == matched_before &&
+              d->pfifo.budget_resume_mismatched == mismatched_before &&
+              d->pfifo.budget_resume_stalled == stalled_before &&
+              d->pfifo.budget_resume_drained == drained_before,
+          "the resume audit moved although no stop occurred");
 }
 
-/* A packet-dense stream CANNOT commit anything before the cap fires, so GET is
- * pinned and every retry repeats the same rejected walk.
+/* REGRESSION: a ring with more than one packet cap's worth of tiny packets
+ * between GET and PUT advances GET on the FIRST walk.
  *
- * This is a real structural property of the cap's SCOPE, and it is recorded
- * rather than papered over. The word budget is per-UNIT (`unit_words` resets at
- * each unit commit) while the packet counter is WALK-CUMULATIVE (`packets` is
- * never reset). For a stream whose packets are small, the word yield
- * (`unit_words + 1 + count > NV2A_SUBMIT_MAX_WORDS`) never fires before the
- * packet cap does -- so the walk reaches the cap having committed NOTHING, and
- * `regs[NV_PFIFO_CACHE1_DMA_GET] = pc` (which is inside `if (ok)`) never runs.
- * GET therefore does not move, and `nv2a_retry_stalled_walk` re-walks the
- * identical stream to the identical stop.
+ * This is the livelock itself. The packet cap used to be a walk-cumulative
+ * STOP while the word budget was a per-unit yield, so for packets small enough
+ * that the word yield never fired first, the walk reached the cap having
+ * committed nothing. GET therefore never moved and every retry
+ * (nv2a_retry_stalled_walk) repeated the identical rejected walk. This test
+ * previously recorded that behaviour as an expected property; it now asserts
+ * its absence.
  *
- * 1025 two-word packets is 2050 words -- half the word budget -- so this is not
- * a "too much work" case; it is the packet term binding at a scope the word
- * term does not share.
- *
- * WHY THIS IS A TEST AND NOT A FIX: the packet cap is deliberately a STOP
- * (compatibility ledger L40) so that 1025 one-word packets rejects rather than
- * being accepted. Changing the scope is a behaviour change with its own
- * evidence requirement. This test exists so the property is measured and
- * cannot be lost, and so that any future change to the scope has to state what
- * it did to this case. */
-static void test_packet_cap_can_pin_get_without_a_commit(void)
+ * 3000 two-word packets (6000 words, 2000 words per ~1024-packet unit, well
+ * under the word budget) are walked in two steps, as a guest would submit
+ * them: first up to packet 1100, then to the end by advancing PUT only.
+ * Every walk must move GET to its PUT, none may count as a stall, and a
+ * retry with nothing left to do must not disturb that. */
+static void test_packet_cap_does_not_livelock_get(void)
 {
     NV2AState *d = fresh();
     Pb pb;
-    uint32_t i;
-    uint32_t get_after_first, get_after_many;
+    uint32_t i, mid_put, get_after_first, w;
+    uint32_t stalled_before;
+    const char *log;
 
     pb_begin(&pb, PB_BASE);
     pb_method(&pb, 0, 0x0000, H_KELVIN);                 /* bind NV097 */
-    for (i = 0; i < 1025u; ++i) {                        /* count 1 = 2 words */
+    for (i = 0; i < 3000u; ++i) {                        /* count 1 = 2 words */
+        if (i == 1100u) mid_put = pb.at;
         pb_word(&pb, (1u << 18) | 0x1760u);
         pb_word(&pb, 0x66660000u + i);
     }
+    stalled_before = d->pfifo.budget_resume_stalled;
+
+    /* First walk: 1101 packets, more than one cap, nothing else committed. */
     cap_begin();
-    kick(d, pb.start, pb.at);
-    cap_end();
-
-    CHECK(strcmp(diag(d), "budget_exhausted") == 0,
-          "expected budget_exhausted, got %s", diag(d));
+    kick(d, pb.start, mid_put);
+    log = cap_end();
     get_after_first = get_ptr(d);
-    CHECK(get_after_first == pb.start,
-          "GET moved to %08X although no unit could have committed (want the "
-          "origin %08X)", get_after_first, pb.start);
+    CHECK(get_after_first != pb.start,
+          "GET did not move off the origin %08X on the first walk of >1024 "
+          "tiny packets: the packet-cap livelock is back (diag=%s)",
+          pb.start, diag(d));
+    CHECK(get_after_first == mid_put,
+          "first walk: GET %08X, want its PUT %08X", get_after_first, mid_put);
+    CHECK(d->pfifo.submit_walk_units == 2u,
+          "first walk: submit_walk_units=%u, want 2 (1024, then 77)",
+          d->pfifo.submit_walk_units);
+    check_no_budget_stop(d, log, "first walk");
 
-    {
-        uint32_t idx = (d->pfifo.budget_event_next + NV2A_BUDGET_EVENT_MAX - 1u)
-                     % NV2A_BUDGET_EVENT_MAX;
-        const NV2ABudgetEvent *ev = &d->pfifo.budget_events[idx];
-        CHECK(ev->units == 0u,
-              "units=%u, want 0: the packet cap must have fired before any unit "
-              "commit for a 2-word-packet stream", ev->units);
-        CHECK(ev->committed_get == ev->start_get,
-              "committed_get=%08X != start_get=%08X, so a unit DID commit and "
-              "this stream no longer demonstrates the zero-commit case",
-              ev->committed_get, ev->start_get);
-        CHECK(ev->packets == 1024u,
-              "packets=%u, want 1024 (the cap)", ev->packets);
-        CHECK(ev->words < NV2A_SUBMIT_MAX_WORDS,
-              "words=%u reached the word budget, so this is not isolating the "
-              "packet term", ev->words);
-    }
+    /* Second walk: the remaining 1900 packets, PUT only, as the guest does. */
+    cap_begin();
+    kick_put(d, pb.at);
+    log = cap_end();
+    CHECK(get_ptr(d) == pb.at,
+          "second walk: GET %08X, want PUT %08X (diag=%s)",
+          get_ptr(d), pb.at, diag(d));
+    CHECK(d->pfifo.submit_walk_units == 2u,
+          "second walk: submit_walk_units=%u, want 2 (1024, then 876)",
+          d->pfifo.submit_walk_units);
+    check_no_budget_stop(d, log, "second walk");
 
-    /* The retry cannot make progress: GET is pinned, so the same walk stops at
-     * the same place. This is the livelock the scope asymmetry permits, and it
-     * is asserted rather than described so a future change to the cap's scope
-     * must consciously update it.
-     *
-     * AND IT IS THE CONTROL FOR THE AUDIT'S DISCRIMINATING POWER. A resume
-     * audit that only compared the next walk's start GET against the previous
-     * stop's committed boundary would score every one of these retries as a
-     * MATCH, because GET is exactly where it was -- the default outcome. The
-     * audit must instead record them as STALLS. If this ever reports matched,
-     * the audit has gone vacuous again.
-     *
-     * ONE capture window around the whole loop: cap_begin opens a tmpfile and
-     * cap_end closes it, so nesting them per iteration would leak five file
-     * handles and their buffers for no benefit -- the walk's own output is what
-     * matters, not which retry produced it. */
-    {
-        uint32_t matched_before = d->pfifo.budget_resume_matched;
-        uint32_t stalled_before = d->pfifo.budget_resume_stalled;
-        cap_begin();
-        for (i = 0; i < 5u; ++i)
-            nv2a_retry_stalled_walk(d);
-        cap_end();
-        CHECK(d->pfifo.budget_resume_stalled == stalled_before + 5u,
-              "five retries of a zero-commit stream produced %u stall(s), want 5: "
-              "a boundary-only audit would score these as matches and cannot "
-              "distinguish resumption from a repeated stall",
-              d->pfifo.budget_resume_stalled - stalled_before);
-        CHECK(d->pfifo.budget_resume_matched == matched_before,
-              "a zero-progress retry was counted as a MATCH (%u -> %u): the "
-              "audit is vacuous again",
-              matched_before, d->pfifo.budget_resume_matched);
-        CHECK(d->pfifo.budget_resume_mismatched == 0u,
-              "a zero-progress retry at the CORRECT boundary was counted as a "
-              "boundary MISMATCH (%u); the two failure modes are being conflated",
-              d->pfifo.budget_resume_mismatched);
-    }
-    get_after_many = get_ptr(d);
-    CHECK(get_after_many == get_after_first,
-          "GET advanced from %08X to %08X across retries of a stream that "
-          "commits nothing: the zero-commit case is no longer a livelock",
-          get_after_first, get_after_many);
-    CHECK(d->pfifo.budget_events_total >= 6u,
-          "budget_events_total=%u, want >= 6 (the first stop plus five retries "
-          "that stopped again)", d->pfifo.budget_events_total);
+    /* Re-walking a drained ring changes nothing. */
+    cap_begin();
+    for (w = 0; w < 5u; ++w)
+        nv2a_retry_stalled_walk(d);
+    log = cap_end();
+    CHECK(get_ptr(d) == pb.at,
+          "GET moved to %08X on retries of a drained ring (want %08X)",
+          get_ptr(d), pb.at);
+    CHECK(d->pfifo.budget_resume_stalled == stalled_before,
+          "stalls went %u -> %u: a walk of tiny packets must never stall",
+          stalled_before, d->pfifo.budget_resume_stalled);
+    check_no_budget_stop(d, log, "retries");
 }
-
 
 /* The packet cap must be a real EXPERIMENTAL VARIABLE, and lowering it must
  * actually change the walk's behaviour.
@@ -1210,19 +975,20 @@ static void test_packet_cap_can_pin_get_without_a_commit(void)
  * Why this test exists: the cap experiment ("does a smaller cap starve the
  * guest, or does continuation just chunk more?") is only evidence if the
  * override actually takes effect. An override that silently did nothing would
- * make three identical runs look like a clean invariance result and would
- * "prove" benign chunking for the wrong reason. So this asserts the negative
- * direction too: a stream that DRAINS at the default cap must STOP at a low
- * cap, and the stop must be the packet limit rather than the word limit.
+ * make three identical runs look like a clean invariance result. The cap is a
+ * per-unit yield now, so its effect is visible as the NUMBER OF UNITS a walk
+ * commits, not as a stop: the same stream must commit in one unit at the
+ * default cap and in more at a low cap, draining either way.
  */
 static void test_packet_cap_override_is_effective(void)
 {
     NV2AState *d;
     Pb pb;
     uint32_t i;
+    const char *log;
 
-    /* 100 packets of count 1 = 200 words: far below BOTH the default packet
-     * cap and the word budget, so it drains cleanly. */
+    /* 100 packets of count 1 plus SET_OBJECT = 101 packets: far below BOTH the
+     * default packet cap and the word budget, so it is one unit. */
     nv2a_packet_cap_override(0);
     CHECK(nv2a_packet_cap() == 1024u,
           "the default packet cap is %u, want 1024", nv2a_packet_cap());
@@ -1236,25 +1002,23 @@ static void test_packet_cap_override_is_effective(void)
     }
     cap_begin();
     kick(d, pb.start, pb.at);
-    cap_end();
+    log = cap_end();
     {
         uint32_t gv = get_ptr(d);
         CHECK(gv == pb.at,
               "100 packets did not drain at the default cap (get=%08X, want %08X, diag=%s)",
               gv, pb.at, diag(d));
     }
-    CHECK(d->pfifo.budget_events_total == 0,
-          "the default-cap walk recorded %u budget event(s), want 0",
-          d->pfifo.budget_events_total);
+    CHECK(d->pfifo.submit_walk_units == 1u,
+          "default cap: submit_walk_units=%u, want 1", d->pfifo.submit_walk_units);
+    check_no_budget_stop(d, log, "default cap");
 
-    /* Now the same stream with a cap BELOW its packet count. This is the
-     * assertion that would fail if the override were inert.
+    /* Now a stream with more packets than the lowered cap. This is the
+     * assertion that would fail if the override were inert: the walk would
+     * still commit one unit.
      *
-     * 40 packets rather than 100: the cap under test is 32, so the stream only
-     * has to exceed it, and a smaller stream keeps the capture window well
-     * inside cap_end()'s static 64 KB buffer. (The transcript is a fixed
-     * buffer, so a test that fills stderr past it truncates rather than
-     * crashing -- but a smaller stream keeps the assertions readable.) */
+     * 40 packets rather than 100 keeps the capture window well inside
+     * cap_end()'s static 64 KB buffer. */
     nv2a_packet_cap_override(32);
     CHECK(nv2a_packet_cap() == 32u,
           "the override did not take effect (cap=%u)", nv2a_packet_cap());
@@ -1268,22 +1032,15 @@ static void test_packet_cap_override_is_effective(void)
     }
     cap_begin();
     kick(d, pb.start, pb.at);
-    cap_end();
-    CHECK(strcmp(diag(d), "budget_exhausted") == 0,
-          "a cap of 32 did not stop a 40-packet stream (diag=%s)", diag(d));
-    CHECK(d->pfifo.budget_events_total == 1,
-          "budget_events_total=%u, want 1 at cap 32", d->pfifo.budget_events_total);
-    CHECK(g_nv2a_submit_state.budget_packets == 32u,
-          "the walk consumed %u packets, want exactly the cap (32)",
-          g_nv2a_submit_state.budget_packets);
-    CHECK(g_nv2a_submit_state.budget_at_packet_limit == 1,
-          "the PACKET cap fired, so at_packet_limit must be 1 (got %u)",
-          g_nv2a_submit_state.budget_at_packet_limit);
-    /* The word budget is nowhere near: this is the packet term, not the word
-     * term, which is what the experiment varies. */
-    CHECK(g_nv2a_submit_state.budget_words < NV2A_SUBMIT_MAX_WORDS,
-          "the word budget was reached (%u) at cap 32, so this test is not "
-          "isolating the packet term", g_nv2a_submit_state.budget_words);
+    log = cap_end();
+    CHECK(get_ptr(d) == pb.at,
+          "a cap of 32 did not let a 40-packet stream drain (get=%08X, want %08X, diag=%s)",
+          get_ptr(d), pb.at, diag(d));
+    /* 41 packets at a cap of 32: 32, then 9. */
+    CHECK(d->pfifo.submit_walk_units == 2u,
+          "cap 32: submit_walk_units=%u, want 2 (32 packets, then 9)",
+          d->pfifo.submit_walk_units);
+    check_no_budget_stop(d, log, "cap 32");
 
     /* Restore the contract default for every later test. */
     nv2a_packet_cap_override(0);
@@ -1880,9 +1637,9 @@ int main(void)
     test_retry_with_nothing_rejected();
     test_retry_recovers_after_ramht_write();
     test_retry_recovers_after_pushbuffer_patch();
-    test_budget_stop_transcript();
-    test_budget_stop_resumes_at_committed_boundary();
-    test_packet_cap_can_pin_get_without_a_commit();
+    test_packet_dense_stream_is_consumed_in_units();
+    test_word_yield_commits_in_units();
+    test_packet_cap_does_not_livelock_get();
     test_packet_cap_override_is_effective();
     test_vblank_delivery_audit();
     test_unit_split_preserves_order();

@@ -1990,10 +1990,9 @@ bool nv2a_submit_pending(NV2AState *d)
      * always advances. That is why NO in-packet carry is needed, and why a
      * packet is never split -- the only case that could commit half a matrix.
      *
-     * The packet term (1024) is deliberately NOT a yield: it stays a stop, so
-     * a stream of many tiny packets still rejects as it does today
-     * (tests/test_nv2a_contract.c pins exactly that for 1025 one-word
-     * packets, which is under the word budget and would otherwise accept).
+     * The packet cap (nv2a_packet_cap(), default 1024) is a per-unit yield
+     * like the word budget, so a stream of many tiny packets commits in units
+     * instead of livelocking on a walk that never advances GET.
      *
      * `units` counts committed units; `unit_words_total` is the structural
      * cycle backstop that replaces the old "one walk <= 4096 words" cap: a
@@ -2003,7 +2002,7 @@ bool nv2a_submit_pending(NV2AState *d)
     /* The page-validation cache is kept across walks; submit_read_word drops it
      * when the pushbuffer mapping or the guest memory generation changes. */
     for (;;) {
-    uint32_t unit_words = 0;
+    uint32_t unit_words = 0, unit_packets = 0;
     bool yielded = false;
     while (pc != put || count) {
         uint32_t h;
@@ -2112,15 +2111,12 @@ bool nv2a_submit_pending(NV2AState *d)
             continue;
         }
         address = pc;
-        /* The PACKET cap stays a STOP, not a yield: a stream of many tiny
-         * packets is rejected exactly as it is today (1025 one-word packets is
-         * under the word budget and would otherwise accept).
-         * tests/test_nv2a_contract.c pins that case. Evaluated before the yield
-         * so a packet-bound stream terminates on the same walk. */
-        if (packets >= nv2a_packet_cap()) {
-            d->pfifo.submit_diag = NV2A_SUBMIT_BUDGET; ok = false;
-            submit_budget_stop(d, get, put, begin, end, pc, words, packets,
-                               count, method, ret, address, false, true);
+        /* The packet cap is a per-unit yield like the word budget: a stream of
+         * many tiny packets commits in units instead of livelocking. The
+         * header is not consumed, so the next unit resumes at it; a unit that
+         * has consumed a packet always has unit_words > 0, so progress holds. */
+        if (unit_packets >= nv2a_packet_cap() && unit_words > 0) {
+            yielded = true;
             break;
         }
         /* Yield point: end this unit AT this header -- not yet consumed -- when
@@ -2156,7 +2152,7 @@ bool nv2a_submit_pending(NV2AState *d)
         if (seen_count < 512) { seen[seen_count * 2] = pc; seen[seen_count * 2 + 1] = ret; ++seen_count; }
         if (!submit_read_word(d, pc, &h)) { d->pfifo.submit_diag = NV2A_SUBMIT_UNREADABLE; ok = false; break; }
         submit_trace_word(d, pc, h);
-        pc = submit_advance(d, pc); ++words; ++unit_words; ++packets;
+        pc = submit_advance(d, pc); ++words; ++unit_words; ++packets; ++unit_packets;
         if ((h & 0xe0000003u) == 0x20000000u || (h & 3u) == 1u || (h & 3u) == 2u || h == 0x00020000u) {
             uint32_t target;
             if ((h & 3u) == 2u) { if (ret) { d->pfifo.submit_diag = NV2A_SUBMIT_LOOP; ok = false; break; } ret = pc; }
@@ -2313,6 +2309,7 @@ bool nv2a_submit_pending(NV2AState *d)
             admitted_count = 0;
             d->pfifo.sink_count = 0;
             unit_words = 0;
+            unit_packets = 0;
             if (actions) action_stage_begin(d, &st);
             continue;
         }
