@@ -395,6 +395,9 @@ struct MCPXAPUState {
 
     bool exiting;
     bool set_irq;
+    /* Reports the interrupt line level to the host; NULL until one is attached. */
+    void (*irq_sink)(void *opaque, int asserted);
+    void *irq_sink_opaque;
 
     QemuThread apu_thread;
     QemuMutex lock;

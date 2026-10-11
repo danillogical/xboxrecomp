@@ -16,6 +16,12 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
+bool apu_hook_set_irq_sink(void (*sink)(void *opaque, int asserted),
+                           void *opaque)
+{
+    return mcpx_apu_set_irq_sink(g_apu_state, sink, opaque);
+}
+
 /* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux the
  * equivalent goes through sigaction + ucontext_t (Stage 2 / main.c). For
  * now the whole body is Windows-only so apu_emu links on Debian. */

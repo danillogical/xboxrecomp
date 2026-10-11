@@ -30,6 +30,11 @@ extern "C" {
  * declines every access while this is NULL. */
 extern MCPXAPUState *g_apu_state;
 
+/* Route the live APU's interrupt line to its host owner (see
+ * mcpx_apu_set_irq_sink). Returns false while g_apu_state is NULL. */
+bool apu_hook_set_irq_sink(void (*sink)(void *opaque, int asserted),
+                           void *opaque);
+
 #if defined(_WIN32)
 #include <windows.h>
 

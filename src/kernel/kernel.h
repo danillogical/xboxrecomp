@@ -525,6 +525,14 @@ void xbox_kernel_bridge_init(void);
  * -1 if no device is up yet. */
 int xbox_Nv2aAttachIrqLine(void);
 
+/* Route the MCPX APU's interrupt line to the guest's vector 5.
+ *
+ * Call after the APU model exists (g_apu_state set). The model asserts the line
+ * from its status and enable registers and the guest's ISR acknowledges through
+ * its own ISTS write; this only connects the two. Returns 0 on success, -1 if
+ * no APU is up. */
+int xbox_ApuAttachIrqLine(void);
+
 /**
  * Per-title kernel ordinal remap.
  *

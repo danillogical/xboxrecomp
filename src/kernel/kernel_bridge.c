@@ -30,6 +30,7 @@
 #include "xbox_memory_layout.h"
 #include "nv2a_state.h"
 #include "nv2a_mmio_hook.h"
+#include "apu_mmio_hook.h"
 #include "nv2a_guest_mem.h"
 #include "recomp_icall_feedback.h"
 #include "guest_meter.h"
@@ -2598,6 +2599,51 @@ static void kernel_deliver_nv2a_irq(void)
     }
 }
 
+/* The APU's interrupt line, delivered like the NV2A's; its ISR services the front-end trap. */
+#define APU_VECTOR 5u
+
+/* The APU's interrupt line, as reported by the model (written from the APU frame or a guest MMIO thread). */
+static volatile LONG g_apu_irq_line;
+
+static void kernel_apu_irq_sink(void *opaque, int asserted)
+{
+    (void)opaque;
+    InterlockedExchange(&g_apu_irq_line, asserted ? 1 : 0);
+}
+
+/* Called once the APU model exists. Returns 0 on success. */
+int xbox_ApuAttachIrqLine(void)
+{
+    if (!apu_hook_set_irq_sink(kernel_apu_irq_sink, NULL))
+        return -1;
+    fprintf(stderr, "  [APU] interrupt line attached to vector %u\n",
+            APU_VECTOR);
+    fflush(stderr);
+    return 0;
+}
+
+/* Level-triggered: the ISR runs once per timer tick until the guest clears the source. */
+static int kernel_apu_irq_pending(void)
+{
+    return InterlockedCompareExchange(&g_apu_irq_line, 0, 0)
+        && xbox_GetConnectedInterrupt(APU_VECTOR);
+}
+
+static void kernel_deliver_apu_irq(void)
+{
+    if (!kernel_apu_irq_pending())
+        return;
+    {
+        static unsigned n;
+        int claimed = kernel_raise_interrupt(APU_VECTOR);
+        if (n++ < 3)
+            fprintf(stderr, "  [APU] irq line -> ISR %s\n",
+                    claimed < 0 ? "not callable" :
+                    claimed ? "claimed it" : "declined it");
+        fflush(stderr);
+    }
+}
+
 /* Run whatever is queued. Called from the timer thread, which has the guest
  * stack and TIB that a deferred routine needs. */
 static void kernel_drain_dpcs(void)
@@ -2910,7 +2956,7 @@ static int kernel_timer_dpc_due(long long now)
 static int kernel_serial_tick(int *open, int *token, int *source)
 {
     long long now = (long long)GetTickCount64();
-    int isr = kernel_nv2a_irq_pending();
+    int isr = kernel_nv2a_irq_pending() || kernel_apu_irq_pending();
 
     *open = 0;
     if (!isr && !dpc_pending() && !kernel_timer_dpc_due(now))
@@ -2921,8 +2967,10 @@ static int kernel_serial_tick(int *open, int *token, int *source)
     if (isr) {
         if (xbox_IrqlBlocksDeviceInterrupts())
             xbox_GuestSerialNoteSkip(XBOX_GS_SKIP_ISR);
-        else
+        else {
             kernel_deliver_nv2a_irq();
+            kernel_deliver_apu_irq();
+        }
     }
     if (xbox_IrqlBlocksInterrupts()) {
         if (dpc_pending() || kernel_timer_dpc_due(now))
@@ -2972,6 +3020,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
                                                   &serial_source);
         } else {
             kernel_deliver_nv2a_irq();   /* the GPU's interrupt line */
+            kernel_deliver_apu_irq();    /* the APU's interrupt line */
             kernel_drain_dpcs();         /* deferred work, before due timers */
         }
         now = (long long)GetTickCount64();

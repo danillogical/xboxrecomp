@@ -64,8 +64,28 @@ void mcpx_debug_begin_frame(void) {}
 void mcpx_debug_end_frame(void) {}
 
 /* ============================================================
- * IRQ handling (stubbed - no PCI bus in standalone)
+ * IRQ handling (no PCI bus in standalone; the line goes to the host's sink)
  * ============================================================ */
+
+static void apu_set_irq_line(MCPXAPUState *d, int asserted)
+{
+    if (d->irq_sink) {
+        d->irq_sink(d->irq_sink_opaque, asserted);
+    }
+}
+
+bool mcpx_apu_set_irq_sink(MCPXAPUState *d,
+                           void (*sink)(void *opaque, int asserted),
+                           void *opaque)
+{
+    if (!d) return false;
+    /* The frame thread holds the lock while it runs, so take it as a waiter. */
+    apu_lock_contended(&d->lock, &d->lock_waiters);
+    d->irq_sink = sink;
+    d->irq_sink_opaque = opaque;
+    qemu_mutex_unlock(&d->lock);
+    return true;
+}
 
 static void update_irq(MCPXAPUState *d)
 {
@@ -76,12 +96,10 @@ static void update_irq(MCPXAPUState *d)
         ((d->regs[NV_PAPU_ISTS] & ~NV_PAPU_ISTS_GINTSTS) &
          d->regs[NV_PAPU_IEN])) {
         qatomic_or(&d->regs[NV_PAPU_ISTS], NV_PAPU_ISTS_GINTSTS);
-        /* In standalone mode we don't raise a PCI IRQ; the game's kernel
-         * stub will poll ISTS directly or we'll signal via a flag. */
-        pci_irq_assert(PCI_DEVICE(d));
+        apu_set_irq_line(d, 1);
     } else {
         qatomic_and(&d->regs[NV_PAPU_ISTS], ~NV_PAPU_ISTS_GINTSTS);
-        pci_irq_deassert(PCI_DEVICE(d));
+        apu_set_irq_line(d, 0);
     }
 }
 
@@ -559,6 +577,12 @@ static void *mcpx_apu_frame_thread(void *arg)
             /* Lightweight: just monitor frame (test tone + software mixer) */
             mcpx_apu_monitor_frame(d);
             d->ep_frame_div++;
+        }
+
+        /* A front-end event or trap raised this frame becomes an interrupt line level. */
+        if (d->set_irq) {
+            d->set_irq = false;
+            update_irq(d);
         }
 
         /* Behind schedule throttle() never waits, so hand the lock to queued threads here. */

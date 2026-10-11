@@ -6,6 +6,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,6 +18,17 @@ typedef struct MCPXAPUState MCPXAPUState;
  * ram_ptr: pointer to the base of Xbox physical RAM (64MB).
  * Returns the APU state, or NULL on failure. */
 MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
+
+/* Route the APU's interrupt line to its host owner.
+ *
+ * The standalone build has no PCI bus, so the model otherwise aggregates its
+ * status and enable registers and tells nobody. The sink is called with the
+ * line level each time the model re-evaluates it, from the frame thread or a
+ * guest MMIO thread, possibly with the APU lock held: it must not take that
+ * lock. Returns false if d is NULL. */
+bool mcpx_apu_set_irq_sink(MCPXAPUState *d,
+                           void (*sink)(void *opaque, int asserted),
+                           void *opaque);
 
 /* Shut down and free the APU state. */
 void mcpx_apu_shutdown(MCPXAPUState *d);

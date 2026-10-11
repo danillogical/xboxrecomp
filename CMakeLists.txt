@@ -61,6 +61,9 @@ add_subdirectory(src/nv2a)
 # remains independently organized while the final runtime links both owners.
 target_link_libraries(xbox_kernel PUBLIC xbox_nv2a)
 
+# The kernel delivers the APU's interrupt line (vector 5), so it links the model's sink hook.
+target_link_libraries(xbox_kernel PUBLIC xbox_apu)
+
 # USB: MCPX OHCI host controllers. A title's XAPI is statically linked and
 # drives these registers directly, so a pad only exists if they do.
 add_subdirectory(src/usb)
