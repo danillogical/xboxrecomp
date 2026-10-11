@@ -1852,6 +1852,10 @@ bool nv2a_submit_pending(NV2AState *d)
     uint32_t seen[1024]; unsigned seen_count = 0;
     uint32_t staged_count = 0;
     uint32_t staged_class[8], staged_object[8];
+    /* One-entry cache of nv2a_method_implemented, keyed on class and method; the first word always misses. */
+    bool impl_cached = false;
+    uint32_t impl_class = 0, impl_method = 0;
+    bool impl_result = false;
     bool ok = true;
     bool actions = nv2a_actions_enabled();
     uint32_t stop = NV2A_SUBMIT_OK;
@@ -2014,6 +2018,16 @@ bool nv2a_submit_pending(NV2AState *d)
             if (pc == put || !submit_read_word(d, pc, &param)) { d->pfifo.submit_diag = pc == put ? NV2A_SUBMIT_TRUNCATED : NV2A_SUBMIT_UNREADABLE; ok = false; goto done; }
             submit_trace_word(d, pc, param);
             pc = submit_advance(d, pc); ++words; ++unit_words;
+            bool impl = true;
+            if (method != M_SET_OBJECT && method != 0x0100u) {
+                if (!impl_cached || impl_class != staged_class[subchannel] || impl_method != method) {
+                    impl_result = nv2a_method_implemented(staged_class[subchannel], method);
+                    impl_class = staged_class[subchannel];
+                    impl_method = method;
+                    impl_cached = true;
+                }
+                impl = impl_result;
+            }
             /* Production SET_OBJECT walks RAMHT in claimed PRAMIN.
              * The fixture seam stays opt-in for isolated 11b4b2 tests. */
             if (method == M_SET_OBJECT) {
@@ -2045,7 +2059,7 @@ bool nv2a_submit_pending(NV2AState *d)
                 staged_class[subchannel] = class_id;
                 staged_object[subchannel] = param;
             } else if (method != 0x0100u &&
-                       !nv2a_method_implemented(staged_class[subchannel], method) &&
+                       !impl &&
                        !(admit && (staged_class[subchannel] == NV097_CLASS ||
                                    staged_class[subchannel] == NV_MEMCPY_CLASS ||
                                    staged_class[subchannel] == NV_SURFACES2D_CLASS ||
@@ -2058,8 +2072,7 @@ bool nv2a_submit_pending(NV2AState *d)
                 ok = false;
                 goto done;
             }
-            if (method != M_SET_OBJECT && method != 0x0100u &&
-                !nv2a_method_implemented(staged_class[subchannel], method)) {
+            if (method != M_SET_OBJECT && method != 0x0100u && !impl) {
                 /* Admitted by the switch: staged like an implemented method.
                  * admitted_total counts this unit's admissions (uncapped, and
                  * published then cleared at the unit commit); admitted[] only
