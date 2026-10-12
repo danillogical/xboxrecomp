@@ -149,6 +149,24 @@ if(BUILD_TESTING AND WIN32)
     add_test(NAME xbox_vm_reuse_decommit COMMAND xbox_vm_reuse_test decommit)
     set_tests_properties(xbox_vm_reuse_decommit PROPERTIES TIMEOUT 60)
 
+    # MmGetPhysicalAddress records which form (ordinary RAM or contiguous window)
+    # it last answered for each 4 KB page, and the APU translation uses it: a DSP
+    # scratch range last answered for ordinary RAM stays ordinary RAM even below
+    # the contiguous high-water mark. Drives the REAL layout, kernel_memory.c and
+    # apu_guest_dma_ptr; includes a two-thread race on the answer bitmap.
+    add_executable(xbox_apu_phys_answer_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/apu_phys_answer_test.c
+    )
+    target_include_directories(xbox_apu_phys_answer_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../apu
+        ${XBOXRECOMP_SRC_DIR}
+    )
+    target_link_libraries(xbox_apu_phys_answer_test PRIVATE
+        xbox_kernel platform kernel32)
+    add_test(NAME apu_phys_answer COMMAND xbox_apu_phys_answer_test)
+    set_tests_properties(apu_phys_answer PROPERTIES TIMEOUT 60)
+
     # A file APC must still be pending when NtReadFile's completion returns,
     # and an alertable zero-interval delay must be what runs it. Inline
     # delivery fails the first assertion.
