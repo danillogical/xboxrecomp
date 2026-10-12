@@ -323,9 +323,10 @@ struct apu_watch_snapshot {
  *
  * It does not use & 0x03FFFFFF. See the comment in apu_watch.c.
  *
- * Claim limit: physical/VA aliasing is not modelled. A title that passes a
- * low-RAM VA below the contiguous high-water mark is misrouted into the window,
- * exactly as dma_resolve would do; that case increments GPDMA_AMBIGUOUS.
+ * A page number whose latest MmGetPhysicalAddress answer was for a low-RAM VA
+ * resolves to low RAM before the high-water rule (xbox_PhysIsLowRamAnswer).
+ * Claim limit: an address no such answer covers, below the high-water mark,
+ * still goes to the window, as dma_resolve would; that increments GPDMA_AMBIGUOUS.
  */
 uint8_t *apu_guest_dma_ptr(uint32_t addr, uint32_t len, uint32_t *translated_va);
 

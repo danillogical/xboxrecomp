@@ -209,6 +209,12 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
  * below 256 MB, or 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 uint32_t xbox_ContiguousAllocatedBytes(void);
+/* MmGetPhysicalAddress records which form it last answered for a page number:
+ * low_ram 1 for a low-RAM VA, 0 for a window VA. xbox_PhysIsLowRamAnswer is 1
+ * when every page of [phys, phys+len) was last answered for a low-RAM VA, so a
+ * device can tell a low-RAM page from the window page with the same number. */
+void xbox_PhysNoteAnswer(uint32_t phys, int low_ram);
+int xbox_PhysIsLowRamAnswer(uint32_t phys, uint32_t len);
 /* Give back a block xbox_ContiguousAlloc returned: 1 if freed, 0 if addr is not
  * the start of a live block. Bytes from va to the end of its live block, or 0. */
 int xbox_ContiguousFree(uint32_t addr);

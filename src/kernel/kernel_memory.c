@@ -11,6 +11,7 @@
 
 #include "kernel.h"
 #include "nv2a_guest_mem.h"
+#include "xbox_memory_layout.h"   /* xbox_PhysNoteAnswer */
 #if defined(_WIN32)
 /* _aligned_malloc/_aligned_free; POSIX gets them from win32_compat.h */
 #include <malloc.h>
@@ -183,9 +184,14 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
      * nothing naming this function.
      */
     uint32_t va = (uint32_t)(uintptr_t)BaseAddress;
-    return (ULONG_PTR)((va >= XBOX_CONTIG_BASE &&
-                        (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE)
-                     ? va - XBOX_CONTIG_BASE : va);
+    int window = va >= XBOX_CONTIG_BASE &&
+                 (uint64_t)va < (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+    uint32_t phys = window ? va - XBOX_CONTIG_BASE : va;
+
+    /* The answer is ambiguous for a page number both forms can produce; record
+     * which form this was, so a device handed it can resolve it (the APU). */
+    xbox_PhysNoteAnswer(phys, !window);
+    return (ULONG_PTR)phys;
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)

@@ -432,6 +432,8 @@ static void note_unmapped(uint32_t addr, uint32_t len)
  *      plausibly writes 0x003CC000 and 0x003C0000 instead, because it calls
  *      MmGetPhysicalAddress (ordinal 173, IAT slot 0x001C40E8) on the
  *      DSOUND path.
+ *   2a. otherwise, a page MmGetPhysicalAddress last answered for a low-RAM VA
+ *      is that low-RAM page (see below).
  *   2. otherwise, P < xbox_ContiguousAllocatedBytes() (the high-water mark
  *      g_contig_next - XBOX_CONTIG_BASE, src/kernel/xbox_memory_layout.c:2694,
  *      i.e. everything some MmAllocateContiguousMemory call returned) means the
@@ -469,12 +471,18 @@ static void note_unmapped(uint32_t addr, uint32_t len)
  * g_memory_base (XBOX_MAP_START is 0), so g_memory_base + (0x80000000 + P) is
  * the window's byte P.
  *
- * Claim limit: physical/VA aliasing is not modelled. A title that passes a
- * low-RAM VA below the contiguous high-water mark is misrouted into the window,
- * exactly as dma_resolve would do. That case increments GPDMA_AMBIGUOUS, which
- * is observation plus this claim limit and nothing else -- no row reads it.
+ * Case 2a, before case 2: a page number whose latest MmGetPhysicalAddress
+ * answer was for a low-RAM VA (xbox_PhysIsLowRamAnswer) is that low-RAM page,
+ * even after the contiguous high-water mark has passed it. Without it the GP
+ * scratch pages, low RAM at 0x01430000 and up, were sent into the window once the
+ * stage's allocations reached them, and the DSP wrote over its vertex buffers.
+ *
+ * Claim limit: an address no MmGetPhysicalAddress answer covers is still
+ * ambiguous, and below the high-water mark it goes to the window, exactly as
+ * dma_resolve would do. That case increments GPDMA_AMBIGUOUS, which is
+ * observation plus this claim limit and nothing else -- no row reads it.
  */
-/* Cases 1-3 below, with no side effects: 1 and the translated VA in *t when the
+/* Cases 1-3 (with 2a) below, with no side effects: 1 and the translated VA in *t when the
  * range is mapped, 0 for case 4. *ambiguous is set for a case-2 range that is
  * also mapped low RAM. Shared by the GP path and the VP accessors. */
 static int apu_translate(uint32_t addr, uint32_t len, uint32_t *t, int *ambiguous)
@@ -487,6 +495,13 @@ static int apu_translate(uint32_t addr, uint32_t len, uint32_t *t, int *ambiguou
     if (addr >= XBOX_CONTIG_BASE &&
         (uint64_t)addr + len <=
             (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE) {
+        *t = addr;
+        return 1;
+    }
+    /* Case 2a: a page number MmGetPhysicalAddress last answered for a low-RAM
+     * VA is that low-RAM page, wherever the high-water mark has since moved. */
+    if (mapped != 0 && (uint64_t)addr + len <= (uint64_t)mapped &&
+            xbox_PhysIsLowRamAnswer(addr, len)) {
         *t = addr;
         return 1;
     }

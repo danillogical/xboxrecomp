@@ -1620,18 +1620,59 @@ static int peek_readable(uint32_t va)
  *
  * Off unless RECOMP_WATCH is set. Costs a page fault per write to that page,
  * so it is a bring-up tool and says so.
+ *
+ * RECOMP_WATCH_WHO=1 adds the writing thread and native RIP to each report, and
+ * for a host thread its native frames (watch_report_who).
  */
 static uint32_t g_watch_va;
 static void    *g_watch_page;
 static uint32_t g_watch_last;
 static void    *g_watch_veh;
 static RECOMP_TLS int s_watch_stepping;
+static RECOMP_TLS uint64_t s_watch_rip;   /* native RIP of the trapped store */
 
 /* A plausible guest code address: inside the image's executable sections,
  * as recorded from the section headers at load. */
 static int watch_is_code(uint32_t va)
 {
     return va >= g_xbox_code_lo && va < g_xbox_code_hi;
+}
+
+/* "module+0xOFFSET" for a native address, into buf. */
+static const char *watch_native_name(uintptr_t addr, char *buf, size_t len)
+{
+    HMODULE mod = NULL;
+    char path[MAX_PATH] = "?";
+    const char *base;
+
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                       | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)addr, &mod);
+    if (mod)
+        GetModuleFileNameA(mod, path, sizeof path);
+    base = strrchr(path, '\\') ? strrchr(path, '\\') + 1 : path;
+    snprintf(buf, len, "%s+0x%llX", base,
+             (unsigned long long)(addr - (uintptr_t)mod));
+    return buf;
+}
+
+/* RECOMP_WATCH_WHO: which native code made the store, and on which thread.
+ * A guest store has a guest chain; a store from a host thread (esp 0: the APU
+ * DSP, a decoder, the back end) has none, and its native frames are the only
+ * name it has. Resolve the exe frames with the run's jsrf_recomp.map. */
+static void watch_report_who(uint32_t esp)
+{
+    char name[MAX_PATH + 32];
+
+    fprintf(stderr, "         who: tid=%lu rip=%s\n", (unsigned long)GetCurrentThreadId(),
+            watch_native_name((uintptr_t)s_watch_rip, name, sizeof name));
+    if (!esp) {
+        void *frames[12];
+        USHORT n = RtlCaptureStackBackTrace(0, 12, frames, NULL), k;
+        for (k = 0; k < n; k++)
+            fprintf(stderr, "         native[%u] %s\n", (unsigned)k,
+                    watch_native_name((uintptr_t)frames[k], name, sizeof name));
+    }
 }
 
 static void watch_report(void)
@@ -1645,6 +1686,8 @@ static void watch_report(void)
     fprintf(stderr, "[WATCH] [%08X] %08X -> %08X  (esp=%08X)\n",
             g_watch_va, g_watch_last, now, esp);
     g_watch_last = now;
+    if (getenv("RECOMP_WATCH_WHO"))
+        watch_report_who(esp);
 
     /* Return addresses the recompiled code pushed, innermost first. Values
      * that merely look like code get printed too -- the chain is a lead, not
@@ -1703,6 +1746,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
             if (!VirtualProtect(g_watch_page, 4096, PAGE_READWRITE, &old))
                 return EXCEPTION_CONTINUE_SEARCH;
             s_watch_stepping = 1;
+            s_watch_rip = ep->ContextRecord->Rip;
             ep->ContextRecord->EFlags |= 0x100u;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -5792,6 +5836,57 @@ void xbox_KmemAllocCounters(struct kmem_alloc_counters *out)
 uint32_t xbox_ContiguousAllocatedBytes(void)
 {
     return g_contig.next - XBOX_CONTIG_BASE;
+}
+
+/* Which form MmGetPhysicalAddress last answered for each physical page number.
+ *
+ * Low RAM and the contiguous window are separate storage here, but both answer
+ * MmGetPhysicalAddress with an offset from 0: a low-RAM VA comes back unchanged
+ * and a window VA comes back less XBOX_CONTIG_BASE. One page number can then
+ * name two different pages, and a device handed it cannot tell which one the
+ * title meant. The measured case is the APU's GP scratch table: its pages are
+ * low RAM at 0x01430000 and up, the stage later allocates the window pages with
+ * the same numbers for vertex buffers, and the high-water rule then sent every
+ * DSP scratch write into the vertex buffers.
+ *
+ * One bit per 4 KB page of the window's size. A set bit means the latest answer
+ * for that page number was a low-RAM VA; an answer for a window VA clears it.
+ * Handing a page out as contiguous memory does not clear it: that is the very
+ * collision above, and the page only becomes a window page to a device once the
+ * title asks for the window VA's physical address.
+ *
+ * Lock-free: writers flip a bit with InterlockedOr/InterlockedAnd on its 32-bit
+ * word, the reader (the APU frame thread) does a plain aligned load. A read that
+ * races a flip sees the old answer or the new one. */
+#define PHYS_ANSWER_PAGES (XBOX_CONTIG_SIZE / 4096u)
+static volatile LONG g_phys_low_ram_answer[PHYS_ANSWER_PAGES / 32u];
+
+void xbox_PhysNoteAnswer(uint32_t phys, int low_ram)
+{
+    uint32_t page = phys >> 12;
+    LONG bit;
+
+    if (page >= PHYS_ANSWER_PAGES)
+        return;
+    bit = (LONG)(1u << (page & 31u));
+    if (low_ram)
+        InterlockedOr(&g_phys_low_ram_answer[page >> 5], bit);
+    else
+        InterlockedAnd(&g_phys_low_ram_answer[page >> 5], ~bit);
+}
+
+int xbox_PhysIsLowRamAnswer(uint32_t phys, uint32_t len)
+{
+    uint64_t end = (uint64_t)phys + (len ? len : 1u);
+    uint32_t page, last;
+
+    if (end > XBOX_CONTIG_SIZE)
+        return 0;
+    last = (uint32_t)((end - 1u) >> 12);
+    for (page = phys >> 12; page <= last; page++)
+        if (!((uint32_t)g_phys_low_ram_answer[page >> 5] & (1u << (page & 31u))))
+            return 0;
+    return 1;
 }
 
 

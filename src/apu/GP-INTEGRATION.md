@@ -26,7 +26,7 @@ technical role, whose rulings set the ledger and accounting design.
    - It returns a host pointer only when the whole range lies in a mapped guest region.
    - It does not use `& 0x03FFFFFF`; a comment explains why. (The `& 0x03FFFFFF` sites in `apu_shim.h`/`apu_vp.c` are VP code, which this semantics leaves untouched — a recorded lead, not scope.)
    - One **uncapped** counter `GPDMA_AMBIGUOUS` is incremented when case 2 is taken for a range that is also mapped low RAM. It is observation plus a claim limit only (6(b)-compliant as a fixed single counter); no row reads it.
-   - **Claim limit:** physical/VA aliasing is not modelled; a title that passes a low-RAM VA below the contiguous high-water mark is misrouted into the window, exactly as `dma_resolve` would do.
+   - **Physical/VA aliasing (2026-10-11):** `xbox_MmGetPhysicalAddress` records, per page number, whether its latest answer was for a low-RAM VA or a window VA, and a page last answered for low RAM resolves to low RAM before the high-water test. This fixed the DSP's GP scratch writes landing in the stage's vertex buffers. **Claim limit:** an address no answer covers is still ambiguous, and below the high-water mark it is routed into the window, exactly as `dma_resolve` would do.
    - VP code is otherwise untouched.
 4. **Synthetic ack removed.** `dsp_ack_frame`, `dsp_ack_init` and every read of `RECOMP_APU_DSP_ACK` are deleted.
 5. **One GP write choke point, with an atomic store.**
