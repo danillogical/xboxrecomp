@@ -3988,6 +3988,18 @@ static void draw_primitive(void)
                     s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
                     s_gpu.tris_drawn - t0,
                     (unsigned long long)(s_gpu.pixels - p0));
+            {
+                /* The first vertices' position and diffuse as fetched from guest memory, whichever path transforms them. */
+                float p[4], c[4];
+                uint32_t k;
+                for (k = 0; k < 3 && k < s_gpu.idx_count; k++) {
+                    p[0] = p[1] = p[2] = p[3] = 0; c[0] = c[1] = c[2] = c[3] = 0;
+                    fetch_attr(&s_gpu.attr[0], s_gpu.idx[k], p);
+                    fetch_attr(&s_gpu.attr[3], s_gpu.idx[k], c);
+                    fprintf(stderr, "[FTRACE]     in%u pos %g %g %g %g diffuse %g %g %g %g%c",
+                            k, p[0], p[1], p[2], p[3], c[0], c[1], c[2], c[3], 10);
+                }
+            }
             if ((s_gpu.xf_mode & 3) == 2)
                 fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
