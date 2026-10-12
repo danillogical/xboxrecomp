@@ -17,7 +17,7 @@
  * Fixed-function, pre-transformed and vertex-program batches all arrive the
  * same way: the executor transforms fixed-function vertices itself and runs
  * vertex programs on the CPU (nv2a_vsh_interp.c), so a back end only ever sees surface
- * pixels. Blend, depth, stencil and alpha state arrive in Nv2aRenderState. A back end
+ * pixels. Blend, depth, stencil, alpha and cull state arrive in Nv2aRenderState. A back end
  * that sets draw_program instead receives vertex-program batches untransformed,
  * with the program and its inputs, and may decline to fall back to the CPU.
  *
@@ -32,6 +32,12 @@
 #include <stdint.h>
 
 #include "nv2a_combiner.h"   /* Nv2aCombiner */
+
+/* Bounded frame diagnostics, on the executor thread only. Zero outside an
+ * draw in an armed RECOMP_FRAME_TRACE frame; otherwise that draw's ordinal.
+ * Backends can join their actual bound state/query results to that batch.
+ * This observes a draw, and never supplies a GPU completion to the guest. */
+uint32_t nv2a_backend_trace_draw_id(void);
 
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical

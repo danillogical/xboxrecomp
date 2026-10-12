@@ -115,12 +115,15 @@ Two things a back end has to get right once such vertices arrive:
   off and depth clamped to [0, 1], a vertex just in front of the eye projects
   to huge x/y and is never clipped: flat, full-screen bands of colour whenever
   the camera turns.
-- **Cull from projected positions.** D3D11 decides facing after clipping, so a
-  triangle reaching behind the eye keeps its true winding; the NV2A decides from
-  the projected, mirrored one. Decide culling per triangle from the projected
-  screen positions and draw with the rasteriser's culling off — identical for
-  triangles wholly in front of the eye. The cull state arrives in
-  `Nv2aRenderState`.
+- **Carry cull state through both vertex paths.** `Nv2aRenderState` carries
+  enable, face (`FRONT`, `BACK`, `FRONT_AND_BACK`) and front-face winding. The
+  D3D11 backend selects a cached rasterizer state on every batch; surface-pixel
+  y-down coordinates map through `1-y*2/h` and the D3D viewport back to y-down,
+  so NV2A CW (`0x900`) maps to `FrontCounterClockwise=FALSE` and CCW (`0x901`)
+  to `TRUE`. Opposite-winding pixel fixtures exercise the production paths;
+  clears always use cull-none. Triangles crossing the eye plane are outside
+  that fixture's evidence; the former claim here that NV2A necessarily uses
+  mirrored projected winding was not established by a hardware comparison.
 
 ### Normals facing away
 

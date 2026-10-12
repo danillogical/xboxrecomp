@@ -2821,6 +2821,13 @@ static struct { uint32_t offset; float *z; } s_zbufs[4];
 static int s_ftrace;            /* frame trace: 0 idle, 2 tracing, 3 done */
 static int s_zbuf_next;
 
+static uint32_t s_backend_trace_draw;
+
+uint32_t nv2a_backend_trace_draw_id(void)
+{
+    return s_backend_trace_draw;
+}
+
 static float zclear_value(void)
 {
     /* Zeta format in SURFACE_FORMAT bits 4-7: 1 is Z16, 2 is Z24S8. */
@@ -3973,11 +3980,16 @@ static void draw_primitive(void)
     {
         uint32_t t0 = s_gpu.tris_drawn;
         uint64_t p0 = s_gpu.pixels;
+        s_backend_trace_draw = s_ftrace == 2 ? s_gpu.draws : 0;
         raster_batch();
+        s_backend_trace_draw = 0;
         if (s_ftrace == 2) {
-            fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
+            fprintf(stderr, "[FTRACE] draw %u %s prim %u n %u surf %08X %ux%u+%u+%u"
                     " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
-                    " eq %X | z test %u func %X mask %u | tris %u px %llu\n",
+                    " eq %X | z test %u func %X mask %u | tris %u cpu_px %llu"
+                    " | cull %u %X %X | stencil %u %X ref %u mask %X/%X ops %X/%X/%X"
+                    " | atest %u %X ref %u | cmask %08X | attr0 %08X\n",
+                    s_gpu.draws,
                     (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                     s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                     s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
@@ -3987,7 +3999,13 @@ static void draw_primitive(void)
                     s_gpu.blend_dfactor, s_gpu.blend_equation,
                     s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
                     s_gpu.tris_drawn - t0,
-                    (unsigned long long)(s_gpu.pixels - p0));
+                    (unsigned long long)(s_gpu.pixels - p0),
+                    s_gpu.rs.cull_enable, s_gpu.rs.cull_face, s_gpu.rs.front_face,
+                    s_gpu.rs.stencil_test_enable, s_gpu.rs.stencil_func, s_gpu.rs.stencil_ref,
+                    s_gpu.rs.stencil_read_mask, s_gpu.rs.stencil_write_mask,
+                    s_gpu.rs.stencil_op_fail, s_gpu.rs.stencil_op_zfail, s_gpu.rs.stencil_op_zpass,
+                    s_gpu.rs.alpha_test_enable, s_gpu.rs.alpha_func, s_gpu.rs.alpha_ref,
+                    s_gpu.rs.color_mask, s_gpu.attr[0].offset);
             {
                 /* The first vertices' position and diffuse as fetched from guest memory, whichever path transforms them. */
                 float p[4], c[4];
@@ -4000,11 +4018,52 @@ static void draw_primitive(void)
                             k, p[0], p[1], p[2], p[3], c[0], c[1], c[2], c[3], 10);
                 }
             }
-            if ((s_gpu.xf_mode & 3) == 2)
-                fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
-                        s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
-                        s_xf[0].pos[3], s_xf[1].pos[0], s_xf[1].pos[1],
-                        s_xf[2].pos[0], s_xf[2].pos[1], 10);
+            if ((s_gpu.xf_mode & 3) == 2) {
+                const uint32_t (*words)[4];
+                uint32_t len, hash, mask, k;
+                int writes_c;
+                if (nv2a_vsh_program_info(&words, &len, &hash, &mask, &writes_c)) {
+                    fprintf(stderr, "[FTRACE]     program hash %08X len %u inputs %04X writes_c %d\n",
+                            hash, len, mask, writes_c);
+                    /* GPU-VSH batches do not populate s_xf. Re-run only pure
+                     * programs as a labelled interpreter reference, never
+                     * publish stale s_xf as an actual GPU output or execute a
+                     * constant-writing program again for diagnostics. */
+                    if (!writes_c) {
+                        for (k = 0; k < 3 && k < s_gpu.idx_count; k++) {
+                            Nv2aVshOutput out;
+                            if (transform_vertex(s_gpu.idx[k], &out))
+                                fprintf(stderr, "[FTRACE]     reference%u pos %g %g %g %g"
+                                        " d0 %g %g %g %g d1 %g %g %g %g fog %g"
+                                        " t0 %g %g %g %g t1 %g %g %g %g"
+                                        " t2 %g %g %g %g t3 %g %g %g %g\n", k,
+                                        out.pos[0], out.pos[1], out.pos[2], out.pos[3],
+                                        out.d0[0], out.d0[1], out.d0[2], out.d0[3],
+                                        out.d1[0], out.d1[1], out.d1[2], out.d1[3], out.fog[0],
+                                        out.tex[0][0], out.tex[0][1], out.tex[0][2], out.tex[0][3],
+                                        out.tex[1][0], out.tex[1][1], out.tex[1][2], out.tex[1][3],
+                                        out.tex[2][0], out.tex[2][1], out.tex[2][2], out.tex[2][3],
+                                        out.tex[3][0], out.tex[3][1], out.tex[3][2], out.tex[3][3]);
+                        }
+                    }
+                } else {
+                    fprintf(stderr, "[FTRACE]     program UNKNOWN (no final instruction)\n");
+                }
+            } else {
+                float p[3][4] = {{0}};
+                uint32_t k;
+                int valid = s_gpu.idx_count >= 3;
+                for (k = 0; k < 3 && k < s_gpu.idx_count; k++) {
+                    int ok = fetch_position(s_gpu.idx[k], p[k]);
+                    valid &= ok;
+                    fprintf(stderr, "[FTRACE]     surface%u valid %d pos %g %g %g rhw %g\n",
+                            k, ok, p[k][0], p[k][1], p[k][2], p[k][3]);
+                }
+                if (valid)
+                    fprintf(stderr, "[FTRACE]     first_area %g (surface y down, positive CW)\n",
+                            (p[1][0] - p[0][0]) * (p[2][1] - p[0][1])
+                          - (p[2][0] - p[0][0]) * (p[1][1] - p[0][1]));
+            }
             if (s_gpu.rc_seen) {
                 int st;
                 fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",
@@ -4017,6 +4076,8 @@ static void draw_primitive(void)
                                 s_gpu.texs[st].height, s_gpu.texs[st].color,
                                 s_gpu.texs[st].valid ? "" : " (invalid)");
                 fputc(10, stderr);
+                fprintf(stderr, "[FTRACE]     rc final constants %08X %08X fogcolor %08X\n",
+                        s_gpu.rc.final_c0, s_gpu.rc.final_c1, s_gpu.fog_color);
                 for (st = 0; st < (int)(s_gpu.rc.control & 0xFF) && st < 8; st++)
                     fprintf(stderr, "[FTRACE]       s%d icw %08X %08X ocw %08X %08X c %08X %08X%c",
                             st, s_gpu.rc.color_icw[st], s_gpu.rc.alpha_icw[st],

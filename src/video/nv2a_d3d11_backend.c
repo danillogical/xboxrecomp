@@ -238,7 +238,7 @@ typedef struct {
 } GbDss;
 
 typedef struct {
-    uint64_t draws, tris, clears, dropped_tris, skipped;
+    uint64_t draws, tris, clears, dropped_tris, skipped, cull_draws, cull_all;
     uint64_t tex_uploads, tex_hits, tex_undecodable, rt_aliases, rt_copies;
     uint64_t rt_loads, readbacks, readback_ticks;
     uint64_t rc_draws, rc_shaders, rc_compile_fail, rc_fallback, rc_compile_ticks;
@@ -268,7 +268,7 @@ static struct {
     UINT vb_vsh_pos, ib_vsh_pos;        /* bytes, indices */
     GbVsh vsh[GB_MAX_VSH];
     unsigned vsh_fail_said;
-    ID3D11RasterizerState *rs;
+    ID3D11RasterizerState *rs[3][2]; /* [none, back, front][front face CCW] */
     ID3D11SamplerState *samp[4][9];     /* [filter][addr_u*3 + addr_v], made on first use */
     ID3D11RenderTargetView *bound_rtv;
     ID3D11DepthStencilView *bound_dsv;
@@ -523,17 +523,34 @@ static int gb_create_pipeline(void)
         return -1;
     }
 
-    /* No culling: the CPU rasteriser this replaces draws both windings, and
-     * depth clamping rather than clipping matches its unclipped z. */
+    /* Surface pixels use y-down coordinates, and both vertex paths map y to
+     * 1-y*2/h before D3D11 rasterization.  Therefore s>0 is clockwise on the
+     * render target; NV2A 0x900 (CW) maps to FrontCounterClockwise=FALSE. */
     memset(&rd, 0, sizeof rd);
     rd.FillMode = D3D11_FILL_SOLID;
-    rd.CullMode = D3D11_CULL_NONE;
     rd.DepthClipEnable = FALSE;
     rd.ScissorEnable = TRUE;
-    hr = ID3D11Device_CreateRasterizerState(g.dev, &rd, &g.rs);
-    if (FAILED(hr)) {
-        gb_fail("rasterizer state", hr);
-        return -1;
+    for (int ccw = 0; ccw < 2; ccw++) {
+        rd.FrontCounterClockwise = ccw ? TRUE : FALSE;
+        rd.CullMode = D3D11_CULL_NONE;
+        if (ccw == 0) {
+            hr = ID3D11Device_CreateRasterizerState(g.dev, &rd, &g.rs[0][0]);
+            if (SUCCEEDED(hr)) g.rs[0][1] = g.rs[0][0];
+        } else {
+            hr = S_OK;
+        }
+        if (SUCCEEDED(hr)) {
+            rd.CullMode = D3D11_CULL_BACK;
+            hr = ID3D11Device_CreateRasterizerState(g.dev, &rd, &g.rs[1][ccw]);
+        }
+        if (SUCCEEDED(hr)) {
+            rd.CullMode = D3D11_CULL_FRONT;
+            hr = ID3D11Device_CreateRasterizerState(g.dev, &rd, &g.rs[2][ccw]);
+        }
+        if (FAILED(hr)) {
+            gb_fail("rasterizer state", hr);
+            return -1;
+        }
     }
 
     /* The context is private to this file, so the fixed state is set once;
@@ -542,7 +559,7 @@ static int gb_create_pipeline(void)
     ID3D11DeviceContext_VSSetConstantBuffers(g.ctx, 0, 1, &g.cb);
     ID3D11DeviceContext_PSSetConstantBuffers(g.ctx, 0, 1, &g.cb);
     ID3D11DeviceContext_PSSetConstantBuffers(g.ctx, 1, 1, &g.cb_rc);
-    ID3D11DeviceContext_RSSetState(g.ctx, g.rs);
+    ID3D11DeviceContext_RSSetState(g.ctx, g.rs[0][0]);
     return 0;
 }
 
@@ -1207,6 +1224,8 @@ typedef struct {
     ID3D11BlendState *bs;
     FLOAT blend_factor[4];
     ID3D11DepthStencilState *dss;
+    ID3D11RasterizerState *rs;
+    uint32_t target_va, cull_enable, cull_face, front_face, color_mask;
     UINT stencil_ref;
     GbConstants k;
     D3D11_RECT scissor;
@@ -1285,6 +1304,7 @@ static void gb_bind(const GbDraw *dr, const GbVsh *vsh, UINT stride, UINT offset
         }
     }
     ID3D11DeviceContext_RSSetScissorRects(g.ctx, 1, &dr->scissor);
+    ID3D11DeviceContext_RSSetState(g.ctx, dr->rs);
     ID3D11DeviceContext_OMSetBlendState(g.ctx, dr->bs, dr->blend_factor, 0xFFFFFFFFu);
     ID3D11DeviceContext_OMSetDepthStencilState(g.ctx, dr->dss, dr->stencil_ref);
     if (!vsh) {
@@ -1308,10 +1328,95 @@ static void gb_bind(const GbDraw *dr, const GbVsh *vsh, UINT stride, UINT offset
     }
 }
 
+typedef struct {
+    uint32_t id;
+    ID3D11Query *query;
+    HRESULT create_hr;
+} GbDrawTrace;
+
+/* An occlusion query counts samples that survived rasterization and depth/stencil.
+ * It is created only for an armed frame-trace batch, and the read is bounded so
+ * diagnostics cannot turn a slow or lost device into an unbounded wait. */
+static GbDrawTrace gb_trace_begin(void)
+{
+    GbDrawTrace tr;
+    D3D11_QUERY_DESC qd;
+    memset(&tr, 0, sizeof tr);
+    tr.id = nv2a_backend_trace_draw_id();
+    tr.create_hr = S_OK;
+    if (!tr.id)
+        return tr;
+    memset(&qd, 0, sizeof qd);
+    qd.Query = D3D11_QUERY_OCCLUSION;
+    tr.create_hr = ID3D11Device_CreateQuery(g.dev, &qd, &tr.query);
+    if (SUCCEEDED(tr.create_hr))
+        ID3D11DeviceContext_Begin(g.ctx, (ID3D11Asynchronous *)tr.query);
+    return tr;
+}
+
+static void gb_trace_finish(const GbDraw *dr, const char *path, GbDrawTrace *tr)
+{
+    D3D11_RASTERIZER_DESC rd;
+    D3D11_DEPTH_STENCIL_DESC dd;
+    ID3D11RasterizerState *bound_rs = NULL;
+    ID3D11DepthStencilState *bound_dss = NULL;
+    UINT bound_ref = 0;
+    UINT64 samples = 0;
+    HRESULT get_hr = tr->create_hr;
+    int timed_out = 0;
+
+    if (!tr->id)
+        return;
+    if (tr->query) {
+        LARGE_INTEGER start, now;
+        unsigned polls = 0;
+        ID3D11DeviceContext_End(g.ctx, (ID3D11Asynchronous *)tr->query);
+        ID3D11DeviceContext_Flush(g.ctx);
+        QueryPerformanceCounter(&start);
+        do {
+            get_hr = ID3D11DeviceContext_GetData(g.ctx, (ID3D11Asynchronous *)tr->query,
+                                                 &samples, sizeof samples,
+                                                 D3D11_ASYNC_GETDATA_DONOTFLUSH);
+            if (get_hr != S_FALSE)
+                break;
+            Sleep(0);
+            QueryPerformanceCounter(&now);
+            polls++;
+        } while (polls < 10000 && (!g.qpf.QuadPart
+                 || (now.QuadPart - start.QuadPart) * 1000 < 50 * g.qpf.QuadPart));
+        timed_out = get_hr == S_FALSE;
+    }
+
+    memset(&rd, 0, sizeof rd);
+    memset(&dd, 0, sizeof dd);
+    ID3D11DeviceContext_RSGetState(g.ctx, &bound_rs);
+    ID3D11DeviceContext_OMGetDepthStencilState(g.ctx, &bound_dss, &bound_ref);
+    if (bound_rs) ID3D11RasterizerState_GetDesc(bound_rs, &rd);
+    if (bound_dss) ID3D11DepthStencilState_GetDesc(bound_dss, &dd);
+    fprintf(stderr, "[GPUBE-TRACE] draw=%u targetVA=%08X path=%s guestCull=%u/%X/%X "
+                    "rsCull=%u rsCCW=%u stencil=%u/%u/%u/%u/%u/%u/%u ref=%u "
+                    "alpha=%d/%u cmask=%08X samples=",
+            tr->id, dr->target_va, path, dr->cull_enable, dr->cull_face, dr->front_face,
+            rd.CullMode, rd.FrontCounterClockwise, dd.StencilEnable, dd.StencilReadMask,
+            dd.StencilWriteMask, dd.FrontFace.StencilFunc, dd.FrontFace.StencilFailOp,
+            dd.FrontFace.StencilDepthFailOp, dd.FrontFace.StencilPassOp, bound_ref,
+            dr->k.tx[2] >= 0.0f, (unsigned)dr->k.tx[3], dr->color_mask);
+    if (SUCCEEDED(get_hr) && !timed_out)
+        fprintf(stderr, "%llu\n", (unsigned long long)samples);
+    else if (timed_out)
+        fprintf(stderr, "UNKNOWN(timeout-50ms)\n");
+    else
+        fprintf(stderr, "UNKNOWN(query-hr=0x%08lX)\n", (unsigned long)get_hr);
+    if (bound_rs) IUnknown_Release((IUnknown *)bound_rs);
+    if (bound_dss) IUnknown_Release((IUnknown *)bound_dss);
+    if (tr->query) IUnknown_Release((IUnknown *)tr->query);
+    fflush(stderr);
+}
+
 /* Upload the usable triangles of `v` (with `x` on the combiner path) and draw
  * them; returns how many vertices were drawn. */
 static uint32_t gb_submit(const GbDraw *dr, const Nv2aVertex *v, const Nv2aVertexExtra *x,
-                          uint32_t n)
+                          uint32_t n, const char *path)
 {
     int rc = dr->rc_ps != NULL;
     UINT cap = rc ? g.vb_rc_cap : g.vb_cap, *pos = rc ? &g.vb_rc_pos : &g.vb_pos;
@@ -1354,7 +1459,11 @@ static uint32_t gb_submit(const GbDraw *dr, const Nv2aVertex *v, const Nv2aVerte
     if (rc && !gb_cb_write(g.cb_rc, &dr->rck, sizeof dr->rck))
         return 0;
     gb_bind(dr, NULL, 0, 0);
-    ID3D11DeviceContext_Draw(g.ctx, out, *pos);
+    {
+        GbDrawTrace tr = gb_trace_begin();
+        ID3D11DeviceContext_Draw(g.ctx, out, *pos);
+        gb_trace_finish(dr, path, &tr);
+    }
     *pos += out;
     return out;
 }
@@ -1373,6 +1482,15 @@ static int gb_scissor(const Nv2aSurface *s, const GbTarget *t, D3D11_RECT *r)
     r->right = (LONG)x1;
     r->bottom = (LONG)y1;
     return 1;
+}
+
+static int gb_cull_mode(const Nv2aRenderState *rs)
+{
+    if (!rs->cull_enable) return 0;
+    if (rs->cull_face == 0x405) return 1; /* BACK */
+    if (rs->cull_face == 0x404) return 2; /* FRONT */
+    if (rs->cull_face == 0x408) return 3; /* FRONT_AND_BACK */
+    return 0;
 }
 
 static UINT8 gb_write_mask(uint32_t color_mask, uint32_t bpp)
@@ -1814,6 +1932,13 @@ static int gb_setup(GbDraw *dr, const Nv2aSurface *s, const Nv2aBatch *b, int rc
     float zs;
 
     memset(dr, 0, sizeof *dr);
+    {
+        int cm = gb_cull_mode(rs);
+        dr->rs = g.rs[cm % 3][rs->front_face == 0x901];
+        dr->target_va = s->color_va;
+        dr->cull_enable = rs->cull_enable; dr->cull_face = rs->cull_face;
+        dr->front_face = rs->front_face; dr->color_mask = rs->color_mask;
+    }
     dr->t = gb_target_for(s);
     if (!dr->t || !gb_scissor(s, dr->t, &dr->scissor))
         return 0;
@@ -1887,6 +2012,10 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 
     if (!g.ok || b->count < 3)
         return;
+    if (gb_cull_mode(b->state) == 3) {
+        g.st.cull_all++;
+        return;
+    }
     st = gb_setup(&dr, s, b, rc);
     if (!st) {
         g.st.skipped++;
@@ -1901,11 +2030,12 @@ static void gb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     if (st < 0)
         return;
 
-    drawn = gb_submit(&dr, b->vertices, dr.rc_ps ? b->extra : NULL, b->count);
+    drawn = gb_submit(&dr, b->vertices, dr.rc_ps ? b->extra : NULL, b->count, "FIX");
     if (!drawn)
         return;
     gb_target_mark(dr.t, &dr.scissor);
     g.st.draws++;
+    if (dr.rs != g.rs[0][0]) g.st.cull_draws++;
     g.st.tris += drawn / 3;
 }
 
@@ -2091,6 +2221,10 @@ static int gb_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     if (!g.ok || !b->combiner || !p->program_len || !p->positions || !p->index_count
         || p->index_count % 3)
         return gb_vsh_decline();
+    if (gb_cull_mode(b->state) == 3) {
+        g.st.cull_all++;
+        return 1;
+    }
     for (k = 0; k < 16; k++)
         nin += (p->input_mask >> k) & 1u;
     stride = 16u * nin;
@@ -2136,9 +2270,14 @@ static int gb_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     g.ib_vsh_pos += p->index_count;
 
     gb_bind(&dr, vsh, stride, voff);
-    ID3D11DeviceContext_DrawIndexed(g.ctx, p->index_count, ioff, 0);
+    {
+        GbDrawTrace tr = gb_trace_begin();
+        ID3D11DeviceContext_DrawIndexed(g.ctx, p->index_count, ioff, 0);
+        gb_trace_finish(&dr, "PRG", &tr);
+    }
     gb_target_mark(dr.t, &dr.scissor);
     g.st.draws++;
+    if (dr.rs != g.rs[0][0]) g.st.cull_draws++;
     g.st.tris += p->index_count / 3;
     g.st.vsh_draws++;
     return 1;
@@ -2157,6 +2296,7 @@ static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
     if (!g.ok)
         return;
     memset(&dr, 0, sizeof dr);
+    dr.rs = g.rs[0][0];
     dr.t = gb_target_for(s);
     if (!dr.t || !gb_scissor(s, dr.t, &dr.scissor)) {
         g.st.skipped++;
@@ -2217,7 +2357,7 @@ static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
     dr.dss = gb_depth_state(&key);
     if (!dr.bs || !dr.dss)
         return;
-    if (!gb_submit(&dr, q, NULL, 6))
+    if (!gb_submit(&dr, q, NULL, 6, "CLEAR"))
         return;
     if (mask)
         gb_target_mark(dr.t, &dr.scissor);
@@ -2239,7 +2379,8 @@ static void gb_stats(int force)
                     " rt_loads=%llu readbacks=%llu readback_ms=%.1f dropped_tris=%llu"
                     " skipped=%llu rc_draws=%llu rc_shaders=%llu rc_compile_fail=%llu"
                     " rc_fallback=%llu rc_compile_ms=%.1f vsh_draws=%llu vsh_shaders=%llu"
-                    " vsh_compile_fail=%llu vsh_fallback=%llu vsh_compile_ms=%.1f\n",
+                    " vsh_compile_fail=%llu vsh_fallback=%llu vsh_compile_ms=%.1f"
+                    " cull_draws=%llu cull_all=%llu\n",
             g.frame, (unsigned long long)g.st.draws, (unsigned long long)g.st.tris,
             (unsigned long long)g.st.clears, (unsigned long long)g.st.tex_uploads,
             (unsigned long long)g.st.tex_hits, (unsigned long long)g.st.tex_undecodable,
@@ -2253,7 +2394,8 @@ static void gb_stats(int force)
             (unsigned long long)g.st.vsh_draws, (unsigned long long)g.st.vsh_shaders,
             (unsigned long long)g.st.vsh_compile_fail, (unsigned long long)g.st.vsh_fallback,
             g.qpf.QuadPart ? (double)g.st.vsh_compile_ticks * 1000.0 / (double)g.qpf.QuadPart
-                           : 0.0);
+                           : 0.0,
+            (unsigned long long)g.st.cull_draws, (unsigned long long)g.st.cull_all);
     fflush(stderr);
 }
 
