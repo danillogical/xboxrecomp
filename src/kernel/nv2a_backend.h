@@ -17,7 +17,7 @@
  * Fixed-function, pre-transformed and vertex-program batches all arrive the
  * same way: the executor transforms fixed-function vertices itself and runs
  * vertex programs on the CPU (nv2a_vsh_interp.c), so a back end only ever sees surface
- * pixels. Blend, depth and alpha state arrive in Nv2aRenderState. A back end
+ * pixels. Blend, depth, stencil and alpha state arrive in Nv2aRenderState. A back end
  * that sets draw_program instead receives vertex-program batches untransformed,
  * with the program and its inputs, and may decline to fall back to the CPU.
  *
@@ -78,6 +78,11 @@ typedef struct {
     uint32_t cull_enable, cull_face, front_face;
     uint32_t zeta_va;                                    /* 0: no depth surface */
     float    depth_min, depth_max;                       /* SET_CLIP_MIN/MAX */
+    /* Stencil, one state for both faces (NV097 has no back-face set); GL enums. */
+    uint32_t stencil_test_enable;
+    uint32_t stencil_write_mask, stencil_read_mask;      /* low 8 bits */
+    uint32_t stencil_func, stencil_ref;
+    uint32_t stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
 } Nv2aRenderState;
 
 /* What the register combiners read per vertex beyond Nv2aVertex, one entry
@@ -126,7 +131,8 @@ typedef struct {
 
 typedef struct {
     /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
-     * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
+     * zstencil: SET_ZSTENCIL_CLEAR_VALUE (Z24S8: depth in the top 24 bits,
+     * stencil in the low 8). */
     void (*clear)(const Nv2aSurface *s, const Nv2aRenderState *rs,
                   uint32_t flags, uint32_t argb, uint32_t zstencil);
     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);

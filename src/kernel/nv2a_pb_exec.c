@@ -4470,6 +4470,14 @@ static void capture_render_state(uint32_t method, uint32_t param)
     case 0x0394: memcpy(&f, &param, 4); r->depth_min = f; break; /* SET_CLIP_MIN */
     case 0x0398: memcpy(&f, &param, 4); r->depth_max = f; break; /* SET_CLIP_MAX */
     case 0x0214: r->zeta_va = param ? dma_resolve(param) : 0; break; /* ZETA_OFFSET */
+    case 0x032C: r->stencil_test_enable = param; break; /* SET_STENCIL_TEST_ENABLE */
+    case 0x0360: r->stencil_write_mask  = param; break; /* SET_STENCIL_MASK */
+    case 0x0364: r->stencil_func        = param; break; /* SET_STENCIL_FUNC */
+    case 0x0368: r->stencil_ref         = param; break; /* SET_STENCIL_FUNC_REF */
+    case 0x036C: r->stencil_read_mask   = param; break; /* SET_STENCIL_FUNC_MASK */
+    case 0x0370: r->stencil_op_fail     = param; break; /* SET_STENCIL_OP_FAIL */
+    case 0x0374: r->stencil_op_zfail    = param; break; /* SET_STENCIL_OP_ZFAIL */
+    case 0x0378: r->stencil_op_zpass    = param; break; /* SET_STENCIL_OP_ZPASS */
     default:     break;
     }
 }
@@ -4563,6 +4571,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         inited = 1;
         s_gpu.color_mask = 0x01010101u;           /* all channels, as reset */
         s_gpu.rs.color_mask = 0x01010101u;        /* the back end's copy too */
+        s_gpu.rs.stencil_write_mask = 0xFF;       /* stencil as reset: off, ALWAYS, KEEP */
+        s_gpu.rs.stencil_read_mask = 0xFF;
+        s_gpu.rs.stencil_func = 0x207;
+        s_gpu.rs.stencil_op_fail = 0x1E00;
+        s_gpu.rs.stencil_op_zfail = 0x1E00;
+        s_gpu.rs.stencil_op_zpass = 0x1E00;
         for (i = 0; i < NV_VERTEX_ATTRS; i++)
             s_gpu.imm_attr[i][3] = 1.0f;
         s_gpu.min_x = s_gpu.min_y = 1e30f;
@@ -4699,6 +4713,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x0398:                                  /* SET_CLIP_MAX */
     case 0x039C:                                  /* SET_CULL_FACE */
     case 0x03A0:                                  /* SET_FRONT_FACE */
+    case 0x032C:                                  /* SET_STENCIL_TEST_ENABLE */
+    case 0x0360:                                  /* SET_STENCIL_MASK */
+    case 0x0364:                                  /* SET_STENCIL_FUNC */
+    case 0x0368:                                  /* SET_STENCIL_FUNC_REF */
+    case 0x036C:                                  /* SET_STENCIL_FUNC_MASK */
+    case 0x0370:                                  /* SET_STENCIL_OP_FAIL */
+    case 0x0374:                                  /* SET_STENCIL_OP_ZFAIL */
+    case 0x0378:                                  /* SET_STENCIL_OP_ZPASS */
         break;
 
     case NV097_CLEAR_SURFACE:

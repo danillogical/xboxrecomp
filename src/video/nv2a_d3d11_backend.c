@@ -16,9 +16,10 @@
  *     A pass that narrows the clip keeps the larger backing, the non-strict
  *     compatibility rule xemu uses, as Mercenaries-Recompiled's
  *     src/nv2a/nv2a_pgraph_d3d11.c does (MIT, credited here).
- *   - Depth is a D32_FLOAT buffer per (zeta address, target size). It is never
- *     loaded from or written to guest memory: like the CPU path, nothing the
- *     title does reads its depth surface back.
+ *   - Depth is a D24S8 buffer per (zeta address, target size), NV2A's Z24S8
+ *     layout. It is never loaded from or written to guest memory: like the CPU
+ *     path, nothing the title does reads its depth surface back. Stencil is
+ *     honoured here only; the CPU path has none.
  *   - Textures are decoded with the executor's own decoder into BGRA8, so the
  *     colours match the CPU path exactly. They are cached and re-verified by a
  *     hash of their guest bytes on their first use after each flip.
@@ -225,8 +226,14 @@ typedef struct {
     ID3D11BlendState *bs;
 } GbBlend;
 
+/* Everything a depth-stencil state is made from; all uint32_t, so memcmp compares it. */
 typedef struct {
-    uint32_t enable, func, write;
+    uint32_t enable, func, write;                        /* depth */
+    uint32_t s_enable, s_read, s_write, s_func, s_fail, s_zfail, s_zpass;
+} GbDssKey;
+
+typedef struct {
+    GbDssKey k;
     ID3D11DepthStencilState *dss;
 } GbDss;
 
@@ -643,7 +650,38 @@ static ID3D11BlendState *gb_blend_state(uint32_t enable, uint32_t src, uint32_t 
     return e->bs;
 }
 
-static ID3D11DepthStencilState *gb_depth_state(uint32_t enable, uint32_t func, uint32_t write)
+/* GL_NEVER..GL_ALWAYS (0x200..0x207) are in D3D11's order, from 1. */
+static D3D11_COMPARISON_FUNC gb_compare(uint32_t func)
+{
+    return (func >= 0x200 && func <= 0x207)
+         ? (D3D11_COMPARISON_FUNC)(func - 0x200 + 1) : D3D11_COMPARISON_ALWAYS;
+}
+
+/* GL INCR/DECR saturate, as D3D11's *_SAT do; the _WRAP forms are D3D11's plain ones. */
+static D3D11_STENCIL_OP gb_stencil_op(uint32_t op)
+{
+    switch (op) {
+    case 0x0000: return D3D11_STENCIL_OP_ZERO;
+    case 0x1E01: return D3D11_STENCIL_OP_REPLACE;
+    case 0x1E02: return D3D11_STENCIL_OP_INCR_SAT;
+    case 0x1E03: return D3D11_STENCIL_OP_DECR_SAT;
+    case 0x150A: return D3D11_STENCIL_OP_INVERT;
+    case 0x8507: return D3D11_STENCIL_OP_INCR;
+    case 0x8508: return D3D11_STENCIL_OP_DECR;
+    default:     return D3D11_STENCIL_OP_KEEP;          /* 0x1E00 */
+    }
+}
+
+/* A key with depth only and stencil off. */
+static void gb_dss_key(GbDssKey *k, uint32_t enable, uint32_t func, uint32_t write)
+{
+    memset(k, 0, sizeof *k);
+    k->enable = enable;
+    k->func = func;
+    k->write = write;
+}
+
+static ID3D11DepthStencilState *gb_depth_state(const GbDssKey *k)
 {
     D3D11_DEPTH_STENCIL_DESC dd;
     GbDss *e;
@@ -652,7 +690,7 @@ static ID3D11DepthStencilState *gb_depth_state(uint32_t enable, uint32_t func, u
 
     for (i = 0; i < g.ndss; i++) {
         e = &g.dsss[i];
-        if (e->enable == enable && e->func == func && e->write == write)
+        if (memcmp(&e->k, k, sizeof *k) == 0)
             return e->dss;
     }
     if (g.ndss < GB_MAX_DSS) {
@@ -662,15 +700,18 @@ static ID3D11DepthStencilState *gb_depth_state(uint32_t enable, uint32_t func, u
         GB_RELEASE(e->dss);
     }
     memset(&dd, 0, sizeof dd);
-    dd.DepthEnable = enable ? TRUE : FALSE;
-    dd.DepthWriteMask = write ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
-    /* GL_NEVER..GL_ALWAYS (0x200..0x207) are in D3D11's order, from 1. */
-    dd.DepthFunc = (func >= 0x200 && func <= 0x207)
-                 ? (D3D11_COMPARISON_FUNC)(func - 0x200 + 1) : D3D11_COMPARISON_ALWAYS;
-    dd.StencilEnable = FALSE;
-    e->enable = enable;
-    e->func = func;
-    e->write = write;
+    dd.DepthEnable = k->enable ? TRUE : FALSE;
+    dd.DepthWriteMask = k->write ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+    dd.DepthFunc = gb_compare(k->func);
+    dd.StencilEnable = k->s_enable ? TRUE : FALSE;
+    dd.StencilReadMask = (UINT8)k->s_read;
+    dd.StencilWriteMask = (UINT8)k->s_write;
+    dd.FrontFace.StencilFailOp = gb_stencil_op(k->s_fail);
+    dd.FrontFace.StencilDepthFailOp = gb_stencil_op(k->s_zfail);
+    dd.FrontFace.StencilPassOp = gb_stencil_op(k->s_zpass);
+    dd.FrontFace.StencilFunc = gb_compare(k->s_func);
+    dd.BackFace = dd.FrontFace;                 /* NV097 has one stencil state for both faces */
+    e->k = *k;
     e->dss = NULL;
     hr = ID3D11Device_CreateDepthStencilState(g.dev, &dd, &e->dss);
     if (FAILED(hr))
@@ -946,7 +987,7 @@ static GbDepth *gb_depth_for(uint32_t va, uint32_t w, uint32_t h)
     td.Height = h;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_D32_FLOAT;
+    td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
@@ -959,8 +1000,9 @@ static GbDepth *gb_depth_for(uint32_t va, uint32_t w, uint32_t h)
         gb_depth_release(d);
         return NULL;
     }
-    /* Far, as the CPU path's fresh buffers are, until the title clears it. */
-    ID3D11DeviceContext_ClearDepthStencilView(g.ctx, d->dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
+    /* Far and stencil 0, as the CPU path's fresh buffers are, until the title clears it. */
+    ID3D11DeviceContext_ClearDepthStencilView(g.ctx, d->dsv,
+                                              D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
     d->used = 1;
     d->va = va;
     d->w = w;
@@ -1165,6 +1207,7 @@ typedef struct {
     ID3D11BlendState *bs;
     FLOAT blend_factor[4];
     ID3D11DepthStencilState *dss;
+    UINT stencil_ref;
     GbConstants k;
     D3D11_RECT scissor;
     /* Combiner path: the generated shader, all four stages, and its constants. */
@@ -1243,7 +1286,7 @@ static void gb_bind(const GbDraw *dr, const GbVsh *vsh, UINT stride, UINT offset
     }
     ID3D11DeviceContext_RSSetScissorRects(g.ctx, 1, &dr->scissor);
     ID3D11DeviceContext_OMSetBlendState(g.ctx, dr->bs, dr->blend_factor, 0xFFFFFFFFu);
-    ID3D11DeviceContext_OMSetDepthStencilState(g.ctx, dr->dss, 0);
+    ID3D11DeviceContext_OMSetDepthStencilState(g.ctx, dr->dss, dr->stencil_ref);
     if (!vsh) {
         gb_pipeline(dr->rc_ps);
     } else {
@@ -1767,6 +1810,7 @@ static int gb_setup(GbDraw *dr, const Nv2aSurface *s, const Nv2aBatch *b, int rc
 {
     const Nv2aRenderState *rs = b->state;
     uint32_t bc = rs->blend_color;
+    GbDssKey key;
     float zs;
 
     memset(dr, 0, sizeof *dr);
@@ -1814,13 +1858,24 @@ static int gb_setup(GbDraw *dr, const Nv2aSurface *s, const Nv2aBatch *b, int rc
         dr->blend_factor[3] = (float)(bc >> 24) / 255.0f;
     }
     if (!dr->d)
-        dr->dss = gb_depth_state(0, 0x207, 0);
+        gb_dss_key(&key, 0, 0x207, 0);
     else if (rs->depth_test_enable)
-        dr->dss = gb_depth_state(1, rs->depth_func, rs->depth_write ? 1u : 0u);
+        gb_dss_key(&key, 1, rs->depth_func, rs->depth_write ? 1u : 0u);
     else if (rs->depth_write)
-        dr->dss = gb_depth_state(1, 0x207, 1);    /* D3D11 cannot write depth with the test off */
+        gb_dss_key(&key, 1, 0x207, 1);    /* D3D11 cannot write depth with the test off */
     else
-        dr->dss = gb_depth_state(0, 0x207, 0);
+        gb_dss_key(&key, 0, 0x207, 0);
+    if (dr->d && rs->stencil_test_enable) {
+        key.s_enable = 1;
+        key.s_read = rs->stencil_read_mask & 0xFF;
+        key.s_write = rs->stencil_write_mask & 0xFF;
+        key.s_func = rs->stencil_func;
+        key.s_fail = rs->stencil_op_fail;
+        key.s_zfail = rs->stencil_op_zfail;
+        key.s_zpass = rs->stencil_op_zpass;
+        dr->stencil_ref = rs->stencil_ref & 0xFF;
+    }
+    dr->dss = gb_depth_state(&key);
     return dr->bs && dr->dss ? 1 : -1;
 }
 
@@ -2093,6 +2148,7 @@ static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
                      uint32_t argb, uint32_t zstencil)
 {
     GbDraw dr;
+    GbDssKey key;
     Nv2aVertex q[6];
     UINT8 mask = 0, all;
     float x0, y0, x1, y1, z;
@@ -2122,7 +2178,7 @@ static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
         else
             gb_target_load(dr.t);
     }
-    if ((flags & 0x1) && rs->zeta_va)
+    if ((flags & 0x3) && rs->zeta_va)
         dr.d = gb_depth_for(rs->zeta_va, dr.t->w, dr.t->h);
     if (!mask && !dr.d)
         return;
@@ -2149,7 +2205,16 @@ static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
     dr.k.xf[3] = 0.0f;
     dr.k.tx[2] = -1.0f;
     dr.bs = gb_blend_state(0, 0, 0, 0, mask);
-    dr.dss = dr.d ? gb_depth_state(1, 0x207, 1) : gb_depth_state(0, 0x207, 0);
+    /* Z is written by an ALWAYS test, stencil by ALWAYS/REPLACE with the low 8 bits as ref. */
+    gb_dss_key(&key, dr.d && (flags & 0x1) ? 1u : 0u, 0x207, dr.d && (flags & 0x1) ? 1u : 0u);
+    if (dr.d && (flags & 0x2)) {
+        key.s_enable = 1;
+        key.s_read = key.s_write = 0xFF;
+        key.s_func = 0x207;
+        key.s_fail = key.s_zfail = key.s_zpass = 0x1E01;
+        dr.stencil_ref = zstencil & 0xFF;
+    }
+    dr.dss = gb_depth_state(&key);
     if (!dr.bs || !dr.dss)
         return;
     if (!gb_submit(&dr, q, NULL, 6))
