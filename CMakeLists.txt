@@ -71,6 +71,9 @@ add_subdirectory(src/usb)
 # Input: Xbox gamepad → XInput
 add_subdirectory(src/input)
 
+# Optional Vulkan: loader, ahead-of-time shader rule, software-ICD test hook.
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/XbrVulkan.cmake)
+
 # Shared FMV player (Media Foundation -> D3D8 texture)
 add_subdirectory(src/video)
 

@@ -17,3 +17,10 @@ if(WIN32)
     # xbox_kernel; it loads d3dcompiler at run time, so none is linked.
     target_link_libraries(xbox_video PUBLIC d3d11 dxgi dxguid xbox_kernel)
 endif()
+
+# Vulkan back-end plumbing: a smoke test that clears and draws on a real device and on
+# the software ICD, using shaders compiled ahead of time (see README.md).
+if(XBR_VULKAN_FOUND AND BUILD_TESTING)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/vk_smoke
+                     ${CMAKE_CURRENT_BINARY_DIR}/vk_smoke)
+endif()
