@@ -535,6 +535,12 @@ real thunk through synthetic guest memory, so they need no game files.
   Smilebit card came out cyan and the grey Dolby card blue. Found and measured
   against xemu in that fork. Our port fixes both the executor's clear and the
   D3D11 backend's (`nv2a_clear_to_argb`).
+- **The fence said "done" before the GPU was** (design ported from andeecollard/jsrf-recomp
+  `5358eec`, MIT). `D3D_SetFence` releases the *pre-increment* counter, so publishing the counter
+  itself satisfied every `BlockOnTime` / `VertexBuffer_Lock` wait. JSRF then rewrote its shared font
+  vertex buffer before the text was drawn: speech-balloon glyphs from the wrong font page, and a
+  name label that vanished. Our port writes each `0x1D70` release into the fence word in stream
+  order (`xbox_Nv2aFenceRelease`, opt-in per mirror).
 - The tests are the part to copy: each is paired with a *negative control* that
   feeds the identical harness the pre-fix expression and requires it to fail, on
   the grounds that a sweep which passes against both spellings is testing

@@ -4628,6 +4628,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         *(volatile uint32_t *)(mem + s_sem_va) = param;
         return;
     }
+    /* Otherwise a fence mirror registered for releases takes it. This runs in
+     * the walk in stream order, so every draw before the release has already
+     * copied its vertices out of guest RAM (draw_primitive at END). */
+    if (method == 0x1D70 && xbox_Nv2aFenceRelease(param))
+        return;
     if (!inited) {
         int i;
         inited = 1;

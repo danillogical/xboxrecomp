@@ -170,6 +170,15 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size);
  * RECOMP_FENCE_MIRROR_LIVE is set, the live counter is mirrored as before.
  *
  * Returns 0 on success, -1 if the table is full.
+ *
+ * xbox_Nv2aMirrorFenceEx with XBOX_FENCE_MIRROR_RELEASES also lets the
+ * executor's BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) drive the word through
+ * xbox_Nv2aFenceRelease. XDK D3D's fence insert releases the counter's value
+ * before it advances it, so the counter is one fence ahead of anything the GPU
+ * can have written, and mirroring it makes every wait return at once. The
+ * first accepted release stands the mirror down for good; until then, and in
+ * RECOMP_FENCE_MIRROR_LIVE runs, the mirror behaves exactly as without the
+ * flag. A title whose stream carries no 0x1D70 never leaves the mirror.
  */
 /* Advance a frame/swap counter inside the D3D device at ~60 Hz.
  *
@@ -222,6 +231,19 @@ uint32_t xbox_ContiguousBlockSize(uint32_t va);
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t src_off, uint32_t ptr_off);
+
+#define XBOX_FENCE_MIRROR_RELEASES 0x1u
+int xbox_Nv2aMirrorFenceEx(uint32_t device_ptr_va, uint32_t src_off,
+                           uint32_t ptr_off, uint32_t flags);
+
+/* Write a semaphore release's parameter, verbatim, into the word of every
+ * mirror registered with XBOX_FENCE_MIRROR_RELEASES, unless
+ * RECOMP_FENCE_MIRROR_LIVE is set. Call it as the release executes, after every
+ * method before it. Returns 1 if any word was written. Lock-free. */
+int xbox_Nv2aFenceRelease(uint32_t value);
+/* Fence words written by releases so far, one per opted-in mirror per release (JSRF has one
+ * mirror, so this is its release count): 0 means the mirror is still driving the word. */
+uint32_t xbox_Nv2aFenceReleaseCount(void);
 
 void xbox_MemoryLayoutShutdown(void);
 

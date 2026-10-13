@@ -201,6 +201,13 @@ left as it is (retiring it is an owner decision); it now calls
 (`nv2a_fence_mirror_overlaps`) every mirror write to the host word the last
 release wrote. With the switch unset the call returns immediately.
 
+The game now registers through `xbox_Nv2aMirrorFenceEx(..., XBOX_FENCE_MIRROR_RELEASES)`.
+That route does not need the switch: the PB executor hands each committed `0x1D70`
+parameter to `xbox_Nv2aFenceRelease`, which writes it to the same word in stream
+order, and the mirror stops writing from the first release on (except under
+`RECOMP_FENCE_MIRROR_LIVE`). So with the switch on as well, both release writers
+store the same value, and the mirror stops causing overlaps after the first release.
+
 ## What cannot be verified here
 
 No JSRF run is possible without game assets, and `0x00193F70` (the software-method

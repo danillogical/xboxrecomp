@@ -13,13 +13,21 @@
  * that reports commits keeps the live mirror; a non-zero live_mode always
  * uses the live counter.
  *
+ * Everything above is the fallback. A mirror registered to take the stream's
+ * own semaphore releases (fence_snapshot_release) stands down at the first
+ * one: the release parameter is the value the GPU writes, so from then on the
+ * executor writes it in stream order and the mirror no longer writes the word.
+ * Live mode never stands down, so it keeps the old mirror for A/B runs.
+ *
  * Threading: kick, commit and partial are called by one writer at a time (the caller
  * serializes them; in the runtime the MMIO owner lock does). value may run
  * concurrently on another thread. commit and partial store published before setting
  * have_published, with release ordering, and value loads have_published before
  * published, with acquire ordering, so a reader that sees the flag sees a
  * published value from some commit, never an unwritten one. Both are aligned
- * 32-bit words, so neither load can tear.
+ * 32-bit words, so neither load can tear. release runs in the submission walk
+ * (the executor) and mirror_owns on the mirror's thread; `released` is stored
+ * with release ordering and loaded with acquire ordering, like have_published.
  *
  * Zero-initialised is the fresh state. Header-only and host-independent.
  */
@@ -33,6 +41,7 @@ typedef struct FenceSnapshot {
     uint32_t kicked;                   /* a kick has been sampled */
     volatile uint32_t published;       /* counter as of the last committed kick */
     volatile uint32_t have_published;  /* a commit or partial has published */
+    volatile uint32_t released;        /* a stream release drives the word */
 } FenceSnapshot;
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -94,6 +103,29 @@ static inline uint32_t fence_snapshot_value(const FenceSnapshot *s, uint32_t liv
     if (live_mode || !fence_snapshot_has_published(s))
         return live;
     return FENCE_SNAPSHOT_LOAD(&((FenceSnapshot *)s)->published);
+}
+
+/* The executor reached a semaphore release. Returns 1 when the caller should
+ * write the release parameter verbatim into the word: the mirror
+ * accepts releases and live mode is off. The first such call latches
+ * `released`, before the caller's write, so the mirror stops writing the word
+ * for good. No comparison with earlier values: the stream's order is the
+ * GPU's order, and verbatim survives wraparound. */
+static inline int fence_snapshot_release(FenceSnapshot *s, int accepts_releases,
+                                         int live_mode)
+{
+    if (!accepts_releases || live_mode)
+        return 0;
+    if (!FENCE_SNAPSHOT_LOAD(&s->released))
+        FENCE_SNAPSHOT_STORE(&s->released, 1u);
+    return 1;
+}
+
+/* Whether the mirror may write the word: always in live mode, otherwise only
+ * until the first accepted release. */
+static inline int fence_snapshot_mirror_owns(const FenceSnapshot *s, int live_mode)
+{
+    return live_mode || !FENCE_SNAPSHOT_LOAD(&((FenceSnapshot *)s)->released);
 }
 
 #endif /* FENCE_SNAPSHOT_H */

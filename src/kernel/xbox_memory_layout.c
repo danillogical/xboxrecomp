@@ -710,6 +710,7 @@ static struct {
     uint32_t device_ptr_va;
     uint32_t src_off;
     uint32_t ptr_off;
+    uint32_t releases;    /* XBOX_FENCE_MIRROR_RELEASES: stream releases drive the word */
     FenceSnapshot snap;   /* src counter as of the last consumed kick */
 } g_fence_mirrors[XBOX_MAX_FENCE_MIRRORS];
 /* Published with an interlocked store after the entry is filled, because the
@@ -761,8 +762,8 @@ static void fence_mirror_observe(int event, uint32_t value)
     }
 }
 
-int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
-                         uint32_t src_off, uint32_t ptr_off)
+int xbox_Nv2aMirrorFenceEx(uint32_t device_ptr_va, uint32_t src_off,
+                           uint32_t ptr_off, uint32_t flags)
 {
     LONG n = g_fence_mirror_count;
     if (n >= XBOX_MAX_FENCE_MIRRORS)
@@ -771,15 +772,79 @@ int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
     g_fence_mirrors[n].device_ptr_va = device_ptr_va;
     g_fence_mirrors[n].src_off = src_off;
     g_fence_mirrors[n].ptr_off = ptr_off;
+    g_fence_mirrors[n].releases = (flags & XBOX_FENCE_MIRROR_RELEASES) != 0;
     InterlockedExchange(&g_fence_mirror_count, n + 1);
     /* Registered with the first mirror, so a title without one has no observer;
      * the title registers mirrors before its entry point runs. */
     if (n == 0)
         nv2a_set_kick_observer(fence_mirror_observe);
     fprintf(stderr, "  NV2A fence mirror: device at 0x%08X,"
-            " +0x%X -> *(+0x%X)\n",
-            device_ptr_va, src_off, ptr_off);
+            " +0x%X -> *(+0x%X)%s\n",
+            device_ptr_va, src_off, ptr_off,
+            g_fence_mirrors[n].releases ? ", driven by semaphore releases once they arrive" : "");
     return 0;
+}
+
+int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
+                         uint32_t src_off, uint32_t ptr_off)
+{
+    return xbox_Nv2aMirrorFenceEx(device_ptr_va, src_off, ptr_off, 0);
+}
+
+/* RECOMP_FENCE_MIRROR_LIVE (presence) mirrors the live counter even after a
+ * commit, and keeps the mirror writing after releases arrive: an A/B escape
+ * hatch for the pre-release behaviour. Read once; the walk and the worker may
+ * both get here first and compute the same answer. */
+static volatile int g_fence_mirror_live = -1;
+
+static int fence_mirror_live_mode(void)
+{
+    if (g_fence_mirror_live < 0)
+        g_fence_mirror_live = getenv("RECOMP_FENCE_MIRROR_LIVE") != NULL;
+    return g_fence_mirror_live;
+}
+
+static volatile LONG g_fence_releases;
+
+/* Runs in the submission walk, from the executor, after every method before the
+ * release has executed; lock-free, because the walk holds the PFIFO lock. */
+int xbox_Nv2aFenceRelease(uint32_t value)
+{
+    LONG n = InterlockedCompareExchange(&g_fence_mirror_count, 0, 0);
+    int live = fence_mirror_live_mode();
+    int wrote = 0;
+
+    for (LONG i = 0; i < n; i++) {
+        uint32_t dev, word_va;
+
+        if (!g_fence_mirrors[i].releases || live)
+            continue;
+        if (!fence_mirror_device((int)i, &dev))
+            continue;
+        word_va = fence_word(dev + g_fence_mirrors[i].ptr_off);
+        if (!fence_readable(word_va, 4))
+            continue;
+        /* Latched before the store, so a tick that sees the new value also
+         * sees that it no longer owns the word. */
+        if (!fence_snapshot_release(&g_fence_mirrors[i].snap, 1, live))
+            continue;
+        InterlockedExchange((volatile LONG *)((uintptr_t)word_va + g_memory_offset),
+                            (LONG)value);
+        wrote = 1;
+        if (InterlockedIncrement(&g_fence_releases) == 1) {
+            fprintf(stderr, "[NV2A] fence mirror: semaphore releases drive the fence"
+                    " from here (first release %u at 0x%08X); the kick/commit mirror"
+                    " stands down (RECOMP_FENCE_MIRROR_LIVE=1 restores it)\n",
+                    value, word_va);
+            fflush(stderr);
+        }
+    }
+    return wrote;
+}
+
+uint32_t xbox_Nv2aFenceReleaseCount(void)
+{
+    return (uint32_t)InterlockedCompareExchange(&g_fence_releases, 0, 0);
 }
 /* A guest address is usable only once the window is mapped and it lands
  * inside it; the chain is followed fresh every poll because the title may not
@@ -992,19 +1057,18 @@ static void frame_counters_tick(void)
     }
 }
 
-/* RECOMP_FENCE_MIRROR_LIVE (presence) mirrors the live counter even after a
- * commit: an A/B escape hatch. Read once, on the worker thread that ticks. */
-static int g_fence_mirror_live = -1;
 static int g_fence_publish_noted;
 
 static void fence_mirrors_tick(void)
 {
     LONG n = InterlockedCompareExchange(&g_fence_mirror_count, 0, 0);
-    if (g_fence_mirror_live < 0)
-        g_fence_mirror_live = getenv("RECOMP_FENCE_MIRROR_LIVE") != NULL;
+    int live = fence_mirror_live_mode();
     for (int i = 0; i < n; i++) {
         uint32_t dev, get_ptr;
 
+        /* Once a release has written the word, the stream owns it. */
+        if (!fence_snapshot_mirror_owns(&g_fence_mirrors[i].snap, live))
+            continue;
         if (!fence_mirror_device(i, &dev))
             continue;
         get_ptr = fence_word(dev + g_fence_mirrors[i].ptr_off);
@@ -1015,8 +1079,8 @@ static void fence_mirrors_tick(void)
                 (volatile uint32_t *)((uintptr_t)get_ptr + g_memory_offset);
             const FenceSnapshot *snap = &g_fence_mirrors[i].snap;
             uint32_t value = fence_snapshot_value(
-                snap, fence_word(dev + g_fence_mirrors[i].src_off), g_fence_mirror_live);
-            if (!g_fence_publish_noted && !g_fence_mirror_live
+                snap, fence_word(dev + g_fence_mirrors[i].src_off), live);
+            if (!g_fence_publish_noted && !live
                     && fence_snapshot_has_published(snap)) {
                 g_fence_publish_noted = 1;
                 fprintf(stderr, "[NV2A] fence mirror: publishing the fence of the last"
@@ -1024,11 +1088,20 @@ static void fence_mirrors_tick(void)
                         " mirror)\n");
                 fflush(stderr);
             }
-            if (*fence != value) {
+            uint32_t seen = *fence;
+            /* Checked again after reading `seen`: the release latches before it
+             * stores, so a `seen` that is already a release fails this test. */
+            if (!fence_snapshot_mirror_owns(snap, live))
+                continue;
+            if (seen != value) {
                 /* The NV2A semaphore release may own this word; it logs the overlap. */
                 extern void nv2a_note_fence_mirror_write(const volatile void *, uint32_t);
                 nv2a_note_fence_mirror_write(fence, value);
-                *fence = value;
+                if (g_fence_mirrors[i].releases)
+                    /* A release landing since `seen` wins: the store is skipped. */
+                    InterlockedCompareExchange((volatile LONG *)fence, (LONG)value, (LONG)seen);
+                else
+                    *fence = value;
             }
         }
     }
