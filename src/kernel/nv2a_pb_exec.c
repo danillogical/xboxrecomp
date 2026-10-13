@@ -1470,6 +1470,7 @@ static void current_surface(Nv2aSurface *out)
     out->height          = s_gpu.clip_h;
     out->pitch           = s_gpu.pitch;
     out->bytes_per_pixel = surface_bpp();
+    out->color_format    = s_gpu.format & 0xF;
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
     out->clip_x          = s_gpu.clip_x;
@@ -1575,11 +1576,11 @@ static void clear_surface(uint32_t param)
             for (x = 0; x < s_gpu.clip_w; x++)
                 p[x] = s_gpu.clear_color;
         } else if (bpp == 2) {
-            /* The clear value is always given as A8R8G8B8; a 16-bit surface
-             * takes the same colour reduced to 5:6:5. */
-            uint16_t v = (uint16_t)(((s_gpu.clear_color >> 8) & 0xF800)
-                                  | ((s_gpu.clear_color >> 5) & 0x07E0)
-                                  | ((s_gpu.clear_color >> 3) & 0x001F));
+            /* The clear value arrives already in the surface's format (D3D
+             * converts the D3DCOLOR before the pushbuffer), so a 16-bit surface
+             * takes the low half verbatim; reducing it again dropped red and
+             * turned white 0xFFFF cyan. Found by jsrf-recomp e2e739c (MIT). */
+            uint16_t v = (uint16_t)s_gpu.clear_color;
             uint16_t *p = (uint16_t *)row + s_gpu.clip_x;
             for (x = 0; x < s_gpu.clip_w; x++)
                 p[x] = v;

@@ -529,6 +529,12 @@ real thunk through synthetic guest memory, so they need no game files.
   #50**, which landed first. #50's body is the one in the tree because it takes
   CF from the sign-extended value as well; the docstring explaining why any of
   it matters is this PR's.
+- **A 16-bit clear was reduced to 5:6:5 twice** (ported from andeecollard/jsrf-recomp
+  `e2e739c`, MIT) — `SET_COLOR_CLEAR_VALUE` already arrives in the surface's own
+  format, so reducing it again as A8R8G8B8 dropped the red field. JSRF's white
+  Smilebit card came out cyan and the grey Dolby card blue. Found and measured
+  against xemu in that fork. Our port fixes both the executor's clear and the
+  D3D11 backend's (`nv2a_clear_to_argb`).
 - The tests are the part to copy: each is paired with a *negative control* that
   feeds the identical harness the pre-fix expression and requires it to fail, on
   the grounds that a sweep which passes against both spellings is testing

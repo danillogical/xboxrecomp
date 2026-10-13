@@ -211,4 +211,11 @@ if(BUILD_TESTING)
     target_include_directories(nv2a_present_track_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME nv2a_present_track COMMAND nv2a_present_track_test)
     set_tests_properties(nv2a_present_track PROPERTIES TIMEOUT 20)
+
+    add_executable(nv2a_clear_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/nv2a_clear_test.c
+    )
+    target_include_directories(nv2a_clear_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    add_test(NAME nv2a_clear COMMAND nv2a_clear_test)
+    set_tests_properties(nv2a_clear PROPERTIES TIMEOUT 20)
 endif()

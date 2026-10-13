@@ -47,6 +47,7 @@ typedef struct {
     uint32_t width, height;     /* clip rectangle size, real pixels */
     uint32_t pitch;             /* bytes per row */
     uint32_t bytes_per_pixel;   /* 2 or 4 */
+    uint32_t color_format;      /* NV097_SET_SURFACE_FORMAT_COLOR: 0x1/0x2 X1R5G5B5, 0x3 R5G6B5 */
     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
     uint32_t clip_x, clip_y;    /* clip rectangle origin, real pixels; vertices are
                                  * relative to (0,0), not to this origin */

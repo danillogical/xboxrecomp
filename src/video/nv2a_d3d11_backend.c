@@ -69,6 +69,7 @@ int nv2a_d3d11_backend_install(void)
 #include <string.h>
 
 #include "kernel/nv2a_backend.h"
+#include "kernel/nv2a_clear.h"
 #include "d3d/d3d8_swizzle.h"
 #include "nv2a_vsh_hlsl.h"
 
@@ -2290,6 +2291,7 @@ static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
     GbDssKey key;
     Nv2aVertex q[6];
     UINT8 mask = 0, all;
+    uint32_t diffuse;
     float x0, y0, x1, y1, z;
     int i;
 
@@ -2323,6 +2325,8 @@ static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
     if (!mask && !dr.d)
         return;
 
+    /* A 16-bit target's clear value is a 5:6:5 word, not ARGB; expand it for the quad. */
+    diffuse = dr.t->bpp == 2 ? nv2a_clear_to_argb(argb, s->color_format) : argb;
     /* The same depth units the draws use, from the top 24 (Z24S8) or low 16 (Z16) bits. */
     z = gb_z_scale(rs) == 65535.0f ? (float)(zstencil & 0xFFFF) / 65535.0f
                                    : (float)(zstencil >> 8) / 16777215.0f;
@@ -2336,7 +2340,7 @@ static void gb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
         q[i].y = cy[i] ? y1 : y0;
         q[i].z = z;
         q[i].rhw = 1.0f;
-        q[i].diffuse = argb;
+        q[i].diffuse = diffuse;
         q[i].u = q[i].v = 0.0f;
     }
     dr.k.xf[0] = 2.0f / (float)dr.t->w;
