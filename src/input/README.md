@@ -7,7 +7,9 @@ Maps the Xbox controller API to Windows XInput. The original Xbox used `XInputGe
 | File | LOC | Purpose |
 |------|-----|---------|
 | `xinput_xbox.h` | 189 | Public header — types, button constants, function prototypes |
-| `xinput_device.c` | 23 | Implementation (maps Xbox calls to Windows XInput) |
+| `xinput_device.c` | | Implementation (maps Xbox calls to Windows XInput / SDL2) |
+| `pad_map.c/.h` | | Pure mappings: `xbox_PadFromXInput`, `xbox_RumbleFromReport` |
+| `keyboard_pad.c/.h` | | Keyboard as port 0 (`RECOMP_KEYBOARD=1`) |
 
 ## Quick Start
 
@@ -114,12 +116,12 @@ XBOX_ANALOG_BUTTON_THRESHOLD  30   // Recommended press threshold
 
 | Xbox Button | XInput Equivalent | Notes |
 |-------------|------------------|-------|
-| A | A | Green button |
+| A | A | Analog byte is 255 or 0 |
 | B | B | Red button |
 | X | X | Blue button |
 | Y | Y | Yellow button |
-| Black | Right Bumper | Mapped to RB |
-| White | Left Bumper | Mapped to LB |
+| Black | Right Bumper | RB (matches xemu / Cxbx-Reloaded; keyboard `E`) |
+| White | Left Bumper | LB (keyboard `Q`) |
 | L Trigger | Left Trigger | Analog 0-255 |
 | R Trigger | Right Trigger | Analog 0-255 |
 | Start | Start/Menu | |
@@ -127,6 +129,19 @@ XBOX_ANALOG_BUTTON_THRESHOLD  30   // Recommended press threshold
 | D-pad | D-pad | Digital only |
 | L Stick | L Stick | Click = L3 |
 | R Stick | R Stick | Click = R3 |
+
+## Rumble
+
+The USB gamepad's output report (interrupt OUT endpoint 2, or SET_REPORT on the control pipe) is 6 bytes: `[0x00, 0x06, left_lo, left_hi, right_lo, right_hi]`, each motor a 16-bit little-endian value. `usb_gamepad_output` parses it with `xbox_RumbleFromReport` and calls `xbox_InputSetState`. Malformed reports are ignored.
+
+## Environment switches
+
+| Variable | Effect |
+|----------|--------|
+| `RECOMP_KEYBOARD=1` | Keyboard drives port 0, merged over any pad |
+| `RECOMP_NO_RUMBLE=1` | Do not forward rumble reports to the host pad |
+
+An empty XInput port is polled at most once per second (the call is slow); hot-plug is noticed within that time, and the keyboard keeps working meanwhile.
 
 ## Ports
 

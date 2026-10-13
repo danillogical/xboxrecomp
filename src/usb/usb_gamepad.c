@@ -12,6 +12,7 @@
  * pad plugged into the PC drives this one.
  */
 #include "usb_gamepad.h"
+#include "../input/pad_map.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -629,4 +630,22 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script_apply(pad, out);
     return 20;
+}
+
+/* A rumble report from the driver, on the interrupt-OUT endpoint or as a
+ * SET_REPORT. RECOMP_NO_RUMBLE=1 drops it. */
+void usb_gamepad_output(int pad, const uint8_t *data, int len)
+{
+    static int off = -1;
+    XBOX_VIBRATION vib;
+
+    if (off < 0) {
+        const char *v = getenv("RECOMP_NO_RUMBLE");
+        off = (v && *v && *v != '0') ? 1 : 0;
+    }
+    if (off || pad < 0 || pad >= USB_GAMEPAD_MAX)
+        return;
+    if (xbox_RumbleFromReport(data, len, &vib) != 0)
+        return;
+    xbox_InputSetState((DWORD)pad, &vib);
 }

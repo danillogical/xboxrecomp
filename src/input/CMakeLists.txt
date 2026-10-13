@@ -3,6 +3,7 @@
 add_library(xbox_input STATIC
     xinput_device.c
     keyboard_pad.c
+    pad_map.c
 )
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -36,4 +37,20 @@ if(BUILD_TESTING)
     target_link_libraries(keyboard_pad_test PRIVATE platform)
     add_test(NAME keyboard_pad COMMAND keyboard_pad_test)
     set_tests_properties(keyboard_pad PROPERTIES TIMEOUT 20)
+endif()
+
+# The XInput -> Xbox pad mapping and the rumble report parser. Pure C, so it
+# links pad_map.c alone and runs on both platforms.
+if(BUILD_TESTING)
+    add_executable(pad_map_test
+        pad_map.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/pad_map/pad_map_test.c
+    )
+    target_include_directories(pad_map_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${XBOXRECOMP_SRC_DIR}
+    )
+    target_link_libraries(pad_map_test PRIVATE platform)
+    add_test(NAME pad_map COMMAND pad_map_test)
+    set_tests_properties(pad_map PROPERTIES TIMEOUT 20)
 endif()

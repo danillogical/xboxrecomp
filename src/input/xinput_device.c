@@ -12,6 +12,7 @@
 
 #include "xinput_xbox.h"
 #include "keyboard_pad.h"
+#include "pad_map.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -25,6 +26,22 @@
 
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
 static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
+
+/* XInputGetState on an empty port costs on the order of a millisecond, and
+ * the USB layer asks per report. After a port fails it is not asked again
+ * until this tick, which still notices a hot-plug within a second. */
+#define EMPTY_PORT_RETRY_MS 1000
+static ULONGLONG g_retry_at[XBOX_MAX_CONTROLLERS] = { 0 };
+
+static BOOL port_throttled(DWORD port)
+{
+    return g_retry_at[port] && GetTickCount64() < g_retry_at[port];
+}
+
+static void port_failed(DWORD port)
+{
+    g_retry_at[port] = GetTickCount64() + EMPTY_PORT_RETRY_MS;
+}
 
 /* ---- keyboard, when there is no pad --------------------------------------
  *
@@ -74,19 +91,24 @@ void xbox_InputInit(void)
         XINPUT_STATE state;
         DWORD result = XInputGetState(i, &state);
         g_controller_connected[i] = (result == ERROR_SUCCESS);
+        if (result != ERROR_SUCCESS)
+            port_failed(i);
     }
 }
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
-    XINPUT_STATE xi_state;
+    XINPUT_STATE xi_state = {0};
     DWORD result;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetState(dwPort, &xi_state);
+    result = port_throttled(dwPort) ? ERROR_DEVICE_NOT_CONNECTED
+                                    : XInputGetState(dwPort, &xi_state);
     if (result != ERROR_SUCCESS) {
+        if (result != ERROR_DEVICE_NOT_CONNECTED || !port_throttled(dwPort))
+            port_failed(dwPort);
         g_controller_connected[dwPort] = FALSE;
         if (dwPort == 0 && keyboard_enabled()) {
             keyboard_state(pState);
@@ -95,32 +117,22 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         return result;
     }
 
+    g_retry_at[dwPort] = 0;
     g_controller_connected[dwPort] = TRUE;
     g_last_packet[dwPort] = xi_state.dwPacketNumber;
 
-    memset(pState, 0, sizeof(XBOX_INPUT_STATE));
-    pState->dwPacketNumber = xi_state.dwPacketNumber;
-    pState->Gamepad.wButtons = xi_state.Gamepad.wButtons & 0x00FF;
-
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_A) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_B) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_X) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_Y) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
-        (xi_state.Gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = xi_state.Gamepad.bLeftTrigger;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = xi_state.Gamepad.bRightTrigger;
-
-    pState->Gamepad.sThumbLX = xi_state.Gamepad.sThumbLX;
-    pState->Gamepad.sThumbLY = xi_state.Gamepad.sThumbLY;
-    pState->Gamepad.sThumbRX = xi_state.Gamepad.sThumbRX;
-    pState->Gamepad.sThumbRY = xi_state.Gamepad.sThumbRY;
+    {
+        XBOX_XINPUT_GAMEPAD g;
+        g.wButtons      = xi_state.Gamepad.wButtons;
+        g.bLeftTrigger  = xi_state.Gamepad.bLeftTrigger;
+        g.bRightTrigger = xi_state.Gamepad.bRightTrigger;
+        g.sThumbLX      = xi_state.Gamepad.sThumbLX;
+        g.sThumbLY      = xi_state.Gamepad.sThumbLY;
+        g.sThumbRX      = xi_state.Gamepad.sThumbRX;
+        g.sThumbRY      = xi_state.Gamepad.sThumbRY;
+        xbox_PadFromXInput(&g, pState);
+        pState->dwPacketNumber = xi_state.dwPacketNumber;
+    }
 
     /* Merge the keyboard on top rather than only standing in for a missing
      * pad.
@@ -159,6 +171,8 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     XINPUT_VIBRATION xi_vib;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    if (port_throttled(dwPort))
         return ERROR_DEVICE_NOT_CONNECTED;
 
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
@@ -259,9 +273,9 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_X) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_Y) ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
-        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) ? 255 : 0;
     pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] =
+        SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) ? 255 : 0;
+    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK] =
         SDL_GameControllerGetButton(c, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER) ? 255 : 0;
 
     /* SDL trigger axes are 0..32767 -> Xbox analog button 0..255 */
