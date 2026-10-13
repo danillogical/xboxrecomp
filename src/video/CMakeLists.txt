@@ -4,6 +4,7 @@ add_library(xbox_video STATIC
     video_pump.c
     fb_present.c
     nv2a_d3d11_backend.c
+    nv2a_vk_backend.c
     nv2a_vsh_hlsl.c
 )
 target_include_directories(xbox_video PUBLIC
@@ -16,6 +17,19 @@ if(WIN32)
     # The NV2A D3D11 back end, which registers with the pushbuffer executor in
     # xbox_kernel; it loads d3dcompiler at run time, so none is linked.
     target_link_libraries(xbox_video PUBLIC d3d11 dxgi dxguid xbox_kernel)
+endif()
+
+# The NV2A Vulkan back end (nv2a_vk_backend.c), built only with Vulkan and its shader
+# tools; otherwise that file is a stub that reports failure. Its shaders are SPIR-V
+# compiled here, and it opens the Vulkan loader at run time, so only headers are used.
+if(XBR_VULKAN_FOUND)
+    target_compile_definitions(xbox_video PRIVATE XBR_VK_BACKEND=1)
+    target_include_directories(xbox_video PRIVATE ${Vulkan_INCLUDE_DIRS})
+    target_link_libraries(xbox_video PUBLIC xbox_kernel ${CMAKE_DL_LIBS})
+    xbr_add_spirv(xbox_video SOURCE ${CMAKE_CURRENT_LIST_DIR}/shaders/nv2a_vk_stage0.hlsl
+        ENTRY vs_main PROFILE vs_6_0 INVERT_Y SYMBOL xbr_nv2a_vk_stage0_vs)
+    xbr_add_spirv(xbox_video SOURCE ${CMAKE_CURRENT_LIST_DIR}/shaders/nv2a_vk_stage0.hlsl
+        ENTRY ps_main PROFILE ps_6_0 SYMBOL xbr_nv2a_vk_stage0_ps)
 endif()
 
 # Vulkan back-end plumbing: a smoke test that clears and draws on a real device and on
