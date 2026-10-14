@@ -19,7 +19,12 @@ It runs `dxc -spirv -T <profile> -E <entry>` (plus `-fvk-invert-y` with `INVERT_
 profiles only), validates with `spirv-val`, and writes `<build>/spirv/<SYMBOL>.spv.h` containing
 `static const uint32_t <SYMBOL>[]` and `static const size_t <SYMBOL>_size` (bytes). The header is
 added to the target's sources and its directory to its include path. A compile or validation error
-fails that target's build. `shaders/smoke_tri_{vs,ps}.hlsl` are the proof pair.
+fails that target's build.
+
+`nv2a_vk_stage0.hlsl` (the stage-0 path) and `nv2a_vk_rc.hlsl` (the NV2A register combiners) are each
+built twice, once per entry point; the combiner shader is one uber shader for every combiner program,
+so nothing is specialised or compiled per configuration. `shaders/smoke_tri_{vs,ps}.hlsl` are the
+proof pair for the smoke test.
 
 ## Software Vulkan driver for CTest
 

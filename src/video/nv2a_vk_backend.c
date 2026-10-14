@@ -22,10 +22,12 @@
  *     render target is sampled from the target (through a snapshot when it is
  *     also the output); any other texture overlapping a target with unflushed
  *     GPU writes flushes that target first.
- *   - Only the stage-0 path exists: stage 0 modulated by diffuse, alpha test in
- *     the pixel shader. Batches carrying register-combiner state are drawn that
- *     way and counted as rc_unsupported; draw_program is NULL, so the executor
- *     transforms vertex programs on the CPU.
+ *   - Two pipelines: stage 0 modulated by diffuse (shaders/nv2a_vk_stage0.hlsl), and the
+ *     register combiners (shaders/nv2a_vk_rc.hlsl): one uber shader that interprets the
+ *     batch's Nv2aCombiner, uploaded per draw to a stream-backed dynamic uniform buffer,
+ *     as nv2a_rc_eval does. A batch whose texture stages it cannot interpret (gb_rc_key's
+ *     rule: modes > 5, true cube maps) is drawn the stage-0 way and counted as
+ *     rc_fallback; draw_program is NULL, so the executor transforms vertex programs on the CPU.
  *
  * Vulkan specifics:
  *   - y: the vertex shader is D3D11's, built with -fvk-invert-y, so surface
@@ -84,9 +86,11 @@ int nv2a_vk_backend_install(void)
 #include "kernel/nv2a_clear.h"
 #include "d3d/d3d8_swizzle.h"
 
-/* Built from shaders/nv2a_vk_stage0.hlsl by xbr_add_spirv. */
+/* Built from shaders/nv2a_vk_stage0.hlsl and shaders/nv2a_vk_rc.hlsl by xbr_add_spirv. */
 #include "xbr_nv2a_vk_stage0_vs.spv.h"
 #include "xbr_nv2a_vk_stage0_ps.spv.h"
+#include "xbr_nv2a_vk_rc_vs.spv.h"
+#include "xbr_nv2a_vk_rc_ps.spv.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -97,6 +101,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 #define VB_MAX_FBS       64
 #define VB_MAX_DIM       4096
 #define VB_STREAM_BYTES  (32u << 20)      /* vertices and uploads of one submission */
+#define VB_STREAM_ALIGN 256u              /* stream slices; >= every device's minUniformBufferOffsetAlignment */
 #define VB_MAX_SETS      8192             /* descriptor sets of one submission */
 #define VB_STATS_MS      10000
 #define VB_WAIT_NS       (10ull * 1000000000ull)
@@ -149,6 +154,34 @@ static PFN_vkCreateDebugUtilsMessengerEXT vkCreateDebugUtilsMessengerEXT;
 /* Push constants, shared by both stages; the D3D11 back end's GbConstants. */
 typedef struct { float xf[4], tx[4]; } VbConstants;
 
+/* What the combiner pipeline reads per vertex: Nv2aVertex and Nv2aVertexExtra merged
+ * (the D3D11 back end's GbRcVertex). */
+typedef struct {
+    float x, y, z, rhw;
+    uint32_t d0, d1;                    /* diffuse, specular: 0xAARRGGBB */
+    float fog;                          /* Nv2aVertexExtra.fog */
+    float t[4][4];                      /* Nv2aVertexExtra.tex */
+} VbRcVertex;
+typedef char vb_rc_vertex_is_92_bytes[sizeof(VbRcVertex) == 92 ? 1 : -1];
+
+/* The combiner registers of one draw, binding 0 of dsl_rc (RcConsts in nv2a_vk_rc.hlsl). Every
+ * member is a whole number of 16-byte vectors, so C and the shader cannot disagree on offsets. */
+typedef struct {
+    uint32_t stage[8][4];               /*   0: color_icw, alpha_icw, color_ocw, alpha_ocw */
+    float    c0[8][4];                  /* 128: FACTOR0[s] r,g,b,a (nv2a_rc_unpack) */
+    float    c1[8][4];                  /* 256: FACTOR1[s] */
+    float    fc0[4];                    /* 384: final_c0 */
+    float    fc1[4];                    /* 400: final_c1 */
+    float    fogc[4];                   /* 416: fog colour (Nv2aBatch.fog_color unpacked) */
+    float    ts[4][4];                  /* 432: per texture stage: scale x,y; z 1 if bound; w 0 */
+    uint32_t ctl[4];                    /* 496: stages, flags, stage_program, clip_plane_mode */
+    uint32_t fin[4];                    /* 512: final0, final1, 0, 0 */
+} VbRcConstants;                        /* 528 */
+typedef char vb_rc_constants_528[sizeof(VbRcConstants) == 528 ? 1 : -1];
+typedef char vb_rc_ts_at_432[offsetof(VbRcConstants, ts) == 432 ? 1 : -1];
+typedef char vb_rc_ctl_at_496[offsetof(VbRcConstants, ctl) == 496 ? 1 : -1];
+typedef char vb_rc_fin_at_512[offsetof(VbRcConstants, fin) == 512 ? 1 : -1];
+
 typedef struct {
     VkImage img;
     VkDeviceMemory mem;
@@ -186,6 +219,7 @@ typedef struct {
 
 /* Everything baked into a pipeline; all uint32_t, so memcmp compares it. */
 typedef struct {
+    uint32_t rc;                                         /* 1: the combiner pipeline (nv2a_vk_rc.hlsl, VbRcVertex, layout_rc) */
     uint32_t has_depth;
     uint32_t blend, src, dst, eq, wmask;                 /* blend: src/dst/eq 0 when off */
     uint32_t z_enable, z_func, z_write;
@@ -217,7 +251,7 @@ typedef struct {
 typedef struct {
     uint64_t draws, tris, clears, dropped_tris, skipped, cull_draws, cull_all;
     uint64_t tex_uploads, tex_hits, tex_undecodable, rt_aliases, rt_copies;
-    uint64_t rt_loads, readbacks, readback_ns, rc_unsupported, pipelines, submits;
+    uint64_t rt_loads, readbacks, readback_ns, rc_draws, rc_fallback, pipelines, submits;
     uint64_t validation_errors, validation_warnings;
 } VbStats;
 
@@ -240,8 +274,11 @@ static struct {
     VkRenderPass rp[2];                 /* [has depth] */
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
+    VkDescriptorSetLayout dsl_rc;       /* the combiner pipeline's set */
+    VkPipelineLayout layout_rc;
     VkPipelineCache pcache;
     VkShaderModule vs, ps;
+    VkShaderModule vs_rc, ps_rc;
     VkDescriptorPool dpool;
     uint32_t sets_used;
     VkBuffer stream;                    /* host-visible ring of one submission */
@@ -558,7 +595,7 @@ static void vb_submit_wait(void)
  * so the allocations that follow cannot submit between being written and used. */
 static void vb_reserve(VkDeviceSize bytes, uint32_t sets)
 {
-    VkDeviceSize off = (g.stream_off + 255) & ~(VkDeviceSize)255;
+    VkDeviceSize off = (g.stream_off + VB_STREAM_ALIGN - 1) & ~(VkDeviceSize)(VB_STREAM_ALIGN - 1);
 
     if (off + bytes > VB_STREAM_BYTES || g.sets_used + sets > VB_MAX_SETS)
         vb_submit_wait();
@@ -584,7 +621,7 @@ static uint8_t *vb_stream(VkDeviceSize bytes, VkBuffer *buf, VkDeviceSize *off)
         return p;
     }
     vb_reserve(bytes, 0);
-    o = (g.stream_off + 255) & ~(VkDeviceSize)255;
+    o = (g.stream_off + VB_STREAM_ALIGN - 1) & ~(VkDeviceSize)(VB_STREAM_ALIGN - 1);
     g.stream_off = o + bytes;
     *buf = g.stream;
     *off = o;
@@ -688,6 +725,19 @@ static VkPipeline vb_pipeline_create(const VbPipeKey *k)
         { 2, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(Nv2aVertex, diffuse) },
         { 3, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Nv2aVertex, u) },
     };
+    /* The combiner vertex, in D3D11's GbRcVertex input layout. */
+    VkVertexInputBindingDescription vb_rc = { 0, sizeof(VbRcVertex), VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription va_rc[9] = {
+        { 0, 0, VK_FORMAT_R32G32B32_SFLOAT,    offsetof(VbRcVertex, x) },
+        { 1, 0, VK_FORMAT_R32_SFLOAT,          offsetof(VbRcVertex, rhw) },
+        { 2, 0, VK_FORMAT_R8G8B8A8_UNORM,      offsetof(VbRcVertex, d0) },
+        { 3, 0, VK_FORMAT_R8G8B8A8_UNORM,      offsetof(VbRcVertex, d1) },
+        { 4, 0, VK_FORMAT_R32_SFLOAT,          offsetof(VbRcVertex, fog) },
+        { 5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VbRcVertex, t) },
+        { 6, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VbRcVertex, t) + 16 },
+        { 7, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VbRcVertex, t) + 32 },
+        { 8, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(VbRcVertex, t) + 48 },
+    };
     VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
     VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
     VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
@@ -704,16 +754,16 @@ static VkPipeline vb_pipeline_create(const VbPipeKey *k)
     memset(st, 0, sizeof st);
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    st[0].module = g.vs;
-    st[0].pName = "vs_main";
+    st[0].module = k->rc ? g.vs_rc : g.vs;
+    st[0].pName = k->rc ? "vs_rc" : "vs_main";
     st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    st[1].module = g.ps;
-    st[1].pName = "ps_main";
+    st[1].module = k->rc ? g.ps_rc : g.ps;
+    st[1].pName = k->rc ? "ps_rc" : "ps_main";
 
     vi.vertexBindingDescriptionCount = 1;
-    vi.pVertexBindingDescriptions = &vb;
-    vi.vertexAttributeDescriptionCount = 4;
-    vi.pVertexAttributeDescriptions = va;
+    vi.pVertexBindingDescriptions = k->rc ? &vb_rc : &vb;
+    vi.vertexAttributeDescriptionCount = k->rc ? 9 : 4;
+    vi.pVertexAttributeDescriptions = k->rc ? va_rc : va;
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     vp.viewportCount = 1;
     vp.scissorCount = 1;
@@ -767,7 +817,7 @@ static VkPipeline vb_pipeline_create(const VbPipeKey *k)
     pi.pDepthStencilState = &ds;
     pi.pColorBlendState = &cb;
     pi.pDynamicState = &dy;
-    pi.layout = g.layout;
+    pi.layout = k->rc ? g.layout_rc : g.layout;
     pi.renderPass = g.rp[k->has_depth ? 1 : 0];
     r = vkCreateGraphicsPipelines(g.dev, g.pcache, 1, &pi, NULL, &pipe);
     if (r != VK_SUCCESS) {
@@ -1501,6 +1551,10 @@ typedef struct {
     VkImageView view;                   /* 0: untextured */
     VkImageLayout view_layout;
     VkSampler samp;
+    VkImageView views[4];               /* combiner stages; 0: g.white is bound */
+    VkImageLayout view_layouts[4];
+    VkSampler samps[4];                 /* 0: g.samp[0][8] is bound */
+    VbRcConstants rck;                  /* the combiner registers, uploaded per draw */
     VbPipeKey key;
     float blend_factor[4];
     uint32_t stencil_ref, stencil_read, stencil_write;
@@ -1514,20 +1568,25 @@ static int vb_vertex_ok(const Nv2aVertex *v)
         && v->rhw != 0.0f;
 }
 
-/* Upload the usable triangles of `v` and draw them; returns how many vertices were drawn. */
-static uint32_t vb_submit(const VbDraw *dr, const Nv2aVertex *v, uint32_t n)
+/* Upload the usable triangles of `v` (with `x` on the combiner path) and draw
+ * them; returns how many vertices were drawn. */
+static uint32_t vb_submit(const VbDraw *dr, const Nv2aVertex *v, const Nv2aVertexExtra *x,
+                          uint32_t n)
 {
-    const uint32_t cap = (VB_STREAM_BYTES / 2) / (uint32_t)sizeof(Nv2aVertex);
+    const int rc = dr->key.rc != 0;
+    const uint32_t stride = rc ? (uint32_t)sizeof(VbRcVertex) : (uint32_t)sizeof(Nv2aVertex);
+    const uint32_t cap = (VB_STREAM_BYTES / 2) / stride;
     VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    VkDescriptorImageInfo ii[2];
-    VkWriteDescriptorSet wr[2];
+    VkDescriptorImageInfo ii[8];
+    VkDescriptorBufferInfo ub;
+    VkWriteDescriptorSet wr[9];
     VkDescriptorSet set;
     VkPipeline pipe;
-    VkBuffer buf;
-    VkDeviceSize off;
+    VkBuffer buf, ubuf = VK_NULL_HANDLE;
+    VkDeviceSize off, uoff = 0, bytes;
     VkViewport vp;
-    Nv2aVertex *dst;
-    uint32_t i, out = 0;
+    uint8_t *dst;
+    uint32_t i, j, out = 0, nw, doff;
     VkResult r;
 
     if (n > cap)
@@ -1535,11 +1594,18 @@ static uint32_t vb_submit(const VbDraw *dr, const Nv2aVertex *v, uint32_t n)
     pipe = vb_pipeline(&dr->key);
     if (!pipe)
         return 0;
-    /* Vertices and the descriptor set land in the same submission as the draw. */
-    vb_reserve((VkDeviceSize)n * sizeof *v, 1);
+    /* Vertices, the combiner registers and the descriptor set land in the same
+     * submission as the draw: the vertex slice, the alignment pad the UBO slice
+     * needs, the UBO and the one set are all reserved before either slice is
+     * written, so no submit can fall between them. */
+    bytes = (VkDeviceSize)n * stride;
+    if (rc)
+        bytes = ((bytes + VB_STREAM_ALIGN - 1) & ~(VkDeviceSize)(VB_STREAM_ALIGN - 1))
+              + sizeof(VbRcConstants);
+    vb_reserve(bytes, 1);
     if (!g.ok)
         return 0;
-    dst = (Nv2aVertex *)vb_stream((VkDeviceSize)n * sizeof *v, &buf, &off);
+    dst = vb_stream((VkDeviceSize)n * stride, &buf, &off);
     if (!dst)
         return 0;
     for (i = 0; i + 3 <= n; i += 3) {
@@ -1547,15 +1613,38 @@ static uint32_t vb_submit(const VbDraw *dr, const Nv2aVertex *v, uint32_t n)
             g.st.dropped_tris++;
             continue;
         }
-        memcpy(dst + out, v + i, 3 * sizeof *v);
+        if (!rc) {
+            memcpy((Nv2aVertex *)dst + out, v + i, 3 * sizeof *v);
+        } else {
+            for (j = i; j < i + 3; j++) {
+                VbRcVertex *o = (VbRcVertex *)dst + out + (j - i);
+                o->x = v[j].x;
+                o->y = v[j].y;
+                o->z = v[j].z;
+                o->rhw = v[j].rhw;
+                o->d0 = v[j].diffuse;
+                o->d1 = x[j].specular;
+                o->fog = x[j].fog;
+                memcpy(o->t, x[j].tex, sizeof o->t);
+            }
+        }
         out += 3;
     }
     if (!out)
         return 0;
+    if (rc) {
+        /* Reserved above, so this cannot submit: the UBO and the draw that reads
+         * it are in the same submission. uoff is 256-aligned, which satisfies
+         * minUniformBufferOffsetAlignment on every device (VB_STREAM_ALIGN). */
+        uint8_t *u = vb_stream(sizeof(VbRcConstants), &ubuf, &uoff);
+        if (!u)
+            return 0;
+        memcpy(u, &dr->rck, sizeof dr->rck);
+    }
 
     dai.descriptorPool = g.dpool;
     dai.descriptorSetCount = 1;
-    dai.pSetLayouts = &g.dsl;
+    dai.pSetLayouts = rc ? &g.dsl_rc : &g.dsl;
     r = vkAllocateDescriptorSets(g.dev, &dai, &set);
     if (r != VK_SUCCESS) {
         vb_fail("vkAllocateDescriptorSets", r);
@@ -1564,18 +1653,51 @@ static uint32_t vb_submit(const VbDraw *dr, const Nv2aVertex *v, uint32_t n)
     g.sets_used++;
     memset(ii, 0, sizeof ii);
     memset(wr, 0, sizeof wr);
-    ii[0].imageView = dr->view ? dr->view : g.white.view;
-    ii[0].imageLayout = dr->view ? dr->view_layout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    ii[1].sampler = dr->samp ? dr->samp : g.samp[0][8];
-    for (i = 0; i < 2; i++) {
-        wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        wr[i].dstSet = set;
-        wr[i].dstBinding = i;
-        wr[i].descriptorCount = 1;
-        wr[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        wr[i].pImageInfo = &ii[i];
+    if (!rc) {
+        ii[0].imageView = dr->view ? dr->view : g.white.view;
+        ii[0].imageLayout = dr->view ? dr->view_layout : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        ii[1].sampler = dr->samp ? dr->samp : g.samp[0][8];
+        for (i = 0; i < 2; i++) {
+            wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wr[i].dstSet = set;
+            wr[i].dstBinding = i;
+            wr[i].descriptorCount = 1;
+            wr[i].descriptorType = i ? VK_DESCRIPTOR_TYPE_SAMPLER
+                                     : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            wr[i].pImageInfo = &ii[i];
+        }
+        nw = 2;
+    } else {
+        ub.buffer = ubuf;
+        ub.offset = 0;
+        ub.range = sizeof(VbRcConstants);
+        wr[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[0].dstSet = set;
+        wr[0].dstBinding = 0;
+        wr[0].descriptorCount = 1;
+        wr[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        wr[0].pBufferInfo = &ub;
+        for (i = 0; i < 4; i++) {
+            ii[i].imageView = dr->views[i] ? dr->views[i] : g.white.view;
+            ii[i].imageLayout = dr->views[i] ? dr->view_layouts[i]
+                                             : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            wr[1 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wr[1 + i].dstSet = set;
+            wr[1 + i].dstBinding = 1 + i;
+            wr[1 + i].descriptorCount = 1;
+            wr[1 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            wr[1 + i].pImageInfo = &ii[i];
+            ii[4 + i].sampler = dr->samps[i] ? dr->samps[i] : g.samp[0][8];
+            wr[5 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wr[5 + i].dstSet = set;
+            wr[5 + i].dstBinding = 5 + i;
+            wr[5 + i].descriptorCount = 1;
+            wr[5 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            wr[5 + i].pImageInfo = &ii[4 + i];
+        }
+        nw = 9;
     }
-    vkUpdateDescriptorSets(g.dev, 2, wr, 0, NULL);
+    vkUpdateDescriptorSets(g.dev, nw, wr, 0, NULL);
 
     if (!vb_begin_pass(dr->t, dr->d))
         return 0;
@@ -1583,9 +1705,13 @@ static uint32_t vb_submit(const VbDraw *dr, const Nv2aVertex *v, uint32_t n)
         vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
         g.bound_pipe = pipe;
     }
-    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &set, 0, NULL);
+    doff = (uint32_t)uoff;
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            rc ? g.layout_rc : g.layout, 0, 1, &set,
+                            rc ? 1u : 0u, rc ? &doff : NULL);
     vkCmdBindVertexBuffers(g.cmd, 0, 1, &buf, &off);
-    vkCmdPushConstants(g.cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+    vkCmdPushConstants(g.cmd, rc ? g.layout_rc : g.layout,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof dr->k, &dr->k);
     vp.x = 0.0f;
     vp.y = 0.0f;
@@ -1640,10 +1766,74 @@ static uint32_t vb_write_mask(uint32_t color_mask, uint32_t bpp)
     return m;
 }
 
+/* Can the combiner pipeline draw this batch? gb_rc_key's rule: bump-environment and
+ * dot-product stage modes (> 5) and true cube maps are not interpreted. */
+static int vb_rc_supported(const Nv2aBatch *b)
+{
+    uint32_t prog = b->combiner->stage_program & 0xFFFFF;
+    int st;
+
+    for (st = 0; st < 4; st++) {
+        uint32_t m = (prog >> (st * 5)) & 0x1F;
+        if (m > 5)
+            return 0;
+        if (m == 3 && b->textures[st] && b->textures[st]->cube)
+            return 0;
+    }
+    return 1;
+}
+
+/* The combiner half of a draw (gb_rc_prepare): the register block and the four stages' textures. */
+static void vb_rc_prepare(VbDraw *dr, const Nv2aBatch *b)
+{
+    const Nv2aCombiner *rc = b->combiner;
+    VbRcConstants *k = &dr->rck;
+    uint32_t n = rc->control & 0xFF, prog = rc->stage_program & 0xFFFFF, i;
+    int st;
+
+    if (n > 8)
+        n = 8;
+    for (i = 0; i < 8; i++) {
+        k->stage[i][0] = rc->color_icw[i];
+        k->stage[i][1] = rc->alpha_icw[i];
+        k->stage[i][2] = rc->color_ocw[i];
+        k->stage[i][3] = rc->alpha_ocw[i];
+        nv2a_rc_unpack(rc->factor0[i], k->c0[i]);
+        nv2a_rc_unpack(rc->factor1[i], k->c1[i]);
+    }
+    nv2a_rc_unpack(rc->final_c0, k->fc0);
+    nv2a_rc_unpack(rc->final_c1, k->fc1);
+    nv2a_rc_unpack(b->fog_color, k->fogc);          /* already a D3DCOLOR (backend_fill_rc) */
+    k->ctl[0] = n;
+    k->ctl[1] = (rc->control >> 8) & 0x111;          /* mux MSB, per-stage c0, c1 */
+    k->ctl[2] = prog;
+    k->ctl[3] = b->clip_plane_mode & 0xFFFF;
+    k->fin[0] = rc->final0;
+    k->fin[1] = rc->final1;
+    for (st = 0; st < 4; st++) {
+        const Nv2aTexture *tx = b->textures[st];
+        uint32_t m = (prog >> (st * 5)) & 0x1F;
+        float iw = 1.0f, ih = 1.0f;
+        k->ts[st][0] = k->ts[st][1] = 1.0f;
+        if (!tx || m < 1 || m > 3)
+            continue;
+        dr->views[st] = vb_texture(tx, dr->t, &dr->view_layouts[st], &iw, &ih);
+        dr->samps[st] = vb_sampler(tx);
+        if (!dr->samps[st])
+            dr->views[st] = VK_NULL_HANDLE;
+        /* Linear formats are addressed in texels, the rest in [0, 1]. */
+        if (tx->linear) {
+            k->ts[st][0] = iw;
+            k->ts[st][1] = ih;
+        }
+        k->ts[st][2] = dr->views[st] ? 1.0f : 0.0f;
+    }
+}
+
 /* Set up everything of a draw but its vertices: target, depth, transform and
- * alpha constants, stage 0, blend and depth state. Returns 1 ready, 0 no target
- * or an empty clip. */
-static int vb_setup(VbDraw *dr, const Nv2aSurface *s, const Nv2aBatch *b)
+ * alpha constants, the combiners when `rc` and the batch is interpretable, else
+ * stage 0, blend and depth state. Returns 1 ready, 0 no target or an empty clip. */
+static int vb_setup(VbDraw *dr, const Nv2aSurface *s, const Nv2aBatch *b, int rc)
 {
     const Nv2aRenderState *rs = b->state;
     uint32_t bc = rs->blend_color;
@@ -1668,7 +1858,10 @@ static int vb_setup(VbDraw *dr, const Nv2aSurface *s, const Nv2aBatch *b)
     dr->k.tx[2] = (rs->alpha_test_enable && rs->alpha_func >= 0x200 && rs->alpha_func < 0x207)
                 ? (float)(rs->alpha_func - 0x200) : -1.0f;
     dr->k.tx[3] = (float)(rs->alpha_ref & 0xFF);
-    if (b->texture) {
+    if (rc && vb_rc_supported(b)) {
+        dr->key.rc = 1;
+        vb_rc_prepare(dr, b);
+    } else if (b->texture) {
         dr->view = vb_texture(b->texture, dr->t, &dr->view_layout, &dr->k.tx[0], &dr->k.tx[1]);
         dr->samp = vb_sampler(b->texture);
         if (!dr->samp)
@@ -1714,6 +1907,7 @@ static void vb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 {
     VbDraw dr;
     uint32_t drawn;
+    int rc = b->combiner && b->extra;
 
     if (!g.ok || b->count < 3)
         return;
@@ -1721,15 +1915,18 @@ static void vb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         g.st.cull_all++;
         return;
     }
-    if (!vb_setup(&dr, s, b)) {
+    if (!vb_setup(&dr, s, b, rc)) {
         g.st.skipped++;
         return;
     }
-    /* No combiner shader yet: drawn as stage 0 modulated by diffuse. */
-    if (b->combiner)
-        g.st.rc_unsupported++;
+    if (rc) {
+        if (dr.key.rc)
+            g.st.rc_draws++;
+        else
+            g.st.rc_fallback++;
+    }
 
-    drawn = vb_submit(&dr, b->vertices, b->count);
+    drawn = vb_submit(&dr, b->vertices, dr.key.rc ? b->extra : NULL, b->count);
     if (!drawn)
         return;
     vb_target_mark(dr.t, &dr.scissor);
@@ -1810,7 +2007,7 @@ static void vb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
         dr.stencil_read = dr.stencil_write = 0xFF;
         dr.stencil_ref = zstencil & 0xFF;
     }
-    if (!vb_submit(&dr, q, 6))
+    if (!vb_submit(&dr, q, NULL, 6))
         return;
     if (mask)
         vb_target_mark(dr.t, &dr.scissor);
@@ -1827,7 +2024,7 @@ static void vb_stats(int force)
     fprintf(stderr, "[GPUVK] flips=%u draws=%llu tris=%llu clears=%llu tex_uploads=%llu"
                     " tex_hits=%llu tex_undecodable=%llu rt_aliases=%llu rt_copies=%llu"
                     " rt_loads=%llu readbacks=%llu readback_ms=%.1f dropped_tris=%llu"
-                    " skipped=%llu rc_unsupported=%llu pipelines=%llu submits=%llu"
+                    " skipped=%llu rc_draws=%llu rc_fallback=%llu pipelines=%llu submits=%llu"
                     " cull_draws=%llu cull_all=%llu validation_errors=%llu"
                     " validation_warnings=%llu\n",
             g.frame, (unsigned long long)g.st.draws, (unsigned long long)g.st.tris,
@@ -1836,7 +2033,8 @@ static void vb_stats(int force)
             (unsigned long long)g.st.rt_aliases, (unsigned long long)g.st.rt_copies,
             (unsigned long long)g.st.rt_loads, (unsigned long long)g.st.readbacks,
             (double)g.st.readback_ns / 1e6, (unsigned long long)g.st.dropped_tris,
-            (unsigned long long)g.st.skipped, (unsigned long long)g.st.rc_unsupported,
+            (unsigned long long)g.st.skipped, (unsigned long long)g.st.rc_draws,
+            (unsigned long long)g.st.rc_fallback,
             (unsigned long long)g.st.pipelines, (unsigned long long)g.st.submits,
             (unsigned long long)g.st.cull_draws, (unsigned long long)g.st.cull_all,
             (unsigned long long)g.st.validation_errors,
@@ -2032,7 +2230,8 @@ static int vb_pick_device(void)
     for (i = 0; i < n; i++) {
         int score, usable;
         vkGetPhysicalDeviceProperties(devs[i], &p);
-        usable = p.apiVersion >= VK_API_VERSION_1_1 && vb_graphics_family(devs[i], &family);
+        usable = p.apiVersion >= VK_API_VERSION_1_1 && vb_graphics_family(devs[i], &family)
+              && p.limits.minUniformBufferOffsetAlignment <= VB_STREAM_ALIGN;
         score = vb_device_score(p.deviceType);
         fprintf(stderr, "[GPUVK] found device %u: %s (type %d, api %u.%u)%s\n", i, p.deviceName,
                 (int)p.deviceType, VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion),
@@ -2124,14 +2323,15 @@ static int vb_create_pipeline_objects(void)
     VkSubpassDescription sub;
     VkRenderPassCreateInfo rpi = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
     VkDescriptorSetLayoutBinding bind[2];
+    VkDescriptorSetLayoutBinding bind_rc[9];
     VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     VkPushConstantRange pcr;
     VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     VkPipelineCacheCreateInfo pci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
     VkShaderModuleCreateInfo smi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-    VkDescriptorPoolSize ps[2];
+    VkDescriptorPoolSize ps[3];
     VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
-    int d;
+    int d, i;
     VkResult r;
 
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -2194,6 +2394,29 @@ static int vb_create_pipeline_objects(void)
     pli.pPushConstantRanges = &pcr;
     if ((r = vkCreatePipelineLayout(g.dev, &pli, NULL, &g.layout)) != VK_SUCCESS)
         goto fail;
+
+    /* The combiner pipeline's own set: the registers in a dynamic UBO, then the four
+     * stages' images and samplers. Its own layout keeps the stage-0 set untouched. */
+    memset(bind_rc, 0, sizeof bind_rc);
+    bind_rc[0].binding = 0;
+    bind_rc[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    bind_rc[0].descriptorCount = 1;
+    bind_rc[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    for (i = 0; i < 4; i++) {
+        bind_rc[1 + i] = bind_rc[0];
+        bind_rc[1 + i].binding = (uint32_t)(1 + i);
+        bind_rc[1 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        bind_rc[5 + i] = bind_rc[0];
+        bind_rc[5 + i].binding = (uint32_t)(5 + i);
+        bind_rc[5 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    }
+    dli.bindingCount = 9;
+    dli.pBindings = bind_rc;
+    if ((r = vkCreateDescriptorSetLayout(g.dev, &dli, NULL, &g.dsl_rc)) != VK_SUCCESS)
+        goto fail;
+    pli.pSetLayouts = &g.dsl_rc;
+    if ((r = vkCreatePipelineLayout(g.dev, &pli, NULL, &g.layout_rc)) != VK_SUCCESS)
+        goto fail;
     if ((r = vkCreatePipelineCache(g.dev, &pci, NULL, &g.pcache)) != VK_SUCCESS)
         goto fail;
     smi.codeSize = xbr_nv2a_vk_stage0_vs_size;
@@ -2204,18 +2427,30 @@ static int vb_create_pipeline_objects(void)
     smi.pCode = xbr_nv2a_vk_stage0_ps;
     if ((r = vkCreateShaderModule(g.dev, &smi, NULL, &g.ps)) != VK_SUCCESS)
         goto fail;
+    smi.codeSize = xbr_nv2a_vk_rc_vs_size;
+    smi.pCode = xbr_nv2a_vk_rc_vs;
+    if ((r = vkCreateShaderModule(g.dev, &smi, NULL, &g.vs_rc)) != VK_SUCCESS)
+        goto fail;
+    smi.codeSize = xbr_nv2a_vk_rc_ps_size;
+    smi.pCode = xbr_nv2a_vk_rc_ps;
+    if ((r = vkCreateShaderModule(g.dev, &smi, NULL, &g.ps_rc)) != VK_SUCCESS)
+        goto fail;
 
+    /* One set per draw, of either kind; the combiner's uses 4 images and 4 samplers. */
     ps[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    ps[0].descriptorCount = VB_MAX_SETS;
+    ps[0].descriptorCount = 4 * VB_MAX_SETS;
     ps[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-    ps[1].descriptorCount = VB_MAX_SETS;
+    ps[1].descriptorCount = 4 * VB_MAX_SETS;
+    ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    ps[2].descriptorCount = VB_MAX_SETS;
     dpi.maxSets = VB_MAX_SETS;
-    dpi.poolSizeCount = 2;
+    dpi.poolSizeCount = 3;
     dpi.pPoolSizes = ps;
     if ((r = vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool)) != VK_SUCCESS)
         goto fail;
     if (!vb_host_buffer(VB_STREAM_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
-                                         | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0,
+                                         | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                                         | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 0,
                         &g.stream, &g.stream_mem, &g.stream_ptr))
         return -1;
     return 0;

@@ -30,6 +30,10 @@ if(XBR_VULKAN_FOUND)
         ENTRY vs_main PROFILE vs_6_0 INVERT_Y SYMBOL xbr_nv2a_vk_stage0_vs)
     xbr_add_spirv(xbox_video SOURCE ${CMAKE_CURRENT_LIST_DIR}/shaders/nv2a_vk_stage0.hlsl
         ENTRY ps_main PROFILE ps_6_0 SYMBOL xbr_nv2a_vk_stage0_ps)
+    xbr_add_spirv(xbox_video SOURCE ${CMAKE_CURRENT_LIST_DIR}/shaders/nv2a_vk_rc.hlsl
+        ENTRY vs_rc PROFILE vs_6_0 INVERT_Y SYMBOL xbr_nv2a_vk_rc_vs)
+    xbr_add_spirv(xbox_video SOURCE ${CMAKE_CURRENT_LIST_DIR}/shaders/nv2a_vk_rc.hlsl
+        ENTRY ps_rc PROFILE ps_6_0 SYMBOL xbr_nv2a_vk_rc_ps)
 endif()
 
 # Vulkan back-end plumbing: a smoke test that clears and draws on a real device and on
