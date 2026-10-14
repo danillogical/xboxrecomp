@@ -1247,6 +1247,11 @@ void nv2a_backend_register(const Nv2aBackend *backend)
     s_backend = backend;
 }
 
+const Nv2aBackend *nv2a_backend_current(void)
+{
+    return s_backend;
+}
+
 /* ── Observation seam ───────────────────────────────────────── */
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);

@@ -153,6 +153,12 @@ typedef struct {
  * submitting work; the executor must also be enabled (RECOMP_PB_EXEC). */
 void nv2a_backend_register(const Nv2aBackend *backend);
 
+/* The registered back end, or NULL. Read-only: it lets a test drive a back end's
+ * draw contract directly, for state the executor cannot program (stage 3's
+ * texture, whose OFFSET/FORMAT methods are not admitted).
+ * nv2a_backend_register stays the only way to change it. */
+const Nv2aBackend *nv2a_backend_current(void);
+
 /* Decode a whole texture to 0xAARRGGBB, row-major, width*height entries.
  * Handles every format the executor can sample (swizzled, linear, DXT).
  * Returns 0 if the format is not supported. */
