@@ -19,6 +19,17 @@ if(WIN32)
     target_link_libraries(xbox_video PUBLIC d3d11 dxgi dxguid xbox_kernel)
 endif()
 
+# The vertex-program translator as a host tool: the game's corpus generator runs it
+# over each program the title uploads, with --vk for the annotations the Vulkan
+# pipeline needs, and feeds the output to dxc. It links the translator alone -- no
+# Vulkan, no Windows libraries -- so it builds with or without Vulkan found.
+add_executable(nv2a_vsh_hlsl nv2a_vsh_hlsl_tool.c nv2a_vsh_hlsl.c)
+target_include_directories(nv2a_vsh_hlsl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(MSVC)
+    target_compile_options(nv2a_vsh_hlsl PRIVATE /W3)
+    target_compile_definitions(nv2a_vsh_hlsl PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 # The NV2A Vulkan back end (nv2a_vk_backend.c), built only with Vulkan and its shader
 # tools; otherwise that file is a stub that reports failure. Its shaders are SPIR-V
 # compiled here, and it opens the Vulkan loader at run time, so only headers are used.

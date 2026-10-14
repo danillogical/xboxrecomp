@@ -27,7 +27,13 @@
  *     batch's Nv2aCombiner, uploaded per draw to a stream-backed dynamic uniform buffer,
  *     as nv2a_rc_eval does. A batch whose texture stages it cannot interpret (gb_rc_key's
  *     rule: modes > 5, true cube maps) is drawn the stage-0 way and counted as
- *     rc_fallback; draw_program is NULL, so the executor transforms vertex programs on the CPU.
+ *     rc_fallback.
+ *   - Vertex programs (draw_program, plan V5): a program batch is looked up in an
+ *     ahead-of-time corpus (nv2a_vsh_aot.h) by hash, its identity re-checked against
+ *     the words the guest uploaded, and its pre-compiled shader run as a third
+ *     pipeline kind paired with ps_rc. Nothing is translated or compiled at run
+ *     time: a program the corpus does not carry, or whose identity does not match,
+ *     is declined and the executor's CPU interpreter draws the batch.
  *
  * Vulkan specifics:
  *   - y: the vertex shader is D3D11's, built with -fvk-invert-y, so surface
@@ -54,10 +60,26 @@
 
 #if !defined(XBR_VK_BACKEND)
 
+#include <string.h>
+
 /* Built without Vulkan: report failure so the caller keeps the CPU path. */
 int nv2a_vk_backend_install(void)
 {
     return -1;
+}
+
+/* No Vulkan, so no program path: the corpus is not consulted and every program
+ * batch falls back to the executor's CPU interpreter. */
+void nv2a_vk_backend_set_programs(const Nv2aVshAotEntry *entries, size_t count)
+{
+    (void)entries;
+    (void)count;
+}
+
+void nv2a_vk_backend_program_stats(Nv2aVkProgramStats *out)
+{
+    if (out)
+        memset(out, 0, sizeof *out);
 }
 
 #else
@@ -85,6 +107,7 @@ int nv2a_vk_backend_install(void)
 #include "kernel/nv2a_backend.h"
 #include "kernel/nv2a_clear.h"
 #include "d3d/d3d8_swizzle.h"
+#include "nv2a_vsh_hlsl.h"              /* Nv2aVshHlslXf, the corpus shaders' second cbuffer */
 
 /* Built from shaders/nv2a_vk_stage0.hlsl and shaders/nv2a_vk_rc.hlsl by xbr_add_spirv. */
 #include "xbr_nv2a_vk_stage0_vs.spv.h"
@@ -104,6 +127,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 #define VB_STREAM_ALIGN 256u              /* stream slices; >= every device's minUniformBufferOffsetAlignment */
 #define VB_MAX_SETS      8192             /* descriptor sets of one submission */
 #define VB_STATS_MS      10000
+#define VB_MAX_MISS_LOG  256              /* distinct missing program hashes logged */
 #define VB_WAIT_NS       (10ull * 1000000000ull)
 #define VB_VALIDATION_SAY 64              /* validation messages printed; all are counted */
 
@@ -130,17 +154,19 @@ typedef char vb_vertex_is_28_bytes[sizeof(Nv2aVertex) == 28 ? 1 : -1];
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) \
     X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) \
     X(vkCreateRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer) \
-    X(vkCreateShaderModule) X(vkCreatePipelineCache) X(vkCreatePipelineLayout) \
+    X(vkCreateShaderModule) X(vkDestroyShaderModule) X(vkCreatePipelineCache) \
+    X(vkCreatePipelineLayout) \
     X(vkCreateDescriptorSetLayout) X(vkCreateDescriptorPool) X(vkResetDescriptorPool) \
     X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) \
     X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
     X(vkCmdPipelineBarrier) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) \
     X(vkCmdCopyImage) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
-    X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdPushConstants) \
+    X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) \
+    X(vkCmdPushConstants) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetStencilReference) \
     X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetBlendConstants) \
-    X(vkCmdDraw)
+    X(vkCmdDraw) X(vkCmdDrawIndexed)
 
 #define VB_DECLARE(fn) static PFN_##fn fn;
 static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
@@ -178,6 +204,8 @@ typedef struct {
     uint32_t fin[4];                    /* 512: final0, final1, 0, 0 */
 } VbRcConstants;                        /* 528 */
 typedef char vb_rc_constants_528[sizeof(VbRcConstants) == 528 ? 1 : -1];
+/* The corpus shaders' second cbuffer (binding 10); its HLSL is float4 g_xf, float4 g_fog. */
+typedef char vb_vsh_xf_is_32_bytes[sizeof(Nv2aVshHlslXf) == 32 ? 1 : -1];
 typedef char vb_rc_ts_at_432[offsetof(VbRcConstants, ts) == 432 ? 1 : -1];
 typedef char vb_rc_ctl_at_496[offsetof(VbRcConstants, ctl) == 496 ? 1 : -1];
 typedef char vb_rc_fin_at_512[offsetof(VbRcConstants, fin) == 512 ? 1 : -1];
@@ -217,15 +245,21 @@ typedef struct {
     VbImage im;                         /* view 0: the format does not decode */
 } VbTex;
 
-/* Everything baked into a pipeline; all uint32_t, so memcmp compares it. */
+/* Everything baked into a pipeline; all uint32_t, so memcmp compares it and a
+ * zero-filled struct is the stage-0 key. */
 typedef struct {
     uint32_t rc;                                         /* 1: the combiner pipeline (nv2a_vk_rc.hlsl, VbRcVertex, layout_rc) */
+    uint32_t prog;                                       /* 1: the vertex-program pipeline (corpus shader, layout_prog) */
+    uint32_t prog_hash;                                  /* prog only: which corpus shader is baked in */
+    uint32_t input_mask;                                 /* prog only: decides the baked vertex input layout */
     uint32_t has_depth;
     uint32_t blend, src, dst, eq, wmask;                 /* blend: src/dst/eq 0 when off */
     uint32_t z_enable, z_func, z_write;
     uint32_t s_enable, s_func, s_fail, s_zfail, s_zpass;
     uint32_t cull, ccw;                                  /* cull 0 none 1 back 2 front */
 } VbPipeKey;
+/* memcmp compares keys, so there must be no padding and no non-integer member. */
+typedef char vb_pipe_key_is_20_words[sizeof(VbPipeKey) == 20 * sizeof(uint32_t) ? 1 : -1];
 
 typedef struct {
     VbPipeKey k;
@@ -253,6 +287,9 @@ typedef struct {
     uint64_t tex_uploads, tex_hits, tex_undecodable, rt_aliases, rt_copies;
     uint64_t rt_loads, readbacks, readback_ns, rc_draws, rc_fallback, pipelines, submits;
     uint64_t validation_errors, validation_warnings;
+    /* The vertex-program path (nv2a_vsh_aot.h); the program stats' counters, so the
+     * same numbers reach the periodic [GPUVK] line. */
+    uint64_t vsh_hits, vsh_misses, vsh_identity_fail, vsh_declines, vsh_tris, vsh_const_uploads;
 } VbStats;
 
 static struct {
@@ -267,6 +304,7 @@ static struct {
     uint32_t family;
     VkFormat depth_format;
     int bc, depth_clamp;                /* features enabled on the device */
+    int shader_clip;                    /* shaderClipDistance; the program path needs it */
     VkCommandPool pool;
     VkCommandBuffer cmd;
     VkFence fence;
@@ -276,6 +314,9 @@ static struct {
     VkPipelineLayout layout;
     VkDescriptorSetLayout dsl_rc;       /* the combiner pipeline's set */
     VkPipelineLayout layout_rc;
+    VkDescriptorSetLayout dsl_prog;     /* the vertex-program pipeline's set: rc's, plus
+                                         * binding 9 (c[192]) and 10 (Nv2aVshHlslXf) */
+    VkPipelineLayout layout_prog;
     VkPipelineCache pcache;
     VkShaderModule vs, ps;
     VkShaderModule vs_rc, ps_rc;
@@ -309,7 +350,25 @@ static struct {
     int stats_said;
     unsigned fails, validation_said;
     VbStats st;
+    /* The vertex-program path's own counters and once-per-hash miss log. */
+    Nv2aVkProgramStats pst;
+    int hit_seen, miss_seen;            /* the latches are write-once, whatever the hash */
+    uint32_t miss_said[VB_MAX_MISS_LOG];
+    unsigned nmiss_said;
+    int miss_log_full;                  /* the suppression note has been printed */
 } g;
+
+/* The ahead-of-time corpus, static storage owned by the caller (nv2a_vk_backend.h). */
+static const Nv2aVshAotEntry *s_programs;
+static size_t s_nprograms;
+
+void nv2a_vk_backend_set_programs(const Nv2aVshAotEntry *entries, size_t count)
+{
+    /* A NULL table with a nonzero count is the same as no corpus: a caller that
+     * has not built one must not make the lookup walk NULL. */
+    s_programs = (entries && count) ? entries : NULL;
+    s_nprograms = s_programs ? count : 0;
+}
 
 static void vb_fail(const char *what, VkResult r)
 {
@@ -591,6 +650,13 @@ static void vb_submit_wait(void)
     g.ngarbage = 0;
 }
 
+/* Round a stream slice up to its alignment; vb_stream aligns every slice this way,
+ * so a caller reserving several slices must sum their rounded sizes. */
+static VkDeviceSize vb_round_up(VkDeviceSize bytes)
+{
+    return (bytes + VB_STREAM_ALIGN - 1) & ~(VkDeviceSize)(VB_STREAM_ALIGN - 1);
+}
+
 /* Make sure `bytes` of stream and `sets` descriptor sets fit in this submission,
  * so the allocations that follow cannot submit between being written and used. */
 static void vb_reserve(VkDeviceSize bytes, uint32_t sets)
@@ -612,7 +678,8 @@ static uint8_t *vb_stream(VkDeviceSize bytes, VkBuffer *buf, VkDeviceSize *off)
         uint8_t *p;
         memset(&e, 0, sizeof e);
         if (!vb_host_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT
-                                   | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 0, &e.buf, &e.mem, &p))
+                                   | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+                                   | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, 0, &e.buf, &e.mem, &p))
             return NULL;
         vb_cmd();                       /* so the discard waits for this submission */
         vb_discard(e);
@@ -709,7 +776,9 @@ static void vb_blend_key(VbPipeKey *k, uint32_t enable, uint32_t src, uint32_t d
     k->wmask = mask;
 }
 
-static VkPipeline vb_pipeline_create(const VbPipeKey *k)
+/* The corpus shader of the pipeline being built, or NULL; prog pipelines make their
+ * module per creation from the entry and destroy it as soon as the pipeline exists. */
+static VkPipeline vb_pipeline_create(const VbPipeKey *k, const Nv2aVshAotEntry *e)
 {
     static const VkDynamicState dyn[] = {
         VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
@@ -748,22 +817,70 @@ static VkPipeline vb_pipeline_create(const VbPipeKey *k)
     VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
     VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
     VkGraphicsPipelineCreateInfo pi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    VkVertexInputBindingDescription vb_prog;
+    VkVertexInputAttributeDescription va_prog[16];
+    VkShaderModuleCreateInfo smi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    VkShaderModule prog_mod = VK_NULL_HANDLE;
+    uint32_t nattr = 0, rank = 0, bit;
     VkPipeline pipe = VK_NULL_HANDLE;
     VkResult r;
 
     memset(st, 0, sizeof st);
     st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    st[0].module = k->rc ? g.vs_rc : g.vs;
-    st[0].pName = k->rc ? "vs_rc" : "vs_main";
     st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    st[1].module = k->rc ? g.ps_rc : g.ps;
-    st[1].pName = k->rc ? "ps_rc" : "ps_main";
+    if (k->prog && (!e || e->hash != k->prog_hash)) {
+        /* The key names a program the entry does not carry: refuse rather than bake
+         * the wrong shader. */
+        vb_fail("vertex-program pipeline key", VK_ERROR_INITIALIZATION_FAILED);
+        return VK_NULL_HANDLE;
+    }
+    if (k->prog) {
+        /* One module per corpus program, made and destroyed around this call. */
+        smi.codeSize = e->spirv_size;
+        smi.pCode = e->spirv;
+        r = vkCreateShaderModule(g.dev, &smi, NULL, &prog_mod);
+        if (r != VK_SUCCESS) {
+            vb_fail("vkCreateShaderModule (vertex program)", r);
+            return VK_NULL_HANDLE;
+        }
+        st[0].module = prog_mod;
+        st[0].pName = "vs_prog";
+    } else {
+        st[0].module = k->rc ? g.vs_rc : g.vs;
+        st[0].pName = k->rc ? "vs_rc" : "vs_main";
+    }
+    st[1].module = (k->rc || k->prog) ? g.ps_rc : g.ps;
+    st[1].pName = (k->rc || k->prog) ? "ps_rc" : "ps_main";
 
-    vi.vertexBindingDescriptionCount = 1;
-    vi.pVertexBindingDescriptions = k->rc ? &vb_rc : &vb;
-    vi.vertexAttributeDescriptionCount = k->rc ? 9 : 4;
-    vi.pVertexAttributeDescriptions = k->rc ? va_rc : va;
+    if (k->prog) {
+        /* The corpus shader's inputs: one float4 per set bit of the mask, in
+         * ascending n, exactly the [[vk::location(n)]] the tool annotated them
+         * with, and the layout p->inputs is uploaded in. */
+        memset(&vb_prog, 0, sizeof vb_prog);
+        for (bit = 0; bit < 16; bit++) {
+            if (!((k->input_mask >> bit) & 1u))
+                continue;
+            va_prog[nattr].location = bit;
+            va_prog[nattr].binding = 0;
+            va_prog[nattr].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+            va_prog[nattr].offset = 16u * rank;
+            nattr++;
+            rank++;
+        }
+        vb_prog.binding = 0;
+        vb_prog.stride = 16u * rank;
+        vb_prog.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+        vi.vertexBindingDescriptionCount = 1;
+        vi.pVertexBindingDescriptions = &vb_prog;
+        vi.vertexAttributeDescriptionCount = nattr;
+        vi.pVertexAttributeDescriptions = va_prog;
+    } else {
+        vi.vertexBindingDescriptionCount = 1;
+        vi.pVertexBindingDescriptions = k->rc ? &vb_rc : &vb;
+        vi.vertexAttributeDescriptionCount = k->rc ? 9 : 4;
+        vi.pVertexAttributeDescriptions = k->rc ? va_rc : va;
+    }
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     vp.viewportCount = 1;
     vp.scissorCount = 1;
@@ -817,9 +934,11 @@ static VkPipeline vb_pipeline_create(const VbPipeKey *k)
     pi.pDepthStencilState = &ds;
     pi.pColorBlendState = &cb;
     pi.pDynamicState = &dy;
-    pi.layout = k->rc ? g.layout_rc : g.layout;
+    pi.layout = k->prog ? g.layout_prog : k->rc ? g.layout_rc : g.layout;
     pi.renderPass = g.rp[k->has_depth ? 1 : 0];
     r = vkCreateGraphicsPipelines(g.dev, g.pcache, 1, &pi, NULL, &pipe);
+    if (prog_mod)
+        vkDestroyShaderModule(g.dev, prog_mod, NULL);
     if (r != VK_SUCCESS) {
         vb_fail("vkCreateGraphicsPipelines", r);
         return VK_NULL_HANDLE;
@@ -828,10 +947,92 @@ static VkPipeline vb_pipeline_create(const VbPipeKey *k)
     return pipe;
 }
 
-/* The pipeline for a key, from the cache or made now; the least recently used goes. */
-static VkPipeline vb_pipeline(const VbPipeKey *k)
+/* ── The ahead-of-time vertex-program corpus ─────────────────────────── */
+
+/* Log a program hash once, then keep quiet about it. `e` NULL: the corpus does not
+ * carry it; otherwise: the corpus carries the hash but the identity did not match. */
+static void vb_program_log_once(const Nv2aProgramBatch *p, const Nv2aVshAotEntry *e)
 {
-    VbPipe *e = NULL;
+    unsigned i;
+
+    for (i = 0; i < g.nmiss_said; i++)
+        if (g.miss_said[i] == p->program_hash)
+            return;
+    if (g.nmiss_said >= VB_MAX_MISS_LOG) {
+        if (!g.miss_log_full) {
+            g.miss_log_full = 1;
+            fprintf(stderr, "[GPUVK] %u distinct vertex programs have been reported;"
+                            " further ones are not logged\n", VB_MAX_MISS_LOG);
+            fflush(stderr);
+        }
+        return;
+    }
+    g.miss_said[g.nmiss_said++] = p->program_hash;
+    if (!e) {
+        fprintf(stderr, "[GPUVK] vertex program %08X (len %u, inputs %04X) is not in the"
+                        " ahead-of-time corpus; the CPU interpreter draws it\n",
+                p->program_hash, p->program_len, p->input_mask);
+    } else {
+        fprintf(stderr, "[GPUVK] vertex program %08X matched hash but not identity"
+                        " (len %u/%u, digest %016llX/%016llX); declined\n",
+                p->program_hash, e->len, p->program_len,
+                (unsigned long long)e->digest,
+                (unsigned long long)nv2a_vsh_aot_digest(e->words, e->len));
+    }
+    fflush(stderr);
+}
+
+/* The entry `hash` names, or NULL. The table is sorted ascending by hash (the
+ * generator guarantees it), so a binary search finds it; a candidate is usable
+ * only when len, input_mask, the digest recomputed from its own words and the
+ * words themselves all match what the batch reports. Any mismatch is a corrupt
+ * or colliding identity, never another program's shader. */
+static const Nv2aVshAotEntry *vb_program_lookup(const Nv2aProgramBatch *p)
+{
+    size_t lo = 0, hi = s_nprograms;
+    const Nv2aVshAotEntry *e;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (s_programs[mid].hash < p->program_hash)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo >= s_nprograms || s_programs[lo].hash != p->program_hash) {
+        g.pst.misses++;
+        g.st.vsh_misses++;
+        if (!g.miss_seen) {
+            g.miss_seen = 1;
+            g.pst.first_miss_hash = p->program_hash;
+            g.pst.first_miss_len = p->program_len;
+            g.pst.first_miss_mask = p->input_mask;
+        }
+        vb_program_log_once(p, NULL);
+        return NULL;
+    }
+    e = &s_programs[lo];
+    /* Every identity field the batch reports must agree, and the digest is
+     * recomputed from both the entry's words and the batch's, so a table whose
+     * identity fields were corrupted cannot select another program's shader. */
+    if (e->len != p->program_len
+        || e->input_mask != p->input_mask
+        || !e->words || !e->spirv || !e->spirv_size
+        || nv2a_vsh_aot_digest(e->words, e->len) != e->digest
+        || nv2a_vsh_aot_digest(p->program, p->program_len) != e->digest
+        || memcmp(e->words, p->program, (size_t)e->len * 16u) != 0) {
+        g.pst.identity_fail++;
+        g.st.vsh_identity_fail++;
+        vb_program_log_once(p, e);
+        return NULL;
+    }
+    return e;
+}
+
+/* The pipeline for a key, from the cache or made now; the least recently used goes. */
+static VkPipeline vb_pipeline(const VbPipeKey *k, const Nv2aVshAotEntry *e)
+{
+    VbPipe *slot = NULL;
     unsigned i;
 
     for (i = 0; i < g.npipes; i++) {
@@ -839,27 +1040,27 @@ static VkPipeline vb_pipeline(const VbPipeKey *k)
             g.pipes[i].last_use = ++g.use_clock;
             return g.pipes[i].pipe;
         }
-        if (!e || g.pipes[i].last_use < e->last_use)
-            e = &g.pipes[i];
+        if (!slot || g.pipes[i].last_use < slot->last_use)
+            slot = &g.pipes[i];
     }
     if (g.npipes < VB_MAX_PIPES) {
-        e = &g.pipes[g.npipes++];
+        slot = &g.pipes[g.npipes++];
     } else {
         VbGarbage gb;
         memset(&gb, 0, sizeof gb);
-        gb.pipe = e->pipe;
+        gb.pipe = slot->pipe;
         if (gb.pipe == g.bound_pipe)
             g.bound_pipe = VK_NULL_HANDLE;
         vb_discard(gb);
     }
-    e->k = *k;
-    e->pipe = vb_pipeline_create(k);
-    e->last_use = ++g.use_clock;
-    if (!e->pipe) {
+    slot->k = *k;
+    slot->pipe = vb_pipeline_create(k, e);
+    slot->last_use = ++g.use_clock;
+    if (!slot->pipe) {
         /* Do not cache the failure under a key that later succeeds elsewhere. */
-        memset(&e->k, 0xFF, sizeof e->k);
+        memset(&slot->k, 0xFF, sizeof slot->k);
     }
-    return e->pipe;
+    return slot->pipe;
 }
 
 /* ── Images, framebuffers, render passes ─────────────────────────────── */
@@ -1591,7 +1792,7 @@ static uint32_t vb_submit(const VbDraw *dr, const Nv2aVertex *v, const Nv2aVerte
 
     if (n > cap)
         n = cap - cap % 3;
-    pipe = vb_pipeline(&dr->key);
+    pipe = vb_pipeline(&dr->key, NULL);
     if (!pipe)
         return 0;
     /* Vertices, the combiner registers and the descriptor set land in the same
@@ -1935,6 +2136,267 @@ static void vb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     g.st.tris += drawn / 3;
 }
 
+/* One program submission's stream slices, in binding order: VbRcConstants is
+ * binding 0 (ps_rc reads it), then the corpus shader's c[192] (9) and xf (10). */
+enum { VB_PROG_SLOT_RC = 0, VB_PROG_SLOT_CONST = 1, VB_PROG_SLOT_XF = 2, VB_PROG_SLOTS = 3 };
+/* vkCmdBindDescriptorSets takes one dynamic offset per dynamic binding, in binding
+ * order: binding 0, then 9, then 10. */
+typedef char vb_prog_slots_is_3[VB_PROG_SLOTS == 3 ? 1 : -1];
+
+/* Draw a vertex-program batch with its pre-compiled corpus shader; 0 hands it
+ * back to the executor's CPU interpreter. There is no translation and no
+ * compilation on this path: the identity check above decides everything. */
+static int vb_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aProgramBatch *p)
+{
+    const Nv2aVshAotEntry *e;
+    VbDraw dr;
+    Nv2aVshHlslXf xf;
+    VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    VkDescriptorBufferInfo ub[VB_PROG_SLOTS];
+    VkDescriptorImageInfo ii[8];
+    VkWriteDescriptorSet wr[VB_PROG_SLOTS + 8];
+    VkDescriptorSet set;
+    VkBuffer vbuf, ubuf[VB_PROG_SLOTS], ibuf;
+    VkDeviceSize voff, uoff[VB_PROG_SLOTS], ioff, total;
+    VkViewport vp;
+    VkPipeline pipe;
+    uint8_t *dst;
+    uint32_t offsets[VB_PROG_SLOTS], nin = 0, stride, bit, i;
+    VkResult r;
+
+    if (!g.ok || !b->combiner || !p->program_len || !p->positions || !p->index_count
+        || p->index_count % 3 || !p->program || !p->constants || !p->inputs || !p->indices) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+    /* Cull FRONT_AND_BACK: nothing is visible. As in D3D11 (gb_draw_program) this
+     * counts as drawn, so the executor does not transform the batch on the CPU;
+     * the key would otherwise bake cull NONE (cull_mode 3 % 3) and draw it. */
+    if (vb_cull_mode(b->state) == 3) {
+        g.st.cull_all++;
+        return 1;
+    }
+    /* The mask decides the baked input layout; 0 or more than 16 attributes
+     * cannot be described at all. */
+    for (bit = 0; bit < 16; bit++)
+        nin += (p->input_mask >> bit) & 1u;
+    if (!nin || nin > 16) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+    stride = 16u * nin;
+    /* The corpus question comes FIRST, because `misses` and `declines` are defined by
+     * the program, not by this draw (nv2a_vk_backend.h): `misses` is "identities the
+     * corpus does not carry" and `declines` is "found, but this draw could not be set
+     * up". Looking up after the setup checks would report a program the corpus lacks as
+     * a decline whenever the batch also happened to be undrawable, and the V5 gate's
+     * "0 misses" would then say nothing about those batches' coverage. */
+    e = vb_program_lookup(p);
+    if (!e)
+        return 0;
+    /* Every corpus shader feeds ps_rc's interpolants, so a combiner the back end
+     * cannot interpret is a decline, never the stage-0 pixel shader; and every one
+     * of them writes SV_ClipDistance0, so without that feature the program path is
+     * off and a decline is the silent, correct answer. */
+    if (!vb_rc_supported(b) || !g.shader_clip) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+    /* Setup after the lookup: a batch this draw cannot set up is a decline, and only a
+     * program the corpus carries can be a decline. */
+    if (!vb_setup(&dr, s, b, 1)) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+    dr.key.rc = 1;                      /* ps_rc and its bindings stay in use */
+    dr.key.prog = 1;
+    /* The hash is what makes the pipeline key unique per program: two programs
+     * with the same mask must not share a cached pipeline, or one would be
+     * rasterised with the other's shader. */
+    dr.key.prog_hash = p->program_hash;
+    dr.key.input_mask = p->input_mask;
+    pipe = vb_pipeline(&dr.key, e);
+    if (!pipe) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+
+    /* One reserve for the whole submission, before any slice is written: a submit
+     * cannot land between writing a constant block and the draw that reads it. Each
+     * slice is 256-aligned by vb_stream, so round each one up before summing; over
+     * the stream size no single reserve holds it all. */
+    total = vb_round_up((VkDeviceSize)p->positions * stride)
+          + vb_round_up((VkDeviceSize)p->index_count * 4u)
+          + vb_round_up(sizeof(VbRcConstants))
+          + vb_round_up(192u * 16u)
+          + vb_round_up(sizeof xf);
+    if (total > VB_STREAM_BYTES) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+    vb_reserve(total, 1);
+    if (!g.ok) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+
+    dst = vb_stream((VkDeviceSize)p->positions * stride, &vbuf, &voff);
+    if (!dst) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+    memcpy(dst, p->inputs, (size_t)p->positions * stride);
+
+    dst = vb_stream((VkDeviceSize)p->index_count * 4u, &ibuf, &ioff);
+    if (!dst) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+    memcpy(dst, p->indices, (size_t)p->index_count * 4u);
+
+    dst = vb_stream(sizeof dr.rck, &ubuf[VB_PROG_SLOT_RC], &uoff[VB_PROG_SLOT_RC]);
+    if (!dst) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+    memcpy(dst, &dr.rck, sizeof dr.rck);
+
+    dst = vb_stream(192u * 16u, &ubuf[VB_PROG_SLOT_CONST], &uoff[VB_PROG_SLOT_CONST]);
+    if (!dst) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+    memcpy(dst, p->constants, 192u * 16u);
+
+    /* The D3D11 back end's block (nv2a_d3d11_backend.c, gb_draw_program). */
+    xf.xf[0] = dr.k.xf[0];
+    xf.xf[1] = dr.k.xf[1];
+    xf.xf[2] = dr.k.xf[2];
+    xf.xf[3] = 0.0f;
+    xf.fog[0] = p->fog_enable ? 1.0f : 0.0f;
+    xf.fog[1] = (float)p->fog_mode;
+    xf.fog[2] = p->fog_param[0];
+    xf.fog[3] = p->fog_param[1];
+    dst = vb_stream(sizeof xf, &ubuf[VB_PROG_SLOT_XF], &uoff[VB_PROG_SLOT_XF]);
+    if (!dst) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+    memcpy(dst, &xf, sizeof xf);
+
+    dai.descriptorPool = g.dpool;
+    dai.descriptorSetCount = 1;
+    dai.pSetLayouts = &g.dsl_prog;
+    r = vkAllocateDescriptorSets(g.dev, &dai, &set);
+    if (r != VK_SUCCESS) {
+        vb_fail("vkAllocateDescriptorSets", r);
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+    g.sets_used++;
+
+    /* Bindings 0 and 9/10: three dynamic uniform buffers, offsets in binding order. */
+    memset(ii, 0, sizeof ii);
+    memset(wr, 0, sizeof wr);
+    for (i = 0; i < VB_PROG_SLOTS; i++) {
+        ub[i].buffer = ubuf[i];
+        ub[i].offset = 0;
+        ub[i].range = i == VB_PROG_SLOT_RC ? sizeof(VbRcConstants)
+                   : i == VB_PROG_SLOT_CONST ? 192u * 16u : sizeof xf;
+        wr[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[i].dstSet = set;
+        wr[i].dstBinding = i == VB_PROG_SLOT_RC ? 0u : (i == VB_PROG_SLOT_CONST ? 9u : 10u);
+        wr[i].descriptorCount = 1;
+        wr[i].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+        wr[i].pBufferInfo = &ub[i];
+    }
+    for (i = 0; i < 4; i++) {
+        ii[i].imageView = dr.views[i] ? dr.views[i] : g.white.view;
+        ii[i].imageLayout = dr.views[i] ? dr.view_layouts[i]
+                                        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        wr[VB_PROG_SLOTS + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[VB_PROG_SLOTS + i].dstSet = set;
+        wr[VB_PROG_SLOTS + i].dstBinding = 1u + i;
+        wr[VB_PROG_SLOTS + i].descriptorCount = 1;
+        wr[VB_PROG_SLOTS + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        wr[VB_PROG_SLOTS + i].pImageInfo = &ii[i];
+        ii[4 + i].sampler = dr.samps[i] ? dr.samps[i] : g.samp[0][8];
+        wr[VB_PROG_SLOTS + 4 + i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[VB_PROG_SLOTS + 4 + i].dstSet = set;
+        wr[VB_PROG_SLOTS + 4 + i].dstBinding = 5u + i;
+        wr[VB_PROG_SLOTS + 4 + i].descriptorCount = 1;
+        wr[VB_PROG_SLOTS + 4 + i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        wr[VB_PROG_SLOTS + 4 + i].pImageInfo = &ii[4 + i];
+    }
+    vkUpdateDescriptorSets(g.dev, VB_PROG_SLOTS + 8, wr, 0, NULL);
+
+    if (!vb_begin_pass(dr.t, dr.d)) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
+    for (i = 0; i < VB_PROG_SLOTS; i++)
+        offsets[i] = (uint32_t)uoff[i];
+    if (g.bound_pipe != pipe) {
+        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        g.bound_pipe = pipe;
+    }
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout_prog, 0, 1,
+                            &set, VB_PROG_SLOTS, offsets);
+    vkCmdBindVertexBuffers(g.cmd, 0, 1, &vbuf, &voff);
+    vkCmdPushConstants(g.cmd, g.layout_prog,
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                       0, sizeof dr.k, &dr.k);
+    vp.x = 0.0f;
+    vp.y = 0.0f;
+    vp.width = (float)dr.t->w;
+    vp.height = (float)dr.t->h;
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    vkCmdSetViewport(g.cmd, 0, 1, &vp);
+    vkCmdSetScissor(g.cmd, 0, 1, &dr.scissor);
+    vkCmdSetStencilReference(g.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr.stencil_ref);
+    vkCmdSetStencilCompareMask(g.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr.stencil_read);
+    vkCmdSetStencilWriteMask(g.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr.stencil_write);
+    vkCmdSetBlendConstants(g.cmd, dr.blend_factor);
+    vkCmdBindIndexBuffer(g.cmd, ibuf, ioff, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(g.cmd, p->index_count, 1, 0, 0, 0);
+
+    vb_target_mark(dr.t, &dr.scissor);
+    g.st.draws++;
+    g.st.tris += p->index_count / 3;
+    if (dr.key.cull)
+        g.st.cull_draws++;
+    g.st.vsh_hits++;
+    g.st.vsh_tris += p->index_count / 3;
+    g.st.vsh_const_uploads++;
+    g.pst.const_uploads++;
+    if (!g.hit_seen) {
+        g.hit_seen = 1;
+        g.pst.first_hit_hash = p->program_hash;
+        g.pst.first_hit_len = p->program_len;
+        g.pst.first_hit_mask = p->input_mask;
+        g.pst.first_hit_digest = e->digest;
+        g.pst.first_hit_tris = p->index_count / 3;
+    }
+    g.pst.hits++;
+    g.pst.tris += p->index_count / 3;
+    return 1;
+}
+
 static void vb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t flags,
                      uint32_t argb, uint32_t zstencil)
 {
@@ -2026,7 +2488,9 @@ static void vb_stats(int force)
                     " rt_loads=%llu readbacks=%llu readback_ms=%.1f dropped_tris=%llu"
                     " skipped=%llu rc_draws=%llu rc_fallback=%llu pipelines=%llu submits=%llu"
                     " cull_draws=%llu cull_all=%llu validation_errors=%llu"
-                    " validation_warnings=%llu\n",
+                    " validation_warnings=%llu vsh_hits=%llu vsh_misses=%llu"
+                    " vsh_identity_fail=%llu vsh_declines=%llu vsh_tris=%llu"
+                    " vsh_const_uploads=%llu\n",
             g.frame, (unsigned long long)g.st.draws, (unsigned long long)g.st.tris,
             (unsigned long long)g.st.clears, (unsigned long long)g.st.tex_uploads,
             (unsigned long long)g.st.tex_hits, (unsigned long long)g.st.tex_undecodable,
@@ -2038,7 +2502,10 @@ static void vb_stats(int force)
             (unsigned long long)g.st.pipelines, (unsigned long long)g.st.submits,
             (unsigned long long)g.st.cull_draws, (unsigned long long)g.st.cull_all,
             (unsigned long long)g.st.validation_errors,
-            (unsigned long long)g.st.validation_warnings);
+            (unsigned long long)g.st.validation_warnings,
+            (unsigned long long)g.st.vsh_hits, (unsigned long long)g.st.vsh_misses,
+            (unsigned long long)g.st.vsh_identity_fail, (unsigned long long)g.st.vsh_declines,
+            (unsigned long long)g.st.vsh_tris, (unsigned long long)g.st.vsh_const_uploads);
     fflush(stderr);
 }
 
@@ -2275,8 +2742,10 @@ static int vb_create_device(void)
     memset(&on, 0, sizeof on);
     on.depthClamp = have.depthClamp;
     on.textureCompressionBC = have.textureCompressionBC;
+    on.shaderClipDistance = have.shaderClipDistance;
     g.depth_clamp = have.depthClamp != 0;
     g.bc = have.textureCompressionBC != 0;
+    g.shader_clip = have.shaderClipDistance != 0;
     qi.queueFamilyIndex = g.family;
     qi.queueCount = 1;
     qi.pQueuePriorities = &prio;
@@ -2309,6 +2778,13 @@ static int vb_create_device(void)
             g.depth_format == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8",
             g.depth_clamp ? "on" : "off (near/far clip instead)",
             g.bc ? "native" : "decoded on the CPU");
+    if (!g.shader_clip) {
+        /* Every corpus shader writes SV_ClipDistance0 (the CPU path's NV_CLIP_W), so
+         * without the feature the program path is off for the whole run. */
+        fprintf(stderr, "[GPUVK] no shaderClipDistance: the vertex-program path is"
+                        " disabled and the CPU interpreter draws every program batch\n");
+        fflush(stderr);
+    }
     return 0;
 }
 
@@ -2324,6 +2800,7 @@ static int vb_create_pipeline_objects(void)
     VkRenderPassCreateInfo rpi = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
     VkDescriptorSetLayoutBinding bind[2];
     VkDescriptorSetLayoutBinding bind_rc[9];
+    VkDescriptorSetLayoutBinding bind_prog[11];
     VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     VkPushConstantRange pcr;
     VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -2417,6 +2894,24 @@ static int vb_create_pipeline_objects(void)
     pli.pSetLayouts = &g.dsl_rc;
     if ((r = vkCreatePipelineLayout(g.dev, &pli, NULL, &g.layout_rc)) != VK_SUCCESS)
         goto fail;
+
+    /* The vertex-program pipeline's set: the combiner registers, the four stages'
+     * images and samplers, then the corpus shader's two cbuffers (float4 c[192] and
+     * Nv2aVshHlslXf), all dynamic. The push-constant range is layout_rc's: ps_rc
+     * still reads VbConstants. */
+    memcpy(bind_prog, bind_rc, sizeof bind_rc);
+    bind_prog[9] = bind_rc[0];
+    bind_prog[9].binding = 9;
+    bind_prog[9].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    bind_prog[10] = bind_prog[9];
+    bind_prog[10].binding = 10;
+    dli.bindingCount = 11;
+    dli.pBindings = bind_prog;
+    if ((r = vkCreateDescriptorSetLayout(g.dev, &dli, NULL, &g.dsl_prog)) != VK_SUCCESS)
+        goto fail;
+    pli.pSetLayouts = &g.dsl_prog;
+    if ((r = vkCreatePipelineLayout(g.dev, &pli, NULL, &g.layout_prog)) != VK_SUCCESS)
+        goto fail;
     if ((r = vkCreatePipelineCache(g.dev, &pci, NULL, &g.pcache)) != VK_SUCCESS)
         goto fail;
     smi.codeSize = xbr_nv2a_vk_stage0_vs_size;
@@ -2436,19 +2931,22 @@ static int vb_create_pipeline_objects(void)
     if ((r = vkCreateShaderModule(g.dev, &smi, NULL, &g.ps_rc)) != VK_SUCCESS)
         goto fail;
 
-    /* One set per draw, of either kind; the combiner's uses 4 images and 4 samplers. */
+    /* One set per draw, of either kind; the combiner's uses 4 images, 4 samplers and
+     * one dynamic uniform buffer, the program's three (rc registers, c[192], the xf
+     * block), so the dynamic count must cover the larger. */
     ps[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     ps[0].descriptorCount = 4 * VB_MAX_SETS;
     ps[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
     ps[1].descriptorCount = 4 * VB_MAX_SETS;
     ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-    ps[2].descriptorCount = VB_MAX_SETS;
+    ps[2].descriptorCount = 3 * VB_MAX_SETS;
     dpi.maxSets = VB_MAX_SETS;
     dpi.poolSizeCount = 3;
     dpi.pPoolSizes = ps;
     if ((r = vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool)) != VK_SUCCESS)
         goto fail;
     if (!vb_host_buffer(VB_STREAM_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+                                         | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
                                          | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
                                          | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 0,
                         &g.stream, &g.stream_mem, &g.stream_ptr))
@@ -2501,7 +2999,13 @@ static int vb_create_defaults(void)
     return 0;
 }
 
-static const Nv2aBackend s_vk_backend = { vb_clear, vb_draw, vb_flip, NULL };
+static const Nv2aBackend s_vk_backend = { vb_clear, vb_draw, vb_flip, vb_draw_program };
+
+void nv2a_vk_backend_program_stats(Nv2aVkProgramStats *out)
+{
+    if (out)
+        *out = g.pst;
+}
 
 int nv2a_vk_backend_install(void)
 {

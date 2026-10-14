@@ -26,6 +26,30 @@ built twice, once per entry point; the combiner shader is one uber shader for ev
 so nothing is specialised or compiled per configuration. `shaders/smoke_tri_{vs,ps}.hlsl` are the
 proof pair for the smoke test.
 
+## Vertex programs: the corpus and the tool
+
+The register-combiner uber shader is compiled once. Vertex programs are not: a title's
+static programs are translated and compiled ahead of time by the game's own build, and the
+Vulkan back end consumes that table (`nv2a_vsh_aot.h`) at run time. It never translates or
+compiles a guest program — a program the corpus does not carry is declined, and the
+executor's CPU interpreter draws the batch.
+
+`nv2a_vsh_hlsl` is the host tool that produces one shader for that pipeline:
+
+```
+nv2a_vsh_hlsl --bin <program.bin> --mask <hex> [--vk] [--out <file>]
+```
+
+`--bin` is `len*16` little-endian bytes, one NV2A instruction per 16 bytes, the last FINAL;
+`--mask` is the program's input mask. Without `--vk` the output is `nv2a_vsh_hlsl.c`'s bytes
+unchanged. With `--vk` it also carries what the pipeline needs and dxc cannot infer: an
+explicit `[[vk::location(n)]]` on every vertex input (dxc otherwise packs ATTR1 and ATTR3 to
+locations 0 and 1, which is not the layout the back end builds from the mask), a location on
+every varying so the shader agrees with `ps_rc`'s inputs, and bindings 9 and 10 for the two
+cbuffers. Each rewrite must find its pattern exactly once, so a change to the translator
+fails the tool rather than emitting a mis-bound shader. The exit codes are 0 success, 2 usage
+or I/O error, 3 translation or rewrite failure.
+
 ## Software Vulkan driver for CTest
 
 `tests/vk_smoke` draws a triangle and checks the pixels. `vk_smoke_hw` uses the default devices
