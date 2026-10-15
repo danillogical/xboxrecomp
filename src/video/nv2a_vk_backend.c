@@ -973,11 +973,28 @@ static void vb_program_log_once(const Nv2aProgramBatch *p, const Nv2aVshAotEntry
                         " ahead-of-time corpus; the CPU interpreter draws it\n",
                 p->program_hash, p->program_len, p->input_mask);
     } else {
+        /* The entry failed the identity check, so its storage is exactly what must
+         * not be walked here: `e->words` may be NULL and `e->len` may be wrong.
+         * Only scalars of `e` and the executor-validated batch are read, and the
+         * reason is chosen from those scalars alone. */
+        const char *why;
+
+        if (e->len != p->program_len)
+            why = "the instruction count differs";
+        else if (e->input_mask != p->input_mask)
+            why = "the input mask differs";
+        else if (!e->words)
+            why = "the corpus entry has no words";
+        else if (!e->spirv || !e->spirv_size)
+            why = "the corpus entry has no shader";
+        else
+            why = "the words or digest differ";
         fprintf(stderr, "[GPUVK] vertex program %08X matched hash but not identity"
-                        " (len %u/%u, digest %016llX/%016llX); declined\n",
-                p->program_hash, e->len, p->program_len,
-                (unsigned long long)e->digest,
-                (unsigned long long)nv2a_vsh_aot_digest(e->words, e->len));
+                        " (%s; len %u/%u, inputs %04X/%04X, digest %016llX);"
+                        " the CPU interpreter draws it\n",
+                p->program_hash, why, e->len, p->program_len,
+                e->input_mask, p->input_mask,
+                (unsigned long long)e->digest);
     }
     fflush(stderr);
 }
@@ -1014,7 +1031,14 @@ static const Nv2aVshAotEntry *vb_program_lookup(const Nv2aProgramBatch *p)
     e = &s_programs[lo];
     /* Every identity field the batch reports must agree, and the digest is
      * recomputed from both the entry's words and the batch's, so a table whose
-     * identity fields were corrupted cannot select another program's shader. */
+     * identity fields were corrupted cannot select another program's shader.
+     *
+     * THE ORDER OF THESE TERMS IS LOAD-BEARING. Each dereference below is guarded
+     * by an earlier term, so a reorder can walk storage that must not be walked:
+     * `e->len != p->program_len` must stay first, and `!e->words` must stay before
+     * both `nv2a_vsh_aot_digest(e->words, ...)` and the `memcmp`, or a NULL or
+     * oversized entry is read instead of rejected. `p->program`/`p->program_len`
+     * are guarded by the caller (vb_draw_program). */
     if (e->len != p->program_len
         || e->input_mask != p->input_mask
         || !e->words || !e->spirv || !e->spirv_size
