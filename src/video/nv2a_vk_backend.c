@@ -2194,15 +2194,38 @@ static int vb_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
         g.pst.declines++;
         return 0;
     }
+    /* The corpus question comes FIRST for every batch that gets this far, because
+     * `misses` and `declines` are defined by the program, not by this draw
+     * (nv2a_vk_backend.h): `misses` is "identities the corpus does not carry" and
+     * `declines` is "found, but this draw could not be set up". A batch whose program
+     * the corpus does not carry is a MISS and returns 0 (CPU fallback) whatever its
+     * mask, and that decision is taken below before any per-draw check; `declines` is
+     * only for a program the corpus carries that this draw cannot set up. Looking up
+     * after the setup checks would report a program the corpus lacks as a decline
+     * whenever the batch also happened to be undrawable, and the V5 gate's "0 misses"
+     * would then say nothing about those batches' coverage. The lookup itself comes
+     * before the cull check below for the same reason: coverage is a property of the
+     * batch's identity, not of whether the batch was visible, so every batch is
+     * looked up exactly once. */
+    e = vb_program_lookup(p);
     /* Cull FRONT_AND_BACK: nothing is visible. As in D3D11 (gb_draw_program) this
      * counts as drawn, so the executor does not transform the batch on the CPU;
-     * the key would otherwise bake cull NONE (cull_mode 3 % 3) and draw it. */
+     * the key would otherwise bake cull NONE (cull_mode 3 % 3) and draw it. This
+     * return does not depend on what the lookup found: nothing visible means nothing
+     * drawn by either path, so the batch must not be transformed on the CPU either,
+     * and the lookup above owns the coverage accounting (a miss stays a miss). */
     if (vb_cull_mode(b->state) == 3) {
         g.st.cull_all++;
         return 1;
     }
+    /* The corpus does not carry this program: a miss, and the CPU path draws the
+     * batch. Deliberately independent of the mask check below — an absent program is
+     * a miss however this batch's inputs look, so the batch is never counted as both. */
+    if (!e)
+        return 0;
     /* The mask decides the baked input layout; 0 or more than 16 attributes
-     * cannot be described at all. */
+     * cannot be described at all. Reached only for a program the corpus carries,
+     * so an undescribable mask here is a decline. */
     for (bit = 0; bit < 16; bit++)
         nin += (p->input_mask >> bit) & 1u;
     if (!nin || nin > 16) {
@@ -2211,15 +2234,6 @@ static int vb_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
         return 0;
     }
     stride = 16u * nin;
-    /* The corpus question comes FIRST, because `misses` and `declines` are defined by
-     * the program, not by this draw (nv2a_vk_backend.h): `misses` is "identities the
-     * corpus does not carry" and `declines` is "found, but this draw could not be set
-     * up". Looking up after the setup checks would report a program the corpus lacks as
-     * a decline whenever the batch also happened to be undrawable, and the V5 gate's
-     * "0 misses" would then say nothing about those batches' coverage. */
-    e = vb_program_lookup(p);
-    if (!e)
-        return 0;
     /* Every corpus shader feeds ps_rc's interpolants, so a combiner the back end
      * cannot interpret is a decline, never the stage-0 pixel shader; and every one
      * of them writes SV_ClipDistance0, so without that feature the program path is
