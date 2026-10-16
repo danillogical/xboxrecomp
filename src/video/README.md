@@ -1,9 +1,14 @@
 # xbox_video: Vulkan build plumbing
 
 The Vulkan pieces are optional. `cmake/XbrVulkan.cmake` runs `find_package(Vulkan)` and looks
-for `dxc` and `spirv-val` (hinted from `$VULKAN_SDK/Bin`). If any is missing, a status line
-says so and everything Vulkan is skipped; the rest builds as before. `XBR_VULKAN_FOUND` is the
-switch.
+for `dxc` and `spirv-val` (hinted from `$VULKAN_SDK/Bin`), and it requires the loader, its
+headers and both tools to EXIST: a cached path that no longer exists is not a toolchain. If any
+is missing, a status line says which check failed and everything Vulkan is skipped; the rest
+builds as before. `XBR_VULKAN_FOUND` is the ONE switch: a cache BOOL, FORCE-refreshed on every
+configure, so no decision from an earlier configure survives, and it is visible to a parent
+project that adds this toolkit with `add_subdirectory` (a plain variable would not reach it).
+When it is FALSE, the cache STRING `XBR_VULKAN_UNAVAILABLE_REASON` names the failed check, so a
+caller can report the reason instead of re-deriving it.
 
 ## Ahead-of-time shaders
 
