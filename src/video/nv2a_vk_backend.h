@@ -15,6 +15,14 @@
  * insensitive, CPU devices included); otherwise the first discrete GPU, then
  * integrated, virtual and other, never a CPU device.
  *
+ * The device it picks must have ONE queue family with both VK_QUEUE_GRAPHICS_BIT
+ * and VK_QUEUE_COMPUTE_BIT: the frame's draws and the readback's pack kernel
+ * (shaders/nv2a_vk_pack.hlsl, the compute pipeline that truncates a 16-bit
+ * target to 5:6:5 on the GPU) are submitted to that one family, and a device
+ * whose graphics family has no compute is not usable at all. There is exactly
+ * one 16-bit publication path, so such a device is passed over and the
+ * executor's CPU rasteriser remains the fallback.
+ *
  * Vertex programs (V5) come from an ahead-of-time corpus (nv2a_vsh_aot.h): the
  * back end looks a batch's program up by hash, re-checks its identity against
  * the words the guest uploaded, and runs the pre-compiled shader. Nothing is
@@ -99,6 +107,38 @@ typedef struct {
 } Nv2aVkRingStats;
 
 void nv2a_vk_backend_ring_stats(Nv2aVkRingStats *out);
+
+/* What the readback publication (the flip's and a target flush/release's write of
+ * guest memory) did. One dirty target at a time is either copied straight out of
+ * its image (a 4-byte target) or packed to 5:6:5 by the compute kernel and then
+ * copied out (a 16-bit target); a bounded group of them shares one submission and
+ * one fence wait, and the host publishes the rows with a memcpy.
+ *
+ * Every counter below except the two time counters describes work that was PUBLISHED:
+ * `readbacks` (targets whose dirty rectangle was written into guest memory), `batches`
+ * (batches that reached that publish, one submission and one fence wait each -- a
+ * `vb_reserve` slot advance in the middle of a batch is not a batch of its own), `packed`
+ * and `packed_pixels` (16-bit targets the compute kernel produced, and the pixels they
+ * cover: each packed dirty rectangle's width times its height, not the dispatch's padded
+ * threads), `copied` (4-byte targets read back straight from their image) and `bytes` (what
+ * went into guest memory). A batch that never reaches its publish leaves all of them
+ * unchanged and leaves its targets dirty, so a partial batch can never be counted as
+ * published work. `wait_ns` is the publication's own vkQueueSubmit plus fence wait -- a
+ * reuse wait inside a `vb_reserve` slot advance is not included -- and `publish_ns` is the
+ * host's memcpy time. Cumulative since start. Same threading contract as the rest of the
+ * back end. */
+typedef struct {
+    uint64_t readbacks;      /* targets whose dirty rectangle was published to guest memory */
+    uint64_t batches;        /* published batches: one submission and one fence wait each */
+    uint64_t packed;         /* published 16-bit targets, packed by cs_pack on the GPU */
+    uint64_t packed_pixels;  /* pixels those packed targets cover (dirty rect w*h, not padded) */
+    uint64_t copied;         /* published 4-byte targets, read back straight from their image */
+    uint64_t bytes;          /* bytes published into guest memory */
+    uint64_t wait_ns;        /* the publication's own submit + fence wait (not a reuse wait) */
+    uint64_t publish_ns;     /* host memcpy time inside publication */
+} Nv2aVkReadbackStats;
+
+void nv2a_vk_backend_readback_stats(Nv2aVkReadbackStats *out);
 
 #ifdef __cplusplus
 }

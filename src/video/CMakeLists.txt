@@ -45,6 +45,11 @@ if(XBR_VULKAN_FOUND)
         ENTRY vs_rc PROFILE vs_6_0 INVERT_Y SYMBOL xbr_nv2a_vk_rc_vs)
     xbr_add_spirv(xbox_video SOURCE ${CMAKE_CURRENT_LIST_DIR}/shaders/nv2a_vk_rc.hlsl
         ENTRY ps_rc PROFILE ps_6_0 SYMBOL xbr_nv2a_vk_rc_ps)
+    # The readback path's pack kernel: the 16-bit targets are 5:6:5-truncated on the GPU, so
+    # the host only memcpy's rows (nv2a_vk_backend.c, vb_targets_flush). A compute entry, so
+    # no invert-y; the pack pipeline is created from xbr_nv2a_vk_pack_cs.spv.h.
+    xbr_add_spirv(xbox_video SOURCE ${CMAKE_CURRENT_LIST_DIR}/shaders/nv2a_vk_pack.hlsl
+        ENTRY cs_pack PROFILE cs_6_0 SYMBOL xbr_nv2a_vk_pack_cs)
 endif()
 
 # Vulkan back-end plumbing: a smoke test that clears and draws on a real device and on

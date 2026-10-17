@@ -11,7 +11,9 @@
  *
  *   - Render targets are cached per guest colour surface (address, pitch, pixel
  *     size) as B8G8R8A8 images, whose bytes are the guest's A8R8G8B8 layout; a
- *     16-bit surface is expanded on load and truncated to 5:6:5 on flush. A
+ *     16-bit surface is expanded on load and truncated to 5:6:5 on flush by the
+ *     cs_pack compute kernel (shaders/nv2a_vk_pack.hlsl), so the flush's host
+ *     side is a memcpy per row and no per-pixel conversion runs on the CPU. A
  *     target is (re)loaded from guest memory on its first use after each flip.
  *   - Depth is a D24S8 image (D32S8 where D24S8 is unsupported) per (zeta
  *     address, target size), never loaded from or written to guest memory; Z16
@@ -60,9 +62,16 @@
  *     command later in submission order -- that is what makes cross-submission
  *     ordering defined (Vulkan defines no implicit execution or memory dependency
  *     between submissions), including blending into one target from two submissions.
- *     Still to come (plan N4): a single batched readback per flip without the CPU
- *     convert on the critical path, narrower barriers and layouts, sub-allocated
+ *     Still to come (plan N4): narrower barriers and layouts, sub-allocated
  *     memory, and a persisted VkPipelineCache.
+ *
+ *   - The readback's publication is one bounded batch per submission: every dirty
+ *     target's slice lands in a staging buffer at a 4-byte-aligned offset, the
+ *     4-byte ones copied straight from their image and the 16-bit ones packed by
+ *     cs_pack into a device-local buffer first, then one copy engine command moves
+ *     each packed slice to the host-visible staging buffer. The queue family must
+ *     therefore have compute as well as graphics, so the pack kernel can be
+ *     dispatched on the same queue as the draws.
  *
  * Everything runs on the executor's thread, one call at a time.
  */
@@ -98,6 +107,14 @@ void nv2a_vk_backend_ring_stats(Nv2aVkRingStats *out)
         memset(out, 0, sizeof *out);
 }
 
+/* No Vulkan, so nothing is ever published here: the executor's CPU path keeps
+ * writing guest memory itself. */
+void nv2a_vk_backend_readback_stats(Nv2aVkReadbackStats *out)
+{
+    if (out)
+        memset(out, 0, sizeof *out);
+}
+
 #else
 
 #define VK_NO_PROTOTYPES
@@ -125,11 +142,13 @@ void nv2a_vk_backend_ring_stats(Nv2aVkRingStats *out)
 #include "d3d/d3d8_swizzle.h"
 #include "nv2a_vsh_hlsl.h"              /* Nv2aVshHlslXf, the corpus shaders' second cbuffer */
 
-/* Built from shaders/nv2a_vk_stage0.hlsl and shaders/nv2a_vk_rc.hlsl by xbr_add_spirv. */
+/* Built from shaders/nv2a_vk_stage0.hlsl, shaders/nv2a_vk_rc.hlsl and
+ * shaders/nv2a_vk_pack.hlsl by xbr_add_spirv. */
 #include "xbr_nv2a_vk_stage0_vs.spv.h"
 #include "xbr_nv2a_vk_stage0_ps.spv.h"
 #include "xbr_nv2a_vk_rc_vs.spv.h"
 #include "xbr_nv2a_vk_rc_ps.spv.h"
+#include "xbr_nv2a_vk_pack_cs.spv.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -143,6 +162,12 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 #define VB_SLOT_STREAM   (16u << 20)      /* vertices and uploads of one slot's submission */
 #define VB_STREAM_ALIGN 256u              /* stream slices; >= every device's minUniformBufferOffsetAlignment */
 #define VB_SLOT_SETS     2048             /* descriptor sets of one slot's submission */
+/* The hard cap on the readback publication's staging buffers, which are grow-only
+ * (see vb_targets_flush): a group of dirty targets whose slices would not fit is
+ * published as several batches instead, and a single target bigger than this stays
+ * dirty and is retried. Every target fits: the largest possible one is a 4096x4096
+ * 4-byte target, 64 MiB. */
+#define VB_READBACK_MAX  (96u << 20)
 /* Submit at a draw entry once the recording slot holds this much, when another slot is
  * free: that is what lets the device start on the earlier part of a frame while the host
  * records its later part. A real Garage frame records about 60 draws and 5 MiB of stream,
@@ -195,12 +220,13 @@ typedef char vb_vertex_is_28_bytes[sizeof(Nv2aVertex) == 28 ? 1 : -1];
     X(vkCreatePipelineLayout) \
     X(vkCreateDescriptorSetLayout) X(vkCreateDescriptorPool) X(vkResetDescriptorPool) \
     X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) \
-    X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) \
+    X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreateComputePipelines) \
     X(vkCmdPipelineBarrier) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) \
-    X(vkCmdCopyImage) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) \
+    X(vkCmdCopyBuffer) X(vkCmdCopyImage) X(vkCmdClearColorImage) \
+    X(vkCmdClearDepthStencilImage) \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) \
     X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) \
-    X(vkCmdPushConstants) \
+    X(vkCmdPushConstants) X(vkCmdDispatch) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetStencilReference) \
     X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetBlendConstants) \
     X(vkCmdDraw) X(vkCmdDrawIndexed)
@@ -226,6 +252,13 @@ typedef struct {
     float t[4][4];                      /* Nv2aVertexExtra.tex */
 } VbRcVertex;
 typedef char vb_rc_vertex_is_92_bytes[sizeof(VbRcVertex) == 92 ? 1 : -1];
+
+/* Push constants of the pack kernel (shaders/nv2a_vk_pack.hlsl's PackPush): the dirty
+ * rectangle in surface pixels, then the slice's byte offset in the staging buffer and its
+ * row stride in bytes. Both members are uint4, so C and the shader cannot disagree on
+ * offsets and the block is exactly the 32 bytes layout_pack declares. */
+typedef struct { uint32_t rect[4], dst[4]; } VbPackPush;
+typedef char vb_pack_push_is_32_bytes[sizeof(VbPackPush) == 32 ? 1 : -1];
 
 /* The combiner registers of one draw, binding 0 of dsl_rc (RcConsts in nv2a_vk_rc.hlsl). Every
  * member is a whole number of 16-byte vectors, so C and the shader cannot disagree on offsets. */
@@ -257,9 +290,6 @@ typedef struct {
     int used;
     uint32_t va, pitch, bpp, w, h;
     VbImage im, copy;                   /* the target, and its snapshot for self-sampling */
-    VkBuffer rb;                        /* readback buffer, w*h*4, made on first flush */
-    VkDeviceMemory rb_mem;
-    uint8_t *rb_ptr;
     int stale;                          /* must be reloaded from guest memory */
     int dirty;                          /* GPU writes not yet in guest memory */
     uint32_t dx0, dy0, dx1, dy1;        /* the rectangle they cover */
@@ -350,6 +380,16 @@ typedef struct {
     uint64_t tex_uploads, tex_hits, tex_undecodable, rt_aliases, rt_copies;
     uint64_t rt_loads, readbacks, readback_ns, rc_draws, rc_fallback, pipelines, submits;
     uint64_t validation_errors, validation_warnings;
+    /* How the readback publication did its work (vb_targets_flush). `readback_batches` is the
+     * batches that reached their publish, and `readback_packs`/`readback_pixels` (16-bit
+     * targets packed by the compute kernel, and the pixels they cover) and
+     * `readback_copies` (4-byte targets read back straight from their image) are counted per
+     * target as it is published, so a batch that never got that far leaves them all
+     * unchanged and leaves its targets dirty. `readback_bytes` is what went into guest
+     * memory, and where the publication's time went is the submit and fence wait
+     * (`readback_wait_ns`) and the host memcpy (`readback_publish_ns`). */
+    uint64_t readback_batches, readback_packs, readback_pixels, readback_copies;
+    uint64_t readback_bytes, readback_wait_ns, readback_publish_ns;
     /* The submission ring (see the file header): submissions issued without waiting for the
      * ones before them, and the fence waits the ring did perform. Deciding instrumentation for
      * the lifetime/overlap gate, so these are counters, not log lines. `overflows` is the part
@@ -402,6 +442,23 @@ static struct {
     VkPipelineCache pcache;
     VkShaderModule vs, ps;
     VkShaderModule vs_rc, ps_rc;
+    VkDescriptorSetLayout dsl_pack;     /* the pack kernel's set: the target's own image
+                                         * (binding 0) and the device-local pack buffer
+                                         * (binding 1, bound whole at offset 0) */
+    VkPipelineLayout layout_pack;       /* that set plus the 32-byte pack push block */
+    VkShaderModule cs_pack;
+    VkPipeline pipe_pack;               /* the compute pipeline (nv2a_vk_pack.hlsl, cs_pack) */
+    /* The readback publication's two staging buffers, process-lifetime like the ring's
+     * streams and grow-only up to VB_READBACK_MAX (vb_readback_reserve). The host never
+     * maps the first; the second is what the host publishes from, once the batch's fence
+     * wait is behind it. */
+    VkBuffer pack_buf;                  /* device-local: cs_pack writes the packed slices here */
+    VkDeviceMemory pack_mem;
+    VkBuffer rb_buf;                    /* host-visible: the destination of the 4-byte copies
+                                         * and of one buffer copy per packed slice */
+    VkDeviceMemory rb_mem;
+    uint8_t *rb_ptr;
+    VkDeviceSize rb_cap;                /* the pair's shared capacity, 0 until first used */
     VbImage white;                      /* bound when a draw is untextured */
     VkSampler samp[4][9];               /* [filter][addr_u*3 + addr_v], made on first use */
     /* The open render pass of the RECORDING slot (closed before any submission), and the
@@ -579,6 +636,38 @@ static int vb_host_buffer(VkDeviceSize size, VkBufferUsageFlags usage, int cache
     }
     *ptr = (uint8_t *)p;
     return 1;
+}
+
+/* A device-local buffer, never mapped: what a compute shader writes and what the copy engine
+ * reads from. No fallback to a host-visible type beyond what vb_alloc's own does, since
+ * anywhere this memory is legal is correct, only slower. */
+static int vb_device_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                            VkBuffer *buf, VkDeviceMemory *mem)
+{
+    VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    VkMemoryRequirements mr;
+    VkResult r;
+
+    bi.size = size;
+    bi.usage = usage;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    r = vkCreateBuffer(g.dev, &bi, NULL, buf);
+    if (r != VK_SUCCESS) {
+        vb_fail("vkCreateBuffer", r);
+        return 0;
+    }
+    vkGetBufferMemoryRequirements(g.dev, *buf, &mr);
+    *mem = vb_alloc(&mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    if (*mem && (r = vkBindBufferMemory(g.dev, *buf, *mem, 0)) == VK_SUCCESS)
+        return 1;
+    if (*mem) {
+        vb_fail("buffer memory", r);
+        vkFreeMemory(g.dev, *mem, NULL);
+    }
+    vkDestroyBuffer(g.dev, *buf, NULL);
+    *buf = VK_NULL_HANDLE;
+    *mem = VK_NULL_HANDLE;
+    return 0;
 }
 
 static void vb_garbage_free(VbGarbage *e)
@@ -1485,104 +1574,327 @@ static int vb_begin_pass(VbTarget *t, VbDepth *d)
 
 static void vb_target_release(VbTarget *t)
 {
-    VbGarbage e;
-
     if (g.pass_t == t)
         vb_end_pass();
     vb_fb_forget(t->im.view);
     vb_image_discard(&t->im);
     vb_image_discard(&t->copy);
-    memset(&e, 0, sizeof e);
-    e.buf = t->rb;
-    e.mem = t->rb_mem;
-    if (e.buf || e.mem)
-        vb_discard(e);
     memset(t, 0, sizeof *t);
 }
 
-/* Write the unflushed rectangles of `n` targets into guest memory in the guest format,
- * with one submission for all of them. */
+/* The bytes one target's dirty rectangle occupies in the staging buffer, and the row stride
+ * it is copied or packed with. Both are multiples of 4 -- the 16-bit stride is rounded up, so
+ * an odd width carries at most two bytes of slack that are never published -- which keeps
+ * every slice offset 4-byte aligned and every buffer copy's size a multiple of 4. */
+static VkDeviceSize vb_readback_slice(const VbTarget *t, uint32_t *row_stride)
+{
+    uint32_t rw = t->dx1 - t->dx0;
+
+    *row_stride = t->bpp == 2 ? ((rw * 2 + 3) & ~3u) : rw * 4;
+    return (VkDeviceSize)*row_stride * (t->dy1 - t->dy0);
+}
+
+/* Room for `bytes` in both publication staging buffers. Grow-only, and never past
+ * VB_READBACK_MAX; the pair is replaced together, so a failure leaves the old two in place.
+ * The replaced buffers go through vb_discard, which holds them until nothing is being
+ * recorded and no submission is in flight: a submission the previous batch made may still be
+ * reading them. Returns 0 if the request is over the cap or the pair could not be made; the
+ * caller then stages nothing and the target keeps its dirty flag. */
+static int vb_readback_reserve(VkDeviceSize bytes)
+{
+    VkBuffer hb = VK_NULL_HANDLE, db = VK_NULL_HANDLE;
+    VkDeviceMemory hm = VK_NULL_HANDLE, dm = VK_NULL_HANDLE;
+    uint8_t *hp = NULL;
+    VkDeviceSize cap;
+    VbGarbage e;
+
+    if (bytes <= g.rb_cap)
+        return 1;
+    if (bytes > VB_READBACK_MAX)
+        return 0;
+    cap = g.rb_cap ? g.rb_cap : (1u << 20);
+    while (cap < bytes)
+        cap *= 2;
+    if (cap > VB_READBACK_MAX)
+        cap = VB_READBACK_MAX;
+    if (!vb_host_buffer(cap, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1, &hb, &hm, &hp)
+        || !vb_device_buffer(cap, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                                  | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &db, &dm)) {
+        memset(&e, 0, sizeof e);
+        e.buf = hb; e.mem = hm;
+        if (e.buf || e.mem)
+            vb_garbage_free(&e);
+        memset(&e, 0, sizeof e);
+        e.buf = db; e.mem = dm;
+        if (e.buf || e.mem)
+            vb_garbage_free(&e);
+        return 0;
+    }
+    memset(&e, 0, sizeof e);
+    e.buf = g.rb_buf; e.mem = g.rb_mem;
+    if (e.buf || e.mem)
+        vb_discard(e);
+    memset(&e, 0, sizeof e);
+    e.buf = g.pack_buf; e.mem = g.pack_mem;
+    if (e.buf || e.mem)
+        vb_discard(e);
+    g.rb_buf = hb;
+    g.rb_mem = hm;
+    g.rb_ptr = hp;
+    g.pack_buf = db;
+    g.pack_mem = dm;
+    g.rb_cap = cap;
+    return 1;
+}
+
+/* Write the unflushed rectangles of `n` targets into guest memory in the guest format.
+ *
+ * The dirty targets are published in bounded batches: one batch is one submission carrying
+ * every slice that fits VB_READBACK_MAX (a 4-byte target copied straight out of its image, a
+ * 16-bit target packed to 5:6:5 by cs_pack into the device-local staging buffer and moved to
+ * the host-visible one by a buffer copy of its own), one fence wait, and then a memcpy per
+ * row into guest memory. No per-pixel work happens on the host.
+ *
+ * A target that cannot be staged -- one whose slice alone is over the cap, a batch whose
+ * staging buffers could not be made, or a batch whose pack descriptor set could not be
+ * allocated -- keeps its dirty flag and is retried by the next flush rather than published
+ * wrong or silently dropped. */
 static void vb_targets_flush(VbTarget **ts, unsigned n)
 {
     VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    uint64_t t0 = vb_now_ns();
-    unsigned i, copies = 0;
+    uint64_t t0 = vb_now_ns(), done0 = g.st.readbacks;
+    unsigned i;
 
     if (!g.ok)                          /* a fence wait already failed: record nothing more */
         return;
-    for (i = 0; i < n; i++) {
-        VbTarget *t = ts[i];
-        VkBufferImageCopy bc;
-        if (!g.ok)                      /* a fence wait failed in an earlier iteration */
-            break;
-        if (!t->dirty)
-            continue;
-        if (!t->rb && !vb_host_buffer((VkDeviceSize)t->w * t->h * 4,
-                                      VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1,
-                                      &t->rb, &t->rb_mem, &t->rb_ptr)) {
-            t->dirty = 0;
+    for (i = 0; i < n; ) {
+        VkDeviceSize slice[VB_MAX_TARGETS], total = 0;
+        uint32_t stride[VB_MAX_TARGETS];
+        int stage[VB_MAX_TARGETS];
+        int batch_ok = 1;               /* 0: this batch recorded nothing usable, so it must
+                                         * not be submitted -- or published -- at all */
+        unsigned j = i, k;
+
+        /* One bounded group: the dirty targets whose slices still fit. A target whose slice
+         * is over the cap on its own can never be staged; it is stepped over -- and left
+         * dirty -- so the targets after it still publish. */
+        while (j < n) {
+            VbTarget *t = ts[j];
+            VkDeviceSize sz;
+            uint32_t st;
+
+            stage[j] = 0;
+            if (t->dirty && t->dx1 > t->dx0 && t->dy1 > t->dy0) {
+                sz = vb_readback_slice(t, &st);
+                if (sz > VB_READBACK_MAX) {
+                    j++;
+                    continue;
+                }
+                if (total + sz > VB_READBACK_MAX)
+                    break;              /* the next batch starts at this target */
+                stage[j] = 1;
+                slice[j] = total;
+                stride[j] = st;
+                total += sz;
+            }
+            j++;
+        }
+        if (!total) {                   /* nothing stageable in this group */
+            i = j;
             continue;
         }
-        memset(&bc, 0, sizeof bc);
-        bc.bufferOffset = ((VkDeviceSize)t->dy0 * t->w + t->dx0) * 4;
-        bc.bufferRowLength = t->w;
-        bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        bc.imageSubresource.layerCount = 1;
-        bc.imageOffset.x = (int32_t)t->dx0;
-        bc.imageOffset.y = (int32_t)t->dy0;
-        bc.imageExtent.width = t->dx1 - t->dx0;
-        bc.imageExtent.height = t->dy1 - t->dy0;
-        bc.imageExtent.depth = 1;
-        vkCmdCopyImageToBuffer(vb_transfer_cmd(), t->im.img, VK_IMAGE_LAYOUT_GENERAL,
-                               t->rb, 1, &bc);
-        copies++;
-    }
-    if (!copies)
-        return;
-    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    /* vb_cmd(), not the slot directly: the copies' vb_transfer_cmd above may have found the
-     * device lost, in which case the slot it left us in is still the GPU's and this barrier
-     * belongs in the dead buffer (a no-op) instead of that submission. */
-    vkCmdPipelineBarrier(vb_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    /* The coherence boundary: those copies are in the newest submission, and the host must
-     * not read the readback buffers until every submission it has made has completed. */
-    vb_slot_submit();
-    vb_drain();
-    if (!g.ok)
-        return;
-    for (i = 0; i < n; i++) {
-        VbTarget *t = ts[i];
-        VkMappedMemoryRange mr = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
-        uint8_t *dst;
-        uint32_t x, y;
-        if (!t->dirty)
+        if (!vb_readback_reserve(total) || !g.ok) {
+            i = j;                      /* retried by the next flush, still dirty */
             continue;
-        /* Cached memory may not be coherent everywhere; invalidating is always allowed. */
-        mr.memory = t->rb_mem;
-        mr.size = VK_WHOLE_SIZE;
-        vkInvalidateMappedMemoryRanges(g.dev, 1, &mr);
-        dst = vb_guest(t->va);
-        for (y = t->dy0; y < t->dy1; y++) {
-            const uint32_t *src = (const uint32_t *)(t->rb_ptr + (size_t)y * t->w * 4) + t->dx0;
-            uint8_t *row = dst + (size_t)y * t->pitch;
+        }
+        /* One recording for the whole batch: every copy and its destination offset, and every
+         * pack dispatch with the buffer copy that reads it, are recorded before anything is
+         * submitted. */
+        vb_transfer_cmd();              /* end any open pass; latched/dead-safe */
+        if (!g.ok)
+            break;
+        for (k = i; k < j; k++) {
+            VbTarget *t = ts[k];
+            uint32_t rw, rh;
+
+            if (!stage[k])
+                continue;
+            /* vb_cmd(): no pass is open here, and a vb_reserve below may have moved the
+             * recording into the next slot, which this follows. */
+            rw = t->dx1 - t->dx0;
+            rh = t->dy1 - t->dy0;
             if (t->bpp == 4) {
-                memcpy(row + (size_t)t->dx0 * 4, src, (size_t)(t->dx1 - t->dx0) * 4);
-            } else {
-                /* Truncated to 5:6:5, as the CPU rasteriser stores it. */
-                uint16_t *p = (uint16_t *)row + t->dx0;
-                for (x = 0; x < t->dx1 - t->dx0; x++) {
-                    uint32_t c = src[x];
-                    p[x] = (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0)
-                                    | ((c >> 3) & 0x001F));
+                VkBufferImageCopy bc;
+
+                memset(&bc, 0, sizeof bc);
+                bc.bufferOffset = slice[k];
+                bc.bufferRowLength = rw;    /* tight rows: the slice is exactly the rectangle */
+                bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                bc.imageSubresource.layerCount = 1;
+                bc.imageOffset.x = (int32_t)t->dx0;
+                bc.imageOffset.y = (int32_t)t->dy0;
+                bc.imageExtent.width = rw;
+                bc.imageExtent.height = rh;
+                bc.imageExtent.depth = 1;
+                vkCmdCopyImageToBuffer(vb_cmd(), t->im.img, VK_IMAGE_LAYOUT_GENERAL, g.rb_buf, 1,
+                                       &bc);
+                continue;
+            }
+            /* 16-bit: pack it on the GPU. vb_reserve(0, 1) first, so the set this dispatch
+             * needs is inside the slot's pool budget and the dispatch and the buffer copy
+             * that reads it stay in one slot; the reserve can move the slot, and can fail on
+             * that move's fence wait, so g.ok is re-checked and the command buffer taken
+             * again after it. */
+            vb_reserve(0, 1);
+            if (!g.ok)
+                break;
+            {
+                VbPackPush pc;
+                VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+                VkDescriptorBufferInfo bi;
+                VkDescriptorImageInfo ii;
+                VkWriteDescriptorSet wr[2];
+                VkDescriptorSet set;
+                VkCommandBuffer cmd = vb_cmd();
+                VkResult r;
+
+                dai.descriptorPool = g.slots[g.cur].dpool;
+                dai.descriptorSetCount = 1;
+                dai.pSetLayouts = &g.dsl_pack;
+                r = vkAllocateDescriptorSets(g.dev, &dai, &set);
+                if (r != VK_SUCCESS) {
+                    /* Only this target's dispatch is missing, but a batch is published as a
+                     * whole: nothing in this batch may be submitted or published, or every
+                     * staged target after this one would be marked clean from bytes that
+                     * were never written. They all keep `dirty` and are retried. Not a
+                     * device loss: a transient pool failure must not stop the back end. */
+                    vb_fail("vkAllocateDescriptorSets", r);
+                    batch_ok = 0;
+                    break;
+                }
+                g.slots[g.cur].sets_used++;
+                memset(&ii, 0, sizeof ii);
+                ii.imageView = t->im.view;      /* the target's own view, in GENERAL */
+                ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                memset(&bi, 0, sizeof bi);
+                bi.buffer = g.pack_buf;
+                bi.offset = 0;
+                bi.range = VK_WHOLE_SIZE;
+                memset(wr, 0, sizeof wr);
+                wr[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                wr[0].dstSet = set;
+                wr[0].dstBinding = 0;
+                wr[0].descriptorCount = 1;
+                wr[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                wr[0].pImageInfo = &ii;
+                wr[1] = wr[0];                  /* the pack buffer is bound whole at 0, so no
+                                                 * dynamic offset is involved */
+                wr[1].dstBinding = 1;
+                wr[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                wr[1].pImageInfo = NULL;
+                wr[1].pBufferInfo = &bi;
+                vkUpdateDescriptorSets(g.dev, 2, wr, 0, NULL);
+                pc.rect[0] = t->dx0;
+                pc.rect[1] = t->dy0;
+                pc.rect[2] = rw;
+                pc.rect[3] = rh;
+                pc.dst[0] = (uint32_t)slice[k];
+                pc.dst[1] = stride[k];
+                pc.dst[2] = pc.dst[3] = 0;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.pipe_pack);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.layout_pack, 0, 1,
+                                        &set, 0, NULL);
+                vkCmdPushConstants(cmd, g.layout_pack, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc,
+                                   &pc);
+                vkCmdDispatch(cmd, (rw + 15u) / 16u, (rh + 7u) / 8u, 1);
+                vb_barrier();           /* the pack's shader writes before the copy that reads
+                                         * them */
+                {
+                    VkBufferCopy region;
+
+                    memset(&region, 0, sizeof region);
+                    region.srcOffset = slice[k];
+                    region.dstOffset = slice[k];
+                    region.size = (VkDeviceSize)stride[k] * rh;
+                    vkCmdCopyBuffer(cmd, g.pack_buf, g.rb_buf, 1, &region);
                 }
             }
         }
-        t->dirty = 0;
-        g.st.readbacks++;
+        if (!g.ok)
+            break;
+        if (!batch_ok) {
+            /* A pack set could not be made, so the batch's copies are incomplete: submit and
+             * publish nothing. Every staged target of this group keeps its dirty flag and is
+             * retried by the next flush. What was recorded so far stays in the recording slot
+             * and is submitted with the next submission the back end makes; the host never
+             * reads the staging buffer for it. */
+            i = j;
+            continue;
+        }
+        /* Order the batch's device writes before the host reads them, whatever wrote them:
+         * the pack kernel's shader writes and the copy engine's writes alike. */
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        /* vb_cmd(), not the slot directly: a fence wait above may have found the device lost,
+         * in which case this barrier belongs in the dead buffer, a no-op. */
+        vkCmdPipelineBarrier(vb_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                             VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        /* The coherence boundary: the batch's commands are in the newest submission, and the
+         * host must not read the staging buffer until every submission it has made has
+         * completed. */
+        {
+            uint64_t w0 = vb_now_ns();
+            vb_slot_submit();
+            vb_drain();
+            g.st.readback_wait_ns += vb_now_ns() - w0;
+        }
+        if (!g.ok)
+            break;
+        g.st.readback_batches++;        /* the batch will publish: one submission, one wait */
+        /* Publish. Cached memory may not be coherent everywhere; invalidating is always
+         * allowed, and once per batch covers every slice in it. */
+        {
+            VkMappedMemoryRange mr = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+            uint64_t p0 = vb_now_ns();
+
+            mr.memory = g.rb_mem;
+            mr.size = VK_WHOLE_SIZE;
+            vkInvalidateMappedMemoryRanges(g.dev, 1, &mr);
+            for (k = i; k < j; k++) {
+                VbTarget *t = ts[k];
+                uint32_t rw = t->dx1 - t->dx0, rows = t->dy1 - t->dy0;
+                uint8_t *dst;
+                uint32_t row;
+
+                if (!stage[k])
+                    continue;
+                dst = vb_guest(t->va);
+                for (row = 0; row < rows; row++) {
+                    memcpy(dst + (size_t)(t->dy0 + row) * t->pitch + (size_t)t->dx0 * t->bpp,
+                           g.rb_ptr + slice[k] + (VkDeviceSize)row * stride[k],
+                           (size_t)rw * t->bpp);
+                }
+                t->dirty = 0;
+                g.st.readbacks++;
+                g.st.readback_bytes += (uint64_t)rw * t->bpp * rows;
+                /* Counted here, not while the batch recorded its commands: these say what was
+                 * published, so a batch that never reached its submit leaves them unchanged
+                 * and leaves its targets dirty. */
+                if (t->bpp == 2) {
+                    g.st.readback_packs++;
+                    g.st.readback_pixels += (uint64_t)rw * rows;
+                } else {
+                    g.st.readback_copies++;
+                }
+            }
+            g.st.readback_publish_ns += vb_now_ns() - p0;
+        }
+        i = j;
     }
-    g.st.readback_ns += vb_now_ns() - t0;
+    /* Counted only when this flush published something, as it always was: a flush that
+     * staged nothing is not readback time. */
+    if (g.st.readbacks != done0)
+        g.st.readback_ns += vb_now_ns() - t0;
 }
 
 static void vb_target_flush(VbTarget *t)
@@ -2853,7 +3165,8 @@ static void vb_stats(int force)
                     " cull_draws=%llu cull_all=%llu validation_errors=%llu"
                     " validation_warnings=%llu vsh_hits=%llu vsh_misses=%llu"
                     " vsh_identity_fail=%llu vsh_declines=%llu vsh_tris=%llu"
-                    " vsh_const_uploads=%llu\n",
+                    " vsh_const_uploads=%llu rb_batches=%llu rb_packs=%llu rb_pixels=%llu"
+                    " rb_copies=%llu rb_bytes=%llu rb_publish_ms=%.1f rb_wait_ms=%.1f\n",
             g.frame, (unsigned long long)g.st.draws, (unsigned long long)g.st.tris,
             (unsigned long long)g.st.clears, (unsigned long long)g.st.tex_uploads,
             (unsigned long long)g.st.tex_hits, (unsigned long long)g.st.tex_undecodable,
@@ -2870,7 +3183,13 @@ static void vb_stats(int force)
             (unsigned long long)g.st.validation_warnings,
             (unsigned long long)g.st.vsh_hits, (unsigned long long)g.st.vsh_misses,
             (unsigned long long)g.st.vsh_identity_fail, (unsigned long long)g.st.vsh_declines,
-            (unsigned long long)g.st.vsh_tris, (unsigned long long)g.st.vsh_const_uploads);
+            (unsigned long long)g.st.vsh_tris, (unsigned long long)g.st.vsh_const_uploads,
+            (unsigned long long)g.st.readback_batches,
+            (unsigned long long)g.st.readback_packs,
+            (unsigned long long)g.st.readback_pixels,
+            (unsigned long long)g.st.readback_copies,
+            (unsigned long long)g.st.readback_bytes,
+            (double)g.st.readback_publish_ns / 1e6, (double)g.st.readback_wait_ns / 1e6);
     fflush(stderr);
 }
 
@@ -3035,12 +3354,22 @@ static int vb_name_has(const char *name, const char *sub)
     return 0;
 }
 
+/* The queue family the back end uses: graphics, and compute so the pack kernel can be
+ * dispatched on the same queue. A family with both is preferred; failing that the first
+ * graphics family is returned, which vb_pick_device then rejects for lacking compute --
+ * there is one 16-bit publication path and it needs the dispatch. */
 static int vb_graphics_family(VkPhysicalDevice pd, uint32_t *family)
 {
     VkQueueFamilyProperties qf[32];
     uint32_t n = 32, i;
 
     vkGetPhysicalDeviceQueueFamilyProperties(pd, &n, qf);
+    for (i = 0; i < n; i++)
+        if ((qf[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT))
+            == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) {
+            *family = i;
+            return 1;
+        }
     for (i = 0; i < n; i++)
         if (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
             *family = i;
@@ -3049,8 +3378,21 @@ static int vb_graphics_family(VkPhysicalDevice pd, uint32_t *family)
     return 0;
 }
 
+/* The flags of the family vb_graphics_family picked, so the usable test can name what the
+ * family lacks. 0 when it is not a valid family index. */
+static VkQueueFlags vb_family_flags(VkPhysicalDevice pd, uint32_t family)
+{
+    VkQueueFamilyProperties qf[32];
+    uint32_t n = 32;
+
+    vkGetPhysicalDeviceQueueFamilyProperties(pd, &n, qf);
+    return family < n ? qf[family].queueFlags : 0;
+}
+
 /* RECOMP_VK_DEVICE picks by name; otherwise discrete > integrated > virtual > other,
- * never a CPU device. Devices below Vulkan 1.1 or without graphics are passed over. */
+ * never a CPU device. Devices below Vulkan 1.1, without a graphics family, without compute
+ * on that family (the pack kernel's dispatch), or whose uniform alignment the stream cannot
+ * meet are passed over, and the line says which of those it was. */
 static int vb_pick_device(void)
 {
     const char *want = getenv("RECOMP_VK_DEVICE");
@@ -3066,14 +3408,23 @@ static int vb_pick_device(void)
         return -1;
     }
     for (i = 0; i < n; i++) {
+        const char *why = "";
         int score, usable;
         vkGetPhysicalDeviceProperties(devs[i], &p);
-        usable = p.apiVersion >= VK_API_VERSION_1_1 && vb_graphics_family(devs[i], &family)
-              && p.limits.minUniformBufferOffsetAlignment <= VB_STREAM_ALIGN;
+        if (p.apiVersion < VK_API_VERSION_1_1)
+            why = " unusable (older than Vulkan 1.1)";
+        else if (!vb_graphics_family(devs[i], &family))
+            why = " unusable (no graphics queue family)";
+        else if (!(vb_family_flags(devs[i], family) & VK_QUEUE_COMPUTE_BIT))
+            why = " unusable (graphics family has no compute, which the readback's pack "
+                  "kernel needs)";
+        else if (p.limits.minUniformBufferOffsetAlignment > VB_STREAM_ALIGN)
+            why = " unusable (minUniformBufferOffsetAlignment exceeds the stream's alignment)";
+        usable = !*why;
         score = vb_device_score(p.deviceType);
         fprintf(stderr, "[GPUVK] found device %u: %s (type %d, api %u.%u)%s\n", i, p.deviceName,
                 (int)p.deviceType, VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion),
-                usable ? "" : " unusable");
+                why);
         if (!usable)
             continue;
         if (want) {
@@ -3172,12 +3523,14 @@ static int vb_create_pipeline_objects(void)
     VkDescriptorSetLayoutBinding bind[2];
     VkDescriptorSetLayoutBinding bind_rc[9];
     VkDescriptorSetLayoutBinding bind_prog[11];
+    VkDescriptorSetLayoutBinding bind_pack[2];
     VkDescriptorSetLayoutCreateInfo dli = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     VkPushConstantRange pcr;
     VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     VkPipelineCacheCreateInfo pci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+    VkComputePipelineCreateInfo cp = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
     VkShaderModuleCreateInfo smi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-    VkDescriptorPoolSize ps[3];
+    VkDescriptorPoolSize ps[4];
     VkDescriptorPoolCreateInfo dpi = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
     int d, i;
     VkResult r;
@@ -3201,8 +3554,10 @@ static int vb_create_pipeline_objects(void)
     ps[1].descriptorCount = 4 * VB_SLOT_SETS;
     ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
     ps[2].descriptorCount = 3 * VB_SLOT_SETS;
+    ps[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    ps[3].descriptorCount = VB_SLOT_SETS;   /* the pack set's one storage buffer */
     dpi.maxSets = VB_SLOT_SETS;
-    dpi.poolSizeCount = 3;
+    dpi.poolSizeCount = 4;
     dpi.pPoolSizes = ps;
     for (i = 0; i < VB_SLOTS; i++) {
         VbSlot *s = &g.slots[i];
@@ -3213,8 +3568,9 @@ static int vb_create_pipeline_objects(void)
         if ((r = vkCreateDescriptorPool(g.dev, &dpi, NULL, &s->dpool)) != VK_SUCCESS)
             goto fail;
         /* One draw's descriptors cover 1 image, 1 sampler and up to 3 dynamic uniform
-         * buffers (the combiner registers, c[192] and the xf block), so the pool sizes
-         * above cover the larger set layout. */
+         * buffers (the combiner registers, c[192] and the xf block), and one packed target's
+         * cover 1 image and 1 storage buffer (the pack buffer), so the pool sizes above
+         * cover the larger of the set layouts and the pack's own. */
         if (!vb_host_buffer(VB_SLOT_STREAM, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
                                             | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
                                             | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
@@ -3321,6 +3677,32 @@ static int vb_create_pipeline_objects(void)
     pli.pSetLayouts = &g.dsl_prog;
     if ((r = vkCreatePipelineLayout(g.dev, &pli, NULL, &g.layout_prog)) != VK_SUCCESS)
         goto fail;
+
+    /* The pack kernel's set: the target's own image as a sampled image, which the kernel reads
+     * with OpImageFetch (no sampler, so it is a plain SAMPLED_IMAGE) and the device-local pack
+     * buffer, bound whole at offset 0 so no dynamic offset alignment is involved. Its push
+     * range is the 32-byte PackPush block. */
+    memset(bind_pack, 0, sizeof bind_pack);
+    bind_pack[0].binding = 0;
+    bind_pack[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    bind_pack[0].descriptorCount = 1;
+    bind_pack[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    bind_pack[1] = bind_pack[0];
+    bind_pack[1].binding = 1;
+    bind_pack[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    dli.bindingCount = 2;
+    dli.pBindings = bind_pack;
+    if ((r = vkCreateDescriptorSetLayout(g.dev, &dli, NULL, &g.dsl_pack)) != VK_SUCCESS)
+        goto fail;
+    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcr.offset = 0;
+    pcr.size = sizeof(VbPackPush);
+    pli.setLayoutCount = 1;
+    pli.pSetLayouts = &g.dsl_pack;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pcr;
+    if ((r = vkCreatePipelineLayout(g.dev, &pli, NULL, &g.layout_pack)) != VK_SUCCESS)
+        goto fail;
     if ((r = vkCreatePipelineCache(g.dev, &pci, NULL, &g.pcache)) != VK_SUCCESS)
         goto fail;
     smi.codeSize = xbr_nv2a_vk_stage0_vs_size;
@@ -3339,11 +3721,23 @@ static int vb_create_pipeline_objects(void)
     smi.pCode = xbr_nv2a_vk_rc_ps;
     if ((r = vkCreateShaderModule(g.dev, &smi, NULL, &g.ps_rc)) != VK_SUCCESS)
         goto fail;
+    smi.codeSize = xbr_nv2a_vk_pack_cs_size;
+    smi.pCode = xbr_nv2a_vk_pack_cs;
+    if ((r = vkCreateShaderModule(g.dev, &smi, NULL, &g.cs_pack)) != VK_SUCCESS)
+        goto fail;
+    cp.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cp.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cp.stage.module = g.cs_pack;
+    cp.stage.pName = "cs_pack";
+    cp.layout = g.layout_pack;
+    if ((r = vkCreateComputePipelines(g.dev, g.pcache, 1, &cp, NULL, &g.pipe_pack)) != VK_SUCCESS)
+        goto fail;
 
     /* One set per draw, of either kind; the combiner's uses 4 images, 4 samplers and
      * one dynamic uniform buffer, the program's three (rc registers, c[192], the xf
-     * block), so the dynamic count must cover the larger. The pools themselves, and the
-     * streams, are the ring slots' (above). */
+     * block), so the dynamic count must cover the larger. One set per packed 16-bit
+     * target uses 1 image and 1 storage buffer (the pack buffer). The pools
+     * themselves, and the streams, are the ring slots' (above). */
     return 0;
 fail:
     vb_fail("pipeline objects", r);
@@ -3425,6 +3819,21 @@ void nv2a_vk_backend_ring_stats(Nv2aVkRingStats *out)
     out->splits = g.st.splits;
     out->overflows = g.st.overflows;
     out->frames = g.frame;
+}
+
+void nv2a_vk_backend_readback_stats(Nv2aVkReadbackStats *out)
+{
+    if (!out)
+        return;
+    memset(out, 0, sizeof *out);
+    out->readbacks = g.st.readbacks;
+    out->batches = g.st.readback_batches;
+    out->packed = g.st.readback_packs;
+    out->packed_pixels = g.st.readback_pixels;
+    out->copied = g.st.readback_copies;
+    out->bytes = g.st.readback_bytes;
+    out->wait_ns = g.st.readback_wait_ns;
+    out->publish_ns = g.st.readback_publish_ns;
 }
 
 int nv2a_vk_backend_install(void)
