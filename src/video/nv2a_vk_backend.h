@@ -184,10 +184,20 @@ void nv2a_vk_backend_readback_stats(Nv2aVkReadbackStats *out);
  * the pool blocks that could not be made at all, each of which fell back once to a dedicated
  * allocation. `dedicated` counts all of them together.
  *
- * Lifetime: `released` counts the ranges given back, `parked` those a recording or a pending
- * submission was still able to read, `parked_peak` the most of them held at once and
- * `parked_lost` those a full park list had to abandon (never handed out again, never freed --
- * the one leak this allocator can have). `reuse_hits` are the ranges taken from a block's free
+ * Lifetime: `released` counts the ranges given back -- an ADMITTED release only, the idle one or
+ * the park copy; a refused one is counted by `parked`/`parked_lost` alone -- `parked` those a
+ * recording or a pending submission was still able to read (every release that had to be parked
+ * or refused, so a refused one counts here too), `parked_peak` the most of them actually held at
+ * once and `parked_lost` the releases a FULL park list refused to admit (capacity failure,
+ * terminal): a refused release is not abandoned and never freed -- the range stays counted live
+ * in its block (`used`/`live`, or `dedicated_bytes` for a dedicated allocation) and no free range
+ * ever receives it, so nothing is freed and nothing is handed out, and the back end stops
+ * write-once. No VbAlloc keeps the range: every production caller reaches the refusal with a
+ * by-value vb_garbage_free entry, and that entry is dropped rather than kept -- vb_stream's
+ * dead-recording branch returns without its local entry, and the deferred-destroy route's drain
+ * drops the entry it holds -- while the range stays pinned and accounted live. So `parked_lost`
+ * is never a silently dropped range, and it is 0 in every sound run. `reuse_hits` are the ranges
+ * taken from a block's free
  * list rather than its bump cursor; `blocks_retired` are the empty blocks given back to the
  * driver. `first_shared_block`/`first_shared_block_kind` and `first_reuse_off`/
  * `first_reuse_block` are write-once latches of the first block with two live ranges in it (the

@@ -114,16 +114,32 @@
  *     not coherent. A range whose release happens while something could still read it is
  *     PARKED: while g.slots[g.cur].recording || g.npending, vb_mem_give puts the range on
  *     the bounded s_pool_pending[] list (counted `parked`) and vb_pool_gc folds it back
- *     only after the ring has drained; a full park list parks it permanently
- *     (`parked_lost`, never handed out again), which is also why a parked range keeps its
- *     block's `used` bytes and a block holding one can never be retired. A pool keeps at
+ *     only after the ring has drained -- which is also why a parked range keeps its block's
+ *     `used` bytes and a block holding one can never be retired. Only two kinds of release skip
+ *     that path, because nothing recorded or in flight can name the range: a failed bind or map
+ *     in this call's own resource creation -- the failed bind never bound the object, and a
+ *     failed map's object is destroyed first, so the range names nothing either way -- and the
+ *     staging pair a readback reserve made in its own call and never published. Each gives the
+ *     range back at once (vb_mem_give_now), so a burst of such rollbacks cannot fill the bounded
+ *     list. A release a recorded or in-flight command may still read stays conservative on
+ *     purpose even when it looks new: a failed vkCreateImageView on an image that IS bound
+ *     (vb_image_create discards it through vb_image_discard) and vb_stream's dead-recording
+ *     branch (which frees its slice through vb_garbage_free) both take the queued/parked path.
+ *     A release the FULL list cannot admit is REFUSED, not dropped (`parked`, `parked_lost`):
+ *     the range keeps being counted live in its block and reaches no free list -- nothing is
+ *     freed and nothing is handed out, and the VbAlloc copy naming it is dropped, not kept by a
+ *     caller -- and the back end stops write-once, because a release the allocator cannot take
+ *     is a state it cannot leave on its own. A pool keeps at
  *     most one empty block, and only one no larger than VB_POOL_KEEP_EMPTY (the size class
  *     the sizing rule makes for small and mid ranges); every other empty block is retired
  *     (vkFreeMemory) by vb_pool_gc, which vb_garbage_drain calls after every fence wait, and
  *     by a pool that needs a block while it is at VB_POOL_BLOCKS. A failed allocate, bind or
- *     map releases exactly what it took (counted `rollbacks`) and leaves the caller's
- *     failure path to destroy the object: no dangling VbAlloc, no double release, and no
- *     resource is usable after a failure.
+ *     map releases exactly what it took (counted `rollbacks`) through vb_mem_give_now, since
+ *     nothing recorded or in flight can name an object this call has just made, and leaves
+ *     the caller's failure path to destroy the object -- the object is destroyed FIRST when
+ *     it was bound, because a bound range may not be handed out while the object still names
+ *     it: no dangling VbAlloc, no double release, no early reuse, and no resource is usable
+ *     after a failure.
  *
  *   - The readback's publication is one bounded batch per submission: every dirty
  *     target's slice lands in a staging buffer at a 4-byte-aligned offset, the
@@ -753,8 +769,12 @@ static Nv2aVkMemoryStats s_mem;
  * far. The periodic [GPUVK] line reports it, which is where a run's evidence survives. */
 static uint64_t s_retired_bytes;
 /* Ranges released while something that could still read them was recording or in flight.
- * vb_pool_gc folds them back into their blocks once the ring has drained; a full list parks a
- * range permanently instead (counted parked_lost, never handed out again). */
+ * vb_pool_gc folds them back into their blocks once the ring has drained. A release the full
+ * list cannot admit is refused instead of dropped: the range keeps being counted live in its
+ * block and reaches no free list -- nothing is freed and nothing is handed out -- while
+ * `parked`/`parked_lost` count the refusal and `released` counts only what was given back, and
+ * the back end stops. The VbAlloc the refusal was handed (a by-value vb_garbage_free entry)
+ * never survives it, so the range stays pinned and accounted live. */
 static VbAlloc s_pool_pending[VB_POOL_PENDING];
 static unsigned s_nparked;
 
@@ -1127,8 +1147,9 @@ static void vb_mem_peak(void)
 }
 
 /* Really give a range back: a pooled range rejoins its block's free list, a dedicated
- * allocation is freed. Only vb_mem_give (while nothing can read it) and vb_pool_gc (after the
- * ring drained) call this. */
+ * allocation is freed. Only vb_mem_give_now (nothing recorded or in flight can name the
+ * range), vb_mem_give while nothing can read it, and vb_pool_gc (after the ring drained) call
+ * this. */
 static void vb_mem_release(VbAlloc *a)
 {
     VbPool *p;
@@ -1160,27 +1181,75 @@ static void vb_mem_release(VbAlloc *a)
     vb_pool_padding(p);                 /* a full free list can turn the range into padding */
 }
 
+/* Defined below with the rest of the coherence stop; a release the bounded park list cannot
+ * admit reports through it (write-once: it latches the stop, announces once and dumps the
+ * stats line, so the refusal's parked_lost reaches a report). */
+static void vb_stop(const char *why);
+
 /* Give a range back. A pooled range may only be handed out again while nothing that could
  * still read it is recording or in flight: otherwise the range is parked in
  * s_pool_pending[] -- keeping its block's `used` bytes, so the block never looks empty -- and
- * folded back by vb_pool_gc after the drain. A full park list parks it permanently: counted
- * parked_lost, never reused, never freed. */
+ * folded back by vb_pool_gc after the drain. Both admitted branches count the range given back
+ * (`released`). A release this bounded list cannot admit is REFUSED, not dropped: the range
+ * keeps being counted live in its block (`used`/`live`, or `dedicated_bytes`) and no free range
+ * ever receives it, so nothing is freed and nothing is handed out, while `parked` and
+ * `parked_lost` count the refusal and `released` does not. The back end stops write-once,
+ * because a release the allocator cannot take is a state it cannot leave on its own. No VbAlloc
+ * keeps the range: every production caller hands in a by-value vb_garbage_free entry, and that
+ * copy is dropped rather than kept -- vb_stream's dead-recording branch returns without its
+ * local entry, and the deferred-destroy route's drain drops the entry it holds -- so the range
+ * is retained and accounted live rather than named by anyone who could hand it back. A range
+ * nothing recorded or in flight can name belongs in vb_mem_give_now instead: a burst of
+ * rollbacks must never be able to reach this refusal. */
 static void vb_mem_give(VbAlloc *a)
 {
     if (a->mem == VK_NULL_HANDLE)
         return;
-    s_mem.released++;
     if (vb_mem_idle()) {
+        s_mem.released++;               /* an admitted release: counted given back */
         vb_mem_release(a);
     } else if (s_nparked < VB_POOL_PENDING) {
+        s_mem.released++;               /* admitted too: the park copy is a release */
         s_pool_pending[s_nparked++] = *a;
         s_mem.parked++;
         if (s_nparked > s_mem.parked_peak)
             s_mem.parked_peak = s_nparked;
     } else {
+        /* Bounded admission failure, reached with `a` pointing at a by-value copy (every
+         * production caller goes through a vb_garbage_free entry), so this call is the only
+         * thing that could hand the range back. It does not: nothing below decrements the
+         * block's `used` or the pool's `live` (or `dedicated_bytes`), no free range is ever
+         * given the range and vkFreeMemory is never called, so the range stays pinned and
+         * accounted live, nothing is freed and nothing is handed out. The copy naming it is
+         * dropped by whoever made it -- vb_stream's dead-recording branch returns without its
+         * local entry, the deferred-destroy route's drain clears the list it holds -- and
+         * `released` is NOT incremented: a refusal is counted by `parked` and `parked_lost`
+         * only. */
         s_mem.parked++;
         s_mem.parked_lost++;
+        vb_fail("VB_POOL_PENDING park list", VK_ERROR_OUT_OF_HOST_MEMORY);
+        vb_stop("a released range cannot be parked: the park list is full, so the range stays "
+                "counted live and reaches no free list -- neither handed out nor freed");
+        return;
     }
+    memset(a, 0, sizeof *a);
+    a->pool = -1;
+    a->block = -1;
+}
+
+/* Give a range back for good, WITHOUT parking: for an allocation nothing recorded or in flight
+ * can reference -- a failed create, bind or map of a brand-new object, or an object destroyed
+ * before any recorded command named it. Such a range is not parked, so a burst of rollbacks can
+ * never fill the bounded park list. If the object was BOUND to the range, the object must be
+ * destroyed FIRST: a bound range may not be handed out again while the object still names it.
+ * For a range a recorded or in-flight command may still read, use vb_mem_give (the parked,
+ * bounded path) instead. */
+static void vb_mem_give_now(VbAlloc *a)
+{
+    if (a->mem == VK_NULL_HANDLE)
+        return;
+    s_mem.released++;
+    vb_mem_release(a);
     memset(a, 0, sizeof *a);
     a->pool = -1;
     a->block = -1;
@@ -1540,16 +1609,18 @@ static int vb_host_buffer(VkDeviceSize size, VkBufferUsageFlags usage, int cache
     *ptr = (uint8_t *)p;
     return 1;
 fail:
-    /* Nothing is left behind: the range goes back to its block (parked when something could
-     * still read that block), or the dedicated allocation is freed, and the buffer is
-     * destroyed. The caller's failure path has no handle, no pointer into memory the back end
-     * no longer owns, and nothing to release. */
-    vb_mem_give(mem);
+    /* The buffer is destroyed FIRST: if this call's bind had succeeded before the map failed,
+     * the buffer names the range, and a bound range may not be handed out while the object
+     * still names it. Nothing recorded or in flight can name a buffer this call has just made,
+     * so the range goes back now (vb_mem_give_now: never parked, so a burst of failed maps or
+     * binds can never fill the park list), and the caller's failure path has no handle, no
+     * pointer into memory the back end no longer owns, and nothing to release. */
+    vkDestroyBuffer(g.dev, *buf, NULL);
+    *buf = VK_NULL_HANDLE;
+    vb_mem_give_now(mem);
     memset(mem, 0, sizeof *mem);
     mem->pool = -1;
     mem->block = -1;
-    vkDestroyBuffer(g.dev, *buf, NULL);
-    *buf = VK_NULL_HANDLE;
     return 0;
 }
 
@@ -1587,25 +1658,48 @@ static int vb_device_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
     s_mem.rollbacks++;
     vb_fail("vkBindBufferMemory", r);
 fail:
-    vb_mem_give(mem);
+    /* Same ordering as vb_host_buffer: the object that may be bound to the range is destroyed
+     * before the range goes back, and the range is never parked because nothing recorded or in
+     * flight can name a buffer this call has just made. */
+    vkDestroyBuffer(g.dev, *buf, NULL);
+    *buf = VK_NULL_HANDLE;
+    vb_mem_give_now(mem);
     memset(mem, 0, sizeof *mem);
     mem->pool = -1;
     mem->block = -1;
-    vkDestroyBuffer(g.dev, *buf, NULL);
-    *buf = VK_NULL_HANDLE;
     return 0;
 }
 
-static void vb_garbage_free(VbGarbage *e)
+/* Destroy the objects one retained entry holds, the objects FIRST: an object bound to the
+ * entry's range is gone before anything may hand that range out again. */
+static void vb_garbage_destroy(VbGarbage *e)
 {
     if (e->fb) vkDestroyFramebuffer(g.dev, e->fb, NULL);
     if (e->pipe) vkDestroyPipeline(g.dev, e->pipe, NULL);
     if (e->view) vkDestroyImageView(g.dev, e->view, NULL);
     if (e->img) vkDestroyImage(g.dev, e->img, NULL);
     if (e->buf) vkDestroyBuffer(g.dev, e->buf, NULL);
+}
+
+/* Free one retained entry whose objects a recorded or in-flight command may still name: the
+ * objects above, then the range through the conservative path (parked while the ring is busy).
+ * This is what vb_discard and vb_garbage_drain use. */
+static void vb_garbage_free(VbGarbage *e)
+{
+    vb_garbage_destroy(e);
     /* The range goes back to the pool it came from -- a block's free list, or the dedicated
      * allocation's own free -- instead of one vkFreeMemory per resource. */
     if (e->mem.mem) vb_mem_give(&e->mem);
+}
+
+/* Free one entry NOTHING recorded or in flight can name -- the pair vb_readback_reserve made
+ * in its own call and never published. The objects go first (they were bound to the range), and
+ * the range follows immediately instead of being parked: a failed reserve must not be able to
+ * fill the bounded park list. */
+static void vb_garbage_free_now(VbGarbage *e)
+{
+    vb_garbage_destroy(e);
+    if (e->mem.mem) vb_mem_give_now(&e->mem);
 }
 
 /* Free the held objects once no recorded command can still read them: nothing is being
@@ -1617,7 +1711,7 @@ static void vb_garbage_drain(void)
     if (g.slots[g.cur].recording || g.npending)
         return;
     for (i = 0; i < g.ngarbage; i++)
-        vb_garbage_free(&g.garbage[i]);
+        vb_garbage_free(&g.garbage[i]);    /* possibly referenced: the conservative path */
     g.ngarbage = 0;
     /* Every fence wait is also where what the releases above parked -- and the blocks they
      * left empty -- are folded and retired: nothing can still read either. */
@@ -1630,6 +1724,8 @@ static void vb_garbage_drain(void)
 static void vb_discard(VbGarbage e)
 {
     if (!g.slots[g.cur].recording && !g.npending) {
+        /* Possibly referenced (an evicted pipeline's or a rebuilt target's objects) but the
+         * ring is idle, so nothing can still read them: still the conservative path. */
         vb_garbage_free(&e);
         return;
     }
@@ -1651,6 +1747,9 @@ static void vb_image_discard(VbImage *im)
 {
     VbGarbage e;
 
+    /* Possibly referenced: a live image a recorded command may have named (or one whose bind
+     * just failed, whose range the caller already released). Either way the entry travels the
+     * conservative vb_discard/vb_garbage_free path. */
     memset(&e, 0, sizeof e);
     e.img = im->img;
     e.view = im->view;
@@ -2047,7 +2146,9 @@ static uint8_t *vb_stream(VkDeviceSize bytes, VkBuffer *buf, VkDeviceSize *off)
         if (g.failed) {
             /* There is no submission to hold this buffer any more (the dead buffer is not one),
              * so vb_discard would free it below and hand back a dangling pointer. Free it here
-             * and refuse the slice instead: every caller checks for NULL. */
+             * and refuse the slice instead: every caller checks for NULL. Conservative path on
+             * purpose: the slice is refused, the recording is dead, and refusing is the safe
+             * answer, so this is not a rollback that may hand a range out early. */
             vb_garbage_free(&e);
             return NULL;
         }
@@ -2497,13 +2598,15 @@ static int vb_image_create(VbImage *im, uint32_t w, uint32_t h, VkFormat fmt,
     }
     r = vkBindImageMemory(g.dev, im->img, im->mem.mem, im->mem.off);
     if (r != VK_SUCCESS) {
-        /* Nothing was ever recorded against this range, so it goes straight back (parked
-         * when the block it came from is in use), and the image is discarded: the caller
+        /* Nothing was ever recorded against this range and the image is not bound to it (the
+         * bind is what failed), so nothing recorded or in flight can name the range: it goes
+         * straight back through vb_mem_give_now, never parked, so 65 failed binds cannot fill
+         * the bounded park list. The image is then discarded exactly as before: the caller
          * sees an image with no handle, no view and no memory. */
         s_mem.bind_failures++;
         s_mem.rollbacks++;
         vb_fail("vkBindImageMemory", r);
-        vb_mem_give(&im->mem);
+        vb_mem_give_now(&im->mem);
         vb_image_discard(im);
         return 0;
     }
@@ -2660,16 +2763,23 @@ static int vb_readback_reserve(VkDeviceSize bytes)
     if (!vb_host_buffer(cap, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1, &hb, &hm, &hp)
         || !vb_device_buffer(cap, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
                                   | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &db, &dm)) {
+        /* NOTHING referenced: both buffers were made in THIS call and never published, so no
+         * recorded command and no submission can name either of them. They are destroyed and
+         * their ranges released at once (vb_garbage_free_now), so a burst of failed reserves
+         * can never fill the bounded park list. */
         memset(&e, 0, sizeof e);
         e.buf = hb; e.mem = hm;
         if (e.buf || e.mem.mem)
-            vb_garbage_free(&e);
+            vb_garbage_free_now(&e);
         memset(&e, 0, sizeof e);
         e.buf = db; e.mem = dm;
         if (e.buf || e.mem.mem)
-            vb_garbage_free(&e);
+            vb_garbage_free_now(&e);
         return 0;
     }
+    /* The replaced pair: possibly referenced, because a submission the PREVIOUS batch made may
+     * still be reading these two, so they stay on the conservative path (held until the ring
+     * is idle), unlike this call's own failed pair above. */
     memset(&e, 0, sizeof e);
     e.buf = g.rb_buf; e.mem = g.rb_mem;
     if (e.buf || e.mem.mem)
