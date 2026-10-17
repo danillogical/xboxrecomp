@@ -363,6 +363,12 @@ typedef struct {
 
 static struct {
     int ok;
+    int failed;                         /* write-once latch: a fatal failure (a wait, an end, a
+                                         * submit, a begin) has been observed, so no slot is
+                                         * recordable any more. `g.ok` is 0 from that point on
+                                         * as well, but `g.ok` is also armed deliberately while
+                                         * installing, and the latch is what distinguishes a
+                                         * lost device from that. */
     void *lib;
     VkInstance inst;
     VkDebugUtilsMessengerEXT messenger;
@@ -375,6 +381,12 @@ static struct {
     int bc, depth_clamp;                /* features enabled on the device */
     int shader_clip;                    /* shaderClipDistance; the program path needs it */
     VkCommandPool pool;
+    /* The buffer for a recording that is not possible: allocated from the same pool, begun once
+     * at install and then never ended, submitted or reset. vb_cmd returns it while the current
+     * slot must not be recorded into (still pending after a failed wait, or a latched failure),
+     * so a stray vkCmd*, transfer or barrier is valid and goes nowhere instead of corrupting a
+     * submission the GPU may still read. */
+    VkCommandBuffer dead;
     VbSlot slots[VB_SLOTS];
     unsigned cur;                       /* the slot being recorded */
     unsigned npending;                  /* slots submitted whose fence is not observed yet */
@@ -395,6 +407,9 @@ static struct {
     /* The open render pass of the RECORDING slot (closed before any submission), and the
      * pipeline bound in its recording command buffer. */
     int pass_open;
+    VkCommandBuffer pass_cmd;           /* the buffer the open pass was begun in, remembered so
+                                         * vb_end_pass ends the pass there instead of assuming
+                                         * the current slot's command buffer */
     VbTarget *pass_t;
     VbDepth *pass_d;
     VbTarget targets[VB_MAX_TARGETS];
@@ -651,6 +666,7 @@ static int vb_slot_wait(unsigned i)
                         "its last published frame\n");
         fflush(stderr);
         g.ok = 0;
+        g.failed = 1;                   /* write-once: no slot is recordable from here on */
         return 1;                       /* nothing is freed: the GPU may still use it */
     }
     vkResetFences(g.dev, 1, &s->fence);
@@ -695,6 +711,7 @@ static void vb_slot_submit(void)
         fflush(stderr);
         s->recording = 0;
         g.ok = 0;
+        g.failed = 1;                   /* write-once: no slot is recordable from here on */
         return;                         /* nothing is freed: the GPU may still use it */
     }
     s->recording = 0;
@@ -762,22 +779,38 @@ static VkCommandBuffer vb_cmd(void)
 {
     VbSlot *s = &g.slots[g.cur];
 
+    /* No recording is possible: the current slot is still pending (its fence wait failed) or a
+     * fatal failure is latched (its command buffer was never begun, or ended/executed already).
+     * Either way its command buffer must not be reset, begun or recorded into, so while nothing
+     * is recordable every command that goes through here is recorded into the dead buffer
+     * instead: it is begun once at install and never ended, submitted or reset, so any vkCmd*,
+     * transfer or barrier into it is valid and discarded. Callers that name
+     * g.slots[g.cur].cmd directly do so only behind their own g.ok check -- the case where that
+     * slot really is theirs. */
+    if (g.failed)
+        return g.dead;
     if (!s->recording) {
         VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         VkResult r;
         /* Never record into a slot still in flight: its command buffer, its descriptor
          * sets and its stream belong to the pending submission. Only a fence wait that
-         * failed (the device is gone) can leave one pending here, and then nothing is
-         * reset or begun: vb_slot_submit refuses to submit once g.ok is 0. */
+         * failed (the device is gone) can leave one pending here -- and that latches the
+         * failure above -- and then nothing is reset or begun. */
         vb_slot_wait(g.cur);
         if (s->pending)
-            return s->cmd;
+            return g.dead;
         vkResetCommandBuffer(s->cmd, 0);
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         r = vkBeginCommandBuffer(s->cmd, &bi);
         if (r != VK_SUCCESS) {
+            /* The slot's command buffer is not usable, so it is left exactly as it is: not
+             * begun, never recorded into. The latch makes every later vb_cmd return the
+             * dead buffer, and its callers check g.ok, so the failure propagates instead
+             * of recording into a buffer the device or the pool no longer owns. */
             vb_fail("vkBeginCommandBuffer", r);
-            g.ok = 0;                   /* the recording cannot be used: stop the back end */
+            g.failed = 1;               /* the recording cannot be used: stop the back end */
+            g.ok = 0;
+            return g.dead;
         }
         s->recording = 1;
         s->bound_pipe = VK_NULL_HANDLE;
@@ -819,7 +852,10 @@ static void vb_end_pass(void)
 {
     if (!g.pass_open)
         return;
-    vkCmdEndRenderPass(g.slots[g.cur].cmd);
+    /* The pass is ended in the buffer that began it, which is remembered when it opens: which
+     * slot is current does not decide where a pass ends, and must not be assumed to. */
+    vkCmdEndRenderPass(g.pass_cmd);
+    g.pass_cmd = VK_NULL_HANDLE;
     g.pass_open = 0;
     g.pass_t = NULL;
     g.pass_d = NULL;
@@ -847,7 +883,11 @@ static VkDeviceSize vb_round_up(VkDeviceSize bytes)
  * moves to the next slot (waiting only if it is still in flight); it never drains the GPU,
  * so a frame's submissions keep overlapping. This is the ONLY thing that moves the slot
  * while recording, and callers do it before the slices it budgets for, so one sequence of
- * slices and its draw stay in one slot. */
+ * slices and its draw stay in one slot.
+ *
+ * It can fail: the advance's wait on the next slot's fence may find the device lost, which
+ * leaves that slot pending (still the GPU's) and g.ok 0. Every caller therefore checks g.ok
+ * before its slices' vb_stream, and before writing a single byte into what it hands back. */
 static void vb_reserve(VkDeviceSize bytes, uint32_t sets)
 {
     VbSlot *s = &g.slots[g.cur];
@@ -862,12 +902,25 @@ static void vb_reserve(VkDeviceSize bytes, uint32_t sets)
 /* `bytes` of host memory the recording commands can read at *buf + *off. A slice over half
  * the slot's stream, or one that no longer fits what this slot has left, gets a buffer of
  * its own -- never a slot move, so a submission's commands can only read their OWN slot's
- * stream (or a buffer whose destruction waits for the whole ring to drain). */
+ * stream (or a buffer whose destruction waits for the whole ring to drain).
+ *
+ * Caller invariant: every caller checks g.ok immediately after the vb_reserve that made room
+ * for its slice and before this call, and returns if it is 0. A failed fence wait inside that
+ * reserve's advance leaves the slot it moved to still pending -- the GPU's -- and g.ok 0, and
+ * writing guest pixels here would overwrite bytes that submission may still read. The check is
+ * before the write because no later guard can undo it.
+ *
+ * The latch is refused here as well, so a failure that appears in the middle of a sequence of
+ * slices (a failed begin, or a failed wait in an earlier caller) hands out no further slice:
+ * a slot's stream is only ever the caller's while the recording into it is alive. NULL is the
+ * answer then, which every caller already handles. */
 static uint8_t *vb_stream(VkDeviceSize bytes, VkBuffer *buf, VkDeviceSize *off)
 {
     VbSlot *s = &g.slots[g.cur];
     VkDeviceSize o = (s->stream_off + VB_STREAM_ALIGN - 1) & ~(VkDeviceSize)(VB_STREAM_ALIGN - 1);
 
+    if (g.failed)                       /* nothing is recordable, so nothing may be written */
+        return NULL;
     if (bytes > VB_SLOT_STREAM / 2 || o + bytes > VB_SLOT_STREAM) {
         VbGarbage e;
         uint8_t *p;
@@ -880,7 +933,15 @@ static uint8_t *vb_stream(VkDeviceSize bytes, VkBuffer *buf, VkDeviceSize *off)
                                    | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 0,
                             &e.buf, &e.mem, &p))
             return NULL;
-        vb_cmd();                       /* so the discard outlives this submission */
+        vb_cmd();                       /* the command that reads this buffer has to be recorded
+                                         * in a live pass of the ring -- see below */
+        if (g.failed) {
+            /* There is no submission to hold this buffer any more (the dead buffer is not one),
+             * so vb_discard would free it below and hand back a dangling pointer. Free it here
+             * and refuse the slice instead: every caller checks for NULL. */
+            vb_garbage_free(&e);
+            return NULL;
+        }
         vb_discard(e);
         *buf = e.buf;
         *off = 0;
@@ -1398,12 +1459,12 @@ static int vb_begin_pass(VbTarget *t, VbDepth *d)
 {
     VkRenderPassBeginInfo bi = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     VkFramebuffer fb;
+    VkCommandBuffer cmd = vb_cmd();
 
-    vb_cmd();
-    if (!g.ok)                          /* a fence wait or a begin failed: record nothing */
+    if (!g.ok)                          /* a fence wait, a submit or a begin failed: record nothing */
         return 0;
     if (g.pass_open && g.pass_t == t && g.pass_d == d)
-        return 1;
+        return 1;                       /* this target's pass is still open, in pass_cmd */
     vb_end_pass();
     fb = vb_framebuffer(t, d);
     if (!fb)
@@ -1412,7 +1473,8 @@ static int vb_begin_pass(VbTarget *t, VbDepth *d)
     bi.framebuffer = fb;
     bi.renderArea.extent.width = t->w;
     bi.renderArea.extent.height = t->h;
-    vkCmdBeginRenderPass(g.slots[g.cur].cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBeginRenderPass(cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    g.pass_cmd = cmd;                   /* vb_end_pass ends exactly this buffer */
     g.pass_open = 1;
     g.pass_t = t;
     g.pass_d = d;
@@ -1479,7 +1541,10 @@ static void vb_targets_flush(VbTarget **ts, unsigned n)
         return;
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(g.slots[g.cur].cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    /* vb_cmd(), not the slot directly: the copies' vb_transfer_cmd above may have found the
+     * device lost, in which case the slot it left us in is still the GPU's and this barrier
+     * belongs in the dead buffer (a no-op) instead of that submission. */
+    vkCmdPipelineBarrier(vb_cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     /* The coherence boundary: those copies are in the newest submission, and the host must
      * not read the readback buffers until every submission it has made has completed. */
@@ -1542,6 +1607,10 @@ static void vb_target_load(VbTarget *t)
      * earlier in this slot is waiting for a command, and the load's copy is recorded after
      * this, in whichever slot the reserve moved to. */
     vb_reserve((VkDeviceSize)t->w * t->h * 4, 0);
+    if (!g.ok)                          /* the reserve's advance found the wait failed: the
+                                         * slot it left us in is still the GPU's, so no slice
+                                         * of guest pixels may be written into its stream */
+        return;
     out = (uint32_t *)vb_stream((VkDeviceSize)t->w * t->h * 4, &buf, &off);
     if (!out)
         return;
@@ -1803,6 +1872,9 @@ static void vb_tex_upload(VbTex *e, const Nv2aTexture *tx)
     /* Same reason as a target load: take a fresh slot rather than allocate a buffer of its
      * own. The copy below is still recorded in the slot this ends up in. */
     vb_reserve(bytes, 0);
+    if (!g.ok)                          /* as in a target load: that reserve's advance may have
+                                         * left us in a slot the GPU is still reading */
+        return;
     dst = vb_stream(bytes, &buf, &off);
     if (!dst)
         return;
@@ -3150,6 +3222,15 @@ static int vb_create_pipeline_objects(void)
                             &s->stream, &s->stream_mem, &s->stream_ptr))
             return -1;
     }
+    /* The dead buffer of vb_cmd, from the same pool: begun once here and then never ended,
+     * submitted or reset, so recording any command into it is valid and reaches nothing. */
+    if ((r = vkAllocateCommandBuffers(g.dev, &cai, &g.dead)) != VK_SUCCESS)
+        goto fail;
+    {
+        VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+        if ((r = vkBeginCommandBuffer(g.dead, &bi)) != VK_SUCCESS)
+            goto fail;
+    }
 
     /* Attachments are loaded and stored, and stay in GENERAL between passes. */
     memset(att, 0, sizeof att);
@@ -3275,6 +3356,7 @@ static int vb_create_defaults(void)
 {
     Nv2aTexture white;
     VkBufferImageCopy bc;
+    VkCommandBuffer cmd;
     VkBuffer buf;
     VkDeviceSize off;
     uint8_t *p;
@@ -3292,7 +3374,11 @@ static int vb_create_defaults(void)
     if (!p)
         return -1;
     memset(p, 0xFF, 4);
-    vb_transfer_cmd();
+    cmd = vb_transfer_cmd();            /* taken from the call that produced it, not assumed to
+                                         * be g.slots[g.cur].cmd: a slot whose begin failed is
+                                         * handed back as the dead buffer, never as an unusable
+                                         * one, so this copy can never land in a never-begun
+                                         * slot command buffer */
     vb_image_barrier(g.white.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     memset(&bc, 0, sizeof bc);
@@ -3300,13 +3386,13 @@ static int vb_create_defaults(void)
     bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     bc.imageSubresource.layerCount = 1;
     bc.imageExtent.width = bc.imageExtent.height = bc.imageExtent.depth = 1;
-    vkCmdCopyBufferToImage(g.slots[g.cur].cmd, buf, g.white.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+    vkCmdCopyBufferToImage(cmd, buf, g.white.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
     vb_image_barrier(g.white.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     g.ok = 1;                               /* the submission path reports a lost device through it */
     vb_slot_submit();
     vb_drain();
-    if (!g.ok)
+    if (g.failed || !g.ok)                  /* the install submission failed: install nothing */
         return -1;
     g.ok = 0;
     return 0;
