@@ -71,6 +71,35 @@ typedef struct {
 
 void nv2a_vk_backend_program_stats(Nv2aVkProgramStats *out);
 
+/* What the bounded submission ring did. The ring is the back end's execution
+ * model: each of `slots` slots owns one command recording, one fence, one
+ * descriptor pool and one upload stream; a submission is issued WITHOUT waiting
+ * for the ones before it; and the host reaches a fence only to reuse an occupied
+ * slot or to publish guest memory (a flip's readback, a target flush/release).
+ * These counters are the deciding instrumentation for the lifetime/overlap gate.
+ * They are the host's own accounting: `in_flight`/`max_in_flight` count slots
+ * submitted and not yet waited for (nothing polls a fence's state, so this is
+ * "issued without waiting", not proof that the device was still executing);
+ * `submissions` splits into `splits` (submitted at a draw entry because the
+ * recording slot was worth sending) and `overflows` (submitted because the
+ * stream or the descriptor pool would have overflowed); `reuse_waits` and
+ * `drain_waits` count the fence waits that were performed, not the ones that
+ * actually stalled the host. Same threading contract as the rest of the back
+ * end. */
+typedef struct {
+    uint32_t slots;             /* the ring size */
+    uint32_t in_flight;         /* slots submitted and not yet waited for */
+    uint32_t max_in_flight;     /* the most of them at any one time */
+    uint64_t submissions;       /* command buffers submitted */
+    uint64_t reuse_waits;       /* fence waits performed before reusing a slot */
+    uint64_t drain_waits;       /* fence waits performed while publishing guest memory */
+    uint64_t splits;            /* submissions begun at a draw entry inside a frame */
+    uint64_t overflows;         /* submissions begun because a slot's stream/sets would overflow */
+    uint64_t frames;            /* flips served */
+} Nv2aVkRingStats;
+
+void nv2a_vk_backend_ring_stats(Nv2aVkRingStats *out);
+
 #ifdef __cplusplus
 }
 #endif

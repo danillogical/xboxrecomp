@@ -45,14 +45,24 @@
  *     viewport, scissor, stencil reference/masks and blend constants are dynamic.
  *   - Every image a target or depth buffer owns stays in GENERAL layout, and
  *     every render pass end and transfer is followed by a global memory barrier.
- *   - Synchronisation is deliberately simple: one command buffer records until
- *     a flip, a readback, or the per-submission vertex/upload stream or
- *     descriptor pool fills; then it is submitted and waited on. Objects released
- *     while commands may still use them are destroyed after that wait.
- *     Later performance work goes there: frames in flight with per-frame streams
- *     and descriptor pools instead of a wait per flip, a single batched readback
- *     per flip without the CPU convert on the critical path, narrower barriers
- *     and layouts, sub-allocated memory, and a persisted VkPipelineCache.
+ *   - Synchronisation is a bounded ring of VB_SLOTS submission slots. A slot owns
+ *     one command recording, one fence, one descriptor pool, one upload stream and
+ *     the objects a pending submission may still read; only the slot being recorded
+ *     is ever written to, so a submission's stream and descriptor sets cannot be
+ *     overwritten while the GPU runs it. A submission is submitted WITHOUT waiting,
+ *     so the device runs one slot while the host records the next, and the ring
+ *     bounds how far the host can get ahead. The host reaches a fence in only three
+ *     places: to reuse a slot that is still in flight, to publish guest memory (the
+ *     flip's readback, and a target flush/release), and on the device's error path.
+ *     A lost device stops the back end (g.ok) instead of freeing or reusing anything
+ *     a pending submission may read. Every submission ends with the same global
+ *     memory barrier, recorded OUTSIDE any render pass, whose second scope is every
+ *     command later in submission order -- that is what makes cross-submission
+ *     ordering defined (Vulkan defines no implicit execution or memory dependency
+ *     between submissions), including blending into one target from two submissions.
+ *     Still to come (plan N4): a single batched readback per flip without the CPU
+ *     convert on the critical path, narrower barriers and layouts, sub-allocated
+ *     memory, and a persisted VkPipelineCache.
  *
  * Everything runs on the executor's thread, one call at a time.
  */
@@ -77,6 +87,12 @@ void nv2a_vk_backend_set_programs(const Nv2aVshAotEntry *entries, size_t count)
 }
 
 void nv2a_vk_backend_program_stats(Nv2aVkProgramStats *out)
+{
+    if (out)
+        memset(out, 0, sizeof *out);
+}
+
+void nv2a_vk_backend_ring_stats(Nv2aVkRingStats *out)
 {
     if (out)
         memset(out, 0, sizeof *out);
@@ -123,9 +139,30 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 #define VB_MAX_PIPES     256
 #define VB_MAX_FBS       64
 #define VB_MAX_DIM       4096
-#define VB_STREAM_BYTES  (32u << 20)      /* vertices and uploads of one submission */
+#define VB_SLOTS         3                /* submission slots the ring can have in flight at once */
+#define VB_SLOT_STREAM   (16u << 20)      /* vertices and uploads of one slot's submission */
 #define VB_STREAM_ALIGN 256u              /* stream slices; >= every device's minUniformBufferOffsetAlignment */
-#define VB_MAX_SETS      8192             /* descriptor sets of one submission */
+#define VB_SLOT_SETS     2048             /* descriptor sets of one slot's submission */
+/* Submit at a draw entry once the recording slot holds this much, when another slot is
+ * free: that is what lets the device start on the earlier part of a frame while the host
+ * records its later part. A real Garage frame records about 60 draws and 5 MiB of stream,
+ * so these thresholds give it two or three submissions -- enough for the device to be
+ * working while the host records the rest, without turning a frame into many small
+ * submissions. Below them a frame stays one submission, exactly as before. */
+#define VB_SPLIT_BYTES   (VB_SLOT_STREAM / 8)
+#define VB_SPLIT_SETS    (VB_SLOT_SETS / 64)
+/* The most one program batch's stream slices may sum to before the batch is declined to the CPU
+ * interpreter -- unchanged from when one 32 MiB stream held a whole submission. A batch this
+ * size may span more than one slot: each slice goes to the recording slot's stream, or -- when
+ * it is over half that stream or no longer fits what is left of it -- to a buffer of its own
+ * that carries every usage a stream slice needs (vertices, indices, transfer source, uniform
+ * block). Either way a slice is read only by commands recorded after it, in that same slot, so
+ * nothing can land between a slice being written and the draw that reads it.
+ */
+#define VB_PROG_RESERVE_MAX (32u << 20)
+/* The per-draw vertex cap, unchanged from when one 32 MiB stream held a whole submission:
+ * a draw that would exceed it is truncated to whole triangles exactly as it was before. */
+#define VB_DRAW_CAP_BYTES ((32u << 20) / 2)
 #define VB_STATS_MS      10000
 #define VB_MAX_MISS_LOG  256              /* distinct missing program hashes logged */
 #define VB_WAIT_NS       (10ull * 1000000000ull)
@@ -282,11 +319,43 @@ typedef struct {
     VkPipeline pipe;
 } VbGarbage;
 
+/* One slot of the bounded submission ring.
+ *
+ * Ownership and reuse invariants:
+ *   - only g.slots[g.cur] is recorded into, and only while `recording`;
+ *   - `pending` means the slot has been submitted and its fence has not been observed
+ *     yet: its command buffer, descriptor pool, stream and fence are then untouched --
+ *     no vkResetCommandBuffer, no vkResetDescriptorPool, no stream write, no re-record;
+ *   - the slot's stream and pool are reset only in vb_slot_wait, i.e. after the fence;
+ *   - the fence is created unsignaled (vkQueueSubmit requires that) and is reset right after
+ *     it signals, so a slot that is recorded into has an unsignaled fence: `pending == 0` is
+ *     the whole definition of a free slot, and nothing ever queries a fence's state directly;
+ *   - the runtime never destroys the ring: the device lives as long as the process. */
+typedef struct {
+    VkCommandBuffer cmd;
+    VkFence fence;
+    int pending;
+    int recording;
+    VkDescriptorPool dpool;
+    uint32_t sets_used;
+    VkBuffer stream;
+    VkDeviceMemory stream_mem;
+    uint8_t *stream_ptr;
+    VkDeviceSize stream_off;
+    VkPipeline bound_pipe;              /* the pipeline bound in this slot's recording */
+} VbSlot;
+
 typedef struct {
     uint64_t draws, tris, clears, dropped_tris, skipped, cull_draws, cull_all;
     uint64_t tex_uploads, tex_hits, tex_undecodable, rt_aliases, rt_copies;
     uint64_t rt_loads, readbacks, readback_ns, rc_draws, rc_fallback, pipelines, submits;
     uint64_t validation_errors, validation_warnings;
+    /* The submission ring (see the file header): submissions issued without waiting for the
+     * ones before them, and the fence waits the ring did perform. Deciding instrumentation for
+     * the lifetime/overlap gate, so these are counters, not log lines. `overflows` is the part
+     * of `submits` that came from `vb_reserve` running out of stream or descriptor sets;
+     * `splits` is the part that came from a draw entry deciding the slot was worth submitting. */
+    uint64_t reuse_waits, drain_waits, splits, overflows;
     /* The vertex-program path (nv2a_vsh_aot.h); the program stats' counters, so the
      * same numbers reach the periodic [GPUVK] line. */
     uint64_t vsh_hits, vsh_misses, vsh_identity_fail, vsh_declines, vsh_tris, vsh_const_uploads;
@@ -306,9 +375,10 @@ static struct {
     int bc, depth_clamp;                /* features enabled on the device */
     int shader_clip;                    /* shaderClipDistance; the program path needs it */
     VkCommandPool pool;
-    VkCommandBuffer cmd;
-    VkFence fence;
-    int recording;
+    VbSlot slots[VB_SLOTS];
+    unsigned cur;                       /* the slot being recorded */
+    unsigned npending;                  /* slots submitted whose fence is not observed yet */
+    unsigned max_inflight;              /* most slots outstanding (submitted, unwaited) at once */
     VkRenderPass rp[2];                 /* [has depth] */
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
@@ -320,19 +390,13 @@ static struct {
     VkPipelineCache pcache;
     VkShaderModule vs, ps;
     VkShaderModule vs_rc, ps_rc;
-    VkDescriptorPool dpool;
-    uint32_t sets_used;
-    VkBuffer stream;                    /* host-visible ring of one submission */
-    VkDeviceMemory stream_mem;
-    uint8_t *stream_ptr;
-    VkDeviceSize stream_off;
     VbImage white;                      /* bound when a draw is untextured */
     VkSampler samp[4][9];               /* [filter][addr_u*3 + addr_v], made on first use */
-    /* The open render pass, and the pipeline bound in the recording command buffer. */
+    /* The open render pass of the RECORDING slot (closed before any submission), and the
+     * pipeline bound in its recording command buffer. */
     int pass_open;
     VbTarget *pass_t;
     VbDepth *pass_d;
-    VkPipeline bound_pipe;
     VbTarget targets[VB_MAX_TARGETS];
     VbDepth depths[VB_MAX_DEPTHS];
     VbTex texs[VB_MAX_TEXTURES];
@@ -512,10 +576,25 @@ static void vb_garbage_free(VbGarbage *e)
     if (e->mem) vkFreeMemory(g.dev, e->mem, NULL);
 }
 
-/* Destroy now if nothing is recorded, else after the submission that may use it. */
+/* Free the held objects once no recorded command can still read them: nothing is being
+ * recorded and no submission is in flight. Called after every fence wait. */
+static void vb_garbage_drain(void)
+{
+    size_t i;
+
+    if (g.slots[g.cur].recording || g.npending)
+        return;
+    for (i = 0; i < g.ngarbage; i++)
+        vb_garbage_free(&g.garbage[i]);
+    g.ngarbage = 0;
+}
+
+/* Destroy now if nothing recorded can still read it, else hold it until the ring has no
+ * outstanding submission: an object released while commands may still use it (an evicted
+ * pipeline, a rebuilt target's image, a forgotten framebuffer) outlives those commands. */
 static void vb_discard(VbGarbage e)
 {
-    if (!g.recording) {
+    if (!g.slots[g.cur].recording && !g.npending) {
         vb_garbage_free(&e);
         return;
     }
@@ -546,19 +625,164 @@ static void vb_image_discard(VbImage *im)
     memset(im, 0, sizeof *im);
 }
 
+/* ── The submission ring ─────────────────────────────────────────────── */
+
+/* Defined below in recording order, and used by the ring's submit path. */
+static void vb_barrier(void);
+static void vb_end_pass(void);
+
+/* Wait for a slot's submission. A fence's first synchronization scope includes every command
+ * submitted before it, so once this returns the slot's stream, its descriptor pool and the
+ * objects its submission may read are all free again. Returns 1 if a fence wait was performed
+ * (0 if the slot was already free); nothing polls a fence's state, so a wait that finds the
+ * work already done is still counted as a wait. A lost device stops the back end and frees
+ * nothing. */
+static int vb_slot_wait(unsigned i)
+{
+    VbSlot *s = &g.slots[i];
+    VkResult r;
+
+    if (!s->pending || !g.ok)
+        return 0;
+    r = vkWaitForFences(g.dev, 1, &s->fence, VK_TRUE, VB_WAIT_NS);
+    if (r != VK_SUCCESS) {
+        vb_fail(r == VK_TIMEOUT ? "submission wait (10 s timeout)" : "submission wait", r);
+        fprintf(stderr, "[GPUVK] the Vulkan back end stops drawing; guest memory keeps "
+                        "its last published frame\n");
+        fflush(stderr);
+        g.ok = 0;
+        return 1;                       /* nothing is freed: the GPU may still use it */
+    }
+    vkResetFences(g.dev, 1, &s->fence);
+    s->pending = 0;
+    g.npending--;
+    vkResetDescriptorPool(g.dev, s->dpool, 0);
+    s->sets_used = 0;
+    s->stream_off = 0;
+    vb_garbage_drain();
+    return 1;
+}
+
+/* End the current slot's recording and submit it, WITHOUT waiting: the device runs this
+ * submission while the host records the next slot. Every submission ends with the global
+ * barrier outside any pass, so its writes are ordered before the commands of every later
+ * submission as well.
+ *
+ * After this returns, the slot is PENDING and nothing may write into it again (its stream,
+ * its descriptor pool, its command buffer): every caller either moves g.cur to another slot
+ * (vb_slot_advance, vb_maybe_split) or waits it out with vb_drain first (the flip, a target
+ * flush, install), both before anything else records. */
+static void vb_slot_submit(void)
+{
+    VbSlot *s = &g.slots[g.cur];
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    VkResult r;
+
+    if (!s->recording || !g.ok)
+        return;
+    vb_end_pass();
+    vb_barrier();
+    r = vkEndCommandBuffer(s->cmd);
+    if (r == VK_SUCCESS) {
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &s->cmd;
+        r = vkQueueSubmit(g.queue, 1, &si, s->fence);
+    }
+    if (r != VK_SUCCESS) {
+        vb_fail("submission", r);
+        fprintf(stderr, "[GPUVK] the Vulkan back end stops drawing; guest memory keeps "
+                        "its last published frame\n");
+        fflush(stderr);
+        s->recording = 0;
+        g.ok = 0;
+        return;                         /* nothing is freed: the GPU may still use it */
+    }
+    s->recording = 0;
+    s->pending = 1;
+    g.npending++;
+    if (g.npending > g.max_inflight)
+        g.max_inflight = g.npending;
+    g.st.submits++;
+}
+
+/* Publish: every submitted slot is complete, so guest memory is up to date. Counted per slot
+ * waited (one publish of a three-slot frame adds up to three). */
+static void vb_drain(void)
+{
+    unsigned i;
+
+    for (i = 0; i < VB_SLOTS; i++)
+        if (vb_slot_wait(i))
+            g.st.drain_waits++;
+}
+
+/* Move to the next slot: submit what the current one recorded (ending its pass and its
+ * ordering), then wait only if the slot we move into is still in flight. That is the ring's
+ * bound, and the only wait in the middle of a frame. */
+static void vb_slot_advance(void)
+{
+    vb_slot_submit();
+    if (!g.ok)
+        return;
+    g.cur = (g.cur + 1u) % VB_SLOTS;
+    if (vb_slot_wait(g.cur))
+        g.st.reuse_waits++;
+}
+
+/* A draw is about to be recorded: if the recording slot already holds a worthwhile amount
+ * of work and another slot is free, submit it now and start the next one. That is what lets
+ * the device run the start of a frame while the host records the rest of it.
+ *
+ * The callers are the three draw entry points, and the call is the FIRST thing they do --
+ * before any of this draw's stream slices are written. That is the invariant that makes
+ * cross-slot reuse sound: a submission reads only its OWN slot's stream and its own
+ * descriptor pool, so waiting for that slot's fence is enough before rewriting either.
+ * When no slot is free the recording continues in the current one -- never a wait here;
+ * the ring stays bounded through vb_reserve, which advances the slot when the stream or the
+ * descriptor pool would overflow. */
+static void vb_maybe_split(void)
+{
+    VbSlot *s = &g.slots[g.cur];
+    unsigned next = (g.cur + 1u) % VB_SLOTS;
+
+    if (!s->recording)
+        return;
+    if (s->stream_off < VB_SPLIT_BYTES && s->sets_used < VB_SPLIT_SETS)
+        return;
+    if (g.slots[next].pending)
+        return;
+    vb_slot_submit();
+    if (!g.ok)
+        return;
+    g.cur = next;
+    g.st.splits++;
+}
+
 static VkCommandBuffer vb_cmd(void)
 {
-    if (!g.recording) {
+    VbSlot *s = &g.slots[g.cur];
+
+    if (!s->recording) {
         VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         VkResult r;
+        /* Never record into a slot still in flight: its command buffer, its descriptor
+         * sets and its stream belong to the pending submission. Only a fence wait that
+         * failed (the device is gone) can leave one pending here, and then nothing is
+         * reset or begun: vb_slot_submit refuses to submit once g.ok is 0. */
+        vb_slot_wait(g.cur);
+        if (s->pending)
+            return s->cmd;
+        vkResetCommandBuffer(s->cmd, 0);
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        r = vkBeginCommandBuffer(g.cmd, &bi);
-        if (r != VK_SUCCESS)
+        r = vkBeginCommandBuffer(s->cmd, &bi);
+        if (r != VK_SUCCESS) {
             vb_fail("vkBeginCommandBuffer", r);
-        g.recording = 1;
-        g.bound_pipe = VK_NULL_HANDLE;
+            g.ok = 0;                   /* the recording cannot be used: stop the back end */
+        }
+        s->recording = 1;
+        s->bound_pipe = VK_NULL_HANDLE;
     }
-    return g.cmd;
+    return s->cmd;
 }
 
 /* Every write before it is visible to every access after it. Deliberately broad. */
@@ -595,59 +819,20 @@ static void vb_end_pass(void)
 {
     if (!g.pass_open)
         return;
-    vkCmdEndRenderPass(g.cmd);
+    vkCmdEndRenderPass(g.slots[g.cur].cmd);
     g.pass_open = 0;
     g.pass_t = NULL;
     g.pass_d = NULL;
     vb_barrier();
 }
 
-/* The recording command buffer, outside any render pass, for a transfer. */
+/* The recording command buffer, outside any render pass, for a transfer. A split is not
+ * allowed here: the transfer may read a stream slice the host has just written into this
+ * slot, and a submission must only ever read its OWN slot's stream. */
 static VkCommandBuffer vb_transfer_cmd(void)
 {
-    VkCommandBuffer c = vb_cmd();
     vb_end_pass();
-    return c;
-}
-
-/* Submit what is recorded and wait for it; then the stream, the descriptor pool
- * and the garbage are free again. A lost device turns the back end off. */
-static void vb_submit_wait(void)
-{
-    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-    VkResult r;
-    size_t i;
-
-    if (g.recording) {
-        vb_end_pass();
-        r = vkEndCommandBuffer(g.cmd);
-        if (r == VK_SUCCESS) {
-            si.commandBufferCount = 1;
-            si.pCommandBuffers = &g.cmd;
-            r = vkQueueSubmit(g.queue, 1, &si, g.fence);
-        }
-        if (r == VK_SUCCESS)
-            r = vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, VB_WAIT_NS);
-        if (r != VK_SUCCESS) {
-            vb_fail(r == VK_TIMEOUT ? "submission wait (10 s timeout)" : "submission", r);
-            fprintf(stderr, "[GPUVK] the Vulkan back end stops drawing; guest memory keeps "
-                            "its last flushed frame\n");
-            fflush(stderr);
-            g.ok = 0;
-            g.recording = 0;
-            return;                     /* nothing is freed: the GPU may still use it */
-        }
-        vkResetFences(g.dev, 1, &g.fence);
-        vkResetCommandBuffer(g.cmd, 0);
-        vkResetDescriptorPool(g.dev, g.dpool, 0);
-        g.recording = 0;
-        g.st.submits++;
-    }
-    g.sets_used = 0;
-    g.stream_off = 0;
-    for (i = 0; i < g.ngarbage; i++)
-        vb_garbage_free(&g.garbage[i]);
-    g.ngarbage = 0;
+    return vb_cmd();
 }
 
 /* Round a stream slice up to its alignment; vb_stream aligns every slice this way,
@@ -657,42 +842,54 @@ static VkDeviceSize vb_round_up(VkDeviceSize bytes)
     return (bytes + VB_STREAM_ALIGN - 1) & ~(VkDeviceSize)(VB_STREAM_ALIGN - 1);
 }
 
-/* Make sure `bytes` of stream and `sets` descriptor sets fit in this submission,
- * so the allocations that follow cannot submit between being written and used. */
+/* Make sure `bytes` of the current slot's stream and `sets` of its descriptor pool fit, so
+ * the allocations that follow cannot submit between being written and used. An overflow
+ * moves to the next slot (waiting only if it is still in flight); it never drains the GPU,
+ * so a frame's submissions keep overlapping. This is the ONLY thing that moves the slot
+ * while recording, and callers do it before the slices it budgets for, so one sequence of
+ * slices and its draw stay in one slot. */
 static void vb_reserve(VkDeviceSize bytes, uint32_t sets)
 {
-    VkDeviceSize off = (g.stream_off + VB_STREAM_ALIGN - 1) & ~(VkDeviceSize)(VB_STREAM_ALIGN - 1);
+    VbSlot *s = &g.slots[g.cur];
+    VkDeviceSize off = (s->stream_off + VB_STREAM_ALIGN - 1) & ~(VkDeviceSize)(VB_STREAM_ALIGN - 1);
 
-    if (off + bytes > VB_STREAM_BYTES || g.sets_used + sets > VB_MAX_SETS)
-        vb_submit_wait();
+    if (off + bytes > VB_SLOT_STREAM || s->sets_used + sets > VB_SLOT_SETS) {
+        g.st.overflows++;
+        vb_slot_advance();
+    }
 }
 
-/* `bytes` of host memory the recording commands can read at *buf + *off. Anything
- * over half the stream gets a buffer of its own, freed after the submission. */
+/* `bytes` of host memory the recording commands can read at *buf + *off. A slice over half
+ * the slot's stream, or one that no longer fits what this slot has left, gets a buffer of
+ * its own -- never a slot move, so a submission's commands can only read their OWN slot's
+ * stream (or a buffer whose destruction waits for the whole ring to drain). */
 static uint8_t *vb_stream(VkDeviceSize bytes, VkBuffer *buf, VkDeviceSize *off)
 {
-    VkDeviceSize o;
+    VbSlot *s = &g.slots[g.cur];
+    VkDeviceSize o = (s->stream_off + VB_STREAM_ALIGN - 1) & ~(VkDeviceSize)(VB_STREAM_ALIGN - 1);
 
-    if (bytes > VB_STREAM_BYTES / 2) {
+    if (bytes > VB_SLOT_STREAM / 2 || o + bytes > VB_SLOT_STREAM) {
         VbGarbage e;
         uint8_t *p;
         memset(&e, 0, sizeof e);
+        /* A slice of its own is used the same way a stream slice is: as vertices, indices, a
+         * transfer source, or a uniform block (the program path's rc/c[192]/xf slices). */
         if (!vb_host_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT
                                    | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
-                                   | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, 0, &e.buf, &e.mem, &p))
+                                   | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+                                   | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 0,
+                            &e.buf, &e.mem, &p))
             return NULL;
-        vb_cmd();                       /* so the discard waits for this submission */
+        vb_cmd();                       /* so the discard outlives this submission */
         vb_discard(e);
         *buf = e.buf;
         *off = 0;
         return p;
     }
-    vb_reserve(bytes, 0);
-    o = (g.stream_off + VB_STREAM_ALIGN - 1) & ~(VkDeviceSize)(VB_STREAM_ALIGN - 1);
-    g.stream_off = o + bytes;
-    *buf = g.stream;
+    s->stream_off = o + bytes;
+    *buf = s->stream;
     *off = o;
-    return g.stream_ptr + o;
+    return s->stream_ptr + o;
 }
 
 /* ── Fixed pipeline state ────────────────────────────────────────────── */
@@ -1073,8 +1270,8 @@ static VkPipeline vb_pipeline(const VbPipeKey *k, const Nv2aVshAotEntry *e)
         VbGarbage gb;
         memset(&gb, 0, sizeof gb);
         gb.pipe = slot->pipe;
-        if (gb.pipe == g.bound_pipe)
-            g.bound_pipe = VK_NULL_HANDLE;
+        if (gb.pipe == g.slots[g.cur].bound_pipe)
+            g.slots[g.cur].bound_pipe = VK_NULL_HANDLE;
         vb_discard(gb);
     }
     slot->k = *k;
@@ -1203,6 +1400,8 @@ static int vb_begin_pass(VbTarget *t, VbDepth *d)
     VkFramebuffer fb;
 
     vb_cmd();
+    if (!g.ok)                          /* a fence wait or a begin failed: record nothing */
+        return 0;
     if (g.pass_open && g.pass_t == t && g.pass_d == d)
         return 1;
     vb_end_pass();
@@ -1213,7 +1412,7 @@ static int vb_begin_pass(VbTarget *t, VbDepth *d)
     bi.framebuffer = fb;
     bi.renderArea.extent.width = t->w;
     bi.renderArea.extent.height = t->h;
-    vkCmdBeginRenderPass(g.cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBeginRenderPass(g.slots[g.cur].cmd, &bi, VK_SUBPASS_CONTENTS_INLINE);
     g.pass_open = 1;
     g.pass_t = t;
     g.pass_d = d;
@@ -1247,9 +1446,13 @@ static void vb_targets_flush(VbTarget **ts, unsigned n)
     uint64_t t0 = vb_now_ns();
     unsigned i, copies = 0;
 
+    if (!g.ok)                          /* a fence wait already failed: record nothing more */
+        return;
     for (i = 0; i < n; i++) {
         VbTarget *t = ts[i];
         VkBufferImageCopy bc;
+        if (!g.ok)                      /* a fence wait failed in an earlier iteration */
+            break;
         if (!t->dirty)
             continue;
         if (!t->rb && !vb_host_buffer((VkDeviceSize)t->w * t->h * 4,
@@ -1276,9 +1479,12 @@ static void vb_targets_flush(VbTarget **ts, unsigned n)
         return;
     mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    vkCmdPipelineBarrier(g.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
-                         0, 1, &mb, 0, NULL, 0, NULL);
-    vb_submit_wait();
+    vkCmdPipelineBarrier(g.slots[g.cur].cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    /* The coherence boundary: those copies are in the newest submission, and the host must
+     * not read the readback buffers until every submission it has made has completed. */
+    vb_slot_submit();
+    vb_drain();
     if (!g.ok)
         return;
     for (i = 0; i < n; i++) {
@@ -1331,6 +1537,11 @@ static void vb_target_load(VbTarget *t)
 
     if (!t->stale)
         return;
+    /* Move to a fresh slot when this load would not fit what the current one has left, so a
+     * load lands in the stream instead of allocating a buffer of its own: nothing written
+     * earlier in this slot is waiting for a command, and the load's copy is recorded after
+     * this, in whichever slot the reserve moved to. */
+    vb_reserve((VkDeviceSize)t->w * t->h * 4, 0);
     out = (uint32_t *)vb_stream((VkDeviceSize)t->w * t->h * 4, &buf, &off);
     if (!out)
         return;
@@ -1359,6 +1570,8 @@ static void vb_target_load(VbTarget *t)
     bc.imageExtent.width = t->w;
     bc.imageExtent.height = t->h;
     bc.imageExtent.depth = 1;
+    if (!g.ok)                          /* a fence wait failed above: record nothing more */
+        return;
     vkCmdCopyBufferToImage(vb_transfer_cmd(), buf, t->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc);
     vb_barrier();
     t->stale = 0;
@@ -1381,6 +1594,8 @@ static int vb_target_create(VbTarget *t, uint32_t va, uint32_t pitch, uint32_t b
     /* Zero, as a fresh D3D11 texture reads, so a first clear that skips the load
      * leaves the same alpha behind. */
     vb_transfer_cmd();
+    if (!g.ok)                          /* a fence wait failed above: record nothing more */
+        return 0;
     vb_image_barrier(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                      VK_IMAGE_LAYOUT_GENERAL);
     memset(&zero, 0, sizeof zero);
@@ -1388,7 +1603,7 @@ static int vb_target_create(VbTarget *t, uint32_t va, uint32_t pitch, uint32_t b
     sr.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     sr.levelCount = 1;
     sr.layerCount = 1;
-    vkCmdClearColorImage(g.cmd, t->im.img, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &sr);
+    vkCmdClearColorImage(g.slots[g.cur].cmd, t->im.img, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &sr);
     vb_barrier();
     t->used = 1;
     t->va = va;
@@ -1444,6 +1659,10 @@ static VbTarget *vb_target_for(const Nv2aSurface *s)
             vb_target_release(t);
         }
     }
+    /* A flush publishes guest memory and may have found the fence wait failed: nothing is
+     * recorded from here on (vb_target_create's own barrier and clear included). */
+    if (!g.ok)
+        return NULL;
     if (!vb_target_create(t, s->color_va, s->pitch, bpp, w, h))
         return NULL;
     t->last_use = ++g.use_clock;
@@ -1516,6 +1735,8 @@ static VbDepth *vb_depth_for(uint32_t va, uint32_t w, uint32_t h)
     }
     /* Far and stencil 0, as the CPU path's fresh buffers are, until the title clears it. */
     vb_transfer_cmd();
+    if (!g.ok)                          /* a fence wait failed above: record nothing more */
+        return NULL;
     vb_image_barrier(d->im.img, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     far0.depth = 1.0f;
@@ -1524,7 +1745,7 @@ static VbDepth *vb_depth_for(uint32_t va, uint32_t w, uint32_t h)
     sr.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     sr.levelCount = 1;
     sr.layerCount = 1;
-    vkCmdClearDepthStencilImage(g.cmd, d->im.img, VK_IMAGE_LAYOUT_GENERAL, &far0, 1, &sr);
+    vkCmdClearDepthStencilImage(g.slots[g.cur].cmd, d->im.img, VK_IMAGE_LAYOUT_GENERAL, &far0, 1, &sr);
     vb_barrier();
     d->used = 1;
     d->va = va;
@@ -1579,6 +1800,9 @@ static void vb_tex_upload(VbTex *e, const Nv2aTexture *tx)
         fmt = VK_FORMAT_B8G8R8A8_UNORM;     /* 0xAARRGGBB words, as decoded */
         bytes = (VkDeviceSize)tx->width * tx->height * 4;
     }
+    /* Same reason as a target load: take a fresh slot rather than allocate a buffer of its
+     * own. The copy below is still recorded in the slot this ends up in. */
+    vb_reserve(bytes, 0);
     dst = vb_stream(bytes, &buf, &off);
     if (!dst)
         return;
@@ -1588,6 +1812,8 @@ static void vb_tex_upload(VbTex *e, const Nv2aTexture *tx)
                          VK_IMAGE_ASPECT_COLOR_BIT))
         return;
     vb_transfer_cmd();
+    if (!g.ok)                          /* a fence wait failed above: record nothing more */
+        return;
     vb_image_barrier(e->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     memset(&bc, 0, sizeof bc);
@@ -1597,7 +1823,7 @@ static void vb_tex_upload(VbTex *e, const Nv2aTexture *tx)
     bc.imageExtent.width = tx->width;
     bc.imageExtent.height = tx->height;
     bc.imageExtent.depth = 1;
-    vkCmdCopyBufferToImage(g.cmd, buf, e->im.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+    vkCmdCopyBufferToImage(g.slots[g.cur].cmd, buf, e->im.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
     vb_image_barrier(e->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     g.st.tex_uploads++;
@@ -1623,6 +1849,8 @@ static VkImageView vb_texture(const Nv2aTexture *tx, VbTarget *out, VkImageLayou
     VbTex *e = NULL, *lru = NULL;
 
     if (!tx->width || !tx->height || tx->width > VB_MAX_DIM || tx->height > VB_MAX_DIM)
+        return VK_NULL_HANDLE;
+    if (!g.ok)                          /* a fence wait already failed: record nothing more */
         return VK_NULL_HANDLE;
 
     for (i = 0; i < VB_MAX_TARGETS; i++) {
@@ -1653,6 +1881,8 @@ static VkImageView vb_texture(const Nv2aTexture *tx, VbTarget *out, VkImageLayou
         ic.extent.width = t->w;
         ic.extent.height = t->h;
         ic.extent.depth = 1;
+        if (!g.ok)                      /* a fence wait failed above: record nothing more */
+            return VK_NULL_HANDLE;
         vkCmdCopyImage(vb_transfer_cmd(), t->im.img, VK_IMAGE_LAYOUT_GENERAL, t->copy.img,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
         vb_barrier();
@@ -1670,6 +1900,8 @@ static VkImageView vb_texture(const Nv2aTexture *tx, VbTarget *out, VkImageLayou
         if (t->used && t->dirty && lo < (uint64_t)tx->offset + span && tx->offset < hi)
             vb_target_flush(t);
     }
+    if (!g.ok)                          /* one of those flushes found the wait failed */
+        return VK_NULL_HANDLE;
 
     for (i = 0; i < VB_MAX_TEXTURES; i++) {
         VbTex *c = &g.texs[i];
@@ -1800,7 +2032,7 @@ static uint32_t vb_submit(const VbDraw *dr, const Nv2aVertex *v, const Nv2aVerte
 {
     const int rc = dr->key.rc != 0;
     const uint32_t stride = rc ? (uint32_t)sizeof(VbRcVertex) : (uint32_t)sizeof(Nv2aVertex);
-    const uint32_t cap = (VB_STREAM_BYTES / 2) / stride;
+    const uint32_t cap = VB_DRAW_CAP_BYTES / stride;
     VkDescriptorSetAllocateInfo dai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
     VkDescriptorImageInfo ii[8];
     VkDescriptorBufferInfo ub;
@@ -1814,6 +2046,8 @@ static uint32_t vb_submit(const VbDraw *dr, const Nv2aVertex *v, const Nv2aVerte
     uint32_t i, j, out = 0, nw, doff;
     VkResult r;
 
+    if (!g.ok)                          /* a fence wait failed during this call's setup */
+        return 0;
     if (n > cap)
         n = cap - cap % 3;
     pipe = vb_pipeline(&dr->key, NULL);
@@ -1867,7 +2101,7 @@ static uint32_t vb_submit(const VbDraw *dr, const Nv2aVertex *v, const Nv2aVerte
         memcpy(u, &dr->rck, sizeof dr->rck);
     }
 
-    dai.descriptorPool = g.dpool;
+    dai.descriptorPool = g.slots[g.cur].dpool;
     dai.descriptorSetCount = 1;
     dai.pSetLayouts = rc ? &g.dsl_rc : &g.dsl;
     r = vkAllocateDescriptorSets(g.dev, &dai, &set);
@@ -1875,7 +2109,7 @@ static uint32_t vb_submit(const VbDraw *dr, const Nv2aVertex *v, const Nv2aVerte
         vb_fail("vkAllocateDescriptorSets", r);
         return 0;
     }
-    g.sets_used++;
+    g.slots[g.cur].sets_used++;
     memset(ii, 0, sizeof ii);
     memset(wr, 0, sizeof wr);
     if (!rc) {
@@ -1926,16 +2160,16 @@ static uint32_t vb_submit(const VbDraw *dr, const Nv2aVertex *v, const Nv2aVerte
 
     if (!vb_begin_pass(dr->t, dr->d))
         return 0;
-    if (g.bound_pipe != pipe) {
-        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-        g.bound_pipe = pipe;
+    if (g.slots[g.cur].bound_pipe != pipe) {
+        vkCmdBindPipeline(g.slots[g.cur].cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        g.slots[g.cur].bound_pipe = pipe;
     }
     doff = (uint32_t)uoff;
-    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+    vkCmdBindDescriptorSets(g.slots[g.cur].cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             rc ? g.layout_rc : g.layout, 0, 1, &set,
                             rc ? 1u : 0u, rc ? &doff : NULL);
-    vkCmdBindVertexBuffers(g.cmd, 0, 1, &buf, &off);
-    vkCmdPushConstants(g.cmd, rc ? g.layout_rc : g.layout,
+    vkCmdBindVertexBuffers(g.slots[g.cur].cmd, 0, 1, &buf, &off);
+    vkCmdPushConstants(g.slots[g.cur].cmd, rc ? g.layout_rc : g.layout,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof dr->k, &dr->k);
     vp.x = 0.0f;
@@ -1944,13 +2178,13 @@ static uint32_t vb_submit(const VbDraw *dr, const Nv2aVertex *v, const Nv2aVerte
     vp.height = (float)dr->t->h;
     vp.minDepth = 0.0f;
     vp.maxDepth = 1.0f;
-    vkCmdSetViewport(g.cmd, 0, 1, &vp);
-    vkCmdSetScissor(g.cmd, 0, 1, &dr->scissor);
-    vkCmdSetStencilReference(g.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr->stencil_ref);
-    vkCmdSetStencilCompareMask(g.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr->stencil_read);
-    vkCmdSetStencilWriteMask(g.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr->stencil_write);
-    vkCmdSetBlendConstants(g.cmd, dr->blend_factor);
-    vkCmdDraw(g.cmd, out, 1, 0, 0);
+    vkCmdSetViewport(g.slots[g.cur].cmd, 0, 1, &vp);
+    vkCmdSetScissor(g.slots[g.cur].cmd, 0, 1, &dr->scissor);
+    vkCmdSetStencilReference(g.slots[g.cur].cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr->stencil_ref);
+    vkCmdSetStencilCompareMask(g.slots[g.cur].cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr->stencil_read);
+    vkCmdSetStencilWriteMask(g.slots[g.cur].cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr->stencil_write);
+    vkCmdSetBlendConstants(g.slots[g.cur].cmd, dr->blend_factor);
+    vkCmdDraw(g.slots[g.cur].cmd, out, 1, 0, 0);
     return out;
 }
 
@@ -2140,6 +2374,9 @@ static void vb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         g.st.cull_all++;
         return;
     }
+    vb_maybe_split();
+    if (!g.ok)
+        return;
     if (!vb_setup(&dr, s, b, rc)) {
         g.st.skipped++;
         return;
@@ -2223,6 +2460,12 @@ static int vb_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
      * a miss however this batch's inputs look, so the batch is never counted as both. */
     if (!e)
         return 0;
+    vb_maybe_split();
+    if (!g.ok) {
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
     /* The mask decides the baked input layout; 0 or more than 16 attributes
      * cannot be described at all. Reached only for a program the corpus carries,
      * so an undescribable mask here is a decline. */
@@ -2250,6 +2493,11 @@ static int vb_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
         g.pst.declines++;
         return 0;
     }
+    if (!g.ok) {                        /* a fence wait failed in setup: record nothing more */
+        g.st.vsh_declines++;
+        g.pst.declines++;
+        return 0;
+    }
     dr.key.rc = 1;                      /* ps_rc and its bindings stay in use */
     dr.key.prog = 1;
     /* The hash is what makes the pipeline key unique per program: two programs
@@ -2264,16 +2512,17 @@ static int vb_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
         return 0;
     }
 
-    /* One reserve for the whole submission, before any slice is written: a submit
-     * cannot land between writing a constant block and the draw that reads it. Each
-     * slice is 256-aligned by vb_stream, so round each one up before summing; over
-     * the stream size no single reserve holds it all. */
+    /* One reserve for the whole submission, before any slice is written, so the slices and the
+     * draw that reads them stay in one slot: nothing after this point moves g.cur but
+     * vb_reserve's advance, which happens before the slice it makes room for, and a slice that
+     * still does not fit goes to a buffer of its own instead of moving on. Each slice is
+     * 256-aligned by vb_stream, so round each one up before summing. */
     total = vb_round_up((VkDeviceSize)p->positions * stride)
           + vb_round_up((VkDeviceSize)p->index_count * 4u)
           + vb_round_up(sizeof(VbRcConstants))
           + vb_round_up(192u * 16u)
           + vb_round_up(sizeof xf);
-    if (total > VB_STREAM_BYTES) {
+    if (total > VB_PROG_RESERVE_MAX) {
         g.st.vsh_declines++;
         g.pst.declines++;
         return 0;
@@ -2334,7 +2583,7 @@ static int vb_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     }
     memcpy(dst, &xf, sizeof xf);
 
-    dai.descriptorPool = g.dpool;
+    dai.descriptorPool = g.slots[g.cur].dpool;
     dai.descriptorSetCount = 1;
     dai.pSetLayouts = &g.dsl_prog;
     r = vkAllocateDescriptorSets(g.dev, &dai, &set);
@@ -2344,7 +2593,7 @@ static int vb_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
         g.pst.declines++;
         return 0;
     }
-    g.sets_used++;
+    g.slots[g.cur].sets_used++;
 
     /* Bindings 0 and 9/10: three dynamic uniform buffers, offsets in binding order. */
     memset(ii, 0, sizeof ii);
@@ -2388,14 +2637,14 @@ static int vb_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     }
     for (i = 0; i < VB_PROG_SLOTS; i++)
         offsets[i] = (uint32_t)uoff[i];
-    if (g.bound_pipe != pipe) {
-        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-        g.bound_pipe = pipe;
+    if (g.slots[g.cur].bound_pipe != pipe) {
+        vkCmdBindPipeline(g.slots[g.cur].cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        g.slots[g.cur].bound_pipe = pipe;
     }
-    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout_prog, 0, 1,
+    vkCmdBindDescriptorSets(g.slots[g.cur].cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout_prog, 0, 1,
                             &set, VB_PROG_SLOTS, offsets);
-    vkCmdBindVertexBuffers(g.cmd, 0, 1, &vbuf, &voff);
-    vkCmdPushConstants(g.cmd, g.layout_prog,
+    vkCmdBindVertexBuffers(g.slots[g.cur].cmd, 0, 1, &vbuf, &voff);
+    vkCmdPushConstants(g.slots[g.cur].cmd, g.layout_prog,
                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof dr.k, &dr.k);
     vp.x = 0.0f;
@@ -2404,14 +2653,14 @@ static int vb_draw_program(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aP
     vp.height = (float)dr.t->h;
     vp.minDepth = 0.0f;
     vp.maxDepth = 1.0f;
-    vkCmdSetViewport(g.cmd, 0, 1, &vp);
-    vkCmdSetScissor(g.cmd, 0, 1, &dr.scissor);
-    vkCmdSetStencilReference(g.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr.stencil_ref);
-    vkCmdSetStencilCompareMask(g.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr.stencil_read);
-    vkCmdSetStencilWriteMask(g.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr.stencil_write);
-    vkCmdSetBlendConstants(g.cmd, dr.blend_factor);
-    vkCmdBindIndexBuffer(g.cmd, ibuf, ioff, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(g.cmd, p->index_count, 1, 0, 0, 0);
+    vkCmdSetViewport(g.slots[g.cur].cmd, 0, 1, &vp);
+    vkCmdSetScissor(g.slots[g.cur].cmd, 0, 1, &dr.scissor);
+    vkCmdSetStencilReference(g.slots[g.cur].cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr.stencil_ref);
+    vkCmdSetStencilCompareMask(g.slots[g.cur].cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr.stencil_read);
+    vkCmdSetStencilWriteMask(g.slots[g.cur].cmd, VK_STENCIL_FACE_FRONT_AND_BACK, dr.stencil_write);
+    vkCmdSetBlendConstants(g.slots[g.cur].cmd, dr.blend_factor);
+    vkCmdBindIndexBuffer(g.slots[g.cur].cmd, ibuf, ioff, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(g.slots[g.cur].cmd, p->index_count, 1, 0, 0, 0);
 
     vb_target_mark(dr.t, &dr.scissor);
     g.st.draws++;
@@ -2444,6 +2693,9 @@ static void vb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
     float x0, y0, x1, y1, z;
     int i;
 
+    if (!g.ok)
+        return;
+    vb_maybe_split();
     if (!g.ok)
         return;
     memset(&dr, 0, sizeof dr);
@@ -2525,6 +2777,7 @@ static void vb_stats(int force)
                     " tex_hits=%llu tex_undecodable=%llu rt_aliases=%llu rt_copies=%llu"
                     " rt_loads=%llu readbacks=%llu readback_ms=%.1f dropped_tris=%llu"
                     " skipped=%llu rc_draws=%llu rc_fallback=%llu pipelines=%llu submits=%llu"
+                    " reuse_waits=%llu drain_waits=%llu splits=%llu overflows=%llu max_inflight=%u"
                     " cull_draws=%llu cull_all=%llu validation_errors=%llu"
                     " validation_warnings=%llu vsh_hits=%llu vsh_misses=%llu"
                     " vsh_identity_fail=%llu vsh_declines=%llu vsh_tris=%llu"
@@ -2538,6 +2791,8 @@ static void vb_stats(int force)
             (unsigned long long)g.st.skipped, (unsigned long long)g.st.rc_draws,
             (unsigned long long)g.st.rc_fallback,
             (unsigned long long)g.st.pipelines, (unsigned long long)g.st.submits,
+            (unsigned long long)g.st.reuse_waits, (unsigned long long)g.st.drain_waits,
+            (unsigned long long)g.st.splits, (unsigned long long)g.st.overflows, g.max_inflight,
             (unsigned long long)g.st.cull_draws, (unsigned long long)g.st.cull_all,
             (unsigned long long)g.st.validation_errors,
             (unsigned long long)g.st.validation_warnings,
@@ -2560,7 +2815,13 @@ static void vb_flip(void)
         if (g.targets[i].used)
             ts[n++] = &g.targets[i];
     vb_targets_flush(ts, n);
-    vb_submit_wait();               /* whatever else was recorded, so a frame never lingers */
+    if (!g.ok)
+        return;
+    /* Whatever else was recorded goes out too, so a frame never lingers unpublished. */
+    vb_slot_submit();
+    vb_drain();
+    if (!g.ok)
+        return;
     for (i = 0; i < n; i++)
         ts[i]->stale = 1;
     g.frame++;
@@ -2853,13 +3114,42 @@ static int vb_create_pipeline_objects(void)
     cpi.queueFamilyIndex = g.family;
     if ((r = vkCreateCommandPool(g.dev, &cpi, NULL, &g.pool)) != VK_SUCCESS)
         goto fail;
+    /* The ring: one command buffer, fence, descriptor pool and upload stream per slot. A slot
+     * is free exactly while `pending` is 0 -- the fence is created unsignaled, as vkQueueSubmit
+     * requires (VUID-vkQueueSubmit-fence-00063), and vb_slot_wait resets it right after it
+     * signals, so a slot that is recorded into again has an unsignaled fence. A slot's objects
+     * are only touched while it is not in flight, so a submission's recording and its resources
+     * stay untouched until its fence has been observed. */
     cai.commandPool = g.pool;
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cai.commandBufferCount = 1;
-    if ((r = vkAllocateCommandBuffers(g.dev, &cai, &g.cmd)) != VK_SUCCESS)
-        goto fail;
-    if ((r = vkCreateFence(g.dev, &fci, NULL, &g.fence)) != VK_SUCCESS)
-        goto fail;
+    ps[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    ps[0].descriptorCount = 4 * VB_SLOT_SETS;
+    ps[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+    ps[1].descriptorCount = 4 * VB_SLOT_SETS;
+    ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    ps[2].descriptorCount = 3 * VB_SLOT_SETS;
+    dpi.maxSets = VB_SLOT_SETS;
+    dpi.poolSizeCount = 3;
+    dpi.pPoolSizes = ps;
+    for (i = 0; i < VB_SLOTS; i++) {
+        VbSlot *s = &g.slots[i];
+        if ((r = vkAllocateCommandBuffers(g.dev, &cai, &s->cmd)) != VK_SUCCESS)
+            goto fail;
+        if ((r = vkCreateFence(g.dev, &fci, NULL, &s->fence)) != VK_SUCCESS)
+            goto fail;
+        if ((r = vkCreateDescriptorPool(g.dev, &dpi, NULL, &s->dpool)) != VK_SUCCESS)
+            goto fail;
+        /* One draw's descriptors cover 1 image, 1 sampler and up to 3 dynamic uniform
+         * buffers (the combiner registers, c[192] and the xf block), so the pool sizes
+         * above cover the larger set layout. */
+        if (!vb_host_buffer(VB_SLOT_STREAM, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+                                            | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+                                            | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                                            | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 0,
+                            &s->stream, &s->stream_mem, &s->stream_ptr))
+            return -1;
+    }
 
     /* Attachments are loaded and stored, and stay in GENERAL between passes. */
     memset(att, 0, sizeof att);
@@ -2971,24 +3261,8 @@ static int vb_create_pipeline_objects(void)
 
     /* One set per draw, of either kind; the combiner's uses 4 images, 4 samplers and
      * one dynamic uniform buffer, the program's three (rc registers, c[192], the xf
-     * block), so the dynamic count must cover the larger. */
-    ps[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    ps[0].descriptorCount = 4 * VB_MAX_SETS;
-    ps[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-    ps[1].descriptorCount = 4 * VB_MAX_SETS;
-    ps[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-    ps[2].descriptorCount = 3 * VB_MAX_SETS;
-    dpi.maxSets = VB_MAX_SETS;
-    dpi.poolSizeCount = 3;
-    dpi.pPoolSizes = ps;
-    if ((r = vkCreateDescriptorPool(g.dev, &dpi, NULL, &g.dpool)) != VK_SUCCESS)
-        goto fail;
-    if (!vb_host_buffer(VB_STREAM_BYTES, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
-                                         | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
-                                         | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
-                                         | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 0,
-                        &g.stream, &g.stream_mem, &g.stream_ptr))
-        return -1;
+     * block), so the dynamic count must cover the larger. The pools themselves, and the
+     * streams, are the ring slots' (above). */
     return 0;
 fail:
     vb_fail("pipeline objects", r);
@@ -3026,11 +3300,12 @@ static int vb_create_defaults(void)
     bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     bc.imageSubresource.layerCount = 1;
     bc.imageExtent.width = bc.imageExtent.height = bc.imageExtent.depth = 1;
-    vkCmdCopyBufferToImage(g.cmd, buf, g.white.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
+    vkCmdCopyBufferToImage(g.slots[g.cur].cmd, buf, g.white.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
     vb_image_barrier(g.white.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    g.ok = 1;                               /* vb_submit_wait reports a lost device through it */
-    vb_submit_wait();
+    g.ok = 1;                               /* the submission path reports a lost device through it */
+    vb_slot_submit();
+    vb_drain();
     if (!g.ok)
         return -1;
     g.ok = 0;
@@ -3043,6 +3318,27 @@ void nv2a_vk_backend_program_stats(Nv2aVkProgramStats *out)
 {
     if (out)
         *out = g.pst;
+}
+
+void nv2a_vk_backend_ring_stats(Nv2aVkRingStats *out)
+{
+    unsigned i, inflight = 0;
+
+    if (!out)
+        return;
+    memset(out, 0, sizeof *out);
+    out->slots = VB_SLOTS;
+    for (i = 0; i < VB_SLOTS; i++)
+        if (g.slots[i].pending)
+            inflight++;
+    out->in_flight = inflight;
+    out->max_in_flight = g.max_inflight;
+    out->submissions = g.st.submits;
+    out->reuse_waits = g.st.reuse_waits;
+    out->drain_waits = g.st.drain_waits;
+    out->splits = g.st.splits;
+    out->overflows = g.st.overflows;
+    out->frames = g.frame;
 }
 
 int nv2a_vk_backend_install(void)
