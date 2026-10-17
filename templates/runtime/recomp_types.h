@@ -395,7 +395,7 @@ static inline int recomp_fp_trig_in_range(double value) {
         g_fp_cc |= 0x0400u;
         return 0;
     }
-    g_fp_cc &= (uint16_t)~0x0400u;
+    g_fp_cc = (uint16_t)(g_fp_cc & ~0x0400u);
     return 1;
 }
 
