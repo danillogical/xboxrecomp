@@ -45,8 +45,19 @@
  *   - Pipelines are cached by the state that is baked into them (blend, write
  *     mask, depth, stencil func/ops, cull, winding, depth attachment present);
  *     viewport, scissor, stencil reference/masks and blend constants are dynamic.
- *   - Every image a target or depth buffer owns stays in GENERAL layout, and
- *     every render pass end and transfer is followed by a global memory barrier.
+ *   - Targets, depth images and the self-sample snapshot stay in GENERAL layout for
+ *     their whole life: a target is an attachment, a sampled image and a copy source
+ *     within one submission, a depth image is an attachment and a transfer
+ *     destination, and the snapshot is a copy destination and a sampled image, so a
+ *     per-access layout would need a transition per draw. Textures go up through
+ *     TRANSFER_DST_OPTIMAL into SHADER_READ_ONLY_OPTIMAL. Each normal-path barrier
+ *     names the stage and access scopes of the producer and of the consumers that
+ *     resource can have, deliberately a superset where a consumer class cannot arise
+ *     on this path today. Only two sites keep every stage and access on both sides,
+ *     both vb_barrier(): the per-submission barrier in vb_slot_submit, the only thing
+ *     that makes cross-submission ordering defined, and the abandonment barrier in
+ *     vb_targets_flush, which must order an abandoned group's writes and reads
+ *     against a whole next group.
  *   - Synchronisation is a bounded ring of VB_SLOTS submission slots. A slot owns
  *     one command recording, one fence, one descriptor pool, one upload stream and
  *     the objects a pending submission may still read; only the slot being recorded
@@ -62,8 +73,8 @@
  *     command later in submission order -- that is what makes cross-submission
  *     ordering defined (Vulkan defines no implicit execution or memory dependency
  *     between submissions), including blending into one target from two submissions.
- *     Still to come (plan N4): narrower barriers and layouts, sub-allocated
- *     memory, and a persisted VkPipelineCache.
+ *     Still to come (plan N4): sub-allocated memory, and a persisted
+ *     VkPipelineCache.
  *
  *   - The readback's publication is one bounded batch per submission: every dirty
  *     target's slice lands in a staging buffer at a 4-byte-aligned offset, the
@@ -932,7 +943,10 @@ static VkCommandBuffer vb_cmd(void)
     return s->cmd;
 }
 
-/* Every write before it is visible to every access after it. Deliberately broad. */
+/* Every write before it is visible to every access after it. Deliberately broad, and used at
+ * exactly two sites: the per-submission barrier in vb_slot_submit, whose second scope must be
+ * every command later in submission order, and the failure-path barrier in vb_targets_flush,
+ * which orders an abandoned batch's writes against the whole next batch. */
 static void vb_barrier(void)
 {
     VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
@@ -943,13 +957,32 @@ static void vb_barrier(void)
                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-static void vb_image_barrier(VkImage img, VkImageAspectFlags aspect, VkImageLayout from,
-                             VkImageLayout to)
+/* Order what `src_stage` writes (with `src_access`) before the accesses `dst_stage` makes
+ * (`dst_access`). vb_barrier() is the deliberately broad form, for the two sites that really do
+ * need every stage and access on both sides; this is the form for a site whose producer and its
+ * consumer are both known from the resource's access contract. Every pair here is an access bit
+ * that its stage supports, so the scoped form is also what synchronization validation checks. */
+static void vb_dep(VkPipelineStageFlags src_stage, VkAccessFlags src_access,
+                   VkPipelineStageFlags dst_stage, VkAccessFlags dst_access)
+{
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+
+    mb.srcAccessMask = src_access;
+    mb.dstAccessMask = dst_access;
+    vkCmdPipelineBarrier(vb_cmd(), src_stage, dst_stage, 0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+/* A layout transition with explicit scopes: the transition's own source and destination,
+ * instead of every stage and access. */
+static void vb_image_dep(VkImage img, VkImageAspectFlags aspect, VkImageLayout from,
+                         VkImageLayout to, VkPipelineStageFlags src_stage,
+                         VkAccessFlags src_access, VkPipelineStageFlags dst_stage,
+                         VkAccessFlags dst_access)
 {
     VkImageMemoryBarrier ib = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
 
-    ib.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    ib.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    ib.srcAccessMask = src_access;
+    ib.dstAccessMask = dst_access;
     ib.oldLayout = from;
     ib.newLayout = to;
     ib.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -958,9 +991,46 @@ static void vb_image_barrier(VkImage img, VkImageAspectFlags aspect, VkImageLayo
     ib.subresourceRange.aspectMask = aspect;
     ib.subresourceRange.levelCount = 1;
     ib.subresourceRange.layerCount = 1;
-    vkCmdPipelineBarrier(vb_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+    vkCmdPipelineBarrier(vb_cmd(), src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &ib);
 }
+
+/* Every stage and access this back end touches a target, a depth image or a texture from: a
+ * render pass writes its colour attachment and reads/writes its depth-stencil attachment, a draw
+ * (or the readback's pack kernel) samples an image, and the transfer engine loads, clears,
+ * snapshots and reads images back. COLOR_ATTACHMENT_READ is in the set because the render pass is
+ * created with loadOp = VK_ATTACHMENT_LOAD_OP_LOAD and initialLayout GENERAL, so every pass reads
+ * the colour attachment's existing contents at COLOR_ATTACHMENT_OUTPUT: the broad barrier's
+ * MEMORY_READ covered that read, so the scoped set must carry the matching read bit beside the
+ * depth-stencil read it already had. TRANSFER_WRITE is in the set because vb_target_for creates a
+ * target (layout transition + clear) and leaves it stale, so the same submission loads it: the
+ * clear's write must be ordered before that later write as well, not only before reads. The
+ * second scope of a barrier that must order one image write before every later access to that
+ * image. */
+#define VB_STAGE_IMAGE_DST (VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT \
+                          | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT \
+                          | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT \
+                          | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT \
+                          | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT \
+                          | VK_PIPELINE_STAGE_TRANSFER_BIT)
+#define VB_ACCESS_IMAGE_DST (VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT \
+                           | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT \
+                           | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT \
+                           | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT \
+                           | VK_ACCESS_SHADER_READ_BIT \
+                           | VK_ACCESS_TRANSFER_READ_BIT \
+                           | VK_ACCESS_TRANSFER_WRITE_BIT)
+/* What a render pass writes: its colour attachment, and its depth-stencil attachment's writes. */
+#define VB_STAGE_ATTACH (VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT \
+                       | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT \
+                       | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)
+#define VB_ACCESS_ATTACH_WRITE (VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT \
+                              | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
+/* What a depth-stencil image is consumed by: the two fragment test stages' depth test and
+ * stencil op. */
+#define VB_STAGE_DEPTH (VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT \
+                      | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)
+#define VB_ACCESS_DEPTH (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT \
+                       | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
 
 static void vb_end_pass(void)
 {
@@ -973,7 +1043,10 @@ static void vb_end_pass(void)
     g.pass_open = 0;
     g.pass_t = NULL;
     g.pass_d = NULL;
-    vb_barrier();
+    /* The pass's colour and depth-stencil attachment writes before every later access to that
+     * target or depth image: a later pass's attachment read/write, a draw or the pack kernel
+     * sampling it, the snapshot copy, and the readback's image copy. */
+    vb_dep(VB_STAGE_ATTACH, VB_ACCESS_ATTACH_WRITE, VB_STAGE_IMAGE_DST, VB_ACCESS_IMAGE_DST);
 }
 
 /* The recording command buffer, outside any render pass, for a transfer. A split is not
@@ -1842,8 +1915,15 @@ static int vb_targets_flush(VbTarget **ts, unsigned n)
                 vkCmdPushConstants(cmd, g.layout_pack, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc,
                                    &pc);
                 vkCmdDispatch(cmd, (rw + 15u) / 16u, (rh + 7u) / 8u, 1);
-                vb_barrier();           /* the pack's shader writes before the copy that reads
-                                         * them */
+                /* The pack kernel's writes of g.pack_buf at this target's slice before the
+                 * vkCmdCopyBuffer that reads exactly that slice. Two dispatches inside one
+                 * batch never overlap: a group's slice offsets accumulate strictly. A later
+                 * batch reusing offset 0 is separated by that batch's own submit plus
+                 * vb_drain, or, for an abandoned batch that continues into the next group, by
+                 * the abandonment barrier in the !batch_ok branch, which is the only thing
+                 * ordering the pack buffer's reuse across that group boundary. */
+                vb_dep(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
                 {
                     VkBufferCopy region;
 
@@ -1878,7 +1958,8 @@ static int vb_targets_flush(VbTarget **ts, unsigned n)
         mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
         /* vb_cmd(), not the slot directly: a fence wait above may have found the device lost,
          * in which case this barrier belongs in the dead buffer, a no-op. */
-        vkCmdPipelineBarrier(vb_cmd(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        vkCmdPipelineBarrier(vb_cmd(),
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
         /* The coherence boundary: the batch's commands are in the newest submission, and the
          * host must not read the staging buffer until every submission it has made has
@@ -2067,7 +2148,11 @@ static void vb_target_load(VbTarget *t)
     if (!g.ok)                          /* a fence wait failed above: record nothing more */
         return;
     vkCmdCopyBufferToImage(vb_transfer_cmd(), buf, t->im.img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc);
-    vb_barrier();
+    /* The load's transfer write before every later access to that target image. The set
+     * also covers the clear-vs-load write-after-write when vb_target_create's clear and this
+     * load share one submission. */
+    vb_dep(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VB_STAGE_IMAGE_DST,
+           VB_ACCESS_IMAGE_DST);
     t->stale = 0;
     g.st.rt_loads++;
 }
@@ -2090,15 +2175,21 @@ static int vb_target_create(VbTarget *t, uint32_t va, uint32_t pitch, uint32_t b
     vb_transfer_cmd();
     if (!g.ok)                          /* a fence wait failed above: record nothing more */
         return 0;
-    vb_image_barrier(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-                     VK_IMAGE_LAYOUT_GENERAL);
+    /* UNDEFINED contents are discarded; the clear that follows is this image's first write. */
+    vb_image_dep(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                 VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     memset(&zero, 0, sizeof zero);
     memset(&sr, 0, sizeof sr);
     sr.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     sr.levelCount = 1;
     sr.layerCount = 1;
     vkCmdClearColorImage(g.slots[g.cur].cmd, t->im.img, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &sr);
-    vb_barrier();
+    /* The clear's transfer write before every later access to that target image, including the
+     * load that follows it in this same submission when vb_target_for left the target stale: a
+     * write-after-write that the destination scope must keep covering. */
+    vb_dep(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VB_STAGE_IMAGE_DST,
+           VB_ACCESS_IMAGE_DST);
     t->used = 1;
     t->va = va;
     t->pitch = pitch;
@@ -2243,8 +2334,11 @@ static VbDepth *vb_depth_for(uint32_t va, uint32_t w, uint32_t h)
     vb_transfer_cmd();
     if (!g.ok)                          /* a fence wait failed above: record nothing more */
         return NULL;
-    vb_image_barrier(d->im.img, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
-                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+    /* As in a target create: the undefined contents are discarded before the clear's write. */
+    vb_image_dep(d->im.img, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                 VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 VK_ACCESS_TRANSFER_WRITE_BIT);
     far0.depth = 1.0f;
     far0.stencil = 0;
     memset(&sr, 0, sizeof sr);
@@ -2252,7 +2346,9 @@ static VbDepth *vb_depth_for(uint32_t va, uint32_t w, uint32_t h)
     sr.levelCount = 1;
     sr.layerCount = 1;
     vkCmdClearDepthStencilImage(g.slots[g.cur].cmd, d->im.img, VK_IMAGE_LAYOUT_GENERAL, &far0, 1, &sr);
-    vb_barrier();
+    /* The clear's transfer write before every later depth test and stencil op on that image. */
+    vb_dep(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VB_STAGE_DEPTH,
+           VB_ACCESS_DEPTH);
     d->used = 1;
     d->va = va;
     d->w = w;
@@ -2323,8 +2419,10 @@ static void vb_tex_upload(VbTex *e, const Nv2aTexture *tx)
     vb_transfer_cmd();
     if (!g.ok)                          /* a fence wait failed above: record nothing more */
         return;
-    vb_image_barrier(e->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    /* Discarded contents before the vkCmdCopyBufferToImage that writes it. */
+    vb_image_dep(e->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     memset(&bc, 0, sizeof bc);
     bc.bufferOffset = off;
     bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -2333,8 +2431,14 @@ static void vb_tex_upload(VbTex *e, const Nv2aTexture *tx)
     bc.imageExtent.height = tx->height;
     bc.imageExtent.depth = 1;
     vkCmdCopyBufferToImage(g.slots[g.cur].cmd, buf, e->im.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
-    vb_image_barrier(e->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    /* The upload's transfer write before the draws that sample this texture: the sampled-image
+     * bindings are fragment-stage, and the compute bit is a deliberate superset for the sampler
+     * class, as at the snapshot barrier in vb_texture. */
+    vb_image_dep(e->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 VK_ACCESS_TRANSFER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_SHADER_READ_BIT);
     g.st.tex_uploads++;
 }
 
@@ -2384,8 +2488,10 @@ static VkImageView vb_texture(const Nv2aTexture *tx, VbTarget *out, VkImageLayou
                                  VK_IMAGE_ASPECT_COLOR_BIT))
                 return VK_NULL_HANDLE;
             vb_transfer_cmd();
-            vb_image_barrier(t->copy.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-                             VK_IMAGE_LAYOUT_GENERAL);
+            /* Discarded contents before the vkCmdCopyImage that writes it. */
+            vb_image_dep(t->copy.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                         VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         }
         memset(&ic, 0, sizeof ic);
         ic.srcSubresource.aspectMask = ic.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -2397,7 +2503,17 @@ static VkImageView vb_texture(const Nv2aTexture *tx, VbTarget *out, VkImageLayou
             return VK_NULL_HANDLE;
         vkCmdCopyImage(vb_transfer_cmd(), t->im.img, VK_IMAGE_LAYOUT_GENERAL, t->copy.img,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
-        vb_barrier();
+        /* The snapshot's transfer write before the draws that sample it (the sampled-image
+         * bindings are fragment-stage; the compute bit is named because the readback's pack
+         * kernel is this back end's one compute consumer, so the scope covers it rather than
+         * tracking which stage samples which image), before the next snapshot copy's read of the
+         * target image, and before that copy's write of this same snapshot image
+         * (write-after-write). */
+        vb_dep(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT
+               | VK_PIPELINE_STAGE_TRANSFER_BIT,
+               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT
+               | VK_ACCESS_TRANSFER_WRITE_BIT);
         g.st.rt_copies++;
         return t->copy.view;
     }
@@ -3916,16 +4032,23 @@ static int vb_create_defaults(void)
                                          * handed back as the dead buffer, never as an unusable
                                          * one, so this copy can never land in a never-begun
                                          * slot command buffer */
-    vb_image_barrier(g.white.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    /* As in vb_tex_upload: discarded contents before the copy that writes it. */
+    vb_image_dep(g.white.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     memset(&bc, 0, sizeof bc);
     bc.bufferOffset = off;
     bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     bc.imageSubresource.layerCount = 1;
     bc.imageExtent.width = bc.imageExtent.height = bc.imageExtent.depth = 1;
     vkCmdCopyBufferToImage(cmd, buf, g.white.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
-    vb_image_barrier(g.white.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    /* As in vb_tex_upload: the upload's write before the draws that sample it, with the same
+     * conservative compute bit for the sampler class. */
+    vb_image_dep(g.white.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 VK_ACCESS_TRANSFER_WRITE_BIT,
+                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                 VK_ACCESS_SHADER_READ_BIT);
     g.ok = 1;                               /* the submission path reports a lost device through it */
     vb_slot_submit();
     vb_drain();
