@@ -2422,7 +2422,10 @@ static void gb_flip(void)
     g.stats_said = 1;
 }
 
-static const Nv2aBackend s_d3d11_backend = { gb_clear, gb_draw, gb_flip, gb_draw_program };
+/* The D3D11 back end never stops publishing: `stopped` is NULL (nv2a_backend.h), which the
+ * executor reads as "this back end cannot stop", so its CPU paths stay as they were. */
+static const Nv2aBackend s_d3d11_backend = { gb_clear, gb_draw, gb_flip, gb_draw_program,
+                                             NULL };
 
 int nv2a_d3d11_backend_install(void)
 {

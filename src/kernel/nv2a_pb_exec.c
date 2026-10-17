@@ -1252,6 +1252,19 @@ const Nv2aBackend *nv2a_backend_current(void)
     return s_backend;
 }
 
+/* Has the registered back end stopped publishing? 0 when there is no back end, or when it
+ * carries no `stopped` entry (nv2a_backend.h: a back end that never stops publishing leaves
+ * it NULL).
+ *
+ * This is the CPU-consumer gate. Guest memory holds the last frame the back end DID publish,
+ * so while this is true no CPU path in this file may write guest framebuffer memory -- the
+ * back end's unpublished newer frame supersedes anything the CPU would put there -- and no
+ * guest-memory frame may be presented as new. Read-only, executor thread. */
+static int backend_stopped(void)
+{
+    return s_backend && s_backend->stopped && s_backend->stopped();
+}
+
 /* ── Observation seam ───────────────────────────────────────── */
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
@@ -1547,6 +1560,13 @@ static void clear_surface(uint32_t param)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
+
+    /* A stopped back end could not publish its newest frame, so guest memory still holds the
+     * last frame it did publish. Clearing here would replace those published pixels with a
+     * frame that nothing published, while the back end's own unpublished frame supersedes
+     * them: no clear runs and none is counted. */
+    if (backend_stopped())
+        return;
 
     /* A back end clears colour and/or depth/stencil itself (flags are the
      * CLEAR_SURFACE bits: Z 0x1, stencil 0x2, colour 0xF0). */
@@ -3657,7 +3677,13 @@ static void raster_batch_program(void)
     uint32_t tris_before = s_gpu.tris_drawn;
     uint64_t px_before = s_gpu.xf_pixels;
     uint64_t t_vsh = pb_qpc_now(), t_tri;
-    int gpu = backend_program_gpu(n);
+    int gpu;
+
+    /* Same CPU-consumer gate as raster_batch's: the fallback below rasterises into guest
+     * framebuffer memory (raster_xf_clipped -> xf_rows), which a stopped back end forbids. */
+    if (backend_stopped())
+        return;
+    gpu = backend_program_gpu(n);
 
     if (gpu > 0) {
         s_t_vsh += pb_qpc_now() - t_vsh;
@@ -3901,6 +3927,13 @@ static void raster_batch(void)
     uint64_t t_ffp;
     static int no_vsh = -1;
 
+    /* The CPU-consumer gate (nv2a_backend.h's `stopped`). This function and everything under it
+     * -- raster_batch_program's fallback and raster_batch_screen's raster_tri -- fills the
+     * guest framebuffer directly. A stopped back end could not publish its newest frame, so
+     * guest memory holds the last frame it DID publish; rasterising here would overwrite those
+     * bytes with a frame nothing published. Nothing is drawn, counted or traced. */
+    if (backend_stopped())
+        return;
     if (s_gpu.idx_count < 3)
         return;
     if (no_vsh < 0)
@@ -4906,17 +4939,41 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_FLIP_STALL: {
         uint32_t presented = 0;
+        int stopped;
 
         /* First, so a back end has written its frame into guest memory before
          * the window copies it and the frame dumps below read it. */
         if (s_backend && s_backend->flip)
             s_backend->flip();
+        /* The back end's swap just finished recording, so the question "can it still publish
+         * a frame?" is answered for this frame. A stopped back end leaves guest memory at the
+         * last frame it DID publish; consuming guest memory as this frame's picture would show
+         * (and dump) the wrong frame. One bounded line, once per process: this is a per-flip
+         * path, and a title flips thousands of times. */
+        stopped = backend_stopped();
+        if (stopped) {
+            static int said;
+            if (!said) {
+                said = 1;
+                fprintf(stderr, "[GPU] the render back end stopped publishing; frames are not"
+                                " presented and batches are not rasterised on the CPU\n");
+                fflush(stderr);
+            }
+        }
 
         if (s_ftrace == 2)
             fprintf(stderr, "[FTRACE] FLIP_STALL presenting %08X (color now %08X)%c",
                     s_gpu.drawn_offset, s_gpu.color_offset, 10);
         /* The stall ends when the buffer being read is the one just finished.
-         * There is no scanout here to wait for, so that is now. */
+         * There is no scanout here to wait for, so that is now.
+         *
+         * Everything from here to the window frame statistics is GUEST-VISIBLE swap accounting,
+         * and it continues whatever the back end did (`stopped` above): the guest's swap still
+         * completes, so no guest path hangs waiting on it. Only the HOST's consumption of guest
+         * memory stops: the window copy, the present-hash trace inside it (`trace_flip`) and the
+         * frame dump below, because guest memory holds the last frame the back end published, not
+         * this one. The `[FTRACE] FLIP_STALL presenting ...` line above keeps printing: it is a
+         * log line that reads no guest memory. */
         s_gpu.flip_read = s_gpu.flip_write;
         /* A stall is a completed swap, but it is NOT a FLIP_INCREMENT_WRITE:
          * it does not advance the write buffer, so it must not be counted in
@@ -4941,8 +4998,14 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * else a previous frame's drawn surface, else the current one. Copying
          * here, rather than letting the window read guest memory on its own
          * clock, is what stops it showing a surface the rasteriser is still
-         * writing. */
-        if (s_gpu.pitch) {
+         * writing.
+         *
+         * All of this is HOST consumption of guest memory, and it stops with the back end --
+         * see `stopped` below where the guest's swap accounting above deliberately does not.
+         * Everything the guest can observe about this swap (flip_read, flip_stalls, the frame
+         * counter, the window frame statistics) has already happened by this point, so a
+         * stopped back end still completes the guest's swap and no guest path hangs. */
+        if (s_gpu.pitch && !stopped) {
             extern void xbox_FramebufferWindowPresent(uint32_t, uint32_t);
             int used_targeted = 0;
             uint32_t done;
@@ -4978,14 +5041,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                            s_present.targeted_offset, pub);
             }
         }
-        {
+        if (!stopped) {
             /* RECOMP_FB_DUMP_FLIPS: dump every presented frame, not one per
              * report -- a consecutive sequence, which is what a headless
              * recording (frames -> ffmpeg) needs. "1" dumps from boot; any
              * other value names a file, and frames are dumped while it
              * exists, so a capture can start mid-game without writing
              * gigabytes of menus first. The surface is the one just
-             * presented. */
+             * presented.
+             *
+             * Reads guest memory, so it stops with the back end: a dump of a frame the back end
+             * never published is a picture of neither frame. */
             static const char *spec = (const char *)-1;
             if (spec == (const char *)-1)
                 spec = getenv("RECOMP_FB_DUMP_FLIPS");
@@ -5316,7 +5382,11 @@ void nv2a_pb_exec_report(void)
             s_gpu.draws, s_gpu.nonzero_draws, s_gpu.verts,
             s_gpu.min_x, s_gpu.max_x, s_gpu.min_y, s_gpu.max_y);
     /* One picture per report rather than per clear: a title clears hundreds of
-     * times a second and nobody wants that many files. */
+     * times a second and nobody wants that many files.
+     *
+     * A diagnostic dump, not a presentation, so it still reads guest memory after a stop: a
+     * stopped back end makes it dump the LAST frame the back end published, deliberately,
+     * because that is the only frame guest memory holds. */
     if (!s_flip_dumping)
         dump_surface_bmp();
 

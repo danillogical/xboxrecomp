@@ -6,6 +6,19 @@
  * and every render target drawn since the last flip is written back into guest
  * memory at the flip, so everything that reads guest memory keeps working.
  *
+ * Publication is explicit. A flush reports whether it left a target dirty; the
+ * coherence boundary that asked for it (the flip, a target release, a texture that
+ * reads guest memory a target overwrote) retries a failed publication EXACTLY ONCE,
+ * and the dirty targets still unpublished after that are counted as
+ * Nv2aVkReadbackStats.incomplete. A boundary that cannot publish at all stops the
+ * back end: it publishes nothing more, presents nothing as a new frame, and leaves
+ * GUEST MEMORY AT THE LAST FRAME IT DID PUBLISH -- the unpublished newer image is
+ * never overwritten by older guest bytes, and no later load, texture decode or CPU
+ * rasterisation may supersede it. A stopped back end reports that through the
+ * executor's optional `stopped` entry (kernel/nv2a_backend.h), which is what makes
+ * the executor's CPU paths stop writing guest framebuffer memory. The D3D11 back
+ * end never stops.
+ *
  * Built only when CMake finds Vulkan and its shader tools (XBR_VULKAN_FOUND);
  * the shaders are SPIR-V compiled at build time, and the Vulkan loader is
  * opened at run time, so the executable does not depend on it. Elsewhere the
@@ -126,7 +139,13 @@ void nv2a_vk_backend_ring_stats(Nv2aVkRingStats *out);
  * published work. `wait_ns` is the publication's own vkQueueSubmit plus fence wait -- a
  * reuse wait inside a `vb_reserve` slot advance is not included -- and `publish_ns` is the
  * host's memcpy time. Cumulative since start. Same threading contract as the rest of the
- * back end. */
+ * back end.
+ *
+ * The one counter that is NOT published work is `incomplete`: the dirty targets a coherence
+ * boundary (the flip, a target release, a texture that reads guest memory a target
+ * overwrote) had to leave unpublished after the flush and its one bounded retry both failed.
+ * Counting one stops the back end: it publishes nothing more, and guest memory keeps the last
+ * frame it did publish. 0 in any run whose frames all published. */
 typedef struct {
     uint64_t readbacks;      /* targets whose dirty rectangle was published to guest memory */
     uint64_t batches;        /* published batches: one submission and one fence wait each */
@@ -136,6 +155,7 @@ typedef struct {
     uint64_t bytes;          /* bytes published into guest memory */
     uint64_t wait_ns;        /* the publication's own submit + fence wait (not a reuse wait) */
     uint64_t publish_ns;     /* host memcpy time inside publication */
+    uint64_t incomplete;     /* dirty targets a boundary left unpublished; nonzero stops it */
 } Nv2aVkReadbackStats;
 
 void nv2a_vk_backend_readback_stats(Nv2aVkReadbackStats *out);

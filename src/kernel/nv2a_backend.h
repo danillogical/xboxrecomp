@@ -147,6 +147,13 @@ typedef struct {
     /* Optional (NULL: unsupported). Draw a vertex-program batch from the program
      * and raw inputs. Returns 1 if drawn, 0 to make the executor transform on the CPU. */
     int (*draw_program)(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aProgramBatch *p);
+    /* Optional (NULL: this back end never stops publishing). Returns 1 once the back end can no
+     * longer publish a frame: it could not write a frame's render targets into guest memory, so
+     * guest memory still holds the last frame it did publish. A caller that sees this must not
+     * rasterise a batch itself (the CPU path writes guest memory that the back end's unpublished
+     * frame supersedes) and must not present guest memory as a new frame. Read-only, same thread;
+     * a back end that reports it stays stopped. */
+    int (*stopped)(void);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts

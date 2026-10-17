@@ -73,6 +73,20 @@
  *     therefore have compute as well as graphics, so the pack kernel can be
  *     dispatched on the same queue as the draws.
  *
+ *   - Publication is explicit at every coherence boundary. vb_targets_flush reports
+ *     whether it left a target dirty; the boundary (the flip, a target release, a
+ *     texture that reads guest memory a target overwrote) retries it EXACTLY ONCE
+ *     through vb_targets_flush_recover, which counts whatever is still dirty as
+ *     `readback_incomplete`. A boundary that still cannot publish stops the back end
+ *     (vb_stop): g.ok and g.failed latch, the stop is announced once, nothing is freed
+ *     or submitted, no target is marked stale and the frame counter does not advance.
+ *     From then on the back end publishes nothing and the executor's CPU path stops
+ *     consuming guest framebuffer memory through the backend's `stopped` entry
+ *     (nv2a_backend.h), so GUEST MEMORY KEEPS THE LAST FRAME THE BACK END PUBLISHED --
+ *     no older guest bytes are ever uploaded over a target whose newer pixels were not
+ *     published, and no CPU rasterisation or present is allowed to supersede them.
+ *     This is the whole N4.2 coherence rule; the D3D11 back end never stops.
+ *
  * Everything runs on the executor's thread, one call at a time.
  */
 #include "nv2a_vk_backend.h"
@@ -390,6 +404,12 @@ typedef struct {
      * (`readback_wait_ns`) and the host memcpy (`readback_publish_ns`). */
     uint64_t readback_batches, readback_packs, readback_pixels, readback_copies;
     uint64_t readback_bytes, readback_wait_ns, readback_publish_ns;
+    /* Dirty targets a coherence boundary (vb_targets_flush_recover) had to leave unpublished
+     * after the flush and its one bounded retry both failed. Counted only there, never by
+     * vb_targets_flush itself: the direct-call gate compares the publication counters across a
+     * failed call. Nonzero means a boundary stopped the back end, so no later load or texture
+     * decode can overwrite the unpublished image with older guest bytes. */
+    uint64_t readback_incomplete;
     /* The submission ring (see the file header): submissions issued without waiting for the
      * ones before them, and the fence waits the ring did perform. Deciding instrumentation for
      * the lifetime/overlap gate, so these are counters, not log lines. `overflows` is the part
@@ -734,6 +754,8 @@ static void vb_image_discard(VbImage *im)
 /* Defined below in recording order, and used by the ring's submit path. */
 static void vb_barrier(void);
 static void vb_end_pass(void);
+/* Defined below with the rest of the statistics; the coherence stop reports through it. */
+static void vb_stats(int force);
 
 /* Wait for a slot's submission. A fence's first synchronization scope includes every command
  * submitted before it, so once this returns the slot's stream, its descriptor pool and the
@@ -1658,15 +1680,25 @@ static int vb_readback_reserve(VkDeviceSize bytes)
  * A target that cannot be staged -- one whose slice alone is over the cap, a batch whose
  * staging buffers could not be made, or a batch whose pack descriptor set could not be
  * allocated -- keeps its dirty flag and is retried by the next flush rather than published
- * wrong or silently dropped. */
-static void vb_targets_flush(VbTarget **ts, unsigned n)
+ * wrong or silently dropped.
+ *
+ * The outcome is the return value: 1 iff no target in `ts` is left dirty when it returns
+ * (every dirty target was published, or none was dirty), 0 as soon as one dirty target could
+ * not be published -- a skipped batch, a slice over the cap, or a fence wait that failed. The
+ * failure behaviour is otherwise exactly as it was: an abandoned batch submits nothing,
+ * publishes nothing, latches nothing and leaves every publication counter unchanged, which is
+ * what the readback fault gate asserts. This function does NOT touch the "left unpublished"
+ * counter: that belongs to vb_targets_flush_recover, the boundary that decided the target
+ * could not be published at all. */
+static int vb_targets_flush(VbTarget **ts, unsigned n)
 {
     VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     uint64_t t0 = vb_now_ns(), done0 = g.st.readbacks;
     unsigned i;
 
-    if (!g.ok)                          /* a fence wait already failed: record nothing more */
-        return;
+    if (!g.ok)                          /* a fence wait already failed: record nothing more, and
+                                         * nothing can be published now */
+        return 0;
     for (i = 0; i < n; ) {
         VkDeviceSize slice[VB_MAX_TARGETS], total = 0;
         uint32_t stride[VB_MAX_TARGETS];
@@ -1895,11 +1927,77 @@ static void vb_targets_flush(VbTarget **ts, unsigned n)
      * staged nothing is not readback time. */
     if (g.st.readbacks != done0)
         g.st.readback_ns += vb_now_ns() - t0;
+    /* The outcome: a target left dirty is a target this flush could not publish. */
+    for (i = 0; i < n; i++)
+        if (ts[i]->dirty)
+            return 0;
+    return 1;
 }
 
-static void vb_target_flush(VbTarget *t)
+/* ── The coherence stop and its bounded retry ────────────────────────────
+ *
+ * A frame's render targets are published into guest memory by the flush above, and a target
+ * whose newer pixels could not be published must never be overwritten by older guest bytes
+ * afterwards. The three functions below are what makes that a property of the back end rather
+ * than of every caller: a failed publication is retried exactly once, and a publication that
+ * fails twice stops the back end, which then leaves guest memory at the last frame it did
+ * publish. */
+
+/* The coherence stop. The back end cannot publish a frame, so it stops publishing: a stopped
+ * back end leaves guest memory at its last published frame, and the executor's CPU path must
+ * not write guest framebuffer memory on top of it (nv2a_backend.h's `stopped`). Idempotent:
+ * once the latch is set the line is not printed again and `g.fails` is not touched, so a
+ * second boundary reaching the same state says nothing new. Nothing is freed, reset, submitted
+ * or destroyed here -- the ring and every live target stay exactly as they are. */
+static void vb_stop(const char *why)
 {
-    vb_targets_flush(&t, 1);
+    if (g.failed)
+        return;
+    fprintf(stderr, "[GPUVK] %s; the Vulkan back end stops publishing; guest memory keeps"
+                    " its last published frame\n", why);
+    fflush(stderr);
+    g.ok = 0;
+    g.failed = 1;
+    /* The stop's own state, once: the periodic [GPUVK] line is printed on the way out of a
+     * SUCCESSFUL flip, and every flip after this one returns at `if (!g.ok)`, so without this
+     * the `readback_incomplete` this very stop just counted would never reach a report line.
+     * No counter's meaning changes -- this only reads them, in a state where nothing can be
+     * submitted or published. */
+    vb_stats(1);
+}
+
+/* Bounded recovery for a failed publication: refresh the ring, then report whether the back
+ * end can still publish. Called only on a failure path. Submits the abandoned batch's harmless
+ * partial recording (staging writes only, never guest memory) and resets every slot's
+ * descriptor pool and stream after its fence, so the next attempt records into a slot the GPU
+ * is done with. Returns 0 once the back end is stopped: a failed wait, submit or begin has
+ * already been latched and nothing more may be recorded. */
+static int vb_readback_recover(void)
+{
+    if (!g.ok)
+        return 0;
+    vb_slot_submit();
+    vb_drain();
+    return g.ok;
+}
+
+/* The coherence boundary's entry point. Publishes the dirty targets of `ts`; on a failure it
+ * recovers the ring and retries EXACTLY ONCE. Nothing is ever published twice: an abandoned
+ * batch publishes nothing, so the retry is the only publication for those targets. A target
+ * still dirty after the retry is counted as left unpublished (`readback_incomplete`) and the
+ * caller must stop the back end. */
+static int vb_targets_flush_recover(VbTarget **ts, unsigned n)
+{
+    unsigned i;
+
+    if (vb_targets_flush(ts, n))
+        return 1;                       /* published */
+    if (vb_readback_recover() && vb_targets_flush(ts, n))
+        return 1;                       /* ONE bounded retry published it */
+    for (i = 0; i < n; i++)
+        if (ts[i]->dirty)
+            g.st.readback_incomplete++;
+    return 0;
 }
 
 /* Bring the GPU copy up to date with guest memory if a flip made it stale. */
@@ -2004,6 +2102,9 @@ static VbTarget *vb_target_for(const Nv2aSurface *s)
     uint32_t bpp = s->bytes_per_pixel, w, h, i;
     VbTarget *t = NULL, *lru = NULL;
 
+    if (!g.ok)                          /* the back end is stopped: nothing new may be made, and
+                                         * no target may be released or reshaped */
+        return NULL;
     if ((bpp != 2 && bpp != 4) || !s->color_va || !s->pitch || !s->width || !s->height)
         return NULL;
     w = s->pitch / bpp;
@@ -2031,12 +2132,21 @@ static VbTarget *vb_target_for(const Nv2aSurface *s)
         /* Same address, new shape: keep the taller backing, rebuilt from guest memory. */
         if (t->pitch == s->pitch && t->bpp == bpp && t->h > h)
             h = t->h;
-        vb_target_flush(t);
+        /* The target's newer image must be published BEFORE it is released or reshaped:
+         * a release here would drop the only copy of pixels guest memory never got. */
+        if (!vb_targets_flush_recover(&t, 1)) {
+            vb_stop("a target replacement could not publish its target");
+            return NULL;
+        }
         vb_target_release(t);
     } else {
         t = lru;
         if (t->used) {
-            vb_target_flush(t);
+            /* Same for an LRU eviction: the victim's unpublished image must land first. */
+            if (!vb_targets_flush_recover(&t, 1)) {
+                vb_stop("a target replacement could not publish its target");
+                return NULL;
+            }
             vb_target_release(t);
         }
     }
@@ -2243,6 +2353,9 @@ static VkImageView vb_texture(const Nv2aTexture *tx, VbTarget *out, VkImageLayou
         if (!vb_tex_aliases(tx, t))
             continue;
         vb_target_load(t);
+        if (!g.ok)                      /* the load froze: the target's pixels are not in guest
+                                         * memory, so nothing may be sampled from it */
+            return VK_NULL_HANDLE;
         g.st.rt_aliases++;
         *inv_w = 1.0f / (float)t->w;
         *inv_h = 1.0f / (float)t->h;
@@ -2281,8 +2394,15 @@ static VkImageView vb_texture(const Nv2aTexture *tx, VbTarget *out, VkImageLayou
     for (i = 0; i < VB_MAX_TARGETS; i++) {
         VbTarget *t = &g.targets[i];
         uint64_t lo = t->va, hi = (uint64_t)t->va + (uint64_t)t->pitch * t->h;
-        if (t->used && t->dirty && lo < (uint64_t)tx->offset + span && tx->offset < hi)
-            vb_target_flush(t);
+        if (t->used && t->dirty && lo < (uint64_t)tx->offset + span && tx->offset < hi) {
+            /* Every publication boundary: the flush, its one bounded retry, and the stop if
+             * even that fails. Decoding now would read stale guest bytes and cache them as
+             * the texture, so a failure here returns without decoding anything. */
+            if (!vb_targets_flush_recover(&t, 1)) {
+                vb_stop("a guest-memory texture could not be published first");
+                return VK_NULL_HANDLE;
+            }
+        }
     }
     if (!g.ok)                          /* one of those flushes found the wait failed */
         return VK_NULL_HANDLE;
@@ -3166,7 +3286,8 @@ static void vb_stats(int force)
                     " validation_warnings=%llu vsh_hits=%llu vsh_misses=%llu"
                     " vsh_identity_fail=%llu vsh_declines=%llu vsh_tris=%llu"
                     " vsh_const_uploads=%llu rb_batches=%llu rb_packs=%llu rb_pixels=%llu"
-                    " rb_copies=%llu rb_bytes=%llu rb_publish_ms=%.1f rb_wait_ms=%.1f\n",
+                    " rb_copies=%llu rb_bytes=%llu rb_publish_ms=%.1f rb_wait_ms=%.1f"
+                    " rb_incomplete=%llu\n",
             g.frame, (unsigned long long)g.st.draws, (unsigned long long)g.st.tris,
             (unsigned long long)g.st.clears, (unsigned long long)g.st.tex_uploads,
             (unsigned long long)g.st.tex_hits, (unsigned long long)g.st.tex_undecodable,
@@ -3189,12 +3310,18 @@ static void vb_stats(int force)
             (unsigned long long)g.st.readback_pixels,
             (unsigned long long)g.st.readback_copies,
             (unsigned long long)g.st.readback_bytes,
-            (double)g.st.readback_publish_ns / 1e6, (double)g.st.readback_wait_ns / 1e6);
+            (double)g.st.readback_publish_ns / 1e6, (double)g.st.readback_wait_ns / 1e6,
+            (unsigned long long)g.st.readback_incomplete);
     fflush(stderr);
 }
 
 /* End of frame: every target drawn since the last flip goes back to guest
- * memory, and every target reloads from guest memory on its next use. */
+ * memory, and every target reloads from guest memory on its next use.
+ *
+ * This is the frame's coherence boundary. A flip that cannot publish every dirty target stops
+ * the back end instead of moving on: no target is marked stale and g.frame is not advanced, so
+ * no later vb_target_load can upload older guest bytes over a target whose newer pixels were
+ * never published. Frames only advance over guest memory that really holds them. */
 static void vb_flip(void)
 {
     VbTarget *ts[VB_MAX_TARGETS];
@@ -3205,9 +3332,10 @@ static void vb_flip(void)
     for (i = 0; i < VB_MAX_TARGETS; i++)
         if (g.targets[i].used)
             ts[n++] = &g.targets[i];
-    vb_targets_flush(ts, n);
-    if (!g.ok)
-        return;
+    if (!vb_targets_flush_recover(ts, n)) {
+        vb_stop("the flip could not publish every dirty target");
+        return;                     /* NO stale marking, NO frame++, NO submit/drain */
+    }
     /* Whatever else was recorded goes out too, so a frame never lingers unpublished. */
     vb_slot_submit();
     vb_drain();
@@ -3792,7 +3920,17 @@ static int vb_create_defaults(void)
     return 0;
 }
 
-static const Nv2aBackend s_vk_backend = { vb_clear, vb_draw, vb_flip, vb_draw_program };
+/* The executor's CPU-consumer gate (nv2a_backend.h): 1 once this back end can no longer
+ * publish a frame, so no CPU path may write guest framebuffer memory on top of the last frame
+ * it did publish, and guest memory must not be presented as a new frame. Read-only, executor
+ * thread, and write-once per process: a back end that reports it stays stopped. */
+static int vb_stopped(void)
+{
+    return g.failed || !g.ok;
+}
+
+static const Nv2aBackend s_vk_backend = { vb_clear, vb_draw, vb_flip, vb_draw_program,
+                                          vb_stopped };
 
 void nv2a_vk_backend_program_stats(Nv2aVkProgramStats *out)
 {
@@ -3834,6 +3972,7 @@ void nv2a_vk_backend_readback_stats(Nv2aVkReadbackStats *out)
     out->bytes = g.st.readback_bytes;
     out->wait_ns = g.st.readback_wait_ns;
     out->publish_ns = g.st.readback_publish_ns;
+    out->incomplete = g.st.readback_incomplete;
 }
 
 int nv2a_vk_backend_install(void)
