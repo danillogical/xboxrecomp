@@ -82,9 +82,12 @@
  *     or submitted, no target is marked stale and the frame counter does not advance.
  *     From then on the back end publishes nothing and the executor's CPU path stops
  *     consuming guest framebuffer memory through the backend's `stopped` entry
- *     (nv2a_backend.h), so GUEST MEMORY KEEPS THE LAST FRAME THE BACK END PUBLISHED --
- *     no older guest bytes are ever uploaded over a target whose newer pixels were not
- *     published, and no CPU rasterisation or present is allowed to supersede them.
+ *     (nv2a_backend.h), so guest memory KEEPS THE LAST BYTES PUBLISHED FOR EACH TARGET
+ *     RECTANGLE -- no older guest bytes are ever uploaded over a target whose newer pixels
+ *     were not published, and no CPU rasterisation or present is allowed to supersede them.
+ *     A flush publishes batch by batch, so an earlier batch may have published before a
+ *     later one failed: the stop preserves the targets never published, and it is not
+ *     whole-frame atomicity.
  *     This is the whole N4.2 coherence rule; the D3D11 back end never stops.
  *
  * Everything runs on the executor's thread, one call at a time.
@@ -408,7 +411,7 @@ typedef struct {
      * after the flush and its one bounded retry both failed. Counted only there, never by
      * vb_targets_flush itself: the direct-call gate compares the publication counters across a
      * failed call. Nonzero means a boundary stopped the back end, so no later load or texture
-     * decode can overwrite the unpublished image with older guest bytes. */
+     * decode can overwrite the unpublished targets with older guest bytes. */
     uint64_t readback_incomplete;
     /* The submission ring (see the file header): submissions issued without waiting for the
      * ones before them, and the fence waits the ring did perform. Deciding instrumentation for
@@ -774,7 +777,7 @@ static int vb_slot_wait(unsigned i)
     if (r != VK_SUCCESS) {
         vb_fail(r == VK_TIMEOUT ? "submission wait (10 s timeout)" : "submission wait", r);
         fprintf(stderr, "[GPUVK] the Vulkan back end stops drawing; guest memory keeps "
-                        "its last published frame\n");
+                        "the last bytes it published for each target rectangle\n");
         fflush(stderr);
         g.ok = 0;
         g.failed = 1;                   /* write-once: no slot is recordable from here on */
@@ -818,7 +821,7 @@ static void vb_slot_submit(void)
     if (r != VK_SUCCESS) {
         vb_fail("submission", r);
         fprintf(stderr, "[GPUVK] the Vulkan back end stops drawing; guest memory keeps "
-                        "its last published frame\n");
+                        "the last bytes it published for each target rectangle\n");
         fflush(stderr);
         s->recording = 0;
         g.ok = 0;
@@ -1859,7 +1862,13 @@ static int vb_targets_flush(VbTarget **ts, unsigned n)
              * publish nothing. Every staged target of this group keeps its dirty flag and is
              * retried by the next flush. What was recorded so far stays in the recording slot
              * and is submitted with the next submission the back end makes; the host never
-             * reads the staging buffer for it. */
+             * reads the staging buffer for it. Order it all the same: the next group's slices
+             * start at offset 0 again, so its copies of the 4-byte targets -- and the pack
+             * kernel's writes of its 16-bit ones -- write the same staging bytes (the
+             * host-visible slice buffer and the device-local pack buffer) as this group's
+             * recorded copies did, and the HOST_READ barrier that publishes that next group
+             * comes after both writes and so cannot order them against each other. */
+            vb_barrier();
             i = j;
             continue;
         }
@@ -1940,12 +1949,18 @@ static int vb_targets_flush(VbTarget **ts, unsigned n)
  * whose newer pixels could not be published must never be overwritten by older guest bytes
  * afterwards. The three functions below are what makes that a property of the back end rather
  * than of every caller: a failed publication is retried exactly once, and a publication that
- * fails twice stops the back end, which then leaves guest memory at the last frame it did
- * publish. */
+ * fails twice stops the back end, which then publishes nothing more: guest memory keeps the
+ * last bytes published for each target rectangle, and the targets never published keep the
+ * newer pixels no CPU path may overwrite. A flush publishes batch by batch, so an earlier
+ * batch may have published before a later one fails: the stop is per target, not a whole-frame
+ * transaction. */
 
 /* The coherence stop. The back end cannot publish a frame, so it stops publishing: a stopped
- * back end leaves guest memory at its last published frame, and the executor's CPU path must
- * not write guest framebuffer memory on top of it (nv2a_backend.h's `stopped`). Idempotent:
+ * back end leaves guest memory holding the last bytes published for each target rectangle, and
+ * the executor's CPU path must not write guest framebuffer memory on top of them
+ * (nv2a_backend.h's `stopped`). An earlier batch of the same flush may already have published,
+ * so the stop preserves the targets that were never published and is not whole-frame
+ * atomicity. Idempotent:
  * once the latch is set the line is not printed again and `g.fails` is not touched, so a
  * second boundary reaching the same state says nothing new. Nothing is freed, reset, submitted
  * or destroyed here -- the ring and every live target stay exactly as they are. */
@@ -1954,7 +1969,7 @@ static void vb_stop(const char *why)
     if (g.failed)
         return;
     fprintf(stderr, "[GPUVK] %s; the Vulkan back end stops publishing; guest memory keeps"
-                    " its last published frame\n", why);
+                    " the last bytes published for each target rectangle\n", why);
     fflush(stderr);
     g.ok = 0;
     g.failed = 1;
@@ -3921,9 +3936,10 @@ static int vb_create_defaults(void)
 }
 
 /* The executor's CPU-consumer gate (nv2a_backend.h): 1 once this back end can no longer
- * publish a frame, so no CPU path may write guest framebuffer memory on top of the last frame
- * it did publish, and guest memory must not be presented as a new frame. Read-only, executor
- * thread, and write-once per process: a back end that reports it stays stopped. */
+ * publish a frame, so no CPU path may write guest framebuffer memory on top of the bytes it
+ * published last for a target rectangle, and guest memory must not be presented as a new
+ * frame. Read-only, executor thread, and write-once per process: a back end that reports it
+ * stays stopped. */
 static int vb_stopped(void)
 {
     return g.failed || !g.ok;

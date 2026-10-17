@@ -149,10 +149,12 @@ typedef struct {
     int (*draw_program)(const Nv2aSurface *s, const Nv2aBatch *b, const Nv2aProgramBatch *p);
     /* Optional (NULL: this back end never stops publishing). Returns 1 once the back end can no
      * longer publish a frame: it could not write a frame's render targets into guest memory, so
-     * guest memory still holds the last frame it did publish. A caller that sees this must not
-     * rasterise a batch itself (the CPU path writes guest memory that the back end's unpublished
-     * frame supersedes) and must not present guest memory as a new frame. Read-only, same thread;
-     * a back end that reports it stays stopped. */
+     * guest memory still holds the last bytes it published for each target rectangle. A caller
+     * that sees this must not rasterise a batch itself (the CPU path writes guest memory that
+     * the back end's unpublished targets supersede) and must not present guest memory as a new
+     * frame. A partial publication is possible: batches that were published before the failing
+     * one are already in guest memory, so this is per target, not whole-frame atomicity.
+     * Read-only, same thread; a back end that reports it stays stopped. */
     int (*stopped)(void);
 } Nv2aBackend;
 

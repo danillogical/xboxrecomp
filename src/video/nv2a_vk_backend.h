@@ -12,11 +12,14 @@
  * and the dirty targets still unpublished after that are counted as
  * Nv2aVkReadbackStats.incomplete. A boundary that cannot publish at all stops the
  * back end: it publishes nothing more, presents nothing as a new frame, and leaves
- * GUEST MEMORY AT THE LAST FRAME IT DID PUBLISH -- the unpublished newer image is
- * never overwritten by older guest bytes, and no later load, texture decode or CPU
- * rasterisation may supersede it. A stopped back end reports that through the
- * executor's optional `stopped` entry (kernel/nv2a_backend.h), which is what makes
- * the executor's CPU paths stop writing guest framebuffer memory. The D3D11 back
+ * guest memory holding the last bytes published for each target rectangle -- the
+ * unpublished newer targets are never overwritten by older guest bytes, and no later
+ * load, texture decode or CPU rasterisation may supersede them. A flush publishes
+ * batch by batch, so an earlier batch may have published before a later one failed:
+ * the stop preserves the targets that were never published, and it is not whole-frame
+ * atomicity. A stopped back end reports that through the executor's optional
+ * `stopped` entry (kernel/nv2a_backend.h), which is what makes the executor's CPU
+ * paths stop writing guest framebuffer memory. The D3D11 back
  * end never stops.
  *
  * Built only when CMake finds Vulkan and its shader tools (XBR_VULKAN_FOUND);
@@ -145,7 +148,7 @@ void nv2a_vk_backend_ring_stats(Nv2aVkRingStats *out);
  * boundary (the flip, a target release, a texture that reads guest memory a target
  * overwrote) had to leave unpublished after the flush and its one bounded retry both failed.
  * Counting one stops the back end: it publishes nothing more, and guest memory keeps the last
- * frame it did publish. 0 in any run whose frames all published. */
+ * bytes published for each target rectangle. 0 in any run whose frames all published. */
 typedef struct {
     uint64_t readbacks;      /* targets whose dirty rectangle was published to guest memory */
     uint64_t batches;        /* published batches: one submission and one fence wait each */

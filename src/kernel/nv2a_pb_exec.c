@@ -1256,10 +1256,11 @@ const Nv2aBackend *nv2a_backend_current(void)
  * carries no `stopped` entry (nv2a_backend.h: a back end that never stops publishing leaves
  * it NULL).
  *
- * This is the CPU-consumer gate. Guest memory holds the last frame the back end DID publish,
- * so while this is true no CPU path in this file may write guest framebuffer memory -- the
- * back end's unpublished newer frame supersedes anything the CPU would put there -- and no
- * guest-memory frame may be presented as new. Read-only, executor thread. */
+ * This is the CPU-consumer gate. Guest memory holds the bytes the back end published last for
+ * each target rectangle -- a stopped back end may have published some of a flush's batches
+ * before a later one failed -- so while this is true no CPU path in this file may write guest
+ * framebuffer memory (the back end's unpublished targets supersede anything the CPU would put
+ * there) and no guest-memory frame may be presented as new. Read-only, executor thread. */
 static int backend_stopped(void)
 {
     return s_backend && s_backend->stopped && s_backend->stopped();
@@ -1561,10 +1562,10 @@ static void clear_surface(uint32_t param)
     uint32_t bpp = surface_bpp();
     uint32_t y, x;
 
-    /* A stopped back end could not publish its newest frame, so guest memory still holds the
-     * last frame it did publish. Clearing here would replace those published pixels with a
-     * frame that nothing published, while the back end's own unpublished frame supersedes
-     * them: no clear runs and none is counted. */
+    /* A stopped back end could not publish all of its newest frame, so guest memory still
+     * holds the last bytes it published for each target rectangle. Clearing here would replace
+     * those published pixels with bytes that nothing published, while the back end's own
+     * unpublished targets supersede them: no clear runs and none is counted. */
     if (backend_stopped())
         return;
 
@@ -3929,9 +3930,10 @@ static void raster_batch(void)
 
     /* The CPU-consumer gate (nv2a_backend.h's `stopped`). This function and everything under it
      * -- raster_batch_program's fallback and raster_batch_screen's raster_tri -- fills the
-     * guest framebuffer directly. A stopped back end could not publish its newest frame, so
-     * guest memory holds the last frame it DID publish; rasterising here would overwrite those
-     * bytes with a frame nothing published. Nothing is drawn, counted or traced. */
+     * guest framebuffer directly. A stopped back end could not publish all of its newest frame,
+     * so guest memory holds the last bytes it published for each target rectangle; rasterising
+     * here would overwrite those bytes with pixels nothing published. Nothing is drawn, counted
+     * or traced. */
     if (backend_stopped())
         return;
     if (s_gpu.idx_count < 3)
@@ -4946,10 +4948,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         if (s_backend && s_backend->flip)
             s_backend->flip();
         /* The back end's swap just finished recording, so the question "can it still publish
-         * a frame?" is answered for this frame. A stopped back end leaves guest memory at the
-         * last frame it DID publish; consuming guest memory as this frame's picture would show
-         * (and dump) the wrong frame. One bounded line, once per process: this is a per-flip
-         * path, and a title flips thousands of times. */
+         * a frame?" is answered for this frame. A stopped back end leaves guest memory holding
+         * the last bytes it published for each target rectangle -- a mixture, possibly, of this
+         * frame's published targets and the previous frame's -- so consuming guest memory as
+         * this frame's picture would show (and dump) the wrong pixels. One bounded line, once
+         * per process: this is a per-flip path, and a title flips thousands of times. */
         stopped = backend_stopped();
         if (stopped) {
             static int said;
@@ -4971,9 +4974,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * and it continues whatever the back end did (`stopped` above): the guest's swap still
          * completes, so no guest path hangs waiting on it. Only the HOST's consumption of guest
          * memory stops: the window copy, the present-hash trace inside it (`trace_flip`) and the
-         * frame dump below, because guest memory holds the last frame the back end published, not
-         * this one. The `[FTRACE] FLIP_STALL presenting ...` line above keeps printing: it is a
-         * log line that reads no guest memory. */
+         * frame dump below, because guest memory holds the last bytes the back end published for
+         * each target rectangle, not this frame. The `[FTRACE] FLIP_STALL presenting ...` line
+         * above keeps printing: it is a log line that reads no guest memory. */
         s_gpu.flip_read = s_gpu.flip_write;
         /* A stall is a completed swap, but it is NOT a FLIP_INCREMENT_WRITE:
          * it does not advance the write buffer, so it must not be counted in
@@ -5385,8 +5388,8 @@ void nv2a_pb_exec_report(void)
      * times a second and nobody wants that many files.
      *
      * A diagnostic dump, not a presentation, so it still reads guest memory after a stop: a
-     * stopped back end makes it dump the LAST frame the back end published, deliberately,
-     * because that is the only frame guest memory holds. */
+     * stopped back end makes it dump the bytes the back end published last for each target
+     * rectangle, deliberately, because those are all that guest memory holds. */
     if (!s_flip_dumping)
         dump_surface_bmp();
 
