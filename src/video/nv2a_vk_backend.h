@@ -163,6 +163,67 @@ typedef struct {
 
 void nv2a_vk_backend_readback_stats(Nv2aVkReadbackStats *out);
 
+/* What device memory the back end holds and how it got it (plan N4.4). One vkAllocateMemory
+ * makes a BLOCK and every pooled resource takes a RANGE out of it (VbAlloc: one memory handle,
+ * a binding offset, a size), so `alloc_calls` is what the pooling actually saved: it is the
+ * number of vkAllocateMemory calls made for a run that used to make one per resource. Pools are
+ * keyed by (memoryTypeIndex, kind) -- an image is optimal tiling, a buffer is linear -- so an
+ * image and a buffer never share a block, which is why bufferImageGranularity can never apply
+ * between two neighbouring ranges.
+ *
+ * A DEDICATED allocation (pool -1, taken at offset 0) is the exception, and every reason it was
+ * taken is counted separately: `dedicated_required` and `dedicated_prefer` (the object's
+ * VkMemoryDedicatedRequirements, from the optional *_MemoryRequirements2 queries),
+ * `dedicated_oversize` (a range over VB_POOL_MAX_BLOCK), `dedicated_noroom` (a pool at its
+ * block or reserve budget, or every pool slot in use) and `dedicated_nohost` (a request whose
+ * SELECTED memory type is host-visible without HOST_COHERENT). The last one is conservative on
+ * purpose: a pooled host-visible block is mapped as a whole, so one range of it could not be
+ * flushed or invalidated without touching the live ranges beside it, which rules pooling out
+ * for such a type -- including for a request that never asked for host visibility, a
+ * device-local image say, when that is the type its requirements select. `fallbacks` counts
+ * the pool blocks that could not be made at all, each of which fell back once to a dedicated
+ * allocation. `dedicated` counts all of them together.
+ *
+ * Lifetime: `released` counts the ranges given back, `parked` those a recording or a pending
+ * submission was still able to read, `parked_peak` the most of them held at once and
+ * `parked_lost` those a full park list had to abandon (never handed out again, never freed --
+ * the one leak this allocator can have). `reuse_hits` are the ranges taken from a block's free
+ * list rather than its bump cursor; `blocks_retired` are the empty blocks given back to the
+ * driver. `first_shared_block`/`first_shared_block_kind` and `first_reuse_off`/
+ * `first_reuse_block` are write-once latches of the first block with two live ranges in it (the
+ * pool's index, and 0 for a linear pool/1 for an optimal-tiling one) and the first reused range
+ * (its offset in its block, and the block's index), so the deciding event survives even when
+ * the counters that describe it are only rates; unset is ~0 for the block fields.
+ *
+ * The byte fields are live values, derived from the pools when this is called: what they
+ * reserve (`reserved_bytes`), what is handed out (`used_bytes`, with `dedicated_bytes` of that
+ * being whole dedicated allocations), what is free (`free_bytes`, `largest_free`), what
+ * alignment wasted (`padding_bytes`) and the allocator's own bookkeeping (`metadata_bytes`,
+ * honestly the arrays it really keeps, not an estimate). `peak_used` is the high-water mark of
+ * `used_bytes`. Same threading contract as the rest of the back end: read it on the executor
+ * thread, or from a single-threaded fixture with no concurrent submission. */
+typedef struct {
+    uint64_t pools;               /* pools in use */
+    uint64_t blocks;              /* pool blocks created (one vkAllocateMemory each) */
+    uint64_t blocks_retired;
+    uint64_t ranges;              /* ranges handed out of blocks */
+    uint64_t reuse_hits;          /* of those, taken from a free range, not the bump */
+    uint64_t dedicated;           /* dedicated allocations, all reasons */
+    uint64_t dedicated_required, dedicated_prefer, dedicated_oversize;
+    uint64_t dedicated_noroom, dedicated_nohost;
+    uint64_t alloc_calls;         /* vkAllocateMemory calls the allocator made */
+    uint64_t released;            /* ranges given back */
+    uint64_t parked, parked_peak, parked_lost;
+    uint64_t reserved_bytes, used_bytes, free_bytes, largest_free, padding_bytes;
+    uint64_t metadata_bytes;      /* the allocator's own bookkeeping, honestly counted */
+    uint64_t dedicated_bytes, peak_used;
+    uint64_t alloc_failures, bind_failures, map_failures, rollbacks, fallbacks;
+    uint32_t first_shared_block, first_shared_block_kind;  /* write-once: >= 2 live ranges in one block */
+    uint64_t first_reuse_off, first_reuse_block;           /* write-once: a range reused; ~0 = none */
+} Nv2aVkMemoryStats;
+
+void nv2a_vk_backend_memory_stats(Nv2aVkMemoryStats *out);
+
 #ifdef __cplusplus
 }
 #endif

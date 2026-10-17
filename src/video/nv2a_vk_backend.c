@@ -73,8 +73,57 @@
  *     command later in submission order -- that is what makes cross-submission
  *     ordering defined (Vulkan defines no implicit execution or memory dependency
  *     between submissions), including blending into one target from two submissions.
- *     Still to come (plan N4): sub-allocated memory, and a persisted
- *     VkPipelineCache.
+ *     Still to come (plan N4): a persisted VkPipelineCache.
+ *
+ *   - Device memory is SUB-ALLOCATED (plan N4.4). One vkAllocateMemory makes a BLOCK and
+ *     every pooled resource takes a RANGE out of it, bound at the range's own offset
+ *     (VbAlloc carries mem/off/size; a dedicated allocation owns its whole allocation and
+ *     has pool -1, block -1, off 0). Pools are keyed by (memoryTypeIndex, nonlinear), so
+ *     an image and a buffer never share a block -- which is why
+ *     VkPhysicalDeviceLimits::bufferImageGranularity can never apply between two
+ *     neighbouring ranges here: every neighbour of an image range is another image range
+ *     and every neighbour of a buffer range is another buffer range. Inside a block a
+ *     bounded bump cursor hands out fresh ranges and a bounded, coalescing free list hands
+ *     back returned ones; a range's offset is aligned to the requirements' alignment and
+ *     at least VB_POOL_ALIGN, two live ranges never overlap, and a block is never asked
+ *     for more than VB_POOL_MAX_BLOCK or a pool for more than VB_POOL_RESERVE.
+ *
+ *     DEDICATED allocations are the exception, each reason counted separately in
+ *     Nv2aVkMemoryStats (nv2a_vk_backend_memory_stats; the periodic [GPUVK] line carries
+ *     the same counters): an object that requires or prefers a dedicated allocation
+ *     (VkMemoryDedicatedRequirements, through the OPTIONAL
+ *     vkGetImageMemoryRequirements2/vkGetBufferMemoryRequirements2 lookups -- an absent
+ *     entrypoint means "not available", and the request is pooled), a range over
+ *     VB_POOL_MAX_BLOCK, a pool at its block or reserve budget, no free pool slot, and a
+ *     request whose selected memory type is host-visible WITHOUT coherence (the rule is on
+ *     the selected type, so it can also catch a request that never asked for host visibility,
+ *     a device-local image say: conservative on purpose, because a pooled host-visible block
+ *     is mapped as a whole and one range of it could not be flushed or invalidated without
+ *     touching the live ranges beside it). A pool block that cannot be made falls back
+ *     ONCE to a dedicated allocation, and fails if that fails too.
+ *
+ *     COHERENCE and lifetime: pooled host-visible memory is coherent, and a flush of it
+ *     would be a no-op, so vb_mem_flush skips one. The coherence calls the back end really
+ *     makes are: one flush of the recording slot's stream before the submission that reads
+ *     it (a no-op while that range is coherent, and the boundary when it is not), and one
+ *     invalidate of the readback staging buffer's range before each published batch reads it
+ *     -- issued for coherent memory too, which is what the publication always did and is
+ *     legal, the atom rule below binding only a type that is not host-coherent. Both helpers
+ *     clip to the range they are given -- never a neighbouring live range of the same block --
+ *     and widen to whole VkPhysicalDeviceLimits::nonCoherentAtomSize atoms when the type is
+ *     not coherent. A range whose release happens while something could still read it is
+ *     PARKED: while g.slots[g.cur].recording || g.npending, vb_mem_give puts the range on
+ *     the bounded s_pool_pending[] list (counted `parked`) and vb_pool_gc folds it back
+ *     only after the ring has drained; a full park list parks it permanently
+ *     (`parked_lost`, never handed out again), which is also why a parked range keeps its
+ *     block's `used` bytes and a block holding one can never be retired. A pool keeps at
+ *     most one empty block, and only one no larger than VB_POOL_KEEP_EMPTY (the size class
+ *     the sizing rule makes for small and mid ranges); every other empty block is retired
+ *     (vkFreeMemory) by vb_pool_gc, which vb_garbage_drain calls after every fence wait, and
+ *     by a pool that needs a block while it is at VB_POOL_BLOCKS. A failed allocate, bind or
+ *     map releases exactly what it took (counted `rollbacks`) and leaves the caller's
+ *     failure path to destroy the object: no dangling VbAlloc, no double release, and no
+ *     resource is usable after a failure.
  *
  *   - The readback's publication is one bounded batch per submission: every dirty
  *     target's slice lands in a staging buffer at a 4-byte-aligned offset, the
@@ -138,6 +187,13 @@ void nv2a_vk_backend_ring_stats(Nv2aVkRingStats *out)
 /* No Vulkan, so nothing is ever published here: the executor's CPU path keeps
  * writing guest memory itself. */
 void nv2a_vk_backend_readback_stats(Nv2aVkReadbackStats *out)
+{
+    if (out)
+        memset(out, 0, sizeof *out);
+}
+
+/* No Vulkan, so no device memory was ever allocated: every counter is 0. */
+void nv2a_vk_backend_memory_stats(Nv2aVkMemoryStats *out)
 {
     if (out)
         memset(out, 0, sizeof *out);
@@ -240,7 +296,7 @@ typedef char vb_vertex_is_28_bytes[sizeof(Nv2aVertex) == 28 ? 1 : -1];
     X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkResetCommandBuffer) X(vkQueueSubmit) \
     X(vkCreateFence) X(vkWaitForFences) X(vkResetFences) \
     X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) \
-    X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) X(vkInvalidateMappedMemoryRanges) \
+    X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) \
     X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements) X(vkBindImageMemory) \
     X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) \
     X(vkCreateRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer) \
@@ -266,7 +322,81 @@ VB_INSTANCE_FNS(VB_DECLARE)
 VB_DEVICE_FNS(VB_DECLARE)
 static PFN_vkCreateDebugUtilsMessengerEXT vkCreateDebugUtilsMessengerEXT;
 
+/* OPTIONAL device entrypoints (plan N4.4). Their absence is never a reason to fail the
+ * install; it only changes what the memory allocator may use.
+ *   - vkGetImageMemoryRequirements2 / vkGetBufferMemoryRequirements2 report
+ *     VkMemoryDedicatedRequirements. NULL means "not available": the resource's plain
+ *     requirements are used and the request is pooled, counted once like any other pool
+ *     range (there is no separate counter for it).
+ *   - vkFlushMappedMemoryRanges / vkInvalidateMappedMemoryRanges are the coherence
+ *     boundary of a range the device and the host both touch. NULL makes that boundary
+ *     fail instead of lying about a non-coherent range.
+ *   - vkUnmapMemory drops a retired host-visible block's mapping. NULL leaves the block
+ *     mapped; nothing is unmapped while a range of it may still live. */
+static PFN_vkGetImageMemoryRequirements2 vkGetImageMemoryRequirements2;
+static PFN_vkGetBufferMemoryRequirements2 vkGetBufferMemoryRequirements2;
+static PFN_vkFlushMappedMemoryRanges vkFlushMappedMemoryRanges;
+static PFN_vkInvalidateMappedMemoryRanges vkInvalidateMappedMemoryRanges;
+static PFN_vkUnmapMemory vkUnmapMemory;
+
 /* ── State ───────────────────────────────────────────────────────────── */
+
+/* The sub-allocator's bounds (plan N4.4). The pools live in `g` (g.pools) and their
+ * implementation is the memory section below; these are here because VbPool is sized by
+ * them and the resource structs below hold a VbAlloc. */
+#define VB_POOLS          6        /* distinct (memoryTypeIndex, kind) pools one device may use */
+#define VB_POOL_BLOCKS    6        /* blocks one pool may hold */
+#define VB_POOL_FREE_MAX  32       /* free ranges one block tracks */
+#define VB_POOL_MIN_BLOCK (1u << 20)
+#define VB_POOL_MAX_BLOCK (64u << 20)   /* a single pooled range may not exceed this */
+#define VB_POOL_SHARE_MAX (8u << 20)    /* a range with a block up to this size gets four times it */
+#define VB_POOL_RESERVE   (256u << 20)  /* bytes one pool may reserve in total */
+#define VB_POOL_PENDING   64       /* range releases parked until the ring is idle */
+#define VB_POOL_ALIGN     256u     /* every pooled range's offset is a multiple of this */
+#define VB_POOL_KEEP_EMPTY (4u << 20)   /* at most one empty block per pool, and only one no
+                                         * larger than this -- the size class the sizing rule
+                                         * makes for small and mid ranges, so a pool that churns
+                                         * keeps one block to reuse instead of freeing it */
+
+typedef struct { VkDeviceSize off, size; } VbFreeRange;
+
+typedef struct {
+    VkDeviceMemory mem;
+    VkDeviceSize size;                 /* the block's whole size */
+    VkDeviceSize bump;                 /* high-water mark of the bump allocator */
+    VkDeviceSize used;                 /* live bytes handed out (not returned) */
+    VkDeviceSize padding;              /* bytes this block spent aligning ranges */
+    uint8_t *map;                      /* host-visible blocks: the whole block, mapped once */
+    VbFreeRange free_list[VB_POOL_FREE_MAX];
+    unsigned nfree;
+} VbBlock;
+
+typedef struct {
+    int used;
+    uint32_t type_index;
+    int nonlinear;                     /* 1: images (optimal tiling); 0: linear buffers */
+    VbBlock blocks[VB_POOL_BLOCKS];
+    unsigned nblocks;
+    /* `used` above is the pool's in-use flag (a C struct cannot have both); these are the
+     * pool's byte counters: bytes its blocks reserve, live bytes handed out of them and the
+     * padding they spent aligning ranges. */
+    uint64_t reserved, live, padding;
+    uint64_t ranges, reuse_hits;
+} VbPool;
+
+/* The memory one resource owns. A pooled allocation names the block and the range inside it;
+ * a dedicated allocation owns the whole allocation and has pool == -1, block == -1, off == 0.
+ * `mem` (not `off`) is what tells an empty one: a zeroed VbAlloc has pool and block 0, and
+ * a pooled range's offset 0 is perfectly ordinary. */
+typedef struct {
+    VkDeviceMemory mem;   /* the object to bind: the block's memory, or the dedicated one */
+    VkDeviceSize off;     /* the binding offset */
+    VkDeviceSize size;    /* the range's size, >= the VkMemoryRequirements size */
+    int pool;             /* index into g.pools, or -1 */
+    int block;            /* index into that pool's blocks, or -1 */
+    int coherent;         /* the selected memory type has HOST_COHERENT */
+    int host_visible;     /* the selected memory type has HOST_VISIBLE */
+} VbAlloc;
 
 /* Push constants, shared by both stages; the D3D11 back end's GbConstants. */
 typedef struct { float xf[4], tx[4]; } VbConstants;
@@ -310,7 +440,7 @@ typedef char vb_rc_fin_at_512[offsetof(VbRcConstants, fin) == 512 ? 1 : -1];
 
 typedef struct {
     VkImage img;
-    VkDeviceMemory mem;
+    VbAlloc mem;
     VkImageView view;
 } VbImage;
 
@@ -371,7 +501,7 @@ typedef struct {
 typedef struct {
     VkImage img;
     VkImageView view;
-    VkDeviceMemory mem;
+    VbAlloc mem;
     VkBuffer buf;
     VkFramebuffer fb;
     VkPipeline pipe;
@@ -397,7 +527,7 @@ typedef struct {
     VkDescriptorPool dpool;
     uint32_t sets_used;
     VkBuffer stream;
-    VkDeviceMemory stream_mem;
+    VbAlloc stream_mem;
     uint8_t *stream_ptr;
     VkDeviceSize stream_off;
     VkPipeline bound_pipe;              /* the pipeline bound in this slot's recording */
@@ -487,14 +617,19 @@ static struct {
      * maps the first; the second is what the host publishes from, once the batch's fence
      * wait is behind it. */
     VkBuffer pack_buf;                  /* device-local: cs_pack writes the packed slices here */
-    VkDeviceMemory pack_mem;
+    VbAlloc pack_mem;
     VkBuffer rb_buf;                    /* host-visible: the destination of the 4-byte copies
                                          * and of one buffer copy per packed slice */
-    VkDeviceMemory rb_mem;
+    VbAlloc rb_mem;
     uint8_t *rb_ptr;
     VkDeviceSize rb_cap;                /* the pair's shared capacity, 0 until first used */
     VbImage white;                      /* bound when a draw is untextured */
     VkSampler samp[4][9];               /* [filter][addr_u*3 + addr_v], made on first use */
+    /* The sub-allocator's pools (VB_POOLS, keyed by memory type index and kind) and the
+     * device's nonCoherentAtomSize (0 or 1: no atom alignment is applied). Both are read
+     * and written only by the memory section below. */
+    VbPool pools[VB_POOLS];
+    VkDeviceSize atom;
     /* The open render pass of the RECORDING slot (closed before any submission), and the
      * pipeline bound in its recording command buffer. */
     int pass_open;
@@ -610,41 +745,760 @@ static int vb_memtype(uint32_t bits, VkMemoryPropertyFlags want)
     return -1;
 }
 
-static VkDeviceMemory vb_alloc(const VkMemoryRequirements *mr, VkMemoryPropertyFlags want,
-                               VkMemoryPropertyFlags fallback)
-{
-    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
-    VkDeviceMemory mem = VK_NULL_HANDLE;
-    int t = vb_memtype(mr->memoryTypeBits, want);
-    VkResult r;
+/* The counters Nv2aVkMemoryStats reports. The live fields of it (pools in use, reserved,
+ * used, free, largest free, padding and the allocator's own footprint) are derived from the
+ * pools at read time by nv2a_vk_backend_memory_stats; everything else is accumulated here. */
+static Nv2aVkMemoryStats s_mem;
+/* One counter the frozen public struct has no field for: the bytes of the blocks retired so
+ * far. The periodic [GPUVK] line reports it, which is where a run's evidence survives. */
+static uint64_t s_retired_bytes;
+/* Ranges released while something that could still read them was recording or in flight.
+ * vb_pool_gc folds them back into their blocks once the ring has drained; a full list parks a
+ * range permanently instead (counted parked_lost, never handed out again). */
+static VbAlloc s_pool_pending[VB_POOL_PENDING];
+static unsigned s_nparked;
 
-    if (t < 0)
-        t = vb_memtype(mr->memoryTypeBits, fallback);
-    if (t < 0) {
-        vb_fail("memory type", VK_ERROR_FEATURE_NOT_PRESENT);
-        return VK_NULL_HANDLE;
+/* Round `v` up to a multiple of `a`; 0 when the result is not representable (overflow). */
+static int vb_up(VkDeviceSize v, VkDeviceSize a, VkDeviceSize *out)
+{
+    VkDeviceSize r;
+
+    if (a <= 1) {
+        *out = v;
+        return 1;
     }
-    ai.allocationSize = mr->size;
-    ai.memoryTypeIndex = (uint32_t)t;
-    r = vkAllocateMemory(g.dev, &ai, NULL, &mem);
-    if (r != VK_SUCCESS) {
-        vb_fail("vkAllocateMemory", r);
-        return VK_NULL_HANDLE;
+    r = v % a;
+    if (!r) {
+        *out = v;
+        return 1;
     }
-    return mem;
+    if (v > (VkDeviceSize)-1 - (a - r))
+        return 0;
+    *out = v + a - r;
+    return 1;
 }
 
-/* A host-visible buffer, persistently mapped; coherent (and cached when `cached`). */
+/* a + b, or 0 on overflow. Every offset and size below goes through vb_up/vb_add: a range's
+ * end has to be representable before anything is handed out. */
+static int vb_add(VkDeviceSize a, VkDeviceSize b, VkDeviceSize *out)
+{
+    if (b > (VkDeviceSize)-1 - a)
+        return 0;
+    *out = a + b;
+    return 1;
+}
+
+/* The device's nonCoherentAtomSize; 0 or 1 means no atom alignment is required (a device that
+ * reports none, and a fixture that never set it). */
+static VkDeviceSize vb_atom(void)
+{
+    return g.atom > 1 ? g.atom : 1;
+}
+
+/* Nothing is recording and nothing is submitted-and-unwaited: the only state in which a
+ * released range may rejoin its block's free list, or a block be freed. */
+static int vb_mem_idle(void)
+{
+    return !g.slots[g.cur].recording && !g.npending;
+}
+
+/* A block nothing lives in. A range that was released but parked still counts in `used`, so a
+ * block holding one never looks empty: this is only ever true when nothing could still read
+ * the block. */
+static int vb_block_empty(const VbBlock *b)
+{
+    return b->used == 0;
+}
+
+/* The pool's live padding, recomputed from its blocks rather than accumulated: a block pads
+ * in three different places (the bump cursor's alignment skip, a free range's, and a freed
+ * range the full free list cannot record), and a recomputed sum cannot drift from the blocks
+ * it describes -- it is what makes `reserved == used + padding + free` hold per pool. */
+static void vb_pool_padding(VbPool *p)
+{
+    uint64_t sum = 0;
+    unsigned i;
+
+    for (i = 0; i < VB_POOL_BLOCKS; i++)
+        if (p->blocks[i].mem != VK_NULL_HANDLE)
+            sum += p->blocks[i].padding;
+    p->padding = sum;
+}
+
+/* Free a block nothing lives in. Its whole mapping goes first -- nothing may be unmapped
+ * while a range of it may live, and `used == 0` is exactly that -- then its memory. */
+static void vb_block_retire(VbPool *p, VbBlock *b)
+{
+    s_retired_bytes += (uint64_t)b->size;
+    s_mem.blocks_retired++;
+    if (b->map && vkUnmapMemory)
+        vkUnmapMemory(g.dev, b->mem);
+    vkFreeMemory(g.dev, b->mem, NULL);
+    if (p->reserved >= b->size)
+        p->reserved -= b->size;
+    else
+        p->reserved = 0;
+    if (p->nblocks)
+        p->nblocks--;
+    memset(b, 0, sizeof *b);
+    vb_pool_padding(p);                 /* the retired block's padding is gone with it */
+}
+
+/* How big a block this pool makes for a `need`-byte range: the request rounded up to
+ * VB_POOL_MIN_BLOCK, and -- while four times that is still at or below VB_POOL_SHARE_MAX --
+ * four times it. Never above VB_POOL_MAX_BLOCK, never below `need`, 0 when the request is not
+ * representable or is over the per-block cap at all (the caller has already sent those to a
+ * dedicated allocation of their own).
+ *
+ * The multiple is what makes the whole exercise worth anything for the resources that churn:
+ * one range per block would spend one of VB_POOL_BLOCKS block slots per resource, which is
+ * exactly the one-allocation-per-resource layout this replaces, and a small or mid range's
+ * block has room for the several live ranges that let the free list do the reusing and keep a
+ * block alive through churn instead of having it emptied and retired at once. A larger range
+ * gets exactly its rounded size instead: over-reserving it would cost more memory than the
+ * sharing it buys back (a range past VB_POOL_SHARE_MAX is rarely one of several live ones),
+ * so there the block is the request. */
+static VkDeviceSize vb_block_size(VkDeviceSize need)
+{
+    VkDeviceSize size;
+
+    if (!vb_up(need, VB_POOL_MIN_BLOCK, &size) || size > VB_POOL_MAX_BLOCK)
+        return 0;
+    while (size <= VB_POOL_SHARE_MAX / 4)
+        size *= 4;
+    return size;
+}
+
+/* A new block of at least `need` bytes in `p`, the whole block mapped once when the pool's
+ * memory type is host-visible. At VB_POOL_BLOCKS the pool retires fully empty blocks first;
+ * when that leaves no slot the request is refused. *refused tells the two refusals apart: 1 is
+ * the budget (the pool is at VB_POOL_BLOCKS or VB_POOL_RESERVE, the request goes dedicated as
+ * dedicated_noroom), 0 is a failed vkAllocateMemory/vkMapMemory of the block (the request falls
+ * back ONCE to a dedicated allocation). Over VB_POOL_MAX_BLOCK is refused too: the caller has
+ * already sent those to a dedicated allocation of their own. */
+static VbBlock *vb_block_make(VbPool *p, VkDeviceSize need, int *refused)
+{
+    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    VkMemoryPropertyFlags fl = g.mp.memoryTypes[p->type_index].propertyFlags;
+    VbBlock *b = NULL;
+    VkDeviceSize size;
+    unsigned i;
+    void *map = NULL;
+    VkResult r;
+
+    *refused = 1;
+    for (i = 0; i < VB_POOL_BLOCKS && !b; i++)
+        if (p->blocks[i].mem == VK_NULL_HANDLE)
+            b = &p->blocks[i];
+    if (!b) {
+        if (g.failed)
+            return NULL;                /* a stopped back end frees nothing */
+        for (i = 0; i < VB_POOL_BLOCKS; i++)
+            if (vb_block_empty(&p->blocks[i]))
+                vb_block_retire(p, &p->blocks[i]);
+        for (i = 0; i < VB_POOL_BLOCKS && !b; i++)
+            if (p->blocks[i].mem == VK_NULL_HANDLE)
+                b = &p->blocks[i];
+        if (!b)
+            return NULL;                /* at VB_POOL_BLOCKS with nothing empty to retire */
+    }
+    size = vb_block_size(need);
+    if (size < need)
+        return NULL;                    /* over VB_POOL_MAX_BLOCK, or not representable */
+    if (p->reserved >= VB_POOL_RESERVE || size > VB_POOL_RESERVE - p->reserved)
+        return NULL;                    /* at VB_POOL_RESERVE */
+    ai.allocationSize = size;
+    ai.memoryTypeIndex = p->type_index;
+    *refused = 0;
+    s_mem.alloc_calls++;
+    r = vkAllocateMemory(g.dev, &ai, NULL, &b->mem);
+    if (r != VK_SUCCESS) {
+        s_mem.alloc_failures++;
+        vb_fail("vkAllocateMemory", r);
+        b->mem = VK_NULL_HANDLE;
+        return NULL;
+    }
+    if (fl & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) {
+        r = vkMapMemory(g.dev, b->mem, 0, VK_WHOLE_SIZE, 0, &map);
+        if (r != VK_SUCCESS) {
+            /* The block is rolled back whole: nothing was handed out of it. */
+            s_mem.map_failures++;
+            s_mem.rollbacks++;
+            vb_fail("vkMapMemory", r);
+            vkFreeMemory(g.dev, b->mem, NULL);
+            b->mem = VK_NULL_HANDLE;
+            return NULL;
+        }
+    }
+    b->size = size;
+    b->bump = 0;
+    b->used = 0;
+    b->padding = 0;
+    b->nfree = 0;
+    b->map = (uint8_t *)map;
+    p->reserved += size;
+    p->nblocks++;
+    s_mem.blocks++;
+    return b;
+}
+
+/* Put [off, off+size) back into b's free ranges, coalescing with everything it touches. A
+ * full list cannot record it: those bytes leave `used` and never come back, counted as
+ * padding, which is what the block then spends them on (nothing else would be true of them). */
+static void vb_block_push_free(VbBlock *b, VkDeviceSize off, VkDeviceSize size)
+{
+    VkDeviceSize end, fe = 0;
+    unsigned i;
+    int merged = 1;
+
+    if (!vb_add(off, size, &end))
+        return;                         /* cannot happen: it came out of this block */
+    while (merged) {
+        merged = 0;
+        for (i = 0; i < b->nfree; i++) {
+            VbFreeRange *f = &b->free_list[i];
+            if (!vb_add(f->off, f->size, &fe))
+                continue;
+            if (f->off > end || off > fe)
+                continue;               /* disjoint, and not even touching */
+            if (f->off < off)
+                off = f->off;
+            if (fe > end)
+                end = fe;
+            b->free_list[i] = b->free_list[--b->nfree];
+            merged = 1;
+            break;
+        }
+    }
+    if (b->nfree == VB_POOL_FREE_MAX) {
+        b->padding += end - off;
+        return;
+    }
+    b->free_list[b->nfree].off = off;
+    b->free_list[b->nfree].size = end - off;
+    b->nfree++;
+}
+
+/* First fit out of the block's free ranges. An aligned head that the range does not consume
+ * ([f->off, o)) STAYS on the free list -- it is free, not padding -- so nothing here counts it:
+ * padding is only what no free range holds. */
+static int vb_block_take_free(VbBlock *b, VkDeviceSize size, VkDeviceSize align,
+                              VkDeviceSize *off)
+{
+    unsigned i;
+
+    for (i = 0; i < b->nfree; i++) {
+        VbFreeRange *f = &b->free_list[i];
+        VkDeviceSize fe, o, end;
+
+        if (!vb_add(f->off, f->size, &fe) || !vb_up(f->off, align, &o))
+            continue;
+        if (!vb_add(o, size, &end) || end > fe)
+            continue;                   /* this range cannot hold the request */
+        if (o == f->off && end == fe) {
+            b->free_list[i] = b->free_list[--b->nfree];
+        } else if (o == f->off) {
+            f->off = end;
+            f->size = fe - end;
+        } else if (end == fe) {
+            f->size = o - f->off;
+        } else {
+            /* A split: the tail stays free (or is padding when the list is full). */
+            VkDeviceSize tail = fe - end;
+
+            f->size = o - f->off;
+            if (b->nfree < VB_POOL_FREE_MAX) {
+                b->free_list[b->nfree].off = end;
+                b->free_list[b->nfree].size = tail;
+                b->nfree++;
+            } else {
+                b->padding += tail;
+            }
+        }
+        *off = o;
+        return 1;
+    }
+    return 0;
+}
+
+/* The bump cursor: fresh bytes, high-water marked, aligned to the request. */
+static int vb_block_take_bump(VbBlock *b, VkDeviceSize size, VkDeviceSize align,
+                              VkDeviceSize *off)
+{
+    VkDeviceSize o, end;
+
+    if (!vb_up(b->bump, align, &o) || o > b->size)
+        return 0;
+    if (!vb_add(o, size, &end) || end > b->size)
+        return 0;
+    b->padding += o - b->bump;
+    b->bump = end;
+    *off = o;
+    return 1;
+}
+
+/* Hand `size` aligned bytes out of p: a block's free range first (a reuse), then a block's
+ * bump cursor, then a new block. NULL when the pool cannot serve it -- *refused then says
+ * whether the budget refused or the device did. */
+static VbBlock *vb_pool_take(VbPool *p, VkDeviceSize size, VkDeviceSize align, VkDeviceSize *off,
+                             int *reused, int *refused)
+{
+    VbBlock *b = NULL;
+    unsigned i;
+
+    *reused = 0;
+    *refused = 1;
+    for (i = 0; i < VB_POOL_BLOCKS && !b; i++) {
+        if (p->blocks[i].mem != VK_NULL_HANDLE
+            && vb_block_take_free(&p->blocks[i], size, align, off)) {
+            *reused = 1;
+            b = &p->blocks[i];
+        }
+    }
+    for (i = 0; i < VB_POOL_BLOCKS && !b; i++) {
+        if (p->blocks[i].mem != VK_NULL_HANDLE
+            && vb_block_take_bump(&p->blocks[i], size, align, off))
+            b = &p->blocks[i];
+    }
+    if (!b) {
+        b = vb_block_make(p, size, refused);
+        if (b && !vb_block_take_bump(b, size, align, off)) {
+            /* Cannot happen -- the block was made to fit -- but a block that cannot serve the
+             * request is worth nothing: it goes back rather than being handed out wrong. */
+            vb_block_retire(p, b);
+            b = NULL;
+        }
+    }
+    if (b)
+        vb_pool_padding(p);             /* the block may have padded to align the range */
+    return b;
+}
+
+/* The pool for (bits, type index, kind), or -1. A pool's identity is the memory type index and
+ * the kind, and it is only reused when the request's own memoryTypeBits allow its type. */
+static int vb_pool_for(uint32_t bits, uint32_t type_index, int nonlinear)
+{
+    unsigned i;
+
+    if (!(bits & (1u << type_index)))
+        return -1;
+    for (i = 0; i < VB_POOLS; i++) {
+        VbPool *p = &g.pools[i];
+        if (p->used && p->type_index == type_index && p->nonlinear == nonlinear)
+            return (int)i;
+    }
+    return -1;
+}
+
+static int vb_pool_new(uint32_t type_index, int nonlinear)
+{
+    unsigned i;
+
+    for (i = 0; i < VB_POOLS; i++) {
+        VbPool *p = &g.pools[i];
+        if (!p->used) {
+            memset(p, 0, sizeof *p);
+            p->used = 1;
+            p->type_index = type_index;
+            p->nonlinear = nonlinear;
+            return (int)i;
+        }
+    }
+    return -1;                          /* VB_POOLS pools are all in use */
+}
+
+/* The allocator's live bytes: what its blocks hold and what its dedicated allocations are. */
+static uint64_t vb_mem_used(void)
+{
+    uint64_t u = s_mem.dedicated_bytes;
+    unsigned i;
+
+    for (i = 0; i < VB_POOLS; i++)
+        u += g.pools[i].live;
+    return u;
+}
+
+static void vb_mem_peak(void)
+{
+    uint64_t u = vb_mem_used();
+
+    if (u > s_mem.peak_used)
+        s_mem.peak_used = u;
+}
+
+/* Really give a range back: a pooled range rejoins its block's free list, a dedicated
+ * allocation is freed. Only vb_mem_give (while nothing can read it) and vb_pool_gc (after the
+ * ring drained) call this. */
+static void vb_mem_release(VbAlloc *a)
+{
+    VbPool *p;
+    VbBlock *b;
+
+    if (a->pool < 0) {
+        if (s_mem.dedicated_bytes >= (uint64_t)a->size)
+            s_mem.dedicated_bytes -= (uint64_t)a->size;
+        else
+            s_mem.dedicated_bytes = 0;
+        vkFreeMemory(g.dev, a->mem, NULL);
+        return;
+    }
+    if (a->pool >= VB_POOLS || a->block < 0 || a->block >= VB_POOL_BLOCKS) {
+        /* Neither a pooled index this allocator hands out nor a dedicated -1: a zeroed or
+         * corrupted VbAlloc reached the release path. Never write through an index like that --
+         * latch it like any other failure and drop the handle. */
+        vb_fail("pool release", VK_ERROR_INITIALIZATION_FAILED);
+        memset(a, 0, sizeof *a);
+        a->pool = -1;
+        a->block = -1;
+        return;
+    }
+    p = &g.pools[a->pool];
+    b = &p->blocks[a->block];
+    b->used = a->size <= b->used ? b->used - a->size : 0;
+    p->live = a->size <= p->live ? p->live - a->size : 0;
+    vb_block_push_free(b, a->off, a->size);
+    vb_pool_padding(p);                 /* a full free list can turn the range into padding */
+}
+
+/* Give a range back. A pooled range may only be handed out again while nothing that could
+ * still read it is recording or in flight: otherwise the range is parked in
+ * s_pool_pending[] -- keeping its block's `used` bytes, so the block never looks empty -- and
+ * folded back by vb_pool_gc after the drain. A full park list parks it permanently: counted
+ * parked_lost, never reused, never freed. */
+static void vb_mem_give(VbAlloc *a)
+{
+    if (a->mem == VK_NULL_HANDLE)
+        return;
+    s_mem.released++;
+    if (vb_mem_idle()) {
+        vb_mem_release(a);
+    } else if (s_nparked < VB_POOL_PENDING) {
+        s_pool_pending[s_nparked++] = *a;
+        s_mem.parked++;
+        if (s_nparked > s_mem.parked_peak)
+            s_mem.parked_peak = s_nparked;
+    } else {
+        s_mem.parked++;
+        s_mem.parked_lost++;
+    }
+    memset(a, 0, sizeof *a);
+    a->pool = -1;
+    a->block = -1;
+}
+
+/* Fold what the parked releases hold back, and retire empty blocks beyond the pool's
+ * retention budget (at most VB_POOL_KEEP_EMPTY bytes of empty blocks per pool, the first small
+ * enough one). Called after every fence wait (vb_garbage_drain) and by a pool that needs a
+ * block: in both cases nothing may still read what was released. */
+static void vb_pool_gc(void)
+{
+    unsigned i, k;
+    uint64_t kept;
+
+    if (g.failed)
+        return;                         /* a stopped back end frees nothing */
+    if (vb_mem_idle()) {
+        for (i = 0; i < s_nparked; i++)
+            vb_mem_release(&s_pool_pending[i]);
+        s_nparked = 0;
+    }
+    for (i = 0; i < VB_POOLS; i++) {
+        VbPool *p = &g.pools[i];
+
+        kept = 0;
+        for (k = 0; k < VB_POOL_BLOCKS; k++) {
+            VbBlock *b = &p->blocks[k];
+
+            if (b->mem == VK_NULL_HANDLE || !vb_block_empty(b))
+                continue;
+            if (b->size <= VB_POOL_KEEP_EMPTY && kept + b->size <= VB_POOL_KEEP_EMPTY) {
+                kept += b->size;
+                continue;
+            }
+            vb_block_retire(p, b);
+        }
+    }
+}
+
+/* The request one flush or invalidate covers: clipped to [a->off, a->off + a->size) -- never a
+ * neighbouring live range of the same block -- and, when the memory type is not coherent,
+ * widened OUT to whole nonCoherentAtomSize atoms, which is what the specification requires of
+ * a flush or an invalidate on such memory. 0 when there is nothing to order. */
+static int vb_mem_range(const VbAlloc *a, VkDeviceSize off, VkDeviceSize size,
+                        VkMappedMemoryRange *mr)
+{
+    VkDeviceSize atom = vb_atom(), s, e;
+
+    if (a->mem == VK_NULL_HANDLE || !a->host_visible || !size)
+        return 0;
+    if (off > a->size)
+        off = a->size;
+    if (size > a->size - off)
+        size = a->size - off;
+    if (!size)
+        return 0;
+    s = off;
+    e = off + size;
+    if (!a->coherent && atom > 1) {
+        s -= s % atom;
+        /* Widened OUT to whole atoms (the specification's rule for memory that is not
+         * host-coherent). The rounding is checked: an end that cannot be represented orders
+         * nothing, and both callers treat 0 as "cannot". */
+        if (e % atom && !vb_add(e, atom - (e % atom), &e))
+            return 0;
+        if (e > a->size)
+            e = a->size;                /* our own range's end, never the neighbour's */
+    }
+    mr->memory = a->mem;
+    mr->offset = a->off + s;
+    mr->size = e - s;
+    return 1;
+}
+
+/* The host has written a range a submission is about to read. A no-op on coherent memory: the
+ * write is already visible, and the driver call would only walk a range with nothing to do.
+ * A range that needs it and cannot get it returns 0: the caller must not submit. */
+static int vb_mem_flush(const VbAlloc *a, VkDeviceSize off, VkDeviceSize size)
+{
+    VkMappedMemoryRange mr = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+    VkResult r;
+
+    if (a->coherent || !vb_mem_range(a, off, size, &mr))
+        return 1;
+    if (!vkFlushMappedMemoryRanges)
+        return 0;
+    r = vkFlushMappedMemoryRanges(g.dev, 1, &mr);
+    if (r != VK_SUCCESS) {
+        vb_fail("vkFlushMappedMemoryRanges", r);
+        return 0;
+    }
+    return 1;
+}
+
+/* The device has written a range the host is about to read. Issued for coherent memory too
+ * (that is what the publication always did, and the atom rule below only binds memory that is
+ * not host-coherent); a range that needs it and cannot get it returns 0. */
+static int vb_mem_invalidate(const VbAlloc *a, VkDeviceSize off, VkDeviceSize size)
+{
+    VkMappedMemoryRange mr = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+    VkResult r;
+
+    if (!vb_mem_range(a, off, size, &mr))
+        return 1;
+    if (!vkInvalidateMappedMemoryRanges)
+        return a->coherent ? 1 : 0;
+    r = vkInvalidateMappedMemoryRanges(g.dev, 1, &mr);
+    if (r != VK_SUCCESS) {
+        vb_fail("vkInvalidateMappedMemoryRanges", r);
+        return 0;
+    }
+    return 1;
+}
+
+/* The resource's memory requirements and its dedication hints. Both *_MemoryRequirements2
+ * entrypoints are OPTIONAL (loaded through vkGetDeviceProcAddr): an absent one means "not
+ * available", so the plain vkGet*MemoryRequirements answers and the request is pooled --
+ * counted once, like any other pool range. */
+static int vb_mem_requirements(VkImage img, VkBuffer buf, VkMemoryRequirements *mr,
+                               int *requires_dedicated, int *prefers_dedicated)
+{
+    *requires_dedicated = 0;
+    *prefers_dedicated = 0;
+    if (img != VK_NULL_HANDLE && vkGetImageMemoryRequirements2) {
+        VkImageMemoryRequirementsInfo2 ir = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2 };
+        VkMemoryRequirements2 m2 = { VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+        VkMemoryDedicatedRequirements dr = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS };
+
+        ir.image = img;
+        m2.pNext = &dr;
+        vkGetImageMemoryRequirements2(g.dev, &ir, &m2);
+        *mr = m2.memoryRequirements;
+        *requires_dedicated = dr.requiresDedicatedAllocation != 0;
+        *prefers_dedicated = dr.prefersDedicatedAllocation != 0;
+        return 1;
+    }
+    if (buf != VK_NULL_HANDLE && vkGetBufferMemoryRequirements2) {
+        VkBufferMemoryRequirementsInfo2 br = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2 };
+        VkMemoryRequirements2 m2 = { VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+        VkMemoryDedicatedRequirements dr = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS };
+
+        br.buffer = buf;
+        m2.pNext = &dr;
+        vkGetBufferMemoryRequirements2(g.dev, &br, &m2);
+        *mr = m2.memoryRequirements;
+        *requires_dedicated = dr.requiresDedicatedAllocation != 0;
+        *prefers_dedicated = dr.prefersDedicatedAllocation != 0;
+        return 1;
+    }
+    if (img != VK_NULL_HANDLE)
+        vkGetImageMemoryRequirements(g.dev, img, mr);
+    else if (buf != VK_NULL_HANDLE)
+        vkGetBufferMemoryRequirements(g.dev, buf, mr);
+    else
+        return 0;
+    return 1;
+}
+
+/* Take memory for one resource: a range out of a pool's block (out->pool >= 0, out->block is
+ * the block it came from, out->off the offset to bind at), or a dedicated allocation
+ * (out->pool == -1, out->off == 0). 0 means neither was possible and nothing was allocated,
+ * handed out or changed.
+ *
+ * `want` then `fallback` select the memory type exactly as the previous one-allocation-per-
+ * resource allocator did, so the same memoryTypeBits, alignment and size are honored. The
+ * coherence rule is on the SELECTED type, and it is conservative and deliberate: a type that
+ * is host-visible without HOST_COHERENT is never pooled -- a pooled host-visible block is
+ * mapped as a whole and one range of it could not be flushed or invalidated without touching
+ * the live ranges beside it -- so such a request gets a dedicated allocation instead, counted
+ * `dedicated_nohost`. That can also catch a request that never asked for host visibility (a
+ * device-local image, say) when the type it lands on is host-visible without coherence; a
+ * device that offers the host-visible coherent type every implementation must have does not
+ * reach this at all. */
+static int vb_mem_take(const VkMemoryRequirements *mr, VkMemoryPropertyFlags want,
+                       VkMemoryPropertyFlags fallback, int nonlinear,
+                       int requires_dedicated, int prefers_dedicated,
+                       const VkImage *dedicated_image, const VkBuffer *dedicated_buffer,
+                       VbAlloc *out)
+{
+    VkMemoryAllocateInfo ai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    VkMemoryDedicatedAllocateInfo di = { VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+    VkMemoryPropertyFlags fl;
+    VkDeviceSize align, need = 0, off = 0;
+    VbBlock *b;
+    VbPool *p;
+    int t, pi, reused = 0, refused = 0;
+    VkResult r;
+
+    memset(out, 0, sizeof *out);
+    out->pool = -1;
+    out->block = -1;
+    if (!s_mem.ranges && !s_mem.dedicated) {
+        /* Nothing has been taken yet, so neither write-once latch below has happened: they
+         * start at a value no pool index, block index or offset can be, so "never" cannot be
+         * read as "the first pool, the first block". */
+        s_mem.first_reuse_block = (uint64_t)-1;
+        s_mem.first_shared_block = (uint32_t)-1;
+    }
+    t = vb_memtype(mr->memoryTypeBits, want);
+    if (t < 0)
+        t = vb_memtype(mr->memoryTypeBits, fallback);
+    if (t < 0 && ((want | fallback) & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+        t = vb_memtype(mr->memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    if (t < 0) {
+        vb_fail("memory type", VK_ERROR_FEATURE_NOT_PRESENT);
+        return 0;
+    }
+    fl = g.mp.memoryTypes[t].propertyFlags;
+    out->coherent = (fl & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+    out->host_visible = (fl & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+    align = mr->alignment > (VkDeviceSize)VB_POOL_ALIGN ? mr->alignment
+                                                       : (VkDeviceSize)VB_POOL_ALIGN;
+    if (!vb_up(mr->size, align, &need) || !need) {
+        vb_fail("memory size", VK_ERROR_OUT_OF_DEVICE_MEMORY);
+        return 0;
+    }
+    /* The dedicated reasons, in the order they are counted: the object's own requirement, the
+     * range's size, the pool's budget, and the coherence a pool may not hold. */
+    if (requires_dedicated) {
+        s_mem.dedicated_required++;
+    } else if (prefers_dedicated) {
+        s_mem.dedicated_prefer++;
+    } else if (need > VB_POOL_MAX_BLOCK) {
+        s_mem.dedicated_oversize++;
+    } else if (out->host_visible && !out->coherent) {
+        s_mem.dedicated_nohost++;
+    } else {
+        pi = vb_pool_for(mr->memoryTypeBits, (uint32_t)t, nonlinear);
+        if (pi < 0)
+            pi = vb_pool_new((uint32_t)t, nonlinear);
+        if (pi < 0) {
+            s_mem.dedicated_noroom++;   /* every pool slot is in use */
+        } else {
+            p = &g.pools[pi];
+            b = vb_pool_take(p, need, align, &off, &reused, &refused);
+            if (b) {
+                uint64_t was = b->used;
+
+                b->used += need;
+                p->live += need;
+                p->ranges++;
+                s_mem.ranges++;
+                out->mem = b->mem;
+                out->off = off;
+                out->size = need;
+                out->pool = pi;
+                out->block = (int)(b - p->blocks);
+                if (reused) {
+                    p->reuse_hits++;
+                    s_mem.reuse_hits++;
+                    if (s_mem.first_reuse_block == (uint64_t)-1) {
+                        s_mem.first_reuse_off = (uint64_t)off;
+                        s_mem.first_reuse_block = (uint64_t)out->block;
+                    }
+                }
+                if (was && s_mem.first_shared_block == (uint32_t)-1) {
+                    /* Two live ranges in one block: one vkAllocateMemory for both. */
+                    s_mem.first_shared_block = (uint32_t)pi;
+                    s_mem.first_shared_block_kind = (uint32_t)p->nonlinear;
+                }
+                vb_mem_peak();
+                return 1;
+            }
+            if (refused)
+                s_mem.dedicated_noroom++;
+            else
+                s_mem.fallbacks++;      /* a block that could not be made: dedicated once */
+        }
+    }
+    /* The dedicated allocation, exactly the size the requirements asked for -- byte for byte
+     * what the one-allocation-per-resource allocator made. */
+    ai.allocationSize = mr->size;
+    ai.memoryTypeIndex = (uint32_t)t;
+    if ((requires_dedicated || prefers_dedicated) && (dedicated_image || dedicated_buffer)) {
+        /* The object requires or prefers a dedicated allocation, so it gets the matching
+         * VkMemoryDedicatedAllocateInfo. (The device is 1.1 or later, which is where the two
+         * queries that report these come from; the entries above only count them.) */
+        di.image = dedicated_image ? *dedicated_image : VK_NULL_HANDLE;
+        di.buffer = dedicated_buffer ? *dedicated_buffer : VK_NULL_HANDLE;
+        ai.pNext = &di;
+    }
+    s_mem.alloc_calls++;
+    r = vkAllocateMemory(g.dev, &ai, NULL, &out->mem);
+    if (r != VK_SUCCESS) {
+        s_mem.alloc_failures++;
+        vb_fail("vkAllocateMemory", r);
+        out->mem = VK_NULL_HANDLE;
+        return 0;
+    }
+    out->off = 0;
+    out->size = ai.allocationSize;
+    s_mem.dedicated++;
+    s_mem.dedicated_bytes += (uint64_t)ai.allocationSize;
+    vb_mem_peak();
+    return 1;
+}
+
+/* A host-visible buffer, persistently mapped; coherent (and cached when `cached`). The
+ * pointer is the range's place in its block's own mapping -- a host-visible block is mapped
+ * whole, once, when it is made -- or, for a dedicated allocation, that allocation's mapping.
+ * `cached` is a hint like want/fallback: the pool a request lands in is the memory type the
+ * requirements' bits and those flags select. */
 static int vb_host_buffer(VkDeviceSize size, VkBufferUsageFlags usage, int cached,
-                          VkBuffer *buf, VkDeviceMemory *mem, uint8_t **ptr)
+                          VkBuffer *buf, VbAlloc *mem, uint8_t **ptr)
 {
     VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     VkMemoryRequirements mr;
     VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                                    | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     void *p = NULL;
+    int reqd = 0, prefd = 0;
     VkResult r;
 
+    *buf = VK_NULL_HANDLE;
+    *ptr = NULL;
+    memset(mem, 0, sizeof *mem);
+    mem->pool = -1;
+    mem->block = -1;
     bi.size = size;
     bi.usage = usage;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -653,35 +1507,67 @@ static int vb_host_buffer(VkDeviceSize size, VkBufferUsageFlags usage, int cache
         vb_fail("vkCreateBuffer", r);
         return 0;
     }
-    vkGetBufferMemoryRequirements(g.dev, *buf, &mr);
-    *mem = vb_alloc(&mr, cached ? coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT : coherent,
-                    coherent);
-    if (*mem && (r = vkBindBufferMemory(g.dev, *buf, *mem, 0)) == VK_SUCCESS)
-        r = vkMapMemory(g.dev, *mem, 0, VK_WHOLE_SIZE, 0, &p);
-    if (!*mem || r != VK_SUCCESS) {
-        if (*mem) {
-            vb_fail("buffer memory", r);
-            vkFreeMemory(g.dev, *mem, NULL);
+    vb_mem_requirements(VK_NULL_HANDLE, *buf, &mr, &reqd, &prefd);
+    if (!vb_mem_take(&mr, cached ? coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT : coherent,
+                     coherent, 0, reqd, prefd, VK_NULL_HANDLE, buf, mem))
+        goto fail;
+    r = vkBindBufferMemory(g.dev, *buf, mem->mem, mem->off);
+    if (r != VK_SUCCESS) {
+        s_mem.bind_failures++;
+        s_mem.rollbacks++;
+        vb_fail("vkBindBufferMemory", r);
+        goto fail;
+    }
+    if (mem->pool >= 0) {
+        VbBlock *b = &g.pools[mem->pool].blocks[mem->block];
+
+        p = b->map ? (void *)(b->map + mem->off) : NULL;
+    } else {
+        r = vkMapMemory(g.dev, mem->mem, 0, VK_WHOLE_SIZE, 0, &p);
+        if (r != VK_SUCCESS) {
+            s_mem.map_failures++;
+            s_mem.rollbacks++;
+            vb_fail("vkMapMemory", r);
+            goto fail;
         }
-        vkDestroyBuffer(g.dev, *buf, NULL);
-        *buf = VK_NULL_HANDLE;
-        *mem = VK_NULL_HANDLE;
-        return 0;
+    }
+    if (!p) {
+        s_mem.map_failures++;
+        s_mem.rollbacks++;
+        vb_fail("vkMapMemory", VK_ERROR_MEMORY_MAP_FAILED);
+        goto fail;
     }
     *ptr = (uint8_t *)p;
     return 1;
+fail:
+    /* Nothing is left behind: the range goes back to its block (parked when something could
+     * still read that block), or the dedicated allocation is freed, and the buffer is
+     * destroyed. The caller's failure path has no handle, no pointer into memory the back end
+     * no longer owns, and nothing to release. */
+    vb_mem_give(mem);
+    memset(mem, 0, sizeof *mem);
+    mem->pool = -1;
+    mem->block = -1;
+    vkDestroyBuffer(g.dev, *buf, NULL);
+    *buf = VK_NULL_HANDLE;
+    return 0;
 }
 
 /* A device-local buffer, never mapped: what a compute shader writes and what the copy engine
- * reads from. No fallback to a host-visible type beyond what vb_alloc's own does, since
- * anywhere this memory is legal is correct, only slower. */
+ * reads from. No fallback to a host-visible type beyond what the requirements' memoryTypeBits
+ * allow, since anywhere this memory is legal is correct, only slower. */
 static int vb_device_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                            VkBuffer *buf, VkDeviceMemory *mem)
+                            VkBuffer *buf, VbAlloc *mem)
 {
     VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
     VkMemoryRequirements mr;
+    int reqd = 0, prefd = 0;
     VkResult r;
 
+    *buf = VK_NULL_HANDLE;
+    memset(mem, 0, sizeof *mem);
+    mem->pool = -1;
+    mem->block = -1;
     bi.size = size;
     bi.usage = usage;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -690,17 +1576,23 @@ static int vb_device_buffer(VkDeviceSize size, VkBufferUsageFlags usage,
         vb_fail("vkCreateBuffer", r);
         return 0;
     }
-    vkGetBufferMemoryRequirements(g.dev, *buf, &mr);
-    *mem = vb_alloc(&mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
-    if (*mem && (r = vkBindBufferMemory(g.dev, *buf, *mem, 0)) == VK_SUCCESS)
+    vb_mem_requirements(VK_NULL_HANDLE, *buf, &mr, &reqd, &prefd);
+    if (!vb_mem_take(&mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, 0, reqd, prefd,
+                     VK_NULL_HANDLE, buf, mem))
+        goto fail;
+    r = vkBindBufferMemory(g.dev, *buf, mem->mem, mem->off);
+    if (r == VK_SUCCESS)
         return 1;
-    if (*mem) {
-        vb_fail("buffer memory", r);
-        vkFreeMemory(g.dev, *mem, NULL);
-    }
+    s_mem.bind_failures++;
+    s_mem.rollbacks++;
+    vb_fail("vkBindBufferMemory", r);
+fail:
+    vb_mem_give(mem);
+    memset(mem, 0, sizeof *mem);
+    mem->pool = -1;
+    mem->block = -1;
     vkDestroyBuffer(g.dev, *buf, NULL);
     *buf = VK_NULL_HANDLE;
-    *mem = VK_NULL_HANDLE;
     return 0;
 }
 
@@ -711,7 +1603,9 @@ static void vb_garbage_free(VbGarbage *e)
     if (e->view) vkDestroyImageView(g.dev, e->view, NULL);
     if (e->img) vkDestroyImage(g.dev, e->img, NULL);
     if (e->buf) vkDestroyBuffer(g.dev, e->buf, NULL);
-    if (e->mem) vkFreeMemory(g.dev, e->mem, NULL);
+    /* The range goes back to the pool it came from -- a block's free list, or the dedicated
+     * allocation's own free -- instead of one vkFreeMemory per resource. */
+    if (e->mem.mem) vb_mem_give(&e->mem);
 }
 
 /* Free the held objects once no recorded command can still read them: nothing is being
@@ -725,6 +1619,9 @@ static void vb_garbage_drain(void)
     for (i = 0; i < g.ngarbage; i++)
         vb_garbage_free(&g.garbage[i]);
     g.ngarbage = 0;
+    /* Every fence wait is also where what the releases above parked -- and the blocks they
+     * left empty -- are folded and retired: nothing can still read either. */
+    vb_pool_gc();
 }
 
 /* Destroy now if nothing recorded can still read it, else hold it until the ring has no
@@ -758,9 +1655,11 @@ static void vb_image_discard(VbImage *im)
     e.img = im->img;
     e.view = im->view;
     e.mem = im->mem;
-    if (e.img || e.view || e.mem)
+    if (e.img || e.view || e.mem.mem)
         vb_discard(e);
     memset(im, 0, sizeof *im);
+    im->mem.pool = -1;                  /* an empty VbAlloc is "no memory", not "pool 0" */
+    im->mem.block = -1;
 }
 
 /* ── The submission ring ─────────────────────────────────────────────── */
@@ -823,6 +1722,21 @@ static void vb_slot_submit(void)
         return;
     vb_end_pass();
     vb_barrier();
+    /* The host wrote this slot's stream (vertices, indices, the program path's uniform
+     * blocks); a submission is about to read it. Flushing the written prefix is a no-op on
+     * coherent memory -- pooled host-visible memory is coherent -- and is the coherence
+     * boundary when it is not: without it the device would read stale bytes, so a flush that
+     * cannot happen stops the submission instead of submitting work that reads them. */
+    if (!vb_mem_flush(&s->stream_mem, 0, s->stream_off)) {
+        vb_fail("stream flush", VK_ERROR_FEATURE_NOT_PRESENT);
+        fprintf(stderr, "[GPUVK] the Vulkan back end stops drawing; guest memory keeps "
+                        "the last bytes it published for each target rectangle\n");
+        fflush(stderr);
+        s->recording = 0;
+        g.ok = 0;
+        g.failed = 1;                   /* write-once: no slot is recordable from here on */
+        return;                         /* nothing is freed: the GPU may still use it */
+    }
     r = vkEndCommandBuffer(s->cmd);
     if (r == VK_SUCCESS) {
         si.commandBufferCount = 1;
@@ -1113,7 +2027,15 @@ static uint8_t *vb_stream(VkDeviceSize bytes, VkBuffer *buf, VkDeviceSize *off)
         uint8_t *p;
         memset(&e, 0, sizeof e);
         /* A slice of its own is used the same way a stream slice is: as vertices, indices, a
-         * transfer source, or a uniform block (the program path's rc/c[192]/xf slices). */
+         * transfer source, or a uniform block (the program path's rc/c[192]/xf slices). Its
+         * range is host-written like the slot stream's, but it is not the same range, so the
+         * submit-time flush of s->stream_mem does not cover it: a device whose memory types
+         * denied this buffer HOST_COHERENT would let the GPU read stale bytes here, exactly as
+         * the one-allocation-per-resource path did before this change (nothing was flushed
+         * anywhere then). It cannot happen on a device that offers the host-visible coherent
+         * type every Vulkan implementation must have; the write-back hazard of flushing a
+         * released range that a pending submission may still be writing makes a blanket flush
+         * of the garbage list the wrong repair, so this stays as it is and is disclosed. */
         if (!vb_host_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT
                                    | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
                                    | VK_BUFFER_USAGE_INDEX_BUFFER_BIT
@@ -1540,9 +2462,12 @@ static int vb_image_create(VbImage *im, uint32_t w, uint32_t h, VkFormat fmt,
     VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
     VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
     VkMemoryRequirements mr;
+    int reqd = 0, prefd = 0;
     VkResult r;
 
     memset(im, 0, sizeof *im);
+    im->mem.pool = -1;
+    im->mem.block = -1;
     ii.imageType = VK_IMAGE_TYPE_2D;
     ii.format = fmt;
     ii.extent.width = w;
@@ -1561,11 +2486,24 @@ static int vb_image_create(VbImage *im, uint32_t w, uint32_t h, VkFormat fmt,
         im->img = VK_NULL_HANDLE;
         return 0;
     }
-    vkGetImageMemoryRequirements(g.dev, im->img, &mr);
-    im->mem = vb_alloc(&mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
-    if (!im->mem || (r = vkBindImageMemory(g.dev, im->img, im->mem, 0)) != VK_SUCCESS) {
-        if (im->mem)
-            vb_fail("vkBindImageMemory", r);
+    /* An image is an optimal-tiling resource, so its ranges live in a nonlinear pool: an
+     * image and a buffer never share a block, and bufferImageGranularity can never apply
+     * between two neighbouring ranges. */
+    if (!vb_mem_requirements(im->img, VK_NULL_HANDLE, &mr, &reqd, &prefd)
+        || !vb_mem_take(&mr, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, 1, reqd, prefd, &im->img,
+                        VK_NULL_HANDLE, &im->mem)) {
+        vb_image_discard(im);
+        return 0;
+    }
+    r = vkBindImageMemory(g.dev, im->img, im->mem.mem, im->mem.off);
+    if (r != VK_SUCCESS) {
+        /* Nothing was ever recorded against this range, so it goes straight back (parked
+         * when the block it came from is in use), and the image is discarded: the caller
+         * sees an image with no handle, no view and no memory. */
+        s_mem.bind_failures++;
+        s_mem.rollbacks++;
+        vb_fail("vkBindImageMemory", r);
+        vb_mem_give(&im->mem);
         vb_image_discard(im);
         return 0;
     }
@@ -1701,7 +2639,7 @@ static VkDeviceSize vb_readback_slice(const VbTarget *t, uint32_t *row_stride)
 static int vb_readback_reserve(VkDeviceSize bytes)
 {
     VkBuffer hb = VK_NULL_HANDLE, db = VK_NULL_HANDLE;
-    VkDeviceMemory hm = VK_NULL_HANDLE, dm = VK_NULL_HANDLE;
+    VbAlloc hm, dm;
     uint8_t *hp = NULL;
     VkDeviceSize cap;
     VbGarbage e;
@@ -1715,26 +2653,30 @@ static int vb_readback_reserve(VkDeviceSize bytes)
         cap *= 2;
     if (cap > VB_READBACK_MAX)
         cap = VB_READBACK_MAX;
+    memset(&hm, 0, sizeof hm);
+    hm.pool = hm.block = -1;
+    memset(&dm, 0, sizeof dm);
+    dm.pool = dm.block = -1;
     if (!vb_host_buffer(cap, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1, &hb, &hm, &hp)
         || !vb_device_buffer(cap, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
                                   | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &db, &dm)) {
         memset(&e, 0, sizeof e);
         e.buf = hb; e.mem = hm;
-        if (e.buf || e.mem)
+        if (e.buf || e.mem.mem)
             vb_garbage_free(&e);
         memset(&e, 0, sizeof e);
         e.buf = db; e.mem = dm;
-        if (e.buf || e.mem)
+        if (e.buf || e.mem.mem)
             vb_garbage_free(&e);
         return 0;
     }
     memset(&e, 0, sizeof e);
     e.buf = g.rb_buf; e.mem = g.rb_mem;
-    if (e.buf || e.mem)
+    if (e.buf || e.mem.mem)
         vb_discard(e);
     memset(&e, 0, sizeof e);
     e.buf = g.pack_buf; e.mem = g.pack_mem;
-    if (e.buf || e.mem)
+    if (e.buf || e.mem.mem)
         vb_discard(e);
     g.rb_buf = hb;
     g.rb_mem = hm;
@@ -1972,16 +2914,18 @@ static int vb_targets_flush(VbTarget **ts, unsigned n)
         }
         if (!g.ok)
             break;
+        /* Publish. The coherence boundary is the range rule: the host-visible staging buffer's
+         * own range -- its offset in its block, its size, never a neighbouring range of the
+         * same block -- widened to whole nonCoherentAtomSize atoms when the type is not
+         * coherent (vb_mem_invalidate). A range that needs it and cannot get it publishes
+         * nothing: the batch's targets stay dirty and are retried, any earlier batch having
+         * published already, exactly like a batch that could not be staged at all. */
+        if (!vb_mem_invalidate(&g.rb_mem, 0, g.rb_mem.size))
+            break;
         g.st.readback_batches++;        /* the batch will publish: one submission, one wait */
-        /* Publish. Cached memory may not be coherent everywhere; invalidating is always
-         * allowed, and once per batch covers every slice in it. */
         {
-            VkMappedMemoryRange mr = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
             uint64_t p0 = vb_now_ns();
 
-            mr.memory = g.rb_mem;
-            mr.size = VK_WHOLE_SIZE;
-            vkInvalidateMappedMemoryRanges(g.dev, 1, &mr);
             for (k = i; k < j; k++) {
                 VbTarget *t = ts[k];
                 uint32_t rw = t->dx1 - t->dx0, rows = t->dy1 - t->dy0;
@@ -3403,11 +4347,16 @@ static void vb_clear(const Nv2aSurface *s, const Nv2aRenderState *rs, uint32_t f
 
 static void vb_stats(int force)
 {
+    Nv2aVkMemoryStats ms;
     uint64_t now = vb_now_ns();
 
     if (!force && now - g.last_stats_ns < (uint64_t)VB_STATS_MS * 1000000ull)
         return;
     g.last_stats_ns = now;
+    /* The memory counters decide the N4.4 optimization, so they are read through the same
+     * accessor a test reads and they are printed here: the deciding numbers have to survive in
+     * the run's archived stderr, not only in a droppable debug log. */
+    nv2a_vk_backend_memory_stats(&ms);
     fprintf(stderr, "[GPUVK] flips=%u draws=%llu tris=%llu clears=%llu tex_uploads=%llu"
                     " tex_hits=%llu tex_undecodable=%llu rt_aliases=%llu rt_copies=%llu"
                     " rt_loads=%llu readbacks=%llu readback_ms=%.1f dropped_tris=%llu"
@@ -3418,7 +4367,19 @@ static void vb_stats(int force)
                     " vsh_identity_fail=%llu vsh_declines=%llu vsh_tris=%llu"
                     " vsh_const_uploads=%llu rb_batches=%llu rb_packs=%llu rb_pixels=%llu"
                     " rb_copies=%llu rb_bytes=%llu rb_publish_ms=%.1f rb_wait_ms=%.1f"
-                    " rb_incomplete=%llu\n",
+                    " rb_incomplete=%llu"
+                    " mem_pools=%llu mem_blocks=%llu mem_blocks_retired=%llu"
+                    " mem_retired_bytes=%llu mem_ranges=%llu mem_reuse=%llu"
+                    " mem_dedicated=%llu mem_ded_required=%llu mem_ded_prefer=%llu"
+                    " mem_ded_oversize=%llu mem_ded_noroom=%llu mem_ded_nohost=%llu"
+                    " mem_alloc_calls=%llu mem_released=%llu mem_parked=%llu"
+                    " mem_parked_peak=%llu mem_parked_lost=%llu mem_reserved_bytes=%llu"
+                    " mem_used_bytes=%llu mem_free_bytes=%llu mem_largest_free=%llu"
+                    " mem_padding_bytes=%llu mem_metadata_bytes=%llu mem_ded_bytes=%llu"
+                    " mem_peak_used=%llu mem_shared_block=%u mem_shared_kind=%u"
+                    " mem_first_reuse_off=%llu mem_first_reuse_block=%llu"
+                    " mem_alloc_failures=%llu mem_bind_failures=%llu mem_map_failures=%llu"
+                    " mem_rollbacks=%llu mem_fallbacks=%llu\n",
             g.frame, (unsigned long long)g.st.draws, (unsigned long long)g.st.tris,
             (unsigned long long)g.st.clears, (unsigned long long)g.st.tex_uploads,
             (unsigned long long)g.st.tex_hits, (unsigned long long)g.st.tex_undecodable,
@@ -3442,7 +4403,25 @@ static void vb_stats(int force)
             (unsigned long long)g.st.readback_copies,
             (unsigned long long)g.st.readback_bytes,
             (double)g.st.readback_publish_ns / 1e6, (double)g.st.readback_wait_ns / 1e6,
-            (unsigned long long)g.st.readback_incomplete);
+            (unsigned long long)g.st.readback_incomplete,
+            (unsigned long long)ms.pools, (unsigned long long)ms.blocks,
+            (unsigned long long)ms.blocks_retired,
+            (unsigned long long)s_retired_bytes, (unsigned long long)ms.ranges,
+            (unsigned long long)ms.reuse_hits, (unsigned long long)ms.dedicated,
+            (unsigned long long)ms.dedicated_required, (unsigned long long)ms.dedicated_prefer,
+            (unsigned long long)ms.dedicated_oversize, (unsigned long long)ms.dedicated_noroom,
+            (unsigned long long)ms.dedicated_nohost, (unsigned long long)ms.alloc_calls,
+            (unsigned long long)ms.released, (unsigned long long)ms.parked,
+            (unsigned long long)ms.parked_peak, (unsigned long long)ms.parked_lost,
+            (unsigned long long)ms.reserved_bytes, (unsigned long long)ms.used_bytes,
+            (unsigned long long)ms.free_bytes, (unsigned long long)ms.largest_free,
+            (unsigned long long)ms.padding_bytes, (unsigned long long)ms.metadata_bytes,
+            (unsigned long long)ms.dedicated_bytes, (unsigned long long)ms.peak_used,
+            (unsigned)ms.first_shared_block, (unsigned)ms.first_shared_block_kind,
+            (unsigned long long)ms.first_reuse_off, (unsigned long long)ms.first_reuse_block,
+            (unsigned long long)ms.alloc_failures, (unsigned long long)ms.bind_failures,
+            (unsigned long long)ms.map_failures, (unsigned long long)ms.rollbacks,
+            (unsigned long long)ms.fallbacks);
     fflush(stderr);
 }
 
@@ -3703,6 +4682,10 @@ static int vb_pick_device(void)
     g.pd = devs[best];
     vb_graphics_family(g.pd, &g.family);
     vkGetPhysicalDeviceProperties(g.pd, &p);
+    /* The atom vb_mem_flush/vb_mem_invalidate widen a non-coherent range to: a deviation from
+     * the range rule would touch a shared block's neighbours, and this is what the
+     * specification fixes the granularity at. 0 means the device reports none. */
+    g.atom = p.limits.nonCoherentAtomSize ? p.limits.nonCoherentAtomSize : 1;
     fprintf(stderr, "[GPUVK] device: %s (type %d, api %u.%u.%u, driver 0x%X)%s\n", p.deviceName,
             (int)p.deviceType, VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion),
             VK_VERSION_PATCH(p.apiVersion), p.driverVersion,
@@ -3741,6 +4724,19 @@ static int vb_create_device(void)
 #define VB_LOAD_DEVICE(fn) fn = (PFN_##fn)vkGetDeviceProcAddr(g.dev, #fn); \
     if (!fn) { fprintf(stderr, "[GPUVK] missing %s\n", #fn); return -1; }
     VB_DEVICE_FNS(VB_LOAD_DEVICE)
+    /* The optional entrypoints (a NULL one is not an install failure; see their declarations):
+     * the requirement queries the allocator honors when they exist, and the two coherence
+     * boundaries and the unmapping a retired block needs. */
+    vkGetImageMemoryRequirements2 =
+        (PFN_vkGetImageMemoryRequirements2)vkGetDeviceProcAddr(g.dev, "vkGetImageMemoryRequirements2");
+    vkGetBufferMemoryRequirements2 =
+        (PFN_vkGetBufferMemoryRequirements2)vkGetDeviceProcAddr(g.dev, "vkGetBufferMemoryRequirements2");
+    vkFlushMappedMemoryRanges =
+        (PFN_vkFlushMappedMemoryRanges)vkGetDeviceProcAddr(g.dev, "vkFlushMappedMemoryRanges");
+    vkInvalidateMappedMemoryRanges =
+        (PFN_vkInvalidateMappedMemoryRanges)vkGetDeviceProcAddr(g.dev,
+                                                               "vkInvalidateMappedMemoryRanges");
+    vkUnmapMemory = (PFN_vkUnmapMemory)vkGetDeviceProcAddr(g.dev, "vkUnmapMemory");
     vkGetDeviceQueue(g.dev, g.family, 0, &g.queue);
     vkGetPhysicalDeviceMemoryProperties(g.pd, &g.mp);
 
@@ -4112,6 +5108,56 @@ void nv2a_vk_backend_readback_stats(Nv2aVkReadbackStats *out)
     out->wait_ns = g.st.readback_wait_ns;
     out->publish_ns = g.st.readback_publish_ns;
     out->incomplete = g.st.readback_incomplete;
+}
+
+/* What the sub-allocator did and holds. Every cumulative counter is accumulated as it
+ * happens; the live fields (pools in use, the bytes reserved/used/free/padding, the largest
+ * free range and the allocator's own footprint) are derived here from the pools, so they
+ * cannot drift from the blocks they describe. Same threading contract as the rest of the back
+ * end: read it on the executor thread, or from a single-threaded fixture. */
+void nv2a_vk_backend_memory_stats(Nv2aVkMemoryStats *out)
+{
+    unsigned i, k, f;
+    uint64_t free_b, widest;
+
+    if (!out)
+        return;
+    *out = s_mem;
+    out->pools = 0;
+    out->reserved_bytes = s_mem.dedicated_bytes;    /* a dedicated allocation reserves itself */
+    out->used_bytes = s_mem.dedicated_bytes;
+    out->free_bytes = 0;
+    out->largest_free = 0;
+    out->padding_bytes = 0;
+    out->metadata_bytes = (uint64_t)(sizeof g.pools + sizeof s_pool_pending);
+    for (i = 0; i < VB_POOLS; i++) {
+        VbPool *p = &g.pools[i];
+
+        if (!p->used)
+            continue;
+        out->pools++;
+        out->reserved_bytes += p->reserved;
+        out->used_bytes += p->live;
+        out->padding_bytes += p->padding;
+        for (k = 0; k < VB_POOL_BLOCKS; k++) {
+            VbBlock *b = &p->blocks[k];
+
+            if (b->mem == VK_NULL_HANDLE)
+                continue;
+            /* The block minus what it holds and minus the padding it spent aligning ranges:
+             * that is exactly the bump cursor's remainder plus the free ranges it still
+             * records (``free list + used + padding == bump'' per block). */
+            free_b = b->size - b->used;
+            free_b -= b->padding < free_b ? b->padding : free_b;
+            out->free_bytes += free_b;
+            widest = b->size - b->bump;
+            for (f = 0; f < b->nfree; f++)
+                if (b->free_list[f].size > widest)
+                    widest = b->free_list[f].size;
+            if (widest > out->largest_free)
+                out->largest_free = widest;
+        }
+    }
 }
 
 int nv2a_vk_backend_install(void)
