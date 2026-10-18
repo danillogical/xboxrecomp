@@ -31,6 +31,11 @@
  * insensitive, CPU devices included); otherwise the first discrete GPU, then
  * integrated, virtual and other, never a CPU device.
  *
+ * RECOMP_VK_PIPELINE_CACHE=<file> persists the driver's VkPipelineCache in that file (unset:
+ * %LOCALAPPDATA%\xboxrecomp\vk-pipeline-cache-<vendorID>-<deviceID>.bin on Windows, off
+ * elsewhere; `off` or `0` disables it). A missing, damaged or foreign file starts the run cold.
+ * It stores only the driver's own builds of the ahead-of-time shaders.
+ *
  * The device it picks must have ONE queue family with both VK_QUEUE_GRAPHICS_BIT
  * and VK_QUEUE_COMPUTE_BIT: the frame's draws and the readback's pack kernel
  * (shaders/nv2a_vk_pack.hlsl, the compute pipeline that truncates a 16-bit
@@ -233,6 +238,19 @@ typedef struct {
 } Nv2aVkMemoryStats;
 
 void nv2a_vk_backend_memory_stats(Nv2aVkMemoryStats *out);
+
+/* The pipeline table and the persisted pipeline cache (plan B2). `created` is the pipelines the
+ * driver built, `evictions` the table's least-recently-used replacements. The cache_ fields
+ * are the cache file's: the blob bytes that seeded the cache, the saves written and failed, the
+ * files (or driver refusals) rejected, and whether persistence is on at all. Same threading
+ * contract as the other stats. */
+typedef struct {
+    uint64_t created, evictions;
+    uint64_t cache_loaded_bytes, cache_saves, cache_save_failures, cache_rejects;
+    uint32_t cache_enabled;
+} Nv2aVkPipelineStats;
+
+void nv2a_vk_backend_pipeline_stats(Nv2aVkPipelineStats *out);
 
 #ifdef __cplusplus
 }

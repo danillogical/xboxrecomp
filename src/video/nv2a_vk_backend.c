@@ -73,7 +73,16 @@
  *     command later in submission order -- that is what makes cross-submission
  *     ordering defined (Vulkan defines no implicit execution or memory dependency
  *     between submissions), including blending into one target from two submissions.
- *     Still to come (plan N4): a persisted VkPipelineCache.
+ *   - Pipeline cache (plan B2): the VkPipelineCache is persisted across runs, so the driver's
+ *     own builds of the ahead-of-time SPIR-V that already happen are not repeated on a warm
+ *     start. Nothing new is translated or compiled: the cache only stores what the driver
+ *     made from the same shaders. RECOMP_VK_PIPELINE_CACHE names the file (unset: one file per
+ *     device, vk-pipeline-cache-<vendorID>-<deviceID>.bin in the xboxrecomp folder under
+ *     %LOCALAPPDATA% on Windows, disabled elsewhere; `off` or `0` disables it). The file is a 20-byte header (magic, version, blob length, CRC-32) and the
+ *     raw vkGetPipelineCacheData blob; a file that is missing, damaged or from another device
+ *     or driver is rejected and the run starts cold. There is no shutdown hook, so vb_flip saves
+ *     the cache during the run, at most every VB_PCACHE_SAVE_MS and only after new pipelines, through
+ *     a per-process temporary file, and never an image its own loader would reject.
  *
  *   - Device memory is SUB-ALLOCATED (plan N4.4). One vkAllocateMemory makes a BLOCK and
  *     every pooled resource takes a RANGE out of it, bound at the range's own offset
@@ -194,6 +203,12 @@ void nv2a_vk_backend_program_stats(Nv2aVkProgramStats *out)
         memset(out, 0, sizeof *out);
 }
 
+void nv2a_vk_backend_pipeline_stats(Nv2aVkPipelineStats *out)
+{
+    if (out)
+        memset(out, 0, sizeof *out);
+}
+
 void nv2a_vk_backend_ring_stats(Nv2aVkRingStats *out)
 {
     if (out)
@@ -227,6 +242,8 @@ void nv2a_vk_backend_memory_stats(Nv2aVkMemoryStats *out)
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <time.h>
 #endif
 #include <ctype.h>
@@ -289,6 +306,10 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
  * a draw that would exceed it is truncated to whole triangles exactly as it was before. */
 #define VB_DRAW_CAP_BYTES ((32u << 20) / 2)
 #define VB_STATS_MS      10000
+#define VB_PCACHE_SAVE_MS 10000           /* least time between two pipeline cache saves */
+#define VB_PCACHE_MAX    (64u << 20)      /* the largest blob a cache file may carry */
+#define VB_PCACHE_HDR    20u              /* magic 8, version 4, blob length 4, CRC-32 4 */
+#define VB_PCACHE_VER    1u
 #define VB_MAX_MISS_LOG  256              /* distinct missing program hashes logged */
 #define VB_WAIT_NS       (10ull * 1000000000ull)
 #define VB_VALIDATION_SAY 64              /* validation messages printed; all are counted */
@@ -354,6 +375,8 @@ static PFN_vkGetBufferMemoryRequirements2 vkGetBufferMemoryRequirements2;
 static PFN_vkFlushMappedMemoryRanges vkFlushMappedMemoryRanges;
 static PFN_vkInvalidateMappedMemoryRanges vkInvalidateMappedMemoryRanges;
 static PFN_vkUnmapMemory vkUnmapMemory;
+/* OPTIONAL (plan B2): NULL means the pipeline cache cannot be saved, nothing else. */
+static PFN_vkGetPipelineCacheData vkGetPipelineCacheData;
 
 /* ── State ───────────────────────────────────────────────────────────── */
 
@@ -579,6 +602,9 @@ typedef struct {
     /* The vertex-program path (nv2a_vsh_aot.h); the program stats' counters, so the
      * same numbers reach the periodic [GPUVK] line. */
     uint64_t vsh_hits, vsh_misses, vsh_identity_fail, vsh_declines, vsh_tris, vsh_const_uploads;
+    /* The pipeline table's evictions and the persisted pipeline cache (plan B2). */
+    uint64_t pipe_evictions, pcache_loaded_bytes, pcache_saves, pcache_save_failures,
+             pcache_rejects;
 } VbStats;
 
 static struct {
@@ -620,6 +646,13 @@ static struct {
                                          * binding 9 (c[192]) and 10 (Nv2aVshHlslXf) */
     VkPipelineLayout layout_prog;
     VkPipelineCache pcache;
+    int pc_on;                          /* the cache file is read and written */
+    int pc_dirty;                       /* pipelines were made since the last good save */
+    uint64_t pc_last_ns;                /* the last save attempt, good or not */
+    char pc_path[1024];
+    VkPhysicalDeviceProperties pc_props;  /* the chosen device, which a cache file must match */
+    int pc_latched;                     /* saving is off for the rest of the run */
+    unsigned pc_fails, pc_said;         /* consecutive save failures; log lines printed */
     VkShaderModule vs, ps;
     VkShaderModule vs_rc, ps_rc;
     VkDescriptorSetLayout dsl_pack;     /* the pack kernel's set: the target's own image
@@ -2412,6 +2445,7 @@ static VkPipeline vb_pipeline_create(const VbPipeKey *k, const Nv2aVshAotEntry *
         return VK_NULL_HANDLE;
     }
     g.st.pipelines++;
+    g.pc_dirty = 1;
     return pipe;
 }
 
@@ -2539,6 +2573,7 @@ static VkPipeline vb_pipeline(const VbPipeKey *k, const Nv2aVshAotEntry *e)
         slot = &g.pipes[g.npipes++];
     } else {
         VbGarbage gb;
+        g.st.pipe_evictions++;
         memset(&gb, 0, sizeof gb);
         gb.pipe = slot->pipe;
         if (gb.pipe == g.slots[g.cur].bound_pipe)
@@ -2553,6 +2588,340 @@ static VkPipeline vb_pipeline(const VbPipeKey *k, const Nv2aVshAotEntry *e)
         memset(&slot->k, 0xFF, sizeof slot->k);
     }
     return slot->pipe;
+}
+
+/* ── The persisted pipeline cache ────────────────────────────────────── */
+
+enum {
+    VB_PC_OK, VB_PC_SHORT, VB_PC_MAGIC, VB_PC_VERSION, VB_PC_TOOBIG, VB_PC_LENGTH, VB_PC_CRC,
+    VB_PC_VKHEADER, VB_PC_DEVICE, VB_PC_REASONS
+};
+
+static const char *const vb_pc_reason[VB_PC_REASONS] = {
+    "ok",
+    "shorter than the file header",
+    "bad magic",
+    "unsupported file version",
+    "blob length over the 64 MiB limit",
+    "blob length disagrees with the file size",
+    "CRC-32 mismatch",
+    "blob has no usable Vulkan pipeline cache header",
+    "cache was made by another device or driver",
+};
+
+static const char vb_pc_magic[8] = { 'X', 'B', 'R', 'V', 'K', 'P', 'C', '1' };
+
+static uint32_t vb_crc32(const uint8_t *p, size_t n)
+{
+    static uint32_t tab[256];
+    uint32_t c = 0xFFFFFFFFu;
+    size_t i;
+
+    if (!tab[1]) {
+        uint32_t k, j, v;
+        for (k = 0; k < 256; k++) {
+            v = k;
+            for (j = 0; j < 8; j++)
+                v = (v & 1) ? 0xEDB88320u ^ (v >> 1) : v >> 1;
+            tab[k] = v;
+        }
+    }
+    for (i = 0; i < n; i++)
+        c = tab[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return ~c;
+}
+
+static uint32_t vb_pc_rd32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+static void vb_pc_wr32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+/* The file header for a blob; the file is these VB_PCACHE_HDR bytes then the blob. */
+static void vb_pcache_header(uint8_t hdr[VB_PCACHE_HDR], const void *blob, size_t n)
+{
+    memcpy(hdr, vb_pc_magic, 8);
+    vb_pc_wr32(hdr + 8, VB_PCACHE_VER);
+    vb_pc_wr32(hdr + 12, (uint32_t)n);
+    vb_pc_wr32(hdr + 16, vb_crc32((const uint8_t *)blob, n));
+}
+
+/* Judge a whole cache file against the chosen device. VB_PC_OK points the blob outputs into `buf`;
+ * anything else says why the file must not seed the cache. The blob's own header is
+ * VkPipelineCacheHeaderVersionOne: length, version, vendor, device, pipelineCacheUUID. */
+static int vb_pcache_parse(const uint8_t *buf, size_t n, const VkPhysicalDeviceProperties *p,
+                           const void **blob, size_t *blob_n)
+{
+    const uint8_t *b;
+    uint32_t len;
+
+    if (blob)
+        *blob = NULL;
+    if (blob_n)
+        *blob_n = 0;
+    if (!buf || n < VB_PCACHE_HDR)
+        return VB_PC_SHORT;
+    if (memcmp(buf, vb_pc_magic, 8) != 0)
+        return VB_PC_MAGIC;
+    if (vb_pc_rd32(buf + 8) != VB_PCACHE_VER)
+        return VB_PC_VERSION;
+    len = vb_pc_rd32(buf + 12);
+    if (len > VB_PCACHE_MAX)
+        return VB_PC_TOOBIG;
+    if ((size_t)len != n - VB_PCACHE_HDR)
+        return VB_PC_LENGTH;
+    b = buf + VB_PCACHE_HDR;
+    if (vb_crc32(b, len) != vb_pc_rd32(buf + 16))
+        return VB_PC_CRC;
+    if (len < 16u + VK_UUID_SIZE || vb_pc_rd32(b) < 16u + VK_UUID_SIZE
+        || vb_pc_rd32(b) > len || vb_pc_rd32(b + 4) != (uint32_t)VK_PIPELINE_CACHE_HEADER_VERSION_ONE)
+        return VB_PC_VKHEADER;
+    if (!p || vb_pc_rd32(b + 8) != p->vendorID || vb_pc_rd32(b + 12) != p->deviceID
+        || memcmp(b + 16, p->pipelineCacheUUID, VK_UUID_SIZE) != 0)
+        return VB_PC_DEVICE;
+    if (blob)
+        *blob = b;
+    if (blob_n)
+        *blob_n = len;
+    return VB_PC_OK;
+}
+
+static int vb_pc_ieq(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++)
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b))
+            return 0;
+    return *a == *b;
+}
+
+/* Decide where the cache lives. `env` is RECOMP_VK_PIPELINE_CACHE, `appdata` is %LOCALAPPDATA%
+ * (NULL off Windows) and `vendor`/`device` name the chosen physical device, so each device has
+ * its own default file. Returns 1 and fills `out` with a path, 0 for off, -1 for a path that does
+ * not fit `cap`. An explicit path is used as given. */
+static int vb_pcache_resolve(const char *env, const char *appdata, uint32_t vendor,
+                             uint32_t device, char *out, size_t cap)
+{
+    int n;
+
+    if (env && *env) {
+        if (!strcmp(env, "0") || vb_pc_ieq(env, "off"))
+            return 0;
+        n = snprintf(out, cap, "%s", env);
+    } else if (appdata && *appdata) {
+        n = snprintf(out, cap, "%s\\xboxrecomp\\vk-pipeline-cache-%08x-%08x.bin", appdata,
+                     (unsigned)vendor, (unsigned)device);
+    } else {
+        return 0;
+    }
+    return n > 0 && (size_t)n < cap ? 1 : -1;
+}
+
+static void vb_pcache_mkparent(const char *path)
+{
+    char dir[1024];
+    size_t n = strlen(path);
+
+    while (n && path[n - 1] != '\\' && path[n - 1] != '/')
+        n--;
+    if (n < 2 || n >= sizeof dir)
+        return;
+    memcpy(dir, path, n - 1);
+    dir[n - 1] = 0;
+#if defined(_WIN32)
+    CreateDirectoryA(dir, NULL);
+#else
+    mkdir(dir, 0777);
+#endif
+}
+
+/* The pipeline cache's own log lines are capped like vb_fail's; the load line is not counted. */
+#define VB_PCACHE_SAY 8
+#define VB_PCACHE_FAILS 3               /* consecutive save failures that turn saving off */
+
+static void vb_pcache_say(const char *fmt, const char *a)
+{
+    if (g.pc_said++ < VB_PCACHE_SAY) {
+        fprintf(stderr, fmt, a);
+        fflush(stderr);
+    }
+}
+
+/* Read the file named by g.pc_path and, when it is valid for this device, return it in a
+ * malloc'd buffer whose blob is returned through the two outputs (the caller frees the return
+ * value). `outcome` receives "cold" or "rejected(<reason>)" when nothing is returned. */
+static uint8_t *vb_pcache_load(const void **blob, size_t *blob_n, char *outcome, size_t cap)
+{
+    FILE *f = fopen(g.pc_path, "rb");
+    uint8_t *buf = NULL;
+    long sz;
+    int why;
+
+    if (!f) {
+        snprintf(outcome, cap, "cold");
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        why = VB_PC_SHORT;
+    } else if ((unsigned long)sz > (unsigned long)VB_PCACHE_MAX + VB_PCACHE_HDR) {
+        why = VB_PC_TOOBIG;
+    } else if (!(buf = (uint8_t *)malloc(sz ? (size_t)sz : 1u))
+               || fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        why = VB_PC_SHORT;
+    } else {
+        why = vb_pcache_parse(buf, (size_t)sz, &g.pc_props, blob, blob_n);
+    }
+    fclose(f);
+    if (why != VB_PC_OK) {
+        g.st.pcache_rejects++;
+        snprintf(outcome, cap, "rejected(%s)", vb_pc_reason[why]);
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+/* Decide the knob and read the file. Runs before the cache is created; the caller prints the
+ * one decision line (vb_pcache_report) once it knows whether the driver took the data. */
+static void vb_pcache_init(const void **blob, size_t *blob_n, uint8_t **file, char *outcome,
+                           size_t cap)
+{
+    const char *env = getenv("RECOMP_VK_PIPELINE_CACHE");
+#if defined(_WIN32)
+    const char *appdata = getenv("LOCALAPPDATA");
+#else
+    const char *appdata = NULL;
+#endif
+    int r = 0;
+
+    *file = NULL;
+    g.pc_on = 0;
+    g.pc_path[0] = 0;
+    snprintf(outcome, cap, "off");
+    if (vkGetPhysicalDeviceProperties) {
+        vkGetPhysicalDeviceProperties(g.pd, &g.pc_props);
+        r = vb_pcache_resolve(env, appdata, g.pc_props.vendorID, g.pc_props.deviceID, g.pc_path,
+                              sizeof g.pc_path);
+    }
+    if (r < 0) {
+        g.pc_path[0] = 0;
+        snprintf(outcome, cap, "off (path too long)");
+    }
+    if (r > 0) {
+        g.pc_on = 1;
+        *file = vb_pcache_load(blob, blob_n, outcome, cap);
+    }
+}
+
+static void vb_pcache_report(const char *outcome)
+{
+    if (g.pc_on)
+        fprintf(stderr, "[GPUVK] pipeline cache: %s %s\n", g.pc_path, outcome);
+    else
+        fprintf(stderr, "[GPUVK] pipeline cache: %s\n", outcome);
+    fflush(stderr);
+}
+
+static void vb_pcache_save_failed(const char *what)
+{
+    g.st.pcache_save_failures++;
+    vb_pcache_say("[GPUVK] pipeline cache: save failed (%s)\n", what);
+    if (++g.pc_fails >= VB_PCACHE_FAILS) {
+        g.pc_latched = 1;
+        vb_pcache_say("[GPUVK] pipeline cache: saving stopped after %s consecutive failures\n",
+                      "3");
+    }
+}
+
+/* Called at every flip: write the cache when pipelines were made since the last good save and
+ * the last attempt is at least VB_PCACHE_SAVE_MS ago. A failure is counted and logged, never
+ * fatal, and is retried no sooner than the next interval; three in a row stop saving for the
+ * run. The file is written beside its target as <path>.<pid>.tmp and renamed over it, and an
+ * image our own loader would reject is never written (saving stops, the old file stays). */
+static void vb_pcache_maybe_save(void)
+{
+    char tmp[1100];
+    uint64_t now;
+    uint8_t *img = NULL;
+    size_t sz = 0, got;
+    FILE *f;
+    VkResult r;
+    int why, ok;
+
+    if (!g.pc_on || !g.pc_dirty || g.pc_latched)
+        return;
+    now = vb_now_ns();
+    if (now - g.pc_last_ns < (uint64_t)VB_PCACHE_SAVE_MS * 1000000ull)
+        return;
+    g.pc_last_ns = now;
+    if (!vkGetPipelineCacheData || !g.pcache) {
+        vb_pcache_save_failed("no vkGetPipelineCacheData");
+        return;
+    }
+#if defined(_WIN32)
+    snprintf(tmp, sizeof tmp, "%s.%lu.tmp", g.pc_path, (unsigned long)GetCurrentProcessId());
+#else
+    snprintf(tmp, sizeof tmp, "%s.%lu.tmp", g.pc_path, (unsigned long)getpid());
+#endif
+    vb_pcache_mkparent(g.pc_path);
+    if (!(f = fopen(tmp, "wb"))) {
+        vb_pcache_save_failed("cannot open the temporary file");
+        return;
+    }
+    if (vkGetPipelineCacheData(g.dev, g.pcache, &sz, NULL) != VK_SUCCESS || !sz
+        || sz > VB_PCACHE_MAX) {
+        vb_pcache_save_failed("size query");
+        goto fail;
+    }
+    if (!(img = (uint8_t *)malloc(VB_PCACHE_HDR + sz))) {
+        vb_pcache_save_failed("out of memory");
+        goto fail;
+    }
+    got = sz;
+    r = vkGetPipelineCacheData(g.dev, g.pcache, &got, img + VB_PCACHE_HDR);
+    if (r != VK_SUCCESS || !got || got > sz) {
+        vb_pcache_save_failed(r == VK_INCOMPLETE ? "vkGetPipelineCacheData was incomplete"
+                                                 : "vkGetPipelineCacheData");
+        goto fail;
+    }
+    vb_pcache_header(img, img + VB_PCACHE_HDR, got);
+    why = vb_pcache_parse(img, VB_PCACHE_HDR + got, &g.pc_props, NULL, NULL);
+    if (why != VB_PC_OK) {
+        g.st.pcache_save_failures++;
+        g.pc_latched = 1;
+        vb_pcache_say("[GPUVK] pipeline cache: not saved, the data would be rejected on load "
+                      "(%s); saving stopped\n", vb_pc_reason[why]);
+        goto fail;
+    }
+    ok = fwrite(img, 1, VB_PCACHE_HDR + got, f) == VB_PCACHE_HDR + got;
+    ok = fflush(f) == 0 && ok;
+    ok = fclose(f) == 0 && ok;
+    f = NULL;
+#if defined(_WIN32)
+    ok = ok && MoveFileExA(tmp, g.pc_path, MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    ok = ok && rename(tmp, g.pc_path) == 0;
+#endif
+    if (!ok) {
+        vb_pcache_save_failed("file write");
+        goto fail;
+    }
+    g.st.pcache_saves++;
+    g.pc_dirty = 0;
+    g.pc_fails = 0;
+    free(img);
+    return;
+fail:
+    if (f)
+        fclose(f);
+    remove(tmp);
+    free(img);
 }
 
 /* ── Images, framebuffers, render passes ─────────────────────────────── */
@@ -4489,7 +4858,9 @@ static void vb_stats(int force)
                     " mem_peak_used=%llu mem_shared_block=%u mem_shared_kind=%u"
                     " mem_first_reuse_off=%llu mem_first_reuse_block=%llu"
                     " mem_alloc_failures=%llu mem_bind_failures=%llu mem_map_failures=%llu"
-                    " mem_rollbacks=%llu mem_fallbacks=%llu\n",
+                    " mem_rollbacks=%llu mem_fallbacks=%llu"
+                    " pipe_evictions=%llu pcache_loaded=%llu pcache_saves=%llu"
+                    " pcache_save_failures=%llu pcache_rejects=%llu\n",
             g.frame, (unsigned long long)g.st.draws, (unsigned long long)g.st.tris,
             (unsigned long long)g.st.clears, (unsigned long long)g.st.tex_uploads,
             (unsigned long long)g.st.tex_hits, (unsigned long long)g.st.tex_undecodable,
@@ -4531,7 +4902,11 @@ static void vb_stats(int force)
             (unsigned long long)ms.first_reuse_off, (unsigned long long)ms.first_reuse_block,
             (unsigned long long)ms.alloc_failures, (unsigned long long)ms.bind_failures,
             (unsigned long long)ms.map_failures, (unsigned long long)ms.rollbacks,
-            (unsigned long long)ms.fallbacks);
+            (unsigned long long)ms.fallbacks,
+            (unsigned long long)g.st.pipe_evictions, (unsigned long long)g.st.pcache_loaded_bytes,
+            (unsigned long long)g.st.pcache_saves,
+            (unsigned long long)g.st.pcache_save_failures,
+            (unsigned long long)g.st.pcache_rejects);
     fflush(stderr);
 }
 
@@ -4564,6 +4939,7 @@ static void vb_flip(void)
     for (i = 0; i < n; i++)
         ts[i]->stale = 1;
     g.frame++;
+    vb_pcache_maybe_save();
     vb_stats(!g.stats_said);
     g.stats_said = 1;
 }
@@ -4847,6 +5223,8 @@ static int vb_create_device(void)
         (PFN_vkInvalidateMappedMemoryRanges)vkGetDeviceProcAddr(g.dev,
                                                                "vkInvalidateMappedMemoryRanges");
     vkUnmapMemory = (PFN_vkUnmapMemory)vkGetDeviceProcAddr(g.dev, "vkUnmapMemory");
+    vkGetPipelineCacheData =
+        (PFN_vkGetPipelineCacheData)vkGetDeviceProcAddr(g.dev, "vkGetPipelineCacheData");
     vkGetDeviceQueue(g.dev, g.family, 0, &g.queue);
     vkGetPhysicalDeviceMemoryProperties(g.pd, &g.mp);
 
@@ -4893,6 +5271,10 @@ static int vb_create_pipeline_objects(void)
     VkPushConstantRange pcr;
     VkPipelineLayoutCreateInfo pli = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
     VkPipelineCacheCreateInfo pci = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+    const void *blob = NULL;
+    size_t blob_n = 0;
+    uint8_t *file = NULL;
+    char outcome[96];
     VkComputePipelineCreateInfo cp = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
     VkShaderModuleCreateInfo smi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
     VkDescriptorPoolSize ps[4];
@@ -5068,7 +5450,27 @@ static int vb_create_pipeline_objects(void)
     pli.pPushConstantRanges = &pcr;
     if ((r = vkCreatePipelineLayout(g.dev, &pli, NULL, &g.layout_pack)) != VK_SUCCESS)
         goto fail;
-    if ((r = vkCreatePipelineCache(g.dev, &pci, NULL, &g.pcache)) != VK_SUCCESS)
+    /* A valid file seeds the cache; if the driver refuses it the cache is made empty instead. */
+    file = NULL;
+    vb_pcache_init(&blob, &blob_n, &file, outcome, sizeof outcome);
+    if (file) {
+        pci.initialDataSize = blob_n;
+        pci.pInitialData = blob;
+    }
+    r = vkCreatePipelineCache(g.dev, &pci, NULL, &g.pcache);
+    if (r != VK_SUCCESS && file) {
+        g.st.pcache_rejects++;
+        snprintf(outcome, sizeof outcome, "rejected(the driver refused the data)");
+        pci.initialDataSize = 0;
+        pci.pInitialData = NULL;
+        r = vkCreatePipelineCache(g.dev, &pci, NULL, &g.pcache);
+    } else if (r == VK_SUCCESS && file) {
+        g.st.pcache_loaded_bytes = blob_n;
+        snprintf(outcome, sizeof outcome, "loaded=%llu", (unsigned long long)blob_n);
+    }
+    free(file);
+    vb_pcache_report(outcome);
+    if (r != VK_SUCCESS)
         goto fail;
     smi.codeSize = xbr_nv2a_vk_stage0_vs_size;
     smi.pCode = xbr_nv2a_vk_stage0_vs;
@@ -5183,6 +5585,20 @@ void nv2a_vk_backend_program_stats(Nv2aVkProgramStats *out)
         *out = g.pst;
 }
 
+void nv2a_vk_backend_pipeline_stats(Nv2aVkPipelineStats *out)
+{
+    if (!out)
+        return;
+    memset(out, 0, sizeof *out);
+    out->created = g.st.pipelines;
+    out->evictions = g.st.pipe_evictions;
+    out->cache_loaded_bytes = g.st.pcache_loaded_bytes;
+    out->cache_saves = g.st.pcache_saves;
+    out->cache_save_failures = g.st.pcache_save_failures;
+    out->cache_rejects = g.st.pcache_rejects;
+    out->cache_enabled = g.pc_on ? 1u : 0u;
+}
+
 void nv2a_vk_backend_ring_stats(Nv2aVkRingStats *out)
 {
     unsigned i, inflight = 0;
@@ -5285,7 +5701,7 @@ int nv2a_vk_backend_install(void)
         return result;
     }
     g.ok = 1;
-    g.last_stats_ns = vb_now_ns();
+    g.last_stats_ns = g.pc_last_ns = vb_now_ns();
     nv2a_backend_register(&s_vk_backend);
     fprintf(stderr, "[GPUVK] Vulkan back end registered%s\n",
             getenv("RECOMP_PB_EXEC") ? ""
