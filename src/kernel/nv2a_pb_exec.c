@@ -100,20 +100,25 @@ static int guest_span_ok(uint64_t addr, uint32_t bytes);
 
 static int surface_hits_image(uint32_t base, uint32_t bytes)
 {
-    if (!bytes)
-        return 0;
-    /* The thread stacks sit just above the image. No surface lives there, so
-     * a DMA offset that reads as a VA in that range is just as wrong as one
-     * that lands on the image. */
-    if (base < XBOX_HEAP_BASE && (uint64_t)base + bytes > XBOX_STACK_BASE)
-        return 1;
-    /* And anything that is not guest memory at all: a clear wrote to
-     * 0xC532311B, an offset that names no memory the guest owns. */
-    if (!guest_span_ok(base, bytes))
-        return 1;
-    if (!g_xbox_image_hi)
+    if (!g_xbox_image_hi || !bytes)
         return 0;
     return base < g_xbox_image_hi && base + bytes > g_xbox_image_lo;
+}
+
+/* Where the executor must not write a surface: the image (above), and
+ * anything that is not guest memory at all (a clear once wrote to
+ * 0xC532311B). Only for writes: dma_resolve keeps the image-only test, since
+ * it decides which address an offset names. The fixed stack range
+ * (XBOX_STACK_BASE..XBOX_HEAP_BASE) is deliberately not refused: in this
+ * layout it is ordinary low RAM that only guest threads claim, and fixtures
+ * with no guest threads place surfaces and vertex buffers there. */
+static int surface_write_forbidden(uint32_t base, uint32_t bytes)
+{
+    if (!bytes)
+        return 0;
+    if (!guest_span_ok(base, bytes))
+        return 1;
+    return surface_hits_image(base, bytes);
 }
 
 /* Where a DMA-object offset actually lives.
@@ -168,13 +173,14 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 {
     static int said;
 
-    if (!surface_hits_image(base, bytes))
+    if (!surface_write_forbidden(base, bytes))
         return 0;
     if (!said) {
         said = 1;
         fprintf(stderr,
                 "  [GPU] REFUSING to %s surface 0x%08X..0x%08X: that overlaps "
-                "the loaded image (0x%08X..0x%08X).\n"
+                "the loaded image (0x%08X..0x%08X) or is outside guest "
+                "memory.\n"
                 "  [GPU]   SET_SURFACE_COLOR_OFFSET is a DMA-object offset, not "
                 "a guest VA, and this executor treats it as one. Writing here "
                 "would destroy the title's own code and globals.\n",
@@ -2091,7 +2097,7 @@ static int surface_begin_batch(const uint8_t *mem)
 {
     uint32_t base = dma_resolve(s_gpu.color_offset);
 
-    if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
+    if (surface_write_forbidden(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return 0;
     s_surface = (uint8_t *)mem + base;
     return 1;
