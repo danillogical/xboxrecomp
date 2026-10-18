@@ -62,6 +62,7 @@ extern void nv2a_set_commit_consumer(nv2a_commit_consumer_fn fn);
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
+extern void xbox_FramebufferWindowSetAA(uint32_t sy);
 extern void xbox_FramebufferWindowStart(void);
 extern uint32_t g_xbox_image_lo, g_xbox_image_hi;
 
@@ -95,9 +96,22 @@ void nv2a_pb_exec_report(void);
  * nothing is strictly better than writing over the guest, and a title that
  * cannot draw is easier to debug than one that has been overwritten.
  */
+static int guest_span_ok(uint64_t addr, uint32_t bytes);
+
 static int surface_hits_image(uint32_t base, uint32_t bytes)
 {
-    if (!g_xbox_image_hi || !bytes)
+    if (!bytes)
+        return 0;
+    /* The thread stacks sit just above the image. No surface lives there, so
+     * a DMA offset that reads as a VA in that range is just as wrong as one
+     * that lands on the image. */
+    if (base < XBOX_HEAP_BASE && (uint64_t)base + bytes > XBOX_STACK_BASE)
+        return 1;
+    /* And anything that is not guest memory at all: a clear wrote to
+     * 0xC532311B, an offset that names no memory the guest owns. */
+    if (!guest_span_ok(base, bytes))
+        return 1;
+    if (!g_xbox_image_hi)
         return 0;
     return base < g_xbox_image_hi && base + bytes > g_xbox_image_lo;
 }
@@ -612,6 +626,33 @@ static void note_unhandled(uint32_t method, uint32_t param)
     }
 }
 
+/* Is [addr, addr + bytes) inside memory the guest owns? That is ordinary RAM
+ * from 0, and the contiguous window at XBOX_CONTIG_BASE. The index of a vertex
+ * comes from the title's pushbuffer, 32 bits of it, so after a desync it can
+ * be anything; this is the one place every vertex read passes through. */
+static int guest_span_ok(uint64_t addr, uint32_t bytes)
+{
+    uint64_t end = addr + bytes;
+
+    if (end <= (uint64_t)XBOX_CONTIG_SIZE)
+        return 1;
+    return addr >= XBOX_CONTIG_BASE
+        && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+}
+
+/* Bytes one element of attribute `a` occupies, as fetch_attr reads it. */
+static uint32_t attr_elem_bytes(const VertexAttr *a)
+{
+    uint32_t n = a->size < 4 ? a->size : 4;
+
+    switch (a->type) {
+    case 0: case 6: return 4;
+    case 1: case 5: return 2u * n;
+    case 4:         return n;
+    default:        return 4u * n;
+    }
+}
+
 /* Read attribute `a` of vertex `index` as floats. Only the float and the
  * normalised-byte types appear in practice; anything else returns 0 so a
  * caller sees a degenerate vertex rather than reading past the array. */
@@ -635,9 +676,11 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
             return 0;
         p = (const uint8_t *)s_gpu.inline_buf + at;
     } else {
-        if (!a->offset)
+        uint64_t at = (uint64_t)a->offset + (uint64_t)index * a->stride;
+
+        if (!a->offset || !guest_span_ok(at, attr_elem_bytes(a)))
             return 0;
-        p = mem + a->offset + (size_t)index * a->stride;
+        p = mem + at;
     }
 
     switch (a->type) {
@@ -1677,8 +1720,10 @@ static void clear_surface(uint32_t param)
     /* Only until the title flips. Following the draw surface on every scan
      * shows the buffer being written right now, half a frame at a time; past
      * the first flip the window is repointed at the finished one instead. */
-    if (s_gpu.flips == 0)
+    if (s_gpu.flips == 0) {
         xbox_FramebufferWindowSet(dma_resolve(s_gpu.color_offset), s_gpu.pitch);
+        xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
+    }
 
     /* And open the window, rather than waiting for AvSetDisplayMode to do it.
      *
@@ -3298,6 +3343,11 @@ static void xf_rows_parallel(const XfTri *T, XfCount *total)
 }
 #endif
 
+/* Menu and overlay vertex shaders skip the epilogue's divide-by-w: oPos.w is
+ * a written constant (0) and xy are already surface pixels. A w this small on
+ * all three vertices marks that path; anything else below it is the eye. */
+#define NV_CLIP_W 1e-3f
+
 static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
                                const Nv2aVshOutput *vc)
 {
@@ -3306,7 +3356,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     const Nv2aVshOutput *v[3];
     const float *a, *b, *c;
     float area, su = 1.0f, sv = 1.0f;
-    int k;
+    int k, screen_space;
     static int no_rc = -1;
 
     if (no_rc < 0)
@@ -3323,7 +3373,16 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     T.a = a; T.b = b; T.c = c;
     if (T.bpp != 4 && T.bpp != 2)
         return;
-    if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
+    /* Menu and overlay shaders skip the epilogue's divide-by-w entirely:
+     * oPos.w is a written constant and xy are already surface pixels. xemu's
+     * epilogue clamps such a w away from zero and carries on; there is no
+     * perspective here, so texture coordinates and colours interpolate
+     * linearly. A negative or tiny-but-mixed w is still the near-plane case
+     * and drops as before. */
+    screen_space = fabsf(a[3]) < NV_CLIP_W && fabsf(b[3]) < NV_CLIP_W
+                && fabsf(c[3]) < NV_CLIP_W;
+    if (!screen_space
+            && (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f)) {
         s_gpu.tris_behind++;
         return;
     }
@@ -3348,7 +3407,7 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
         sv = (float)s_gpu.texs[0].height;
     }
     for (k = 0; k < 3; k++) {
-        T.iw[k] = 1.0f / v[k]->pos[3];
+        T.iw[k] = screen_space ? 1.0f : 1.0f / v[k]->pos[3];
         T.uv[k][0] = v[k]->tex[0][0] * su * T.iw[k];
         T.uv[k][1] = v[k]->tex[0][1] * sv * T.iw[k];
     }
@@ -3415,7 +3474,6 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
  * w = NV_CLIP_W (Sutherland-Hodgman, one plane), re-projected, and fanned.
  * ponytail: the near plane only; x/y/far fall to the rasteriser's bounds
  * check, which is correct, just slower for huge off-screen triangles. */
-#define NV_CLIP_W 1e-3f
 
 static void xf_to_clip(const Nv2aVshOutput *v, const float k[3],
                        const float o[3], float c[3])
@@ -3449,6 +3507,15 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
     }
     if (a->pos[3] <= NV_CLIP_W && b->pos[3] <= NV_CLIP_W
         && c->pos[3] <= NV_CLIP_W) {
+        /* Unless none of the three has a real w at all -- the menu/overlay
+         * path, where xy are surface pixels and w is a written constant.
+         * There is nothing to clip; the rasteriser's bounds check does the
+         * work and its iw=1 keeps interpolation linear. */
+        if (fabsf(a->pos[3]) < NV_CLIP_W && fabsf(b->pos[3]) < NV_CLIP_W
+                && fabsf(c->pos[3]) < NV_CLIP_W) {
+            raster_xf_triangle(a, b, c);
+            return;
+        }
         s_gpu.tris_behind++;                  /* wholly behind: nothing */
         return;
     }
@@ -3493,7 +3560,16 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 
     for (a = 0; a < NV2A_VSH_INPUTS; a++)
         fetch_attr(&s_gpu.attr[a], index, in[a]);   /* absent: 0,0,0,1 */
-    return nv2a_vsh_run((const float (*)[4])in, out);
+    if (!nv2a_vsh_run((const float (*)[4])in, out))
+        return 0;
+    /* oPos.w == 0 comes from a program that never divided by w: x, y and z
+     * are already surface units. The hardware draws such a vertex (xemu
+     * clamps w away from zero, in front of the eye), but raster_xf_clipped
+     * would count it behind the eye. w = 1 draws it at the same place and
+     * keeps 1/w finite. -0 stays behind the eye and is clipped, as on xemu. */
+    if (out->pos[3] == 0.0f && !signbit(out->pos[3]))
+        out->pos[3] = 1.0f;
+    return 1;
 }
 
 /* A program batch for a back end: the vertex program has already run, so the
@@ -4721,6 +4797,32 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             fprintf(stderr, "[FTRACE]   m %u:%04X = %08X%c", subch, method,
                     param, 10);
     }
+    {
+        /* RECOMP_VSH_DUMP: constant-arrival watch. Every channel that can
+         * reach the constant file is shown: the dedicated "set" methods
+         * (0x0A00-0x0B00, where the viewport scale/offset constants come from)
+         * and the transform block (0x1E00-0x1EFF). A per-method cap keeps a
+         * whole run's traffic to a few hundred lines. */
+        static int vdump = -1;
+        if (vdump < 0)
+            vdump = getenv("RECOMP_VSH_DUMP") != NULL;
+        if (vdump
+                && ((method >= 0x0A00 && method < 0x0B00)
+                    || (method >= 0x1E00 && method < 0x1F00))) {
+            static int shown[1024];
+            int slot = (method < 0x0B00) ? (int)method - 0x0A00
+                                         : 0x100 + (int)method - 0x1E00;
+            if (slot >= 0 && slot < 1024 && shown[slot]++ < 6)
+                fprintf(stderr, "  [VSH] s%u m %04X = %08X (%g)\n", subch,
+                        method, param, *(const float *)&param);
+        }
+        if (vdump && subch != 0) {
+            static int oshown[2048];
+            if (method / 2 < 2048 && oshown[method / 2]++ < 4)
+                fprintf(stderr, "  [VSH] NONZERO SUBCH s%u m %04X = %08X\n",
+                        subch, method, param);
+        }
+    }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
         note_unhandled(method, param);
         return;
@@ -5034,6 +5136,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             if (done) {
                 uint32_t pub = dma_resolve(done);
                 xbox_FramebufferWindowSet(pub, s_gpu.pitch);
+                /* 2x2 anti-aliasing: the window takes every other row. */
+                xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
                 xbox_FramebufferWindowPresent(pub, s_gpu.pitch);
                 presented = done;
                 /* Observational, and deliberately AFTER the present call so the

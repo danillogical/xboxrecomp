@@ -29,13 +29,17 @@
 
 /* Bring the models up. Safe to call more than once; does nothing unless
  * RECOMP_USB is set, so a title that was working without a controller keeps
- * behaving exactly as it did.
+ * behaving exactly as it did. Call it after guest memory is mapped (it
+ * disables itself otherwise).
+ *
+ * The registers are trapped on Windows x86-64 and on POSIX arm64 hosts. On
+ * any other host the model stays off, with a one-line notice, and the title
+ * sees the aperture as plain memory, as it does with RECOMP_USB unset.
  *
  * On Windows this is self-contained: it makes both register blocks
  * PAGE_NOACCESS and registers its own vectored exception handler, so the
  * faults are answered without the embedder wiring anything. Call it after
- * guest memory is mapped (it disables itself otherwise) and after the
- * embedder's own handler if the embedder has one, because this one runs
+ * the embedder's own handler if the embedder has one, because this one runs
  * first and would otherwise swallow its diagnostics. */
 void xbox_OhciInit(void);
 
@@ -43,11 +47,14 @@ void xbox_OhciInit(void);
 int  xbox_OhciOwnsAddress(uint32_t xbox_va);
 
 /* Service a trapped access. Returns 1 if the faulting instruction was decoded
- * and stepped over. `ctx` is a PCONTEXT; void * keeps windows.h out of here.
+ * and stepped over. `ctx` is the fault's thread state: the PCONTEXT from a
+ * Win32 VEH, or the ucontext_t * a POSIX SA_SIGINFO handler receives (its
+ * third argument). void * keeps windows.h out of here.
  *
- * Public for a harness that wants to route faults itself. An embedder that
- * just calls xbox_OhciInit does not need it: the model registers its own
- * handler. */
+ * On POSIX a title's fault handler calls this (or xbox_PosixMmioFault, which
+ * routes to it) before it treats the fault as a crash. On Windows the model
+ * registers its own handler, so an embedder that just calls xbox_OhciInit
+ * does not need it; it stays public for a harness that routes faults itself. */
 int  xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
 
 /* Report counts at exit, so a run says whether the driver ever looked. */

@@ -210,7 +210,7 @@ class FpuLifterTest(unittest.TestCase):
             self.assertNotIn("/* FPU:", out, cmov)
             self.assertNotIn("RECOMP_UNIMPL", out, cmov)
             self.assertRegex(out, r"if \(.*\) fp_top\(\) = fp_st1\(\);", cmov)
-            self.assertIn(f"/* {cmov} */", out)
+            self.assertIn(f"/* {cmov} st(0), st(1) */", out)
 
     def test_fcmov_without_tracked_flags_uses_materialised_flags(self):
         insn = Instruction(0, 2, "fcmovb", "st(0), st(1)", "dac1")

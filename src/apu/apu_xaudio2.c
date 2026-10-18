@@ -11,8 +11,8 @@
 #include <string.h>
 #include "apu_xaudio2.h"
 
-/* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
- * stubbed to report inactive; real audio output via SDL2 comes later. */
+/* The XAudio2 backend is Windows-only. On POSIX hosts apu_sdl2.c provides
+ * the same xa2_* functions over SDL2. */
 #if defined(_WIN32)
 
 #define COBJMACROS
@@ -161,12 +161,9 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
-#else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+#else /* !_WIN32: apu_sdl2.c implements the same contract over SDL2 */
 
-int  xa2_init(void)                                   { return 0; }
-void xa2_shutdown(void)                               {}
-int  xa2_is_active(void)                              { return 0; }
-int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
-int  xa2_get_buffer_size(void)                        { return 0; }
+/* ISO C wants at least one declaration in a translation unit. */
+typedef int apu_xaudio2_posix_unused;
 
 #endif /* _WIN32 */

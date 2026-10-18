@@ -265,6 +265,14 @@ static int pb_bad_target(uint32_t w, uint32_t at, uint32_t target, uint32_t put)
 static uint32_t s_get = 0xFFFFFFFFu, s_ret;
 static int      s_in_call;
 
+/* A method whose parameters the walk has not all reached: the header said
+ * `count` words and PUT came first. The DMA engine stalls at PUT and carries
+ * on with the same method when PUT moves; reading the next word as a new
+ * header instead would decode vertex data as commands. (D3D streams large
+ * inline arrays across several kicks, so this is routine, not a desync.) */
+static uint32_t s_pend_left, s_pend_i, s_pend_method, s_pend_subch;
+static int      s_pend_noninc;
+
 /* The title moved GET itself: XDK D3D resets the ring by writing DMA_PUT and
  * DMA_GET together (CDevice::KickOff's restart path). Walking on from the old
  * position would read whatever lies between as commands. */
@@ -275,6 +283,35 @@ void nv2a_pb_resync(uint32_t get_phys)
     pb_flow(s_get, 0xFFFFFFFFu, get_phys & PB_PHYS_MASK);
     s_get = get_phys & PB_PHYS_MASK;
     s_in_call = 0;
+    s_pend_left = 0;
+}
+
+/* Feed the parameters of the method in progress to the survey and the
+ * executor, up to PUT. */
+static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
+{
+    while (s_pend_left && s_get < PB_RAM_BYTES && s_get != put) {
+        uint32_t m = s_pend_noninc ? s_pend_method : s_pend_method + s_pend_i * 4;
+        uint32_t param = *(const uint32_t *)(mem + (0x80000000u | s_get));
+
+        note(s_pend_subch, m);
+        /* Same walk, two consumers: the survey counts, the executor
+         * acts. Keeping them on one decode means they can never
+         * disagree about what the stream said.
+         *
+         * Unless the MMIO state owner is active. Then the submission
+         * walk is the single source of committed methods and feeds the
+         * executor itself; letting this scan feed it too would execute
+         * every method twice, from two different walks that can
+         * disagree about what was committed. The survey still counts,
+         * because it is read-only; only the execution is suppressed. */
+        if (s_exec_enabled && !scan_exec_suppressed())
+            nv2a_pb_exec_method(s_pend_subch, m, param);
+        s_get = (s_get + 4) & PB_PHYS_MASK;
+        s_pend_i++;
+        s_pend_left--;
+        (*words)++;
+    }
 }
 
 void nv2a_pb_scan(uint32_t put_phys)
@@ -290,9 +327,11 @@ void nv2a_pb_scan(uint32_t put_phys)
      * walk, and this is on the poll path. */
     suppress_exec = scan_exec_suppressed();
     if (s_get == 0xFFFFFFFFu) {               /* never resynced: start at PUT */
-        s_get = put;
+        s_get = put, s_pend_left = 0;
         return;
     }
+
+    pb_consume(mem, put, &words);             /* the method PUT stalled inside */
 
     while (s_get != put) {
         uint32_t at = s_get, target;
@@ -303,7 +342,7 @@ void nv2a_pb_scan(uint32_t put_phys)
             xbox_Nv2aAckBusyBits();
 
         if (s_get >= PB_RAM_BYTES) {
-            s_get = put;
+            s_get = put, s_pend_left = 0;
             break;
         }
         w = *(const uint32_t *)(mem + (0x80000000u | s_get));
@@ -312,14 +351,14 @@ void nv2a_pb_scan(uint32_t put_phys)
         s_hist_n++;
 
         if (++words > 0x400000u || unknown > 64) {
-            s_get = put;                      /* lost sync, or runaway */
+            s_get = put, s_pend_left = 0;     /* lost sync, or runaway */
             break;
         }
         s_get = (s_get + 4) & PB_PHYS_MASK;
 
         if ((w & 0xE0000003u) == 0x20000000u) {         /* old-style jump */
             target = w & 0x1FFFFFFCu;
-            if (pb_bad_target(w, at, target, put)) { s_get = put; break; }
+            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0; break; }
             pb_flow(at, w, target);
             s_get = target;
             jumps++;
@@ -327,7 +366,7 @@ void nv2a_pb_scan(uint32_t put_phys)
         }
         if ((w & 3u) == 1u) {                            /* jump */
             target = w & 0xFFFFFFFCu;
-            if (pb_bad_target(w, at, target, put)) { s_get = put; break; }
+            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0; break; }
             pb_flow(at, w, target);
             s_get = target;
             jumps++;
@@ -335,7 +374,15 @@ void nv2a_pb_scan(uint32_t put_phys)
         }
         if ((w & 3u) == 2u) {                            /* call */
             target = w & 0xFFFFFFFCu;
-            if (pb_bad_target(w, at, target, put)) { s_get = put; break; }
+            if (pb_bad_target(w, at, target, put)) { s_get = put, s_pend_left = 0; break; }
+            if (s_in_call) {
+                /* One level only: the hardware raises a CALL error and stops
+                 * the pusher. Taking it would overwrite the return address
+                 * and send the first RETURN to the wrong place. */
+                s_in_call = 0;
+                s_get = put, s_pend_left = 0;
+                break;
+            }
             s_ret = s_get;
             s_in_call = 1;
             pb_flow(at, w, target);
@@ -356,25 +403,17 @@ void nv2a_pb_scan(uint32_t put_phys)
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
 
-            for (uint32_t i = 0; i < count && s_get < PB_RAM_BYTES; i++) {
-                uint32_t m = noninc ? method : method + i * 4;
-                uint32_t param = *(const uint32_t *)(mem + (0x80000000u | s_get));
-                note(subch, m);
-                /* Same walk, two consumers: the survey counts, the executor
-                 * acts. Keeping them on one decode means they can never
-                 * disagree about what the stream said.
-                 *
-                 * Unless the MMIO state owner is active. Then the submission
-                 * walk is the single source of committed methods and feeds the
-                 * executor itself; letting this scan feed it too would execute
-                 * every method twice, from two different walks that can
-                 * disagree about what was committed. The survey still counts,
-                 * because it is read-only; only the execution is suppressed. */
-                if (s_exec_enabled && !scan_exec_suppressed())
-                    nv2a_pb_exec_method(subch, m, param);
-                s_get = (s_get + 4) & PB_PHYS_MASK;
-                words++;
-            }
+            /* PUT bounds the parameters too. A count that runs past it must
+             * not carry s_get beyond PUT (the outer loop would then replay a
+             * lap of stale ring contents), nor be forgotten (the leftover
+             * parameters would be read as headers): the method stays pending
+             * and the next walk finishes it. */
+            s_pend_left = count;
+            s_pend_i = 0;
+            s_pend_method = method;
+            s_pend_subch = subch;
+            s_pend_noninc = noninc;
+            pb_consume(mem, put, &words);
             unknown = 0;
             continue;
         }

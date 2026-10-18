@@ -11,10 +11,43 @@
  */
 
 #include "xinput_xbox.h"
-#include "keyboard_pad.h"
+#include "keyboard.h"
+#include "mkb_input.h"
 #include "pad_map.h"
 #include <stdlib.h>
 #include <string.h>
+
+/* Merge the keyboard on top of a pad on port 0 rather than only standing in
+ * for a missing one.
+ *
+ * The first version put the keyboard behind XInput's failure, on the
+ * assumption that with nothing plugged in the call would fail. It does
+ * not: under Wine XInputGetState returns ERROR_SUCCESS and a gamepad
+ * with every button at rest, so the fallback was unreachable and
+ * pressing a key did nothing at all.
+ *
+ * Merging is also the better rule. A real pad keeps working -- its
+ * buttons are already in pState and the keyboard only adds to them --
+ * and there is no special case left to get wrong. */
+static void keyboard_merge(XBOX_INPUT_STATE *pState)
+{
+    XBOX_INPUT_STATE kb;
+    int i;
+
+    if (!xbox_InputKeyboardPoll(&kb))
+        return;
+    pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
+    for (i = 0; i < 8; i++)
+        if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
+            pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
+    if (kb.Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
+    if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
+    if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
+    if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
+    /* The input layer records edges, so an unchanged packet number is
+     * read as the same state and the press never happens. */
+    pState->dwPacketNumber = kb.dwPacketNumber;
+}
 
 /* ======================================================================== */
 #if defined(_WIN32)
@@ -43,47 +76,8 @@ static void port_failed(DWORD port)
     g_retry_at[port] = GetTickCount64() + EMPTY_PORT_RETRY_MS;
 }
 
-/* ---- keyboard, when there is no pad --------------------------------------
- *
- * Off by default, because a keyboard silently acting as player 1 is
- * surprising when a real pad is what you meant to use. RECOMP_KEYBOARD=1
- * turns it on. It only ever answers for port 0, and is merged on top of a
- * pad connected there, so a real controller keeps working.
- *
- * The mapping itself lives in keyboard_pad.c, shared with the test that
- * asserts it, so there is one table rather than one table and one copy.
- */
-static BOOL keyboard_enabled(void)
-{
-    static int on = -1;
-    if (on < 0) {
-        const char *v = getenv("RECOMP_KEYBOARD");
-        on = (v && *v && *v != '0') ? 1 : 0;
-    }
-    return on ? TRUE : FALSE;
-}
-
-/* The framebuffer window records what is held; see src/video/fb_present.c.
- *
- * GetAsyncKeyState was the first attempt and reads nothing here -- under
- * Wine it answers about a state a GDI-drawing guest never touches. Going
- * through the window is also the better gate: a window only receives keys
- * while it has the focus, so there is no separate focus check to get wrong
- * and no way for typing in another application to drive the game.
- *
- * Declared rather than included so src/input does not depend on the video
- * module's include path. */
-extern int xbox_FramebufferKeyDown(int vk);
-
-static int key_down(int vk)
-{
-    return xbox_FramebufferKeyDown(vk);
-}
-
-static void keyboard_state(XBOX_INPUT_STATE *pState)
-{
-    xbox_KeyboardPadState(pState, key_down);
-}
+/* The keyboard on port 0 (RECOMP_KEYBOARD=1) comes from keyboard.c, shared
+ * with the SDL backend; the GDI window in fb_present.c records the keys. */
 
 void xbox_InputInit(void)
 {
@@ -110,9 +104,16 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         if (result != ERROR_DEVICE_NOT_CONNECTED || !port_throttled(dwPort))
             port_failed(dwPort);
         g_controller_connected[dwPort] = FALSE;
-        if (dwPort == 0 && keyboard_enabled()) {
-            keyboard_state(pState);
-            return ERROR_SUCCESS;
+        if (dwPort == 0) {
+            /* Keyboard and mouse stand in for an absent pad, so the game is
+             * playable with no controller plugged in. */
+            int kb;
+            memset(pState, 0, sizeof *pState);
+            kb = xbox_InputKeyboardPoll(pState);
+            if (mkb_merge(dwPort, pState))
+                g_controller_connected[dwPort] = TRUE;
+            if (kb || mkb_enabled())
+                return ERROR_SUCCESS;
         }
         return result;
     }
@@ -134,34 +135,13 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         pState->dwPacketNumber = xi_state.dwPacketNumber;
     }
 
-    /* Merge the keyboard on top rather than only standing in for a missing
-     * pad.
-     *
-     * The first version put the keyboard behind XInput's failure, on the
-     * assumption that with nothing plugged in the call would fail. It does
-     * not: under Wine XInputGetState returns ERROR_SUCCESS and a gamepad
-     * with every button at rest, so the fallback was unreachable and
-     * pressing a key did nothing at all.
-     *
-     * Merging is also the better rule. A real pad keeps working -- its
-     * buttons are already in pState and the keyboard only adds to them --
-     * and there is no special case left to get wrong. */
-    if (dwPort == 0 && keyboard_enabled()) {
-        XBOX_INPUT_STATE kb;
-        int i;
-        keyboard_state(&kb);
-        pState->Gamepad.wButtons |= kb.Gamepad.wButtons;
-        for (i = 0; i < 8; i++)
-            if (kb.Gamepad.bAnalogButtons[i] > pState->Gamepad.bAnalogButtons[i])
-                pState->Gamepad.bAnalogButtons[i] = kb.Gamepad.bAnalogButtons[i];
-        if (kb.Gamepad.sThumbLX) pState->Gamepad.sThumbLX = kb.Gamepad.sThumbLX;
-        if (kb.Gamepad.sThumbLY) pState->Gamepad.sThumbLY = kb.Gamepad.sThumbLY;
-        if (kb.Gamepad.sThumbRX) pState->Gamepad.sThumbRX = kb.Gamepad.sThumbRX;
-        if (kb.Gamepad.sThumbRY) pState->Gamepad.sThumbRY = kb.Gamepad.sThumbRY;
-        /* The input layer records edges, so an unchanged packet number is
-         * read as the same state and the press never happens. */
-        pState->dwPacketNumber = kb.dwPacketNumber;
-    }
+    if (dwPort == 0)
+        keyboard_merge(pState);
+
+    /* Mouse+keyboard merges on top of a real pad too: the mouse owns the
+     * aim stick while it is moving, WASD owns movement while held. */
+    if (dwPort == 0)
+        mkb_merge(dwPort, pState);
 
     return ERROR_SUCCESS;
 }
@@ -215,6 +195,26 @@ static SDL_GameController *g_pads[XBOX_MAX_CONTROLLERS];
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS];
 static DWORD g_packet[XBOX_MAX_CONTROLLERS];
 
+/* Set while the framebuffer window's main thread pumps SDL events
+ * (src/video/fb_present_sdl.c). The pump already updates the controllers,
+ * and SDL_GameControllerUpdate pumps events itself, which on macOS must only
+ * happen on the main thread; so then this side only reads them. */
+static volatile int g_main_pump;
+
+void xbox_InputSetMainPump(int on)
+{
+    g_main_pump = on;
+}
+
+/* Whether any controller is open: SDL must stay up for it at shutdown. */
+int xbox_InputAnyOpen(void)
+{
+    for (int i = 0; i < XBOX_MAX_CONTROLLERS; i++)
+        if (g_pads[i])
+            return 1;
+    return 0;
+}
+
 /* Open up to XBOX_MAX_CONTROLLERS attached game controllers. */
 static void open_controllers(void)
 {
@@ -232,6 +232,9 @@ static void open_controllers(void)
 
 void xbox_InputInit(void)
 {
+    /* Keep the default SIGINT/SIGTERM: SDL would turn them into an SDL_QUIT
+     * that nothing reads without a window, and Ctrl-C would stop working. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER))
         SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
     open_controllers();
@@ -245,10 +248,13 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     SDL_GameController *c = g_pads[dwPort];
     if (!c || !SDL_GameControllerGetAttached(c)) {
         g_controller_connected[dwPort] = FALSE;
+        if (dwPort == 0 && xbox_InputKeyboardPoll(pState))
+            return ERROR_SUCCESS;
         return ERROR_DEVICE_NOT_CONNECTED;
     }
 
-    SDL_GameControllerUpdate();
+    if (!g_main_pump)
+        SDL_GameControllerUpdate();
     g_controller_connected[dwPort] = TRUE;
 
     memset(pState, 0, sizeof(XBOX_INPUT_STATE));
@@ -293,6 +299,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->Gamepad.sThumbRY =
         (SHORT)(-1 - SDL_GameControllerGetAxis(c, SDL_CONTROLLER_AXIS_RIGHTY));
 
+    if (dwPort == 0)
+        keyboard_merge(pState);
     return ERROR_SUCCESS;
 }
 

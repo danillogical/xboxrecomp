@@ -269,6 +269,18 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 size_t xbox_GetMappedSize(void);
 void xbox_ProtectMirrorsForDebug(void);
 
+/* Trapped hardware registers (APU, USB OHCI). A title's fault handler calls
+ * one of these first and resumes the thread when it returns 1; only 0 is a
+ * crash. void * keeps windows.h and ucontext.h out of here.
+ *   xbox_VehMmioFault   Win32 VEH: the PEXCEPTION_POINTERS.
+ *   xbox_PosixMmioFault POSIX SIGBUS/SIGSEGV handler: its ucontext_t * and
+ *                       si_addr. Always 0 on a host with no decoder. */
+#if defined(_WIN32)
+int xbox_VehMmioFault(void *exception_pointers);
+#else
+int xbox_PosixMmioFault(void *ucv, uintptr_t fault);
+#endif
+
 /* Dump the guest call stack and abort if the title has not exited within
  * RECOMP_WATCHDOG_SECS seconds. Call from the thread that runs guest code;
  * does nothing unless that variable is set. */

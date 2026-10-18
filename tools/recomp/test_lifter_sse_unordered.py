@@ -193,10 +193,7 @@ class SseUnorderedLifterTest(unittest.TestCase):
     def test_single_precision_branches_match_x86_o2(self):
         self._check("-O2", lambda n: not self._is_double(n))
 
-    # The lifter reads xmm registers through .f[0] for comisd/ucomisd too, so
-    # a double in xmm0.d[0] is compared as its low float lane. x86 compares the
-    # full double; this fails until the register form reads .d[0].
-    @unittest.expectedFailure
+    # comisd/ucomisd compare the full double in xmm.d[0], as x86 does.
     def test_double_precision_branches_match_x86(self):
         self._check("-O0", lambda n: self._is_double(n))
 

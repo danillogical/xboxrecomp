@@ -36,6 +36,8 @@ add_library(xbox_apu STATIC
     apu_watch.c
     apu_mmio_hook.c
     apu_xaudio2.c
+    # The SDL2 audio device on POSIX hosts; empty on Windows.
+    apu_sdl2.c
 
     ${XBOXRECOMP_DSP_DIR}/dsp.c
     ${XBOXRECOMP_DSP_DIR}/dsp_c.c
@@ -93,7 +95,8 @@ if(WIN32)
     # XAudio2Create rather than at build time here.
     target_link_libraries(xbox_apu PRIVATE platform kernel32 winmm xaudio2_8 ole32)
 else()
-    # Linux: platform layer (Win32 primitives on POSIX) + SDL2 audio + libm
+    # POSIX (macOS, Linux): platform layer (Win32 primitives on POSIX),
+    # SDL2 for the audio device (apu_sdl2.c) and libm
     find_package(SDL2 REQUIRED)
     target_link_libraries(xbox_apu PRIVATE platform SDL2::SDL2 m)
 endif()

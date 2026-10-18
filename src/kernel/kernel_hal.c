@@ -14,9 +14,10 @@
 #include "kernel.h"
 #include "guest_meter.h"
 #include "nv2a/nv2a_mmio_hook.h"
-#include "xbox_memory_layout.h"   /* RECOMP_TLS */
+#include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -786,47 +787,14 @@ VOID __stdcall xbox_WRITE_PORT_BUFFER_USHORT(PUSHORT Port, PUSHORT Buffer, ULONG
     (void)Count;
 }
 
-static uint32_t g_last_io_port;
-static uint32_t g_last_io_value;
-
-VOID xbox_outb(uint16_t port, uint8_t value)
-{
-    g_last_io_port = port;
-    g_last_io_value = value;
-    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL, "outb port=0x%04X value=0x%02X", port, value);
-}
-
-VOID xbox_outw(uint16_t port, uint16_t value)
-{
-    g_last_io_port = port;
-    g_last_io_value = value;
-    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL, "outw port=0x%04X value=0x%04X", port, value);
-}
-
-VOID xbox_outl(uint16_t port, uint32_t value)
-{
-    g_last_io_port = port;
-    g_last_io_value = value;
-    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL, "outl port=0x%04X value=0x%08X", port, value);
-}
-
-uint8_t xbox_inb(uint16_t port)
-{
-    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL, "inb port=0x%04X -> 0", port);
-    return 0;
-}
-
-uint16_t xbox_inw(uint16_t port)
-{
-    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL, "inw port=0x%04X -> 0", port);
-    return 0;
-}
-
-uint32_t xbox_inl(uint16_t port)
-{
-    xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_HAL, "inl port=0x%04X -> 0", port);
-    return 0;
-}
+/* The byte/word/dword spellings generated code from before the lifter emitted
+ * xbox_PortIn/xbox_PortOut still calls; one port model answers both. */
+VOID xbox_outb(uint16_t port, uint8_t value)  { xbox_PortOut(port, value, 1); }
+VOID xbox_outw(uint16_t port, uint16_t value) { xbox_PortOut(port, value, 2); }
+VOID xbox_outl(uint16_t port, uint32_t value) { xbox_PortOut(port, value, 4); }
+uint8_t  xbox_inb(uint16_t port) { return (uint8_t)xbox_PortIn(port, 1); }
+uint16_t xbox_inw(uint16_t port) { return (uint16_t)xbox_PortIn(port, 2); }
+uint32_t xbox_inl(uint16_t port) { return xbox_PortIn(port, 4); }
 
 /* ============================================================================
  * System Time (Set)
@@ -1167,6 +1135,92 @@ ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
      * monotonic, which is the property callers actually depend on.
      */
     return (ULONGLONG)GetTickCount64() * 10000ULL;
+}
+
+/* =========================================================================
+ * x86 port I/O
+ *
+ * The lifter turns `in`/`out` into these. The MCPX decodes I/O space: its
+ * ACPI/PM block sits at 0x8000 and SMBus at 0xC000, and the kernel exports
+ * cover SMBus, so a title touches ports directly only for the odd pin.
+ *
+ * 0x80C0 is the first GPIO register of the ACPI block. Bit 5 is the field pin
+ * of the video encoder: D3D's vblank ISR stores !bit5 in [device+0x1DF8], and
+ * D3DDevice_GetDisplayFieldStatus reports D3DFIELD_ODD while that is set.
+ * Interlaced output alternates fields every vblank, so the pin follows the
+ * parity of the vblank count. A constant answer says "odd field" for ever,
+ * and the XDK's XMV player only starts its clock on an even one: Burnout 3's
+ * EA intro waited on its loading screen indefinitely.
+ *
+ * The count is xbox_VblankCount, the vblanks the NV2A model has raised. Two
+ * regimes follow from it:
+ *  - tick-driven (once the first vblank is counted): the pin is the count's
+ *    parity and holds still between vblanks, however often it is read;
+ *  - no tick (before the first vblank): the count is 0, so the pin toggles
+ *    on every read instead. A reader waiting for either field still sees it;
+ *    nothing is implied about vblank delivery.
+ *
+ * The field pin is new device behaviour relative to what this runtime
+ * answered before (0 from every port), so it is dormant: RECOMP_PORT_FIELD_PIN=1
+ * arms it, and without it 0x80C0 reads 0 like every other port.
+ *
+ * Every other port reads 0 and is logged on first use, once per port.
+ * ========================================================================= */
+static int port_first_use(uint32_t port, int is_out)
+{
+    static uint32_t seen[32];
+    static volatile LONG nseen;
+    uint32_t key = (port & 0xFFFFu) | (is_out ? 0x10000u : 0u);
+    LONG i, n = nseen;
+
+    for (i = 0; i < n && i < 32; i++)
+        if (seen[i] == key)
+            return 0;
+    i = InterlockedIncrement(&nseen) - 1;
+    if (i < 32)
+        seen[i] = key;
+    return i < 32;
+}
+
+static int port_field_pin_armed(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("RECOMP_PORT_FIELD_PIN");
+        on = v && strcmp(v, "1") == 0;
+    }
+    return on;
+}
+
+uint32_t xbox_PortIn(uint32_t port, int width)
+{
+    uint32_t v = 0;
+
+    port &= 0xFFFFu;
+    if (port == 0x80C0u && port_field_pin_armed()) {
+        static volatile LONG reads;
+        uint32_t n = xbox_VblankCount();
+        if (!n)
+            n = (uint32_t)InterlockedIncrement(&reads);
+        v = (n & 1u) << 5;
+        return v;
+    }
+    if (port_first_use(port, 0)) {
+        fprintf(stderr, "  [PORT] in%c 0x%04X -> 0 (not modelled)\n",
+                width == 1 ? 'b' : width == 2 ? 'w' : 'd', port);
+        fflush(stderr);
+    }
+    return v;
+}
+
+void xbox_PortOut(uint32_t port, uint32_t value, int width)
+{
+    port &= 0xFFFFu;
+    if (port_first_use(port, 1)) {
+        fprintf(stderr, "  [PORT] out%c 0x%04X = 0x%X (ignored)\n",
+                width == 1 ? 'b' : width == 2 ? 'w' : 'd', port, value);
+        fflush(stderr);
+    }
 }
 
 #endif /* !XBOXRECOMP_TIMESTAMP_TEST_BUILD */

@@ -21,7 +21,7 @@
 
 int main(void)
 {
-    const char *expect_env = getenv("APU_MIXDOWN_EXPECT");
+    const char *expect_env = getenv("RECOMP_TEST_MIXDOWN_EXPECT");
     const int expect_heard = expect_env ? atoi(expect_env) : 1;
 
     /* Zeroed is deliberately enough: monitor.point 0 is MON_AC97, which is not

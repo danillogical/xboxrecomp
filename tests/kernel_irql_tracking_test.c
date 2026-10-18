@@ -23,6 +23,7 @@ bool nv2a_hook_pci_config_write(uint32_t offset, const void *buffer, uint32_t le
 { (void)offset; (void)buffer; (void)length; return false; }
 void xbox_log(int level, const char *subsystem, const char *fmt, ...)
 { (void)level; (void)subsystem; (void)fmt; }
+uint32_t xbox_VblankCount(void) { return 0; }   /* the port model's field pin */
 
 static unsigned checks, failures;
 

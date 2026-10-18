@@ -2,16 +2,20 @@
 
 add_library(xbox_input STATIC
     xinput_device.c
-    keyboard_pad.c
+    keyboard.c          # the key table and the one key map (every host)
     pad_map.c
 )
 
 target_include_directories(xbox_input PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(WIN32)
+    # Mouse+keyboard pad (RECOMP_MKB) reads Win32 raw input.
+    target_sources(xbox_input PRIVATE mkb_input.c)
     target_link_libraries(xbox_input PUBLIC platform xinput)
 else()
     find_package(SDL2 REQUIRED)
+    # The SDL window's key and focus events into that table.
+    target_sources(xbox_input PRIVATE keyboard_sdl.c)
     target_link_libraries(xbox_input PUBLIC platform SDL2::SDL2)
 endif()
 
@@ -21,22 +25,22 @@ else()
     target_compile_options(xbox_input PRIVATE -Wall -Wextra -O2)
 endif()
 
-# The Enter -> Xbox Start boundary, tested against the mapping the runtime
-# links. Runs on both platforms: the mapping table is the same code, and the
-# only thing it needs from the host is a key-state callback the test supplies.
+# The key table and the one key map, tested against the code the runtime
+# links (tests/input_keyboard, also a standalone project). Pure C, so it runs
+# on both platforms.
 if(BUILD_TESTING)
     get_filename_component(XBOXRECOMP_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
-    add_executable(keyboard_pad_test
-        keyboard_pad.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/keyboard_pad/keyboard_pad_test.c
+    add_executable(input_keyboard_test
+        keyboard.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/input_keyboard/test_main.c
     )
-    target_include_directories(keyboard_pad_test PRIVATE
+    target_include_directories(input_keyboard_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${XBOXRECOMP_SRC_DIR}
     )
-    target_link_libraries(keyboard_pad_test PRIVATE platform)
-    add_test(NAME keyboard_pad COMMAND keyboard_pad_test)
-    set_tests_properties(keyboard_pad PROPERTIES TIMEOUT 20)
+    target_link_libraries(input_keyboard_test PRIVATE platform)
+    add_test(NAME input_keyboard COMMAND input_keyboard_test)
+    set_tests_properties(input_keyboard PROPERTIES TIMEOUT 20)
 endif()
 
 # The XInput -> Xbox pad mapping and the rumble report parser. Pure C, so it

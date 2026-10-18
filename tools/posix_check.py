@@ -76,9 +76,9 @@ NATIVE_TESTS = [
     ('adpcm_decode', ['tests/adpcm_decode/test_main.c'] + APU, [], [('adpcm_decode', {})]),
     ('apu_mixdown', ['tests/apu_mixdown/test_main.c', 'src/apu/apu_mixdown.c',
                      'tests/posix/apu_core_stubs.c'], [], [
-        ('apu_mixdown_all', {'RECOMP_APU_MIXDOWN_ALL': '1', 'APU_MIXDOWN_EXPECT': '1'}),
-        ('apu_mixdown_even_odd', {'RECOMP_APU_MIXDOWN_ALL': '2', 'APU_MIXDOWN_EXPECT': '1'}),
-        ('apu_mixdown_two_bins', {'RECOMP_APU_MIXDOWN_ALL': '0', 'APU_MIXDOWN_EXPECT': '0'}),
+        ('apu_mixdown_all', {'RECOMP_APU_MIXDOWN_ALL': '1', 'RECOMP_TEST_MIXDOWN_EXPECT': '1'}),
+        ('apu_mixdown_even_odd', {'RECOMP_APU_MIXDOWN_ALL': '2', 'RECOMP_TEST_MIXDOWN_EXPECT': '1'}),
+        ('apu_mixdown_two_bins', {'RECOMP_APU_MIXDOWN_ALL': '0', 'RECOMP_TEST_MIXDOWN_EXPECT': '0'}),
     ]),
     ('mmx_integer', ['tests/mmx_integer/test_main.c'], [], [('mmx_integer', {})]),
 ]

@@ -12,6 +12,9 @@
  * 4. Set memory protection (read-only for .rdata)
  */
 
+#if !defined(_WIN32) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* glibc declares dladdr/Dl_info (RECOMP_WATCH) only under it */
+#endif
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "nv2a_guest_mem.h"
@@ -550,6 +553,95 @@ static void ac97_arm_write_trap(void)
                     " (channel reset completes on write)\n",
             XBOX_MCPX_BASE + AC97_NABM_OFFSET);
 }
+
+/*
+ * Trapped-MMIO dispatch: one call for a title's fault handler.
+ *
+ * The APU and the USB OHCI controllers answer hardware registers by faulting
+ * on them, and each has its own handler. These route the fault to whichever
+ * model owns the address and return 1 when it was serviced, so the caller
+ * resumes the thread instead of reporting a crash. They only re-route: each
+ * model's own handler does the work. On Windows the OHCI model also
+ * registers its own VEH (xbox_OhciInit) and the AC'97 page has its own trap
+ * above, so a title that never calls these loses nothing.
+ */
+#include "apu/apu.h"
+#include "usb/ohci.h"
+
+#define MMIO_APU_BASE 0xFE800000u   /* what MemoryLayoutInit unmaps for the APU */
+#define MMIO_APU_END  0xFE880000u
+
+extern MCPXAPUState *g_apu_state;   /* apu_mmio_hook.c; NULL until audio is up */
+
+/* The guest VA a host fault address names. Only an address inside the 4 GB
+ * guest window names one: truncating the offset to 32 bits would let a host
+ * address far above it alias into a device range. */
+static int mmio_fault_va(uintptr_t fault, uint32_t *va)
+{
+    uintptr_t base = (uintptr_t)xbox_GetMemoryOffset();
+    uint64_t rel = (uint64_t)fault - (uint64_t)base;
+
+    if (fault < base || rel >= 0x100000000ull)
+        return 0;
+    *va = (uint32_t)rel;
+    return 1;
+}
+
+#if defined(_WIN32)
+extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+                                 uint32_t fault_xbox_va, int is_write);
+
+/* Win32: call from the title's VEH for an access violation; on 1, return
+ * EXCEPTION_CONTINUE_EXECUTION. APU, then OHCI. */
+int xbox_VehMmioFault(void *exception_pointers)
+{
+    PEXCEPTION_POINTERS ep = (PEXCEPTION_POINTERS)exception_pointers;
+    uintptr_t fault;
+    uint32_t va;
+
+    if (!ep || ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return 0;
+    fault = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+    if (!mmio_fault_va(fault, &va))
+        return 0;
+    if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
+        return g_apu_state
+            && apu_hook_handle_mmio(ep->ContextRecord, fault, va,
+                   ep->ExceptionRecord->ExceptionInformation[0] ? 1 : 0);
+    if (xbox_OhciOwnsAddress(va))
+        return xbox_OhciHandleMmio(ep->ContextRecord, va);
+    return 0;
+}
+#else
+#if defined(__aarch64__)
+extern bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
+                                       uint32_t fault_xbox_va, int is_write);
+#endif
+
+/* POSIX: call from the title's SIGBUS/SIGSEGV handler (SA_SIGINFO) with its
+ * ucontext_t * and si_addr; on 1, return from the handler and the thread
+ * resumes after the emulated instruction. APU, then OHCI (the AC'97 write
+ * trap above is Win32-only). Only arm64 hosts have a decoder; elsewhere
+ * nothing is trapped and this returns 0. */
+int xbox_PosixMmioFault(void *ucv, uintptr_t fault)
+{
+#if defined(__aarch64__)
+    uint32_t va;
+
+    if (!mmio_fault_va(fault, &va))
+        return 0;
+    /* The APU decodes the direction from the opcode; is_write is advisory. */
+    if (va >= MMIO_APU_BASE && va < MMIO_APU_END)
+        return g_apu_state
+            && apu_hook_handle_mmio_posix(ucv, fault, va, 0);
+    if (xbox_OhciOwnsAddress(va))
+        return xbox_OhciHandleMmio(ucv, va);
+#else
+    (void)ucv; (void)fault;
+#endif
+    return 0;
+}
+#endif
 
 /*
  * Command words the DSP stub completes instantly. A bring-up probe, not a
@@ -1552,6 +1644,8 @@ int g_force_return = 0;
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
 RECOMP_TLS int g_fp_cmp = 0;
 RECOMP_TLS uint16_t g_fp_cc = 0x4000;
+/* SSE control and status: every exception masked, rounding to nearest. */
+RECOMP_TLS uint32_t g_mxcsr = 0x1F80u;
 
 /* Defined below, with the other guest registers. */
 extern RECOMP_TLS uint32_t g_ebp;

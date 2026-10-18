@@ -305,6 +305,9 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
     if (xa2_is_active()) {
         int buf_size = xa2_get_buffer_size();
         int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
+        /* The SDL2 device's buffer size is an environment knob up to 4096. */
+        if (buf_size > 1024)
+            buf_size = 1024;
         int remaining = buf_size;
         int out_offset = 0;
 

@@ -21,6 +21,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* Which keys are down, for the pad stand-in in src/input: this window
+ * records them in the shared key table (src/input/keyboard.c).
+ *
+ * GetAsyncKeyState looked like the cheaper way to ask and does not work
+ * here: it reads a state Wine keeps for the X server, and a guest process
+ * drawing through GDI never sees it change. The window that has the focus
+ * is the thing that receives the keys, so that is what has to remember
+ * them. */
+#include "keyboard.h"   /* src/input */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -56,6 +65,16 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
         s_fb_pitch = pitch;
 }
 
+/* Vertical anti-aliasing factor of the surface being shown: 2 for 2x2, where
+ * the surface has twice the rows as well as twice the columns, and 1 for
+ * everything else (2x1 included). Only the pushbuffer executor knows it. */
+static uint32_t s_fb_aa_sy = 1;
+
+void xbox_FramebufferWindowSetAA(uint32_t sy)
+{
+    s_fb_aa_sy = sy ? sy : 1;
+}
+
 /* Called by the pushbuffer executor when the title flips. */
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 {
@@ -77,7 +96,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     bpp = pitch / s_fb_width;
     src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
     for (y = 0; y < s_fb_height; y++) {
-        const uint8_t *row = src + (size_t)y * pitch;
+        const uint8_t *row = src + (size_t)y * pitch * (bpp == 8 ? s_fb_aa_sy : 1);
         uint32_t *dst = s_present[next] + (size_t)y * s_fb_width;
 
         if (bpp == 4) {
@@ -262,19 +281,6 @@ static void fb_present_observe(void)
     seen = n;
 }
 
-/* Which keys are down, for the pad stand-in in src/input.
- *
- * GetAsyncKeyState looked like the cheaper way to ask and does not work
- * here: it reads a state Wine keeps for the X server, and a guest process
- * drawing through GDI never sees it change. The window that has the focus
- * is the thing that receives the keys, so that is what has to remember
- * them.
- *
- * Reading this needs no lock. Each entry is written only by the window
- * thread and read only by the USB thread, one byte at a time, and a press
- * seen a frame late is indistinguishable from one made a frame later. */
-static volatile unsigned char s_key_down[256];
-
 /* Title bar, the way ps3recomp's window shows it. Written by the flip,
  * read once a second by the window thread; a torn read shows one stale
  * number for a second, which nobody can tell apart from a real one. */
@@ -297,13 +303,6 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
     InterlockedExchange(&s_frame_draws, (LONG)draws);
 }
 
-int xbox_FramebufferKeyDown(int vk)
-{
-    if ((unsigned)vk > 255)
-        return 0;
-    return s_key_down[vk] != 0;
-}
-
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -314,8 +313,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
-        if ((unsigned)w < 256)
-            s_key_down[w] = 1;
+        xbox_InputKeySet((int)w, 1);
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
          *
          * The obvious diagnostic -- sampling which keys are held, once a
@@ -336,13 +334,12 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYUP:
     case WM_SYSKEYUP:
-        if ((unsigned)w < 256)
-            s_key_down[w] = 0;
+        xbox_InputKeySet((int)w, 0);
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
 
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
-        memset((void *)s_key_down, 0, sizeof s_key_down);
+        xbox_InputKeysClear();
         return 0;
     }
     return DefWindowProcA(h, m, w, l);
@@ -356,7 +353,8 @@ static void fb_convert(const uint8_t *src, uint32_t bpp)
     uint32_t x, y;
 
     for (y = 0; y < s_fb_height; y++) {
-        const uint8_t *row = src + (size_t)y * s_fb_pitch;
+        const uint8_t *row = src + (size_t)y * s_fb_pitch
+                           * (bpp == 8 ? s_fb_aa_sy : 1);
         uint32_t *dst = s_rgb + (size_t)y * s_fb_width;
 
         if (bpp == 4) {
@@ -563,13 +561,8 @@ void xbox_FramebufferWindowStart(void)
         InterlockedExchange(&s_fb_running, 0);
 }
 
-#else
-void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
-void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
-void xbox_FramebufferWindowStart(void) {}
-int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
+#else /* POSIX hosts get the SDL2 window in fb_present_sdl.c */
+/* The present tracker exists only for the GDI window. */
 uint32_t xbox_FramebufferPresentSerial(void) { return 0; }
 unsigned long long xbox_FramebufferPresentHash(void) { return 0; }
-void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
-void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 #endif
