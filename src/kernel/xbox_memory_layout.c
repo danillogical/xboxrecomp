@@ -753,24 +753,28 @@ static void ac97m_store32(uint32_t off, uint32_t v)
  * whichever path applied the bytes, so overlapping writes (e.g. at 0x12B or 0x12E, or a byte store
  * to 0x131 that writes bit 8 itself) all converge on the same derived bit. Nothing else is
  * masked, cleared or held read-only: all other GLOB_STA bits round-trip as written. */
-static void ac97m_apply_write(uint32_t off, uint32_t val, int size)
+static void ac97m_apply_write(uint32_t off, uint64_t val, int size)
 {
     int base = ac97m_block_of(off);
     int i;
 
     if (base >= 0 && (off - (uint32_t)base) + (uint32_t)size <= 0x10u) {
-        if (off - (uint32_t)base == 0x00u && size == 4) {
-            /* BDBAR: the two low bits are address bits the register does not store. */
-            uint32_t v = val & ~3u;
+        if (off - (uint32_t)base == 0x00u && size >= 4) {
+            /* BDBAR: the two low bits are address bits the register does not store. A wider
+             * write starting here masks only its first dword; the bytes past it keep the
+             * normal per-byte rules (LVI/SR/CR) in increasing address order. */
+            uint64_t v = val & ~3ull;
             for (i = 0; i < 4; i++)
-                s_ac97m_regs[off + i] = (uint8_t)(v >> (8 * i));
+                s_ac97m_regs[off + i] = (uint8_t)((v >> (8u * (unsigned)i)) & 0xFFu);
+            for (i = 4; i < size; i++)
+                ac97m_apply_byte(off + (uint32_t)i, (uint8_t)(val >> (8u * (unsigned)i)) & 0xFFu);
         } else {
             for (i = 0; i < size; i++)
-                ac97m_apply_byte(off + (uint32_t)i, (val >> (8 * i)) & 0xFFu);
+                ac97m_apply_byte(off + (uint32_t)i, (uint8_t)(val >> (8u * (unsigned)i)) & 0xFFu);
         }
     } else {
         for (i = 0; i < size; i++)
-            s_ac97m_regs[off + i] = (uint8_t)(val >> (8 * i));
+            s_ac97m_regs[off + i] = (uint8_t)((val >> (8u * (unsigned)i)) & 0xFFu);
     }
 
     /* One overlap test after the whole write is applied, not a special case per path: the block
@@ -794,7 +798,7 @@ static uint64_t ac97m_rd(void *dev, uint32_t off, int size)
 static void ac97m_wr(void *dev, uint32_t off, uint64_t val, int size)
 {
     (void)dev;
-    ac97m_apply_write(off, (uint32_t)val, size);
+    ac97m_apply_write(off, val, size);
 }
 
 /* The Windows owner. One leaf lock covers the WHOLE decoded instruction -- including the read and
@@ -1937,18 +1941,21 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                  * what the model holds, which is the only state that decides the guest's poll; the
                  * guest-visible path is proven separately by a real faulting read in the gate. */
                 uint32_t gc_now, gs_now;
+                int take;
 
                 EnterCriticalSection(&s_ac97m_lock);
                 gc_now = (uint32_t)ac97m_rd(NULL, AC97M_GC_OFF, 4);
                 ac97m_sync_gs();
                 gs_now = (uint32_t)ac97m_rd(NULL, AC97M_GS_OFF, 4);
-                if (!g_ac97_witness_done && (gc_now & MCPX_AC97_COLD_RESET)) {
+                take = (!g_ac97_witness_done && (gc_now & MCPX_AC97_COLD_RESET));
+                if (take)
                     g_ac97_witness_done = 1;
+                LeaveCriticalSection(&s_ac97m_lock);
+                if (take) {
                     fprintf(stderr, "[A3A] ac97 witness: gc=0x%08X gs=0x%08X\n",
                             (unsigned)gc_now, (unsigned)gs_now);
                     fflush(stderr);
                 }
-                LeaveCriticalSection(&s_ac97m_lock);
                 ac97m_report();
             } else
 #endif
