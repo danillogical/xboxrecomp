@@ -554,6 +554,478 @@ static void ac97_arm_write_trap(void)
             XBOX_MCPX_BASE + AC97_NABM_OFFSET);
 }
 
+/* ── AC'97: the production NABM owner (Windows) ────────────────────────────────────────────────
+ *
+ * WHY THIS EXISTS. DSOUND resets a bus-master channel by storing 2 (RR) into that channel's NABM
+ * control byte and then reading the byte ONCE, spinning on the value it latched: on hardware the
+ * reset completes inside the write, so the read returns RR clear. Against plain RAM the read
+ * returns the 2 that was just stored and the guest never leaves the loop (TR §31.45).
+ *
+ * WHY NOT THE READ-ONLY PAGE ABOVE. That trap makes the page writable for one thread's single step,
+ * which leaves a window in which another thread's reset store lands unobserved -- and its own
+ * latched read then sees RR still set. It exists for the legacy A2H overlap fixture and is NEVER
+ * armed in production. This owner instead keeps the page PERMANENTLY inaccessible and services each
+ * access by decoding the faulting instruction against private state, exactly as OHCI does, so there
+ * is no window to miss and no page the guest can read behind the model's back.
+ *
+ * WHAT IS MODELLED. The register-visible reset contract of the pinned device source (xemu
+ * hw/audio/ac97.c @ 2799183e, TR §31.46/§31.47; Intel ICH4 290744-001 §§14.2.1-14.2.7 corroborates
+ * the related NABM behaviour but is NOT an MCPX channel-address source) for the four bus-master
+ * blocks the Xbox model defines -- PI 0x00, PO 0x10, MC 0x20, SO 0x70, at page+0x100. An
+ * RR-carrying write to a control byte keeps `prior_cr & 0x1C` (RR and RPBM cleared, the
+ * interrupt-enable bits retained from the prior state), zeroes BDBAR/CIV/LVI/PICB/PIV and leaves the
+ * channel halted (SR = DCH); a write without RR stores `value & 0x1F`. The four reserved CR-shaped
+ * bytes (0x3B/0x4B/0x5B/0x6B) are NOT masked, and every other location keeps the storage behaviour
+ * it had as plain RAM.
+ *
+ * WHAT IS NOT MODELLED, SAID OUT LOUD. There is no DMA engine, no audio output and no interrupt
+ * delivery here, so nothing may manufacture progress: a start write (RPBM set) does not clear the
+ * halted bit, does not move CIV/PIV and does not fetch a descriptor. A channel is halted because the
+ * engine behind it does not exist, which is the truthful state; SR's halt bit is read-only, as the
+ * source has it, so no write can clear it. If later guest work needs an absent DMA transition, that
+ * is a NEW horizon to classify rather than to fake here.
+ *
+ * L20 IS PRESERVED. GC (0x2C) is stored as written and GS (0x30) bit 8 is the level of GC bit 1 --
+ * evaluated on the guest's GC write and again by the ack worker every tick -- rather than xemu's
+ * unconditional ready bit, which would be a synthetic-readiness shortcut.
+ *
+ * POSIX IS UNCHANGED: the page is only ever protected on Windows, so the POSIX tick keeps reading
+ * and writing the mapped aperture exactly as before. */
+#if defined(_WIN32)
+#include "../platform/mmio_decode.h"
+
+#define AC97M_PAGE_SIZE   AC97_TRAP_BYTES                 /* 0x1000 */
+#define AC97M_NABM        0x100u
+#define AC97M_NABM_SIZE   0x80u                           /* NABM spans 128 bytes */
+#define AC97M_GC_OFF      (AC97M_NABM + 0x2Cu)            /* GLOB_CNT, page offset 0x12C */
+#define AC97M_GS_OFF      (AC97M_NABM + 0x30u)            /* GLOB_STA, page offset 0x130 */
+#define AC97M_CAS_OFF     (AC97M_NABM + 0x34u)            /* CAS,      page offset 0x134 */
+
+#define AC97M_CR_RR       0x02u     /* CR_RR   -- reset registers, self-clearing */
+#define AC97M_CR_RPBM     0x01u     /* CR_RPBM -- run/pause bus master          */
+#define AC97M_CR_KEEP     0x1Cu     /* CR_DONT_CLEAR_MASK = IOCE|FEIE|LVBIE     */
+#define AC97M_CR_VALID    0x1Fu     /* CR_VALID_MASK                            */
+#define AC97M_SR_DCH      0x0001u   /* halted, read-only                        */
+#define AC97M_SR_CELV     0x0002u   /* read-only                                */
+#define AC97M_SR_RO       (AC97M_SR_DCH | AC97M_SR_CELV)
+#define AC97M_SR_WCLEAR   0x001Cu   /* FIFOE|BCIS|LVBCI, write-one-to-clear     */
+#define AC97M_GC_CR       0x0002u   /* cold-reset request bit                   */
+#define AC97M_GS_S0CR     0x0100u   /* primary codec ready                      */
+
+/* The four blocks the Xbox model defines (ac97_int.h PI/PO/MC/SO at NABM 0x00/0x10/0x20/0x70),
+ * as PAGE offsets: the NABM block starts at page+0x100. Everything here is indexed by page offset
+ * because that is what the decoded operand gives and what s_ac97m_regs is addressed by. */
+static const uint16_t s_ac97m_block[4] = {
+    AC97M_NABM + 0x00u, AC97M_NABM + 0x10u, AC97M_NABM + 0x20u, AC97M_NABM + 0x70u
+};
+
+static uint8_t           s_ac97m_regs[AC97M_PAGE_SIZE];
+static CRITICAL_SECTION  s_ac97m_lock;
+static char             *s_ac97m_host;          /* host address of the protected page */
+static volatile LONG     s_ac97m_armed;         /* state+lock+handler are live; tick uses the model */
+static void             *s_ac97m_veh;
+static volatile LONG     s_ac97m_serviced;
+static volatile LONG     s_ac97m_refused;
+static volatile LONG     s_ac97m_max_us;     /* longest single decoded service, microseconds */
+static uint64_t          s_ac97m_report_ms;  /* last counter line, for the bounded report      */
+static volatile LONG     s_ac97m_report_s;   /* counts as last reported                        */
+static volatile LONG     s_ac97m_report_r;
+
+static uint32_t ac97m_load32(uint32_t off);
+static void     ac97m_store32(uint32_t off, uint32_t v);
+
+/* GS bit 8 is the level of GC bit 1. Called with the lock held, after any write that can change
+ * either register and once per tick -- on the 32-bit register, because bit 8 is bit 0 of the
+ * SECOND byte (page offset GS+1): touching s_ac97m_regs[GS_OFF] alone would silently never set it. */
+static void ac97m_sync_gs(void)
+{
+    uint32_t gs = ac97m_load32(AC97M_GS_OFF);
+
+    if (s_ac97m_regs[AC97M_GC_OFF] & AC97M_GC_CR)
+        gs |= AC97M_GS_S0CR;
+    else
+        gs &= ~(uint32_t)AC97M_GS_S0CR;
+    ac97m_store32(AC97M_GS_OFF, gs);
+}
+
+/* Which defined block, if any, an NABM offset names; returns the block base or -1. */
+static int ac97m_block_of(uint32_t nabm_off)
+{
+    int i;
+
+    for (i = 0; i < 4; i++)
+        if (nabm_off >= s_ac97m_block[i] && nabm_off < (uint32_t)s_ac97m_block[i] + 0x10u)
+            return s_ac97m_block[i];
+    return -1;
+}
+
+static uint16_t ac97m_field16(uint32_t off)
+{
+    return (uint16_t)(s_ac97m_regs[off] | ((uint16_t)s_ac97m_regs[off + 1] << 8));
+}
+
+static void ac97m_set_field16(uint32_t off, uint16_t v)
+{
+    s_ac97m_regs[off]     = (uint8_t)(v & 0xFFu);
+    s_ac97m_regs[off + 1] = (uint8_t)(v >> 8);
+}
+
+/* The register-visible reset of one bus-master channel: BDBAR/CIV/LVI/PICB/PIV zeroed, SR halted,
+ * the descriptor list invalid (nothing here models descriptors), and the control register left to
+ * the caller because its prior-state retention is the contract that matters. */
+static void ac97m_reset_block(uint32_t base)
+{
+    uint32_t i;
+
+    for (i = 0; i < 0x0Au; i++)                 /* BDBAR, CIV, LVI, SR/PICB low bytes ... */
+        s_ac97m_regs[base + i] = 0;
+    s_ac97m_regs[base + 0x0Au] = 0;             /* PIV                                    */
+    ac97m_set_field16(base + 0x06u, AC97M_SR_DCH);   /* SR = halted, everything else cleared */
+}
+
+/* Apply one byte of a write inside a defined block. The two rules the pinned source implements at
+ * byte granularity are the control byte's reset contract and the status byte's write-one-to-clear
+ * behaviour; every other byte keeps plain storage, which is what the location did when the page was
+ * RAM. Called in increasing address order so that a wider access covering the control byte resets
+ * the block LAST -- the order the source's own byte-split writes produce. */
+static void ac97m_apply_byte(uint32_t off, uint32_t v)
+{
+    int base = ac97m_block_of(off);
+    uint32_t rel;
+
+    if (base < 0) {
+        s_ac97m_regs[off] = (uint8_t)v;
+        return;
+    }
+    rel = off - (uint32_t)base;
+    if (rel == 0x0Bu) {                         /* the control byte: the deciding contract */
+        uint8_t prior = s_ac97m_regs[off];
+
+        if (v & AC97M_CR_RR) {
+            s_ac97m_regs[off] = (uint8_t)(prior & AC97M_CR_KEEP);
+            ac97m_reset_block((uint32_t)base);
+        } else {
+            s_ac97m_regs[off] = (uint8_t)(v & AC97M_CR_VALID);
+            if (!(v & AC97M_CR_RPBM)) {         /* halted, and it can only ever be halted */
+                uint16_t sr = ac97m_field16((uint32_t)base + 0x06u);
+                ac97m_set_field16((uint32_t)base + 0x06u, (uint16_t)(sr | AC97M_SR_DCH));
+            }
+        }
+        return;
+    }
+    if (rel == 0x06u) {                         /* SR low byte: RO bits kept, W1C cleared */
+        uint16_t keep = (uint16_t)(~(uint32_t)(AC97M_SR_RO | AC97M_SR_WCLEAR) & 0xFFFFu);
+        uint16_t sr = ac97m_field16(off);
+        sr = (uint16_t)(sr | ((uint16_t)v & keep));
+        sr = (uint16_t)(sr & ~((uint16_t)v & AC97M_SR_WCLEAR));
+        ac97m_set_field16(off, sr);
+        return;
+    }
+    if (rel == 0x05u) {                         /* LVI is a 5-bit index */
+        s_ac97m_regs[off] = (uint8_t)(v & 0x1Fu);
+        return;
+    }
+    s_ac97m_regs[off] = (uint8_t)v;
+}
+
+static uint32_t ac97m_load32(uint32_t off)
+{
+    return (uint32_t)s_ac97m_regs[off]
+         | ((uint32_t)s_ac97m_regs[off + 1] << 8)
+         | ((uint32_t)s_ac97m_regs[off + 2] << 16)
+         | ((uint32_t)s_ac97m_regs[off + 3] << 24);
+}
+
+static void ac97m_store32(uint32_t off, uint32_t v)
+{
+    s_ac97m_regs[off]     = (uint8_t)(v & 0xFFu);
+    s_ac97m_regs[off + 1] = (uint8_t)((v >> 8) & 0xFFu);
+    s_ac97m_regs[off + 2] = (uint8_t)((v >> 16) & 0xFFu);
+    s_ac97m_regs[off + 3] = (uint8_t)((v >> 24) & 0xFFu);
+}
+
+/* Apply one write. A write that lies inside a defined block is decomposed byte by byte (so an
+ * access overlapping the control byte or the status byte gets the same semantics as the byte access
+ * the guest actually issues); every other byte keeps the plain storage it had when the page was
+ * RAM. GLOB_CNT and GLOB_STA are plain storage too, plus one derived bit: whenever the written
+ * byte range overlaps either global ([GC_OFF, GC_OFF+4) or [GS_OFF, GS_OFF+4)), ac97m_sync_gs()
+ * re-derives GLOB_STA bit 8 as the level of GLOB_CNT bit 1. The test is on the RANGE, after
+ * whichever path applied the bytes, so overlapping writes (e.g. at 0x12B or 0x12E, or a byte store
+ * to 0x131 that writes bit 8 itself) all converge on the same derived bit. Nothing else is
+ * masked, cleared or held read-only: all other GLOB_STA bits round-trip as written. */
+static void ac97m_apply_write(uint32_t off, uint32_t val, int size)
+{
+    int base = ac97m_block_of(off);
+    int i;
+
+    if (base >= 0 && (off - (uint32_t)base) + (uint32_t)size <= 0x10u) {
+        if (off - (uint32_t)base == 0x00u && size == 4) {
+            /* BDBAR: the two low bits are address bits the register does not store. */
+            uint32_t v = val & ~3u;
+            for (i = 0; i < 4; i++)
+                s_ac97m_regs[off + i] = (uint8_t)(v >> (8 * i));
+        } else {
+            for (i = 0; i < size; i++)
+                ac97m_apply_byte(off + (uint32_t)i, (val >> (8 * i)) & 0xFFu);
+        }
+    } else {
+        for (i = 0; i < size; i++)
+            s_ac97m_regs[off + i] = (uint8_t)(val >> (8 * i));
+    }
+
+    /* One overlap test after the whole write is applied, not a special case per path: the block
+     * dispatch above treats page offsets 0x120-0x12F as the MC block (ac97m_block_of uses a
+     * 0x10-byte span), so a GLOB_CNT byte reached through the block path still lands here. */
+    if (off < AC97M_GS_OFF + 4u && off + (uint32_t)size > AC97M_GC_OFF)
+        ac97m_sync_gs();
+}
+
+static uint64_t ac97m_rd(void *dev, uint32_t off, int size)
+{
+    uint64_t v = 0;
+    int i;
+
+    (void)dev;
+    for (i = 0; i < size; i++)
+        v |= (uint64_t)s_ac97m_regs[off + i] << (8 * i);
+    return v;
+}
+
+static void ac97m_wr(void *dev, uint32_t off, uint64_t val, int size)
+{
+    (void)dev;
+    ac97m_apply_write(off, (uint32_t)val, size);
+}
+
+/* The Windows owner. One leaf lock covers the WHOLE decoded instruction -- including the read and
+ * the write of a read-modify-write form -- and each host (tick) transaction, so nothing interleaves
+ * inside a reset and no partial state is observable. The callbacks touch only model state: no guest
+ * pointer, no logging, no allocation, no nested emulation. */
+static LONG CALLBACK ac97m_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    mmio_insn_t d;
+    uint64_t base, lo, hi;
+    uint32_t off;
+
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != STATUS_GUARD_PAGE_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (!InterlockedCompareExchange(&s_ac97m_armed, 0, 0))
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    /* Cheap ownership prefilter, and it is also what makes the refusal counter a record of THIS
+     * owner's refusals: without it every access violation anywhere in the process (the NV2A and APU
+     * apertures fault constantly) would be decoded here and counted. The page is the only
+     * inaccessible one this owner owns, so a fault whose first byte is not in it cannot be an
+     * operand that starts in it: a split access faults on the byte in the inaccessible page. */
+    if (!s_ac97m_host
+            || (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1] < (uintptr_t)s_ac97m_host
+            || (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1]
+                    >= (uintptr_t)s_ac97m_host + AC97M_PAGE_SIZE)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    EnterCriticalSection(&s_ac97m_lock);
+    if (!mmio_decode(ep->ContextRecord, &d)) {
+        /* Not a form this decoder covers: refuse without touching anything. */
+        InterlockedIncrement(&s_ac97m_refused);
+        LeaveCriticalSection(&s_ac97m_lock);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    base = (uint64_t)(uintptr_t)s_ac97m_host;
+    lo   = d.eff;
+    hi   = d.eff + (uint64_t)d.size;
+    if (!base || lo < base || hi > base + AC97M_PAGE_SIZE) {
+        /* The OPERAND is not ours. A fault on a page boundary can name the second page, so the
+         * fault address is never used to decide this -- `d.eff` is -- and an operand that starts
+         * outside the page is refused rather than guessed at. */
+        InterlockedIncrement(&s_ac97m_refused);
+        LeaveCriticalSection(&s_ac97m_lock);
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    off = (uint32_t)(lo - base);
+    {
+        LARGE_INTEGER t0, t1, freq;
+        LONG us;
+
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&t0);
+        if (!mmio_emulate(ep->ContextRecord, off, NULL, ac97m_rd, ac97m_wr)) {
+            InterlockedIncrement(&s_ac97m_refused);
+            LeaveCriticalSection(&s_ac97m_lock);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        QueryPerformanceCounter(&t1);
+        us = (LONG)((t1.QuadPart - t0.QuadPart) * 1000000 / (freq.QuadPart ? freq.QuadPart : 1));
+        if (us > InterlockedCompareExchange(&s_ac97m_max_us, 0, 0))
+            InterlockedExchange(&s_ac97m_max_us, us);
+    }
+    InterlockedIncrement(&s_ac97m_serviced);
+    LeaveCriticalSection(&s_ac97m_lock);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+/* One bounded counter line for the run record: printed only when a counter has changed and at most
+ * once a second, from the ack worker. The counters themselves are the lossless record (they are
+ * incremented at the event); this line only makes them visible without a debugger. */
+static void ac97m_report(void)
+{
+    LONG s = InterlockedCompareExchange(&s_ac97m_serviced, 0, 0);
+    LONG r = InterlockedCompareExchange(&s_ac97m_refused, 0, 0);
+    uint64_t now = GetTickCount64();
+
+    if ((s != InterlockedCompareExchange(&s_ac97m_report_s, 0, 0)
+                || r != InterlockedCompareExchange(&s_ac97m_report_r, 0, 0))
+            && now - s_ac97m_report_ms >= 1000u) {
+        InterlockedExchange(&s_ac97m_report_s, s);
+        InterlockedExchange(&s_ac97m_report_r, r);
+        s_ac97m_report_ms = now;
+        fprintf(stderr, "[AC97] serviced=%ld refused=%ld max_service_us=%ld\n",
+                (long)s, (long)r, (long)InterlockedCompareExchange(&s_ac97m_max_us, 0, 0));
+        fflush(stderr);
+    }
+}
+
+/* Arm the owner. State, lock and handler are all live before the page is protected, so no fault can
+ * arrive without a handler and no host access can land on an inaccessible page. */
+static void ac97m_arm(void)
+{
+    DWORD old;
+
+    if (!g_mcpx_memory || InterlockedCompareExchange(&s_ac97m_armed, 0, 0))
+        return;
+    s_ac97m_host = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
+    InitializeCriticalSection(&s_ac97m_lock);
+    memset(s_ac97m_regs, 0, sizeof(s_ac97m_regs));
+    {
+        int i;
+
+        for (i = 0; i < 4; i++)
+            ac97m_set_field16((uint32_t)s_ac97m_block[i] + 0x06u, AC97M_SR_DCH);
+        ac97m_sync_gs();
+    }
+    s_ac97m_veh = AddVectoredExceptionHandler(1, ac97m_veh);
+    if (!s_ac97m_veh) {
+        fprintf(stderr, "  AC97: FAILED to register the NABM owner; the channel reset would spin\n");
+        return;
+    }
+    /* Published before the page is protected: the tick must already be using the model when the
+     * page becomes inaccessible. */
+    InterlockedExchange(&s_ac97m_armed, 1);
+    if (!VirtualProtect(s_ac97m_host, AC97M_PAGE_SIZE, PAGE_NOACCESS, &old)) {
+        InterlockedExchange(&s_ac97m_armed, 0);
+        RemoveVectoredExceptionHandler(s_ac97m_veh);
+        s_ac97m_veh = NULL;
+        s_ac97m_host = NULL;
+        fprintf(stderr, "  AC97: FAILED to protect 0x%08X (error %lu); the channel reset would"
+                        " spin\n", XBOX_MCPX_BASE + AC97_NABM_OFFSET, (unsigned long)GetLastError());
+        return;
+    }
+    fprintf(stderr, "  AC97: NABM owner armed at 0x%08X..0x%08X (%u bytes inaccessible,"
+                    " reset completes inside the write)\n",
+            XBOX_MCPX_BASE + AC97_NABM_OFFSET,
+            XBOX_MCPX_BASE + AC97_NABM_OFFSET + AC97M_PAGE_SIZE - 1u, AC97M_PAGE_SIZE);
+    fflush(stderr);
+}
+
+static void ac97m_shutdown(void)
+{
+    DWORD old;
+
+    if (!InterlockedCompareExchange(&s_ac97m_armed, 0, 0))
+        return;
+    InterlockedExchange(&s_ac97m_armed, 0);
+    if (s_ac97m_host)
+        VirtualProtect(s_ac97m_host, AC97M_PAGE_SIZE, PAGE_READWRITE, &old);
+    if (s_ac97m_veh) {
+        RemoveVectoredExceptionHandler(s_ac97m_veh);
+        s_ac97m_veh = NULL;
+    }
+    s_ac97m_host = NULL;
+}
+
+/* ── test seams ────────────────────────────────────────────────────────────────────────────────
+ *
+ * The independent test exercises the PRODUCTION path (a real decoded faulting access against the
+ * protected page). These only let it seed a state the public register interface cannot reach --
+ * a prior control value with RR already set, which every real write clears -- and read the counters.
+ * They are not part of the runtime and nothing in the runtime calls them.
+ *
+ * Fail-safe misuse: Seed does nothing and Peek returns 0 when the model is not armed (before the
+ * init arming, or after shutdown), so neither touches the uninitialised lock; Tick already
+ * returns. The request is validated before memory is touched: size must be 1, 2 or 4, and the
+ * range must lie inside the page in overflow-safe form (page_off >= PAGE_SIZE or
+ * size > PAGE_SIZE - page_off rejects, where page_off + size > PAGE_SIZE would wrap). */
+int xbox_Ac97ModelFixtureArmed(void)
+{
+    return InterlockedCompareExchange(&s_ac97m_armed, 0, 0) ? 1 : 0;
+}
+
+/* 0 unless size is a width the decoder can produce. */
+static int ac97m_seam_size_ok(int size)
+{
+    return size == 1 || size == 2 || size == 4;
+}
+
+/* 0 unless [page_off, page_off+size) lies inside the page; the subtraction form cannot wrap. */
+static int ac97m_seam_range_ok(uint32_t page_off, int size)
+{
+    return ac97m_seam_size_ok(size)
+        && page_off < AC97M_PAGE_SIZE
+        && (uint32_t)size <= AC97M_PAGE_SIZE - page_off;
+}
+
+void xbox_Ac97ModelFixtureSeed(uint32_t page_off, uint32_t val, int size)
+{
+    int i;
+
+    if (!InterlockedCompareExchange(&s_ac97m_armed, 0, 0))
+        return;
+    if (!ac97m_seam_range_ok(page_off, size))
+        return;
+    EnterCriticalSection(&s_ac97m_lock);
+    for (i = 0; i < size; i++)
+        s_ac97m_regs[page_off + i] = (uint8_t)(val >> (8 * i));
+    LeaveCriticalSection(&s_ac97m_lock);
+}
+
+uint32_t xbox_Ac97ModelFixturePeek(uint32_t page_off, int size)
+{
+    uint64_t v;
+    int i;
+
+    v = 0;
+    if (!InterlockedCompareExchange(&s_ac97m_armed, 0, 0))
+        return 0;
+    if (!ac97m_seam_range_ok(page_off, size))
+        return 0;
+    EnterCriticalSection(&s_ac97m_lock);
+    for (i = 0; i < size; i++)
+        v |= (uint64_t)s_ac97m_regs[page_off + i] << (8 * i);
+    LeaveCriticalSection(&s_ac97m_lock);
+    return (uint32_t)v;
+}
+
+uint32_t xbox_Ac97ModelFixtureServiced(void)
+{
+    return (uint32_t)InterlockedCompareExchange(&s_ac97m_serviced, 0, 0);
+}
+
+uint32_t xbox_Ac97ModelFixtureRefused(void)
+{
+    return (uint32_t)InterlockedCompareExchange(&s_ac97m_refused, 0, 0);
+}
+
+/* The tick's coherent GC/GS transaction, so a test can drive it without the worker thread. */
+void xbox_Ac97ModelFixtureTick(void)
+{
+    if (!InterlockedCompareExchange(&s_ac97m_armed, 0, 0))
+        return;
+    EnterCriticalSection(&s_ac97m_lock);
+    ac97m_sync_gs();
+    LeaveCriticalSection(&s_ac97m_lock);
+}
+#endif /* _WIN32 */
+
 /*
  * Trapped-MMIO dispatch: one call for a title's fault handler.
  *
@@ -1455,6 +1927,32 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * from the host -- it is read only, so the guest's own value is what
          * drives the model. */
         if (g_mcpx_regs) {
+#if defined(_WIN32)
+            if (InterlockedCompareExchange(&s_ac97m_armed, 0, 0)) {
+                /* Windows: the NABM page belongs to the owner above and is PAGE_NOACCESS, so the
+                 * whole transaction -- read GC, evaluate the L20 relation, sample the witness --
+                 * runs under the owner's lock against the MODEL's state. GC is still guest-written
+                 * (through a decoded store) and GS is still read by the guest (through a decoded
+                 * load); this thread never touches the page. The witness below therefore reports
+                 * what the model holds, which is the only state that decides the guest's poll; the
+                 * guest-visible path is proven separately by a real faulting read in the gate. */
+                uint32_t gc_now, gs_now;
+
+                EnterCriticalSection(&s_ac97m_lock);
+                gc_now = (uint32_t)ac97m_rd(NULL, AC97M_GC_OFF, 4);
+                ac97m_sync_gs();
+                gs_now = (uint32_t)ac97m_rd(NULL, AC97M_GS_OFF, 4);
+                if (!g_ac97_witness_done && (gc_now & MCPX_AC97_COLD_RESET)) {
+                    g_ac97_witness_done = 1;
+                    fprintf(stderr, "[A3A] ac97 witness: gc=0x%08X gs=0x%08X\n",
+                            (unsigned)gc_now, (unsigned)gs_now);
+                    fflush(stderr);
+                }
+                LeaveCriticalSection(&s_ac97m_lock);
+                ac97m_report();
+            } else
+#endif
+            {
             volatile uint32_t *gc =
                 (volatile uint32_t *)((char *)g_mcpx_regs + MCPX_AC97_GLOB_CNT);
             volatile uint32_t *gs =
@@ -1476,13 +1974,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
              * Emitted with a bare fprintf + fflush, NOT through the
              * KERNEL_LOG_ON budget gate, so it survives log truncation -- the
              * same property that makes the KeConnectInterrupt line usable as
-             * AC4-POLL. */
+             * AC4-POLL.
+             *
+             * This is the POSIX and not-armed path: the page is plain memory there, so the tick
+             * keeps writing it exactly as before. */
             if (!g_ac97_witness_done && (gc_now & MCPX_AC97_COLD_RESET)) {
                 g_ac97_witness_done = 1;
                 fprintf(stderr,
                         "[A3A] ac97 witness: gc=0x%08X gs=0x%08X\n",
                         (unsigned)*gc, (unsigned)*gs);
                 fflush(stderr);
+            }
             }
         }
 
@@ -1762,6 +2264,16 @@ static int peek_readable(uint32_t va)
         { g_flash_memory,  XBOX_FLASH_BASE,   XBOX_FLASH_SIZE },
     };
     size_t i;
+
+#if defined(_WIN32)
+    /* The AC'97 NABM page is deliberately inaccessible once the owner is armed. A diagnostic that
+     * read a guest VA there would fault on the DIAGNOSTIC's thread and be decoded as if the
+     * instruction were guest code, so the window is declined instead. */
+    if (InterlockedCompareExchange(&s_ac97m_armed, 0, 0)
+            && va >= XBOX_MCPX_BASE + AC97_NABM_OFFSET
+            && va <  XBOX_MCPX_BASE + AC97_NABM_OFFSET + AC97_TRAP_BYTES)
+        return 0;
+#endif
 
     for (i = 0; i < sizeof(win) / sizeof(win[0]); i++) {
         if (!win[i].mapped || !win[i].size)
@@ -3287,6 +3799,14 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     "(error %lu); USB/audio register access will fault\n",
                     XBOX_MCPX_BASE, GetLastError());
         }
+        /* The AC'97 NABM owner (Windows only) loads its state, registers its handler and only then
+         * makes the page inaccessible (see ac97m_arm): the model, its lock and its VEH exist BEFORE
+         * the Nv2a ack worker is created below (xbox_Nv2aAckStart), so the worker's first tick
+         * already runs against the model rather than the page. On POSIX the tick keeps using the
+         * mapped aperture. */
+#if defined(_WIN32)
+        ac97m_arm();
+#endif
     }
 
     /* Flash ROM aperture -- see XBOX_FLASH_BASE for why. */
@@ -5631,6 +6151,10 @@ void xbox_MemoryLayoutShutdown(void)
         CloseHandle(g_nv2a_ack_thread);
         g_nv2a_ack_thread = NULL;
     }
+    /* After the ack worker is stopped: it is the only host accessor of the owner's state. */
+#if defined(_WIN32)
+    ac97m_shutdown();
+#endif
     if (g_nv2a_memory) {
         VirtualFree(g_nv2a_memory, 0, MEM_RELEASE);
         g_nv2a_memory = NULL;
