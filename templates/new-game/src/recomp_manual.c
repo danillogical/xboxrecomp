@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
+#include <stdlib.h>   /* abort */
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -125,6 +126,17 @@ void recomp_icall_fail_log(uint32_t va)
             fprintf(stderr, "    [%2d] 0x%08X\n", i, g_icall_trace[idx]);
     }
     fflush(stderr);
+}
+
+/* A jump the generator could not express (see RECOMP_JUMP_TRAP). The guest
+ * was about to transfer control somewhere no generated body can enter, so
+ * there is nothing correct to continue with: report it and stop. */
+void recomp_jump_trap(uint32_t site, uint32_t target)
+{
+    fprintf(stderr, "[JUMP] untranslatable jump at 0x%08X to 0x%08X\n",
+            site, target);
+    recomp_icall_fail_log(target);
+    abort();
 }
 
 /* An indirect call whose target is not code: a null or wild function pointer.

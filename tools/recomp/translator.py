@@ -215,15 +215,23 @@ def flag_gaps(lifter):
                   for (addr, form), (func, setter) in lifter.flag_gaps.items())
 
 
-def dead_gotos(lifter):
-    """Every jump the label validator deleted, as sorted tuples.
+# Marks a goto with the address of the jump that produced it, between block
+# emission and label validation in translate_function. Never left in output.
+_GOTO_SITE_TAG = " /*@site %08X@*/"
+_GOTO_SITE_RE = re.compile(r" /\*@site ([0-9A-F]{8})@\*/")
 
-    (function start, target, callable). callable means the target has its own
-    symbol, so the jump should have been a tail call; the rest jump into the
-    interior of another body, or to a non-leader address, where there is no
-    symbol to enter and no label in scope.
+
+def dead_gotos(lifter):
+    """Every jump the label validator could not keep, as sorted tuples.
+
+    (function start, target, callable, sites). callable means the target has
+    its own symbol, so the jump should have been a tail call; the rest jump
+    into the interior of another body, or to a non-leader address, where there
+    is no symbol to enter and no label in scope. Each is a RECOMP_JUMP_TRAP in
+    the output; sites are the addresses of the jumps.
     """
-    return sorted((func, target, callable_)
+    return sorted((func, target, callable_,
+                   sorted(lifter.dead_goto_sites.get((func, target), ())))
                   for (func, target), callable_ in lifter.dead_gotos.items())
 
 
@@ -2993,12 +3001,19 @@ class FunctionTranslator:
                 materialise=sorted(materialise.get(bb.start, ())))
             if self.backedge_yield:
                 stmts = _mark_back_edges(stmts, start, bb.last_insn.address)
+            # A jump ends its block, so the block's last instruction is the
+            # site of any goto in it. Tag the goto with it for the label
+            # validator below, which strips the tag again.
+            site_tag = _GOTO_SITE_TAG % bb.last_insn.address
             for stmt in stmts:
+                if "goto loc_" in stmt:
+                    stmt += site_tag
                 lines.append(f"    {stmt}")
             bypass = debug_slide_bypasses.get(bb.last_insn.address)
             if bypass is not None:
                 lines.append(
-                    f"    goto loc_{bypass:08X}; /* int 0x2d skips slide int3 */")
+                    f"    goto loc_{bypass:08X}; /* int 0x2d skips slide int3 */"
+                    + site_tag)
             if (start in self.coalesced_function_starts
                     and (bb.last_insn.mnemonic in ("ud2", "hlt")
                          or (bb.last_insn.mnemonic == "int3"
@@ -3044,17 +3059,26 @@ class FunctionTranslator:
                 defined_labels.add(lbl_match.group(1))
             goto_match = re.search(r'goto (loc_[0-9A-Fa-f]+);', line)
             if goto_match:
-                goto_lines.append((idx, goto_match.group(1)))
-        for idx, target in goto_lines:
+                site_match = _GOTO_SITE_RE.search(line)
+                if site_match:
+                    lines[idx] = _GOTO_SITE_RE.sub("", line)
+                site = int(site_match.group(1), 16) if site_match else start
+                goto_lines.append((idx, goto_match.group(1), site))
+        for idx, target, site in goto_lines:
             if target not in defined_labels:
-                # Recorded so the run reports every deletion: a jump into
-                # another body's interior has no correct C spelling here, but
-                # one that reached this point with a callable target is a
-                # tail call the lifter missed.
-                self.lifter.record_dead_goto(int(target[4:], 16))
+                # C has no goto into another function, so this jump cannot be
+                # kept. It used to become `(void)0`, which on a taken path
+                # falls through into code the guest never ran. A trap at the
+                # site makes taking it fatal and names both ends; every one is
+                # also reported at generation time. A callable target reaching
+                # here is a tail call the lifter missed, and fails generation.
+                address = int(target[4:], 16)
+                self.lifter.record_dead_goto(address, site)
                 lines[idx] = lines[idx].replace(
                     f"goto {target};",
-                    f"(void)0; /* goto {target} - dead code, label not in function */")
+                    f"RECOMP_JUMP_TRAP(0x{site:08X}u, 0x{address:08X}u); "
+                    f"/* goto {target}: no label in this function, "
+                    f"no symbol at the target */")
 
         # Ensure labels at end of function have a statement after them.
         # In C, a label must be followed by a statement; a comment alone is not
@@ -3484,9 +3508,9 @@ class BatchTranslator:
         #     returns to a frame the guest expected to keep using.
         #   * Worse, the duplicate's body can still contain `goto loc_<addr>`
         #     for a label that lives in the parent's body, not in this one. The
-        #     label validator at the end of this method cannot resolve it and
-        #     rewrites the jump to `(void)0`. On JSRF that silently deleted
-        #     1032 live jumps, every one of them inside a taken `if`.
+        #     label validator at the end of this method cannot resolve it; it
+        #     used to rewrite the jump to `(void)0` (now a fatal trap). On JSRF
+        #     that silently deleted 1032 live jumps, every one inside a taken `if`.
         #
         # The entry still has to be *dispatched*, because an indirect branch can
         # name the alias address. It must not be a second definition, and it
@@ -3507,6 +3531,16 @@ class BatchTranslator:
         _alias_dispatch = {}
         # alias VA -> the owner's VA, for the dispatch writer's alias observer.
         _alias_owner = {}
+        # alias VA -> owner VA for the folds whose owner starts AFTER the alias.
+        # Folding is only sound when the owner's body contains the alias, which
+        # needs the owner to start first. The abutting rule below folds onto the
+        # next entry instead, and on JSRF that silently replaced whole functions
+        # (0x000C42E0, slot 7 of a .data handler table, dispatched to the
+        # unrelated sub_000C44D0). Such an alias is either a label inside some
+        # other body or a function the detector missed; this pass cannot tell
+        # which, so its entry is made fatal and reported, and the project
+        # recovers the ones that are functions.
+        _late_owner = {}
         # The parent's *name* is needed for the dispatch tuple, and func_list is
         # consumed as an iterator below, so index it first.
         func_list_by_addr = {a: i for a, i in func_list}
@@ -3556,6 +3590,12 @@ class BatchTranslator:
         # being a free-for-all; the alias-to-alias chain is still walked by
         # _resolve_owner below. Only used when the same-end rule found nothing,
         # so a genuine same-end owner always wins.
+        #
+        # That union argument does not hold for the bytes themselves: the owner
+        # here starts where the alias ends, so its body never contains them and
+        # dispatching the alias to it runs a different function. These folds
+        # therefore keep no body and get a fatal dispatch entry (_late_owner),
+        # and each one is reported for the project to classify.
         _real_by_start = {}
         for _addr, _info in func_list:
             if _info.get("detection_method") != "tail_jump_alias":
@@ -3631,6 +3671,12 @@ class BatchTranslator:
                     _alias_dispatch[addr] = _parent_info.get(
                         "name", f"sub_{_owner:08X}")
                     _alias_owner[addr] = _owner
+                    if _owner > addr:
+                        # The owner starts after the alias, so its body does
+                        # not contain these bytes and running it from its start
+                        # is a different function. Dispatch through a fatal
+                        # wrapper instead; see _alias_observer_lines.
+                        _late_owner[addr] = _owner
                 manual_decls[addr] = name
                 stats["alias_entries"] = stats.get("alias_entries", 0) + 1
                 continue
@@ -3693,6 +3739,7 @@ class BatchTranslator:
         }
         stats["flag_gaps"] = flag_gaps(self.translator.lifter)
         stats["dead_gotos"] = dead_gotos(self.translator.lifter)
+        stats["late_owner_aliases"] = sorted(_late_owner.items())
 
         # Generate header with all forward declarations
         header_path = os.path.join(output_dir, header_name)
@@ -3898,7 +3945,8 @@ class BatchTranslator:
         dispatch_path = os.path.join(output_dir, f"{prefix}_dispatch.c")
         self._write_dispatch_table(dispatch_entries, dispatch_path, header_name,
                                    alias_redirect=_alias_dispatch,
-                                   alias_owner=_alias_owner)
+                                   alias_owner=_alias_owner,
+                                   fatal_aliases=set(_late_owner))
         generated_files.append(dispatch_path)
 
         stats["files"] = generated_files
@@ -3907,7 +3955,7 @@ class BatchTranslator:
         return stats
 
     @staticmethod
-    def _alias_observer_lines(observed):
+    def _alias_observer_lines(observed, fatal=None):
         """C for the alias-entry observer in the dispatch unit.
 
         An alias VA is dispatched to its owner's symbol, so an indirect call to
@@ -3920,7 +3968,12 @@ class BatchTranslator:
         then calls the owner exactly as the plain entry did. The wrapper runs
         on a call, not on a lookup, so address probes of recomp_lookup are
         not counted. `observed` is a list of (alias VA, owner VA, owner symbol).
+
+        An alias in `fatal` is counted the same way and then fails through
+        recomp_icall_fail_log and abort(), like an unresolved-call stub: its
+        owner starts after it, so calling the owner would run another function.
         """
+        fatal = fatal or set()
         out = [
             "/* ----------------------------------------------------------------",
             " * Alias-entry observer.",
@@ -3972,12 +4025,19 @@ class BatchTranslator:
             "",
         ]
         for i, (addr, owner, symbol) in enumerate(observed):
+            if addr in fatal:
+                out.append(f"static void recomp_alias_{addr:08X}(void) "
+                           f"{{ recomp_alias_observe({i}u); "
+                           f"recomp_icall_fail_log(0x{addr:08X}u); abort(); }}"
+                           f" /* owner 0x{owner:08X} starts after this alias */")
+                continue
             out.append(f"static void recomp_alias_{addr:08X}(void) "
                        f"{{ recomp_alias_observe({i}u); {symbol}(); }}")
         return out + [""]
 
     def _write_dispatch_table(self, translations, output_path, header_name,
-                              alias_redirect=None, alias_owner=None):
+                              alias_redirect=None, alias_owner=None,
+                              fatal_aliases=None):
         """
         Generate a dispatch table mapping Xbox VA -> function pointer.
 
@@ -3993,6 +4053,10 @@ class BatchTranslator:
         alias is dispatched through a small generated wrapper that counts the
         call and then runs the owner from its start, which is what an alias
         entry does today; see _alias_observer_lines.
+
+        fatal_aliases is the subset whose owner starts after the alias. Their
+        wrappers still count the call, then fail it as an unresolved target
+        rather than run a function that does not contain the alias.
         """
         alias_redirect = alias_redirect or {}
         alias_owner = alias_owner or {}
@@ -4026,7 +4090,7 @@ class BatchTranslator:
             "} recomp_entry_t;",
             "",
         ]
-        lines.extend(self._alias_observer_lines(observed))
+        lines.extend(self._alias_observer_lines(observed, fatal_aliases))
         lines.append(f"static const recomp_entry_t g_recomp_table[] = {{")
 
         for addr, name, _ in translations:

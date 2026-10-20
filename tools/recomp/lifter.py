@@ -1401,9 +1401,11 @@ class Lifter:
         # means the caller has not said, and then a tail_jump_alias target is
         # assumed folded into its owner. See _is_external_target.
         self.callable_entries = None
-        # Jumps the label validator had to delete, as
-        # {(function start, target): callable}. See record_dead_goto.
+        # Jumps the label validator could not keep, as
+        # {(function start, target): callable}, and the addresses of those
+        # jumps as {(function start, target): {site}}. See record_dead_goto.
         self.dead_gotos = {}
+        self.dead_goto_sites = {}
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
@@ -2821,18 +2823,20 @@ class Lifter:
             return True
         return self.callable_entries is not None and addr in self.callable_entries
 
-    def record_dead_goto(self, target):
-        """Note a jump the label validator deleted from the current function.
+    def record_dead_goto(self, target, site=None):
+        """Note a jump the label validator could not keep in this function.
 
         A goto whose label this body does not emit cannot be C, so the
-        validator turns it into `(void)0`. That is only harmless if the jump is
-        genuinely unreachable; on a taken path it silently changes control
-        flow. Returns whether the target has its own symbol: if it does, the
-        jump should have been lifted as a tail call and the deletion is a
-        lifter bug, which the translator reports as an error.
+        validator replaces it with RECOMP_JUMP_TRAP at the jump's site.
+        Returns whether the target has its own symbol: if it does, the jump
+        should have been lifted as a tail call, which is a lifter bug and
+        fails generation.
         """
         callable_ = self._has_own_symbol(target)
-        self.dead_gotos[(self.func_start, target)] = callable_
+        key = (self.func_start, target)
+        self.dead_gotos[key] = callable_
+        if site is not None:
+            self.dead_goto_sites.setdefault(key, set()).add(site)
         return callable_
 
     def _read_jump_table(self, table_va, max_entries=256):

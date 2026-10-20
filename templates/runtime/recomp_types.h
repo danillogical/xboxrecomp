@@ -443,6 +443,16 @@ extern RECOMP_TLS volatile uint64_t g_icall_count;
  */
 void recomp_icall_fail_log(uint32_t va);
 
+/* A jump the generator could not express in C. Its target is neither a label
+ * in the function that jumps nor the start of a function with its own symbol:
+ * a label inside some other body, or bytes no body decodes. The jump is
+ * replaced at its site by RECOMP_JUMP_TRAP rather than deleted, so taking it
+ * fails loudly instead of falling through. Implement recomp_jump_trap in your
+ * game-specific code to report site and target and then fail the way an
+ * unresolved call does; it must not return. */
+void recomp_jump_trap(uint32_t site, uint32_t target);
+#define RECOMP_JUMP_TRAP(site, target) recomp_jump_trap((site), (target))
+
 /* Report an indirect call whose target is not code (a null or wild
  * function pointer). Rate-limited per address by the implementation,
  * because these usually arrive inside a loop -- which is exactly why

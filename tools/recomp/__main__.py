@@ -222,27 +222,47 @@ def _report_flag_gaps(stats):
 
 
 def _report_dead_gotos(stats):
-    """List the jumps the label validator deleted; return (callable, total).
+    """List the jumps the label validator could not keep; return (callable, total).
 
-    Each became `(void)0`, so if it is ever taken control falls through
-    instead of jumping. One whose target has its own symbol should have been a
-    tail call, and generation fails on it. The rest land inside another body
-    or on an address no body labels; --strict-jumps fails on those too.
+    Each became a RECOMP_JUMP_TRAP at its site, so taking it is fatal at run
+    time. One whose target has its own symbol should have been a tail call,
+    and generation fails on it. The rest land inside another body or on an
+    address no body labels; --strict-jumps fails on those too.
     """
     sites = stats.get("dead_gotos") or []
     if not sites:
         return 0, 0
     missed = [s for s in sites if s[2]]
-    print(f"JUMPS: {len(sites)} jump(s) deleted as dead code "
-          f"(label not in the function); {len(missed)} target a function "
-          f"with its own symbol:", file=sys.stderr)
-    for func, target, callable_ in (missed + [s for s in sites if not s[2]])[:60]:
+    print(f"JUMPS: {len(sites)} jump(s) with no label in the function became "
+          f"fatal traps; {len(missed)} target a function with its own symbol:",
+          file=sys.stderr)
+    for func, target, callable_, at in (missed + [s for s in sites if not s[2]])[:60]:
         kind = ("ERROR callable target" if callable_
                 else "no symbol at target")
-        print(f"    sub_{func:08X} -> 0x{target:08X}  {kind}", file=sys.stderr)
+        where = ", ".join(f"0x{a:08X}" for a in at) or "?"
+        print(f"    sub_{func:08X} @ {where} -> 0x{target:08X}  {kind}",
+              file=sys.stderr)
     if len(sites) > 60:
         print(f"    ... and {len(sites) - 60} more", file=sys.stderr)
     return len(missed), len(sites)
+
+
+def _report_late_owner_aliases(stats):
+    """List the aliases whose fold owner starts after them.
+
+    The owner's body cannot contain the alias, so each gets a fatal dispatch
+    entry instead of running the owner. Each is either a label inside another
+    body or a function the detector missed, which a project recovers.
+    """
+    late = stats.get("late_owner_aliases") or []
+    if not late:
+        return 0
+    print(f"ALIASES: {len(late)} tail_jump_alias entr(ies) would fold onto a "
+          f"function that starts after them; their dispatch entries are fatal:",
+          file=sys.stderr)
+    for alias, owner in late:
+        print(f"    0x{alias:08X} -> owner 0x{owner:08X}", file=sys.stderr)
+    return len(late)
 
 
 def main():
@@ -341,8 +361,8 @@ def main():
                         help="Exit non-zero when any emitted conditional "
                              "reads a _flags nothing assigned")
     parser.add_argument("--strict-jumps", action="store_true",
-                        help="Exit non-zero when the label validator deletes "
-                             "any jump, not only one to a callable target")
+                        help="Exit non-zero when any jump becomes a fatal "
+                             "trap, not only one to a callable target")
 
     args = parser.parse_args()
 
@@ -591,6 +611,7 @@ def main():
         _report_unimplemented(stats)
         flag_gap_count = _report_flag_gaps(stats)
         missed_jumps, dead_jumps = _report_dead_gotos(stats)
+        _report_late_owner_aliases(stats)
         for f_path in stats.get("files", []):
             print(f"  {f_path}", file=sys.stderr)
     else:
@@ -619,11 +640,11 @@ def main():
         sys.exit(1)
     if missed_jumps:
         print(f"{missed_jumps} jump(s) to a function with its own symbol were "
-              f"deleted instead of lifted as tail calls; failing",
+              f"trapped instead of lifted as tail calls; failing",
               file=sys.stderr)
         sys.exit(1)
     if args.strict_jumps and dead_jumps:
-        print(f"--strict-jumps: {dead_jumps} jump(s) deleted as dead code; "
+        print(f"--strict-jumps: {dead_jumps} jump(s) became fatal traps; "
               f"failing", file=sys.stderr)
         sys.exit(1)
 
