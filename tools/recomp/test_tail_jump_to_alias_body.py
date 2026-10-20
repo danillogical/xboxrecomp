@@ -9,11 +9,17 @@ another function, the label validator deletes it, and the jump never runs: the
 adjustor thunk `sub dword ptr [esp+4], 4; jmp 0x168230` returned without the
 callee's `ret 8` and left the guest stack 8 bytes low.
 
-What stays as it was: a jump to a folded alias (no body of its own) or to the
-interior of another body (no symbol at all) has nowhere to be called, so it is
-still the goto the validator deletes. Generation now reports every such
-deletion, fails when one had a callable target, and `--strict-jumps` fails on
-any.
+A jump to a folded alias (no body of its own) or to the interior of another
+body (no symbol at all) has nowhere to be called, and C has no goto into another
+function. It becomes `RECOMP_JUMP_TRAP(site, target)` at the jump, which is fatal
+at run time, never a `(void)0` that lets a taken jump fall through. Generation
+reports every trap (`JUMPS:`), fails when one had a callable target, and
+`--strict-jumps` fails on any.
+
+An alias is folded into its owner only when the owner's body contains it, which
+needs the owner to start first. An abutting fold names the entry that starts where
+the alias ends, whose body never contains the alias: that alias keeps no body and
+its dispatch wrapper is fatal (`ALIASES:` lists it).
 
 These tests drive the real CLI over a synthetic image, so they exercise the
 batch pass that decides which entries keep a body rather than a copy of it.
@@ -41,6 +47,8 @@ THUNK_TO_REAL = BASE + 0x0A0
 REAL_ENTRY = BASE + 0x0C0
 THUNK_TO_MANUAL = BASE + 0x0E0
 MANUAL_ALIAS = BASE + 0x100         # tail_jump_alias, hand-written
+LATE_ALIAS = BASE + 0x120           # tail_jump_alias ending where LATE_OWNER starts
+LATE_OWNER = BASE + 0x130
 PARENT_END = BASE + 0x052
 SECTION_SIZE = 0x400
 
@@ -70,6 +78,8 @@ def _image():
     put(REAL_ENTRY, bytes.fromhex("c20800"))
     put(THUNK_TO_MANUAL, _thunk(THUNK_TO_MANUAL, MANUAL_ALIAS))
     put(MANUAL_ALIAS, bytes.fromhex("c3"))
+    put(LATE_ALIAS, bytes.fromhex("40c3"))                # inc eax; ret
+    put(LATE_OWNER, bytes.fromhex("c3"))
     return bytes(img)
 
 
@@ -90,6 +100,8 @@ ENTRIES = {
     "real": _entry(REAL_ENTRY, REAL_ENTRY + 3),
     "thunk_manual": _entry(THUNK_TO_MANUAL, THUNK_TO_MANUAL + 16),
     "manual_alias": _entry(MANUAL_ALIAS, MANUAL_ALIAS + 1, "tail_jump_alias"),
+    "late_alias": _entry(LATE_ALIAS, LATE_OWNER, "tail_jump_alias"),
+    "late_owner": _entry(LATE_OWNER, LATE_OWNER + 1),
 }
 
 
@@ -140,14 +152,25 @@ def _function(gen_dir, start):
     return m.group(0) if m else None
 
 
+def _dispatch(gen_dir):
+    return (gen_dir / "recomp_dispatch.c").read_text(encoding="utf-8")
+
+
+def _alias_wrapper(gen_dir, alias):
+    """The dispatch wrapper line for an alias VA, or None."""
+    m = re.search(rf"^static void recomp_alias_{alias:08X}\(void\).*$",
+                  _dispatch(gen_dir), re.M)
+    return m.group(0) if m else None
+
+
 def test_jump_to_an_alias_that_kept_a_body_is_a_tail_call(tmp_path, capsys):
     code, err, gen = _generate(tmp_path, capsys, ["thunk_own", "own_alias"])
     thunk = _function(gen, THUNK_TO_OWN_BODY)
     # Premise: the alias kept a body, so there is a symbol to call.
     assert _function(gen, OWN_BODY_ALIAS) is not None, err
     assert f"sub_{OWN_BODY_ALIAS:08X}(); return;" in thunk, thunk
-    assert "(void)0" not in thunk, thunk
-    assert "dead code" not in thunk, thunk
+    assert "(void)0;" not in thunk, thunk
+    assert "RECOMP_JUMP_TRAP" not in thunk, thunk
     # The decrement before the jump is still emitted, then control leaves.
     assert thunk.index("MEM32(esp + 4)") < thunk.index(
         f"sub_{OWN_BODY_ALIAS:08X}();")
@@ -161,7 +184,8 @@ def test_jump_to_a_hand_written_alias_is_a_manual_tail_call(tmp_path, capsys):
                                manual=[MANUAL_ALIAS])
     thunk = _function(gen, THUNK_TO_MANUAL)
     assert f"RECOMP_ITAIL(0x{MANUAL_ALIAS:08X}u); return;" in thunk, thunk
-    assert "(void)0" not in thunk, thunk
+    assert "(void)0;" not in thunk, thunk
+    assert "RECOMP_JUMP_TRAP" not in thunk, thunk
     assert code == 0, err
 
 
@@ -177,21 +201,27 @@ def test_jump_to_an_ordinary_entry_is_still_a_tail_call(tmp_path, capsys):
     pytest.param(["parent", "folded", "thunk_folded"], id="folded-alias"),
     pytest.param(["parent", "thunk_interior"], id="fragment-interior"),
 ])
-def test_jump_into_another_body_keeps_the_old_handling(tmp_path, capsys, keys):
-    """No symbol at the target: the goto is deleted as before, and reported."""
+def test_jump_into_another_body_is_a_fatal_trap_at_the_jump(
+        tmp_path, capsys, keys):
+    """No label and no symbol at the target: a trap naming both ends, reported."""
     thunk_at = THUNK_TO_FOLDED if "thunk_folded" in keys else THUNK_TO_INTERIOR
+    site = thunk_at + 5            # the jmp, after the 5-byte `sub [esp+4], 4`
     code, err, gen = _generate(tmp_path, capsys, keys)
     thunk = _function(gen, thunk_at)
-    assert "(void)0; /* goto loc_%08X - dead code, label not in function */" \
-        % FOLDED_ALIAS in thunk, thunk
+    assert f"RECOMP_JUMP_TRAP(0x{site:08X}u, 0x{FOLDED_ALIAS:08X}u);" in thunk, thunk
+    # Never the silent form: a taken jump must not fall through.
+    assert "(void)0;" not in thunk, thunk
+    assert "dead code" not in thunk, thunk
     assert f"sub_{FOLDED_ALIAS:08X}();" not in thunk, thunk
+    # The trap replaces the jump in place, after the decrement it follows.
+    assert thunk.index("MEM32(esp + 4)") < thunk.index("RECOMP_JUMP_TRAP")
     # Premise: the folded alias has no body; the label lives in the parent.
     assert _function(gen, FOLDED_ALIAS) is None
     assert f"loc_{FOLDED_ALIAS:08X}:" in _function(gen, PARENT)
-    # Reported, but not an error: nothing callable was lost.
-    assert "JUMPS: 1 jump(s) deleted as dead code" in err, err
-    assert f"sub_{thunk_at:08X} -> 0x{FOLDED_ALIAS:08X}  no symbol at target" \
-        in err, err
+    # Reported with its site, but not a generation error: nothing callable was lost.
+    assert "JUMPS: 1 jump(s)" in err, err
+    assert (f"sub_{thunk_at:08X} @ 0x{site:08X} -> 0x{FOLDED_ALIAS:08X}  "
+            "no symbol at target") in err, err
     assert "ERROR callable target" not in err, err
     assert code == 0, err
 
@@ -200,34 +230,34 @@ def test_jump_into_another_body_keeps_the_old_handling(tmp_path, capsys, keys):
     pytest.param(["parent", "folded", "thunk_folded"], id="folded-alias"),
     pytest.param(["parent", "thunk_interior"], id="fragment-interior"),
 ])
-def test_strict_jumps_fails_on_a_remaining_deleted_jump(tmp_path, capsys, keys):
+def test_strict_jumps_fails_on_a_remaining_trap(tmp_path, capsys, keys):
     code, err, _ = _generate(tmp_path, capsys, keys,
                              extra_args=["--strict-jumps"])
     assert code == 1, (code, err)
-    assert "--strict-jumps: 1 jump(s) deleted as dead code" in err, err
+    assert "--strict-jumps: 1 jump(s) became fatal traps" in err, err
 
 
-def test_strict_jumps_passes_when_nothing_was_deleted(tmp_path, capsys):
+def test_strict_jumps_passes_when_nothing_was_trapped(tmp_path, capsys):
     code, err, _ = _generate(tmp_path, capsys, ["thunk_own", "own_alias"],
                              extra_args=["--strict-jumps"])
     assert code == 0, (code, err)
     assert "JUMPS:" not in err, err
 
 
-def test_a_deleted_jump_with_a_callable_target_fails_generation(
+def test_a_trapped_jump_with_a_callable_target_fails_generation(
         tmp_path, capsys, monkeypatch):
-    """The backstop: should a lifter regress, the deletion cannot go quiet.
+    """The backstop: should a lifter regress, the trap cannot go quiet.
 
     The jump is forced back to a goto, as the pre-fix lifter emitted it. The
-    validator deletes it and the target has a body, which must be an error
+    validator traps it and the target has a body, which must be an error
     even without --strict-jumps.
     """
     monkeypatch.setattr(Lifter, "_is_external_target", lambda self, addr: False)
     code, err, _ = _generate(tmp_path, capsys, ["thunk_own", "own_alias"])
     assert code == 1, (code, err)
-    assert f"sub_{THUNK_TO_OWN_BODY:08X} -> 0x{OWN_BODY_ALIAS:08X}  " \
-        "ERROR callable target" in err, err
-    assert "1 jump(s) to a function with its own symbol were deleted" in err, err
+    assert (f"sub_{THUNK_TO_OWN_BODY:08X} @ 0x{THUNK_TO_OWN_BODY + 5:08X} -> "
+            f"0x{OWN_BODY_ALIAS:08X}  ERROR callable target") in err, err
+    assert "1 jump(s) to a function with its own symbol were trapped" in err, err
 
 
 def test_emitted_entries_reads_back_every_body_but_no_folded_alias(
@@ -237,3 +267,47 @@ def test_emitted_entries_reads_back_every_body_but_no_folded_alias(
                             ["thunk_own", "own_alias", "parent", "folded"])
     assert emitted_entries(str(gen)) == {
         THUNK_TO_OWN_BODY, OWN_BODY_ALIAS, PARENT}, err
+
+
+def test_an_alias_whose_owner_starts_after_it_is_fatal_not_folded(
+        tmp_path, capsys):
+    """The abutting fold names an owner whose body does not contain the alias.
+
+    Dispatching the alias to that owner runs a different function (JSRF
+    0x000C42E0 ran the constructor at 0x000C44D0). The alias keeps no body, its
+    slot in the dispatch table stays, and its wrapper fails instead of calling.
+    """
+    code, err, gen = _generate(tmp_path, capsys, ["late_alias", "late_owner"])
+    assert code == 0, err
+    assert _function(gen, LATE_ALIAS) is None
+    assert _function(gen, LATE_OWNER) is not None
+    wrapper = _alias_wrapper(gen, LATE_ALIAS)
+    assert wrapper is not None, _dispatch(gen)
+    assert f"recomp_icall_fail_log(0x{LATE_ALIAS:08X}u); abort();" in wrapper, wrapper
+    assert f"sub_{LATE_OWNER:08X}" not in wrapper, wrapper
+    # The slot is still in the table, pointing at the wrapper.
+    entry = re.search(rf"\{{\s*0x{LATE_ALIAS:08X}u\s*,\s*\(recomp_func_t\)\s*(\w+)\s*\}}",
+                      _dispatch(gen))
+    assert entry and entry.group(1) == f"recomp_alias_{LATE_ALIAS:08X}", \
+        _dispatch(gen)
+    assert "ALIASES: 1 tail_jump_alias" in err, err
+    assert f"0x{LATE_ALIAS:08X} -> owner 0x{LATE_OWNER:08X}" in err, err
+
+
+def test_an_alias_whose_owner_starts_before_it_still_folds(tmp_path, capsys):
+    """Control: the same-end rule's owner contains the alias, so it is called."""
+    code, err, gen = _generate(tmp_path, capsys, ["parent", "folded"])
+    assert code == 0, err
+    assert _function(gen, FOLDED_ALIAS) is None
+    wrapper = _alias_wrapper(gen, FOLDED_ALIAS)
+    assert wrapper is not None, _dispatch(gen)
+    assert f"sub_{PARENT:08X}();" in wrapper, wrapper
+    assert "abort" not in wrapper and "fail_log" not in wrapper, wrapper
+    assert "ALIASES:" not in err, err
+
+
+def test_strict_jumps_does_not_fail_on_a_fatal_alias_alone(tmp_path, capsys):
+    """ALIASES are reported for classification; they are not trapped jumps."""
+    code, err, _ = _generate(tmp_path, capsys, ["late_alias", "late_owner"],
+                             extra_args=["--strict-jumps"])
+    assert code == 0, (code, err)
