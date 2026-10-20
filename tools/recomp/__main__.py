@@ -221,6 +221,30 @@ def _report_flag_gaps(stats):
     return len(gaps)
 
 
+def _report_dead_gotos(stats):
+    """List the jumps the label validator deleted; return (callable, total).
+
+    Each became `(void)0`, so if it is ever taken control falls through
+    instead of jumping. One whose target has its own symbol should have been a
+    tail call, and generation fails on it. The rest land inside another body
+    or on an address no body labels; --strict-jumps fails on those too.
+    """
+    sites = stats.get("dead_gotos") or []
+    if not sites:
+        return 0, 0
+    missed = [s for s in sites if s[2]]
+    print(f"JUMPS: {len(sites)} jump(s) deleted as dead code "
+          f"(label not in the function); {len(missed)} target a function "
+          f"with its own symbol:", file=sys.stderr)
+    for func, target, callable_ in (missed + [s for s in sites if not s[2]])[:60]:
+        kind = ("ERROR callable target" if callable_
+                else "no symbol at target")
+        print(f"    sub_{func:08X} -> 0x{target:08X}  {kind}", file=sys.stderr)
+    if len(sites) > 60:
+        print(f"    ... and {len(sites) - 60} more", file=sys.stderr)
+    return len(missed), len(sites)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Xbox x86 -> C Static Recompiler")
@@ -316,6 +340,9 @@ def main():
     parser.add_argument("--strict-flags", action="store_true",
                         help="Exit non-zero when any emitted conditional "
                              "reads a _flags nothing assigned")
+    parser.add_argument("--strict-jumps", action="store_true",
+                        help="Exit non-zero when the label validator deletes "
+                             "any jump, not only one to a callable target")
 
     args = parser.parse_args()
 
@@ -563,6 +590,7 @@ def main():
                   file=sys.stderr)
         _report_unimplemented(stats)
         flag_gap_count = _report_flag_gaps(stats)
+        missed_jumps, dead_jumps = _report_dead_gotos(stats)
         for f_path in stats.get("files", []):
             print(f"  {f_path}", file=sys.stderr)
     else:
@@ -578,6 +606,7 @@ def main():
               file=sys.stderr)
         print_stats(stats)
         flag_gap_count = _report_flag_gaps(stats)
+        missed_jumps, dead_jumps = _report_dead_gotos(stats)
 
     # Write summary
     output_dir = args.output_dir or os.path.join(
@@ -587,6 +616,15 @@ def main():
     if args.strict_flags and flag_gap_count:
         print(f"--strict-flags: {flag_gap_count} conditional(s) read an "
               f"unassigned _flags; failing", file=sys.stderr)
+        sys.exit(1)
+    if missed_jumps:
+        print(f"{missed_jumps} jump(s) to a function with its own symbol were "
+              f"deleted instead of lifted as tail calls; failing",
+              file=sys.stderr)
+        sys.exit(1)
+    if args.strict_jumps and dead_jumps:
+        print(f"--strict-jumps: {dead_jumps} jump(s) deleted as dead code; "
+              f"failing", file=sys.stderr)
         sys.exit(1)
 
 

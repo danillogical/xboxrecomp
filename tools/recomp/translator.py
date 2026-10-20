@@ -215,6 +215,36 @@ def flag_gaps(lifter):
                   for (addr, form), (func, setter) in lifter.flag_gaps.items())
 
 
+def dead_gotos(lifter):
+    """Every jump the label validator deleted, as sorted tuples.
+
+    (function start, target, callable). callable means the target has its own
+    symbol, so the jump should have been a tail call; the rest jump into the
+    interior of another body, or to a non-leader address, where there is no
+    symbol to enter and no label in scope.
+    """
+    return sorted((func, target, callable_)
+                  for (func, target), callable_ in lifter.dead_gotos.items())
+
+
+def emitted_entries(gen_dir):
+    """Start VAs of every body a full pass wrote into gen_dir's chunks.
+
+    A script that relifts or recovers single functions after the full pass has
+    no batch to fold aliases with, so it cannot tell on its own which
+    tail_jump_alias entries kept a body. The chunks the pass wrote are the
+    answer, and reading them back keeps the script consistent with that pass.
+    Pass the result (plus any hand-written VAs) as lifter.callable_entries.
+    """
+    starts = set()
+    header = re.compile(
+        r"^ \* Original: 0x([0-9A-Fa-f]{8}) - 0x[0-9A-Fa-f]{8} ", re.M)
+    for path in sorted(glob.glob(os.path.join(gen_dir, "recomp_*.c"))):
+        with open(path, "r", encoding="utf-8") as fh:
+            starts.update(int(m.group(1), 16) for m in header.finditer(fh.read()))
+    return starts
+
+
 def write_if_changed(path, text):
     """Write text to path only when it differs from what is already there.
 
@@ -3017,6 +3047,11 @@ class FunctionTranslator:
                 goto_lines.append((idx, goto_match.group(1)))
         for idx, target in goto_lines:
             if target not in defined_labels:
+                # Recorded so the run reports every deletion: a jump into
+                # another body's interior has no correct C spelling here, but
+                # one that reached this point with a callable target is a
+                # tail call the lifter missed.
+                self.lifter.record_dead_goto(int(target[4:], 16))
                 lines[idx] = lines[idx].replace(
                     f"goto {target};",
                     f"(void)0; /* goto {target} - dead code, label not in function */")
@@ -3256,6 +3291,12 @@ class BatchTranslator:
         if max_funcs:
             func_list = func_list[:max_funcs]
 
+        # Every entry here gets its own body, aliases included; see
+        # translate_batch_split for why the lifter needs to know.
+        self.translator.lifter.callable_entries = (
+            {addr for addr, _ in func_list}
+            | self.translator.lifter.manual_functions)
+
         stats = {
             "total": len(func_list),
             "translated": 0,
@@ -3319,6 +3360,7 @@ class BatchTranslator:
         stats["output_file"] = output_file
         stats["output_size"] = len(output_text)
         stats["flag_gaps"] = flag_gaps(self.translator.lifter)
+        stats["dead_gotos"] = dead_gotos(self.translator.lifter)
 
         return stats
 
@@ -3534,6 +3576,16 @@ class BatchTranslator:
                 continue
             alias_parent[_addr] = _end
 
+        # Tell the lifter which entries will have a symbol of their own: every
+        # entry this pass emits a body for, plus every hand-written one. A jump
+        # to one of these from another function is a tail call. A folded alias
+        # is the one entry without a symbol, so a jump to it stays a goto. The
+        # detector's tail_jump_alias label cannot answer this by itself; only
+        # the folding just above knows which aliases kept a body.
+        self.translator.lifter.callable_entries = (
+            {_addr for _addr, _ in func_list if _addr not in alias_parent}
+            | set(manual))
+
         # Resolve each parent to a symbol that actually has a body. An alias's
         # parent can itself be an alias -- several fragments of one original
         # function share an end, so folding into the nearest earlier start can
@@ -3640,6 +3692,7 @@ class BatchTranslator:
             for m, addrs in self.translator.lifter.unimplemented.items()
         }
         stats["flag_gaps"] = flag_gaps(self.translator.lifter)
+        stats["dead_gotos"] = dead_gotos(self.translator.lifter)
 
         # Generate header with all forward declarations
         header_path = os.path.join(output_dir, header_name)

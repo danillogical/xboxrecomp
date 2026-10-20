@@ -1396,6 +1396,14 @@ class Lifter:
         self.abi_db = abi_db or {}
         self.xbe_data = xbe_data
         self.manual_functions = set(manual_functions or ())
+        # Entry VAs that have a symbol of their own in the program being built:
+        # every body the pass emits plus every hand-written definition. None
+        # means the caller has not said, and then a tail_jump_alias target is
+        # assumed folded into its owner. See _is_external_target.
+        self.callable_entries = None
+        # Jumps the label validator had to delete, as
+        # {(function start, target): callable}. See record_dead_goto.
+        self.dead_gotos = {}
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
@@ -2777,11 +2785,24 @@ class Lifter:
         direct `RECOMP_ABI_CALL` at `0x00011C5A`. The jump was a tail call and
         was rewritten to `(void)0`.
 
-        "Real entry point" deliberately excludes `tail_jump_alias`, whose whole
-        definition is that it is a fragment sharing its owner's bytes.
+        "Real entry point" excludes a `tail_jump_alias` only when the alias
+        really was folded into its owner. The detector's label says where a
+        tail jump landed, not whether a body exists there: a regenerated
+        database can label an address `tail_jump_alias` that still gets its
+        own body (no owner to fold into) or a hand-written definition. Trusting
+        the label alone emitted `goto loc_X` for those, the validator deleted
+        it, and the jump never ran -- JSRF's adjustor thunk `0x169000
+        sub [esp+4],4; jmp 0x168230` returned without the callee's `ret 8` and
+        left the guest stack 8 bytes low. So the test is whether the target
+        has a symbol of its own (callable_entries, manual_functions), which is
+        the same fact that decides whether anything links against it.
         """
         if self.func_start <= addr < self.func_end:
             return False
+        if self._has_own_symbol(addr):
+            # A separately emitted body or a hand-written definition: entering
+            # it at its start is exactly what the jump does.
+            return True
         info = self.func_db.get(addr)
         if info is None:
             # Not an entry at all. If it lands inside a body this batch emits,
@@ -2793,6 +2814,26 @@ class Lifter:
         # A real entry point. External, so it stays a tail call even when its
         # span is one of the batch spans.
         return True
+
+    def _has_own_symbol(self, addr):
+        """Whether addr is the start of a body or definition with its own name."""
+        if addr in self.manual_functions:
+            return True
+        return self.callable_entries is not None and addr in self.callable_entries
+
+    def record_dead_goto(self, target):
+        """Note a jump the label validator deleted from the current function.
+
+        A goto whose label this body does not emit cannot be C, so the
+        validator turns it into `(void)0`. That is only harmless if the jump is
+        genuinely unreachable; on a taken path it silently changes control
+        flow. Returns whether the target has its own symbol: if it does, the
+        jump should have been lifted as a tail call and the deletion is a
+        lifter bug, which the translator reports as an error.
+        """
+        callable_ = self._has_own_symbol(target)
+        self.dead_gotos[(self.func_start, target)] = callable_
+        return callable_
 
     def _read_jump_table(self, table_va, max_entries=256):
         """Read 32-bit jump table entries from the XBE at a given VA.
