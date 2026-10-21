@@ -95,7 +95,9 @@ def test_arm_that_cannot_run_alone_is_left_unresolved():
 def test_switch_inside_a_recovered_arm_gets_its_arms_too():
     # BASE dispatches through T1 to ARM_A, past its end. ARM_A dispatches
     # through T2, which lies past T1 -- so ARM_A's own recovery, bounded by
-    # T1, cannot inline it -- to ARM_B and ARM_C (JSRF 0x001297EC -> 0x0012A5BC).
+    # T1, cannot inline it -- to ARM_B and ARM_C. ARM_A's recovered code also
+    # runs past both arms (a je to a ret after them), so they lie inside its
+    # body and still need entries (JSRF 0x001297EC -> 0x0012A5BC).
     arm_a, arm_b, arm_c = BASE + 0x10, BASE + 0x20, BASE + 0x24
     t1, t2 = BASE + 0x40, BASE + 0x48
     image = bytearray(b"\xCC" * 0x100)
@@ -104,7 +106,9 @@ def test_switch_inside_a_recovered_arm_gets_its_arms_too():
         image[va - BASE:va - BASE + len(data)] = data
 
     put(BASE, b"\xFF\x24\x85" + t1.to_bytes(4, "little"))
-    put(arm_a, b"\xFF\x24\x85" + t2.to_bytes(4, "little"))
+    put(arm_a, b"\x85\xC0\x74\x1C")                       # test eax,eax; je BASE+0x30
+    put(arm_a + 4, b"\xFF\x24\x85" + t2.to_bytes(4, "little"))
+    put(BASE + 0x30, b"\xC3")
     put(arm_b, b"\xC3")
     put(arm_c, b"\xC3")
     put(t1, arm_a.to_bytes(4, "little"))

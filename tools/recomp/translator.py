@@ -1419,10 +1419,13 @@ class FunctionTranslator:
 
         An arm recovered this way can hold a switch of its own, which it also
         emits as an indirect tail call, so the new entries are scanned in turn
-        until none appear. Jet Set Radio Future's 0x00129180 reaches arm
-        0x001297EC through one table, and that arm dispatches through another
-        (0x0012A5BC) whose eight arms had entries only while a neighbouring
-        body happened to provide them.
+        until none appear. A recovered body inlines only the tables its
+        recovery found, so for it an arm inside the body still needs an entry.
+        Jet Set Radio Future's 0x00129180 reaches arm 0x001297EC through one
+        table, and that arm -- recovered up to that table, which spans its
+        arms -- dispatches through another (0x0012A5BC) past it, whose eight
+        arms had entries only while a neighbouring body happened to provide
+        them.
 
         Run after discover_cfg_ownership, which settles translated bounds.
         """
@@ -1462,20 +1465,24 @@ class FunctionTranslator:
                 if operand.mem_disp in known:
                     continue  # recovered as an in-function switch
                 if operand.mem_index and not operand.mem_base:
-                    sites.append((start, end, operand.mem_disp))
+                    sites.append((start, end, operand.mem_disp,
+                                  recovered is not None))
 
         # A table ends where the next indexed jump's table begins.
-        all_tables.update(table for _, _, table in sites)
+        all_tables.update(table for _, _, table, _ in sites)
         tables = sorted(all_tables)
         arms = {}
-        for start, end, table in sites:
+        for start, end, table, recovered in sites:
             following = bisect.bisect_right(tables, table)
             limit = table + 4 * 256
             if following < len(tables):
                 limit = min(limit, tables[following])
             # MSVC places a switch table after the code it indexes.
             targets = self._read_bounded_jump_table(table, start, limit)
-            if all(start <= target < end for target in targets):
+            # A recovered body inlines only the tables its recovery found
+            # (`known` above); any other table is an indirect tail call even
+            # when every arm lies inside the body.
+            if not recovered and all(start <= target < end for target in targets):
                 continue  # lifted as in-function gotos
             for target in targets:
                 if target not in self.func_db:
