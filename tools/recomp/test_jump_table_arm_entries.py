@@ -92,8 +92,34 @@ def test_arm_that_cannot_run_alone_is_left_unresolved():
     print("ok  arm_that_cannot_run_alone_is_left_unresolved")
 
 
+def test_switch_inside_a_recovered_arm_gets_its_arms_too():
+    # BASE dispatches through T1 to ARM_A, past its end. ARM_A dispatches
+    # through T2, which lies past T1 -- so ARM_A's own recovery, bounded by
+    # T1, cannot inline it -- to ARM_B and ARM_C (JSRF 0x001297EC -> 0x0012A5BC).
+    arm_a, arm_b, arm_c = BASE + 0x10, BASE + 0x20, BASE + 0x24
+    t1, t2 = BASE + 0x40, BASE + 0x48
+    image = bytearray(b"\xCC" * 0x100)
+
+    def put(va, data):
+        image[va - BASE:va - BASE + len(data)] = data
+
+    put(BASE, b"\xFF\x24\x85" + t1.to_bytes(4, "little"))
+    put(arm_a, b"\xFF\x24\x85" + t2.to_bytes(4, "little"))
+    put(arm_b, b"\xC3")
+    put(arm_c, b"\xC3")
+    put(t1, arm_a.to_bytes(4, "little"))
+    put(t2, arm_b.to_bytes(4, "little") + arm_c.to_bytes(4, "little"))
+    config._install(
+        [config.Section(".text", BASE, len(image), 0x0000, len(image), True)],
+        entry_point=BASE, kernel_thunk_addr=BASE, origin="jump-table-arm-test")
+    translator = FunctionTranslator(bytes(image), {BASE: _entry(BASE, BASE + 7)})
+    assert translator.discover_jump_table_entries() == {arm_a, arm_b, arm_c}
+    print("ok  switch_inside_a_recovered_arm_gets_its_arms_too")
+
+
 if __name__ == "__main__":
     test_arm_gets_an_entry_covering_its_reachable_code()
     test_switch_inside_its_function_adds_nothing()
     test_arm_that_cannot_run_alone_is_left_unresolved()
+    test_switch_inside_a_recovered_arm_gets_its_arms_too()
     print("jump_table_arm_entries: ALL PASS")
