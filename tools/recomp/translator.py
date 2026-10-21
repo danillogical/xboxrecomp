@@ -215,6 +215,17 @@ def flag_gaps(lifter):
                   for (addr, form), (func, setter) in lifter.flag_gaps.items())
 
 
+def _stub_definition(name: str, addr: int, popped: int) -> str:
+    """One unresolved-target stub: report, then return as a `ret popped` would.
+
+    The report is recomp_icall_fail_log, which a project implements; it is
+    the stub's only sign that it ran, and a project can make it fatal.
+    """
+    note = f"ret {popped}" if popped else "not detected"
+    return (f"void {name}(void) {{ recomp_icall_fail_log(0x{addr:08X}u); "
+            f"g_esp += {4 + popped}; /* 0x{addr:08X}: {note} */ }}")
+
+
 # Marks a goto with the address of the jump that produced it, between block
 # emission and label validation in translate_function. Never left in output.
 _GOTO_SITE_TAG = " /*@site %08X@*/"
@@ -3939,11 +3950,7 @@ class BatchTranslator:
             stub_lines.append("")
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
-                note = (f"ret {popped}" if popped else "not detected")
-                stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ recomp_icall_fail_log(0x{addr:08X}u); g_esp += {4 + popped}; "
-                    f"/* 0x{addr:08X}: {note} */ }}"
-                )
+                stub_lines.append(_stub_definition(unresolved[addr], addr, popped))
             stub_lines.append("")
 
             write_if_changed(stub_path, "\n".join(stub_lines))
