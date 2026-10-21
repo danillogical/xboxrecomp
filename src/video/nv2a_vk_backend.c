@@ -257,6 +257,7 @@ void nv2a_vk_backend_memory_stats(Nv2aVkMemoryStats *out)
 #include "kernel/nv2a_backend.h"
 #include "kernel/nv2a_clear.h"
 #include "d3d/d3d8_swizzle.h"
+#include "nv2a_vk_rc_coverage.h"        /* the rc refusal rule and its counters */
 #include "nv2a_vsh_hlsl.h"              /* Nv2aVshHlslXf, the corpus shaders' second cbuffer */
 
 /* Built from shaders/nv2a_vk_stage0.hlsl, shaders/nv2a_vk_rc.hlsl and
@@ -4075,6 +4076,11 @@ typedef struct {
     uint32_t stencil_ref, stencil_read, stencil_write;
     VbConstants k;
     VkRect2D scissor;
+    /* Diagnostic only (RECOMP_PB_COVERAGE): the refusal nv2a_vk_rc_refusal()
+     * reported when rc was requested but unsupported. Plain fields, NOT part
+     * of VbPipeKey: a pipeline is never selected from them, and with the gate
+     * off they are simply never read. */
+    uint32_t rc_reason, rc_stage, rc_mode;
 } VbDraw;
 
 static int vb_vertex_ok(const Nv2aVertex *v)
@@ -4283,21 +4289,27 @@ static uint32_t vb_write_mask(uint32_t color_mask, uint32_t bpp)
     return m;
 }
 
-/* Can the combiner pipeline draw this batch? gb_rc_key's rule: bump-environment and
- * dot-product stage modes (> 5) and true cube maps are not interpreted. */
-static int vb_rc_supported(const Nv2aBatch *b)
+/* One bit per stage that carries a true cube texture, for nv2a_vk_rc_refusal. */
+static uint32_t vb_cube_mask(const Nv2aBatch *b)
 {
-    uint32_t prog = b->combiner->stage_program & 0xFFFFF;
+    uint32_t mask = 0;
     int st;
 
-    for (st = 0; st < 4; st++) {
-        uint32_t m = (prog >> (st * 5)) & 0x1F;
-        if (m > 5)
-            return 0;
-        if (m == 3 && b->textures[st] && b->textures[st]->cube)
-            return 0;
-    }
-    return 1;
+    for (st = 0; st < 4; st++)
+        if (b->textures[st] && b->textures[st]->cube)
+            mask |= 1u << st;
+    return mask;
+}
+
+/* Can the combiner pipeline draw this batch? gb_rc_key's rule: bump-environment and
+ * dot-product stage modes (> 5) and true cube maps are not interpreted. The rule
+ * itself lives in nv2a_vk_rc_coverage.c so a fixture and this back end share one
+ * definition; behavior here is unchanged. */
+static int vb_rc_supported(const Nv2aBatch *b)
+{
+    uint32_t stage, mode;
+    return nv2a_vk_rc_refusal(b->combiner->stage_program, vb_cube_mask(b),
+                              &stage, &mode) == 0;
 }
 
 /* The combiner half of a draw (gb_rc_prepare): the register block and the four stages' textures. */
@@ -4355,6 +4367,7 @@ static int vb_setup(VbDraw *dr, const Nv2aSurface *s, const Nv2aBatch *b, int rc
     const Nv2aRenderState *rs = b->state;
     uint32_t bc = rs->blend_color;
     int cm = vb_cull_mode(rs);
+    int rc_ok = 0;
     float zs;
 
     memset(dr, 0, sizeof *dr);
@@ -4375,10 +4388,23 @@ static int vb_setup(VbDraw *dr, const Nv2aSurface *s, const Nv2aBatch *b, int rc
     dr->k.tx[2] = (rs->alpha_test_enable && rs->alpha_func >= 0x200 && rs->alpha_func < 0x207)
                 ? (float)(rs->alpha_func - 0x200) : -1.0f;
     dr->k.tx[3] = (float)(rs->alpha_ref & 0xFF);
-    if (rc && vb_rc_supported(b)) {
-        dr->key.rc = 1;
-        vb_rc_prepare(dr, b);
-    } else if (b->texture) {
+    if (rc) {
+        uint32_t rs_stage, rs_mode;
+        uint32_t reason = nv2a_vk_rc_refusal(b->combiner->stage_program,
+                                             vb_cube_mask(b), &rs_stage, &rs_mode);
+        if (!reason) {
+            dr->key.rc = 1;
+            vb_rc_prepare(dr, b);
+            rc_ok = 1;
+        } else {
+            /* Unsupported rc: remember why for vb_draw's diagnostic record. The
+             * setup below is exactly the old `else if (b->texture)` branch. */
+            dr->rc_reason = reason;
+            dr->rc_stage = rs_stage;
+            dr->rc_mode = rs_mode;
+        }
+    }
+    if (!rc_ok && b->texture) {
         dr->view = vb_texture(b->texture, dr->t, &dr->view_layout, &dr->k.tx[0], &dr->k.tx[1]);
         dr->samp = vb_sampler(b->texture);
         if (!dr->samp)
@@ -4440,10 +4466,17 @@ static void vb_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         return;
     }
     if (rc) {
-        if (dr.key.rc)
+        if (dr.key.rc) {
             g.st.rc_draws++;
-        else
+        } else {
             g.st.rc_fallback++;
+            /* Diagnostic only: total here is exactly this counter for the
+             * process. Off the gate, nothing is recorded. */
+            if (nv2a_vk_rc_coverage_enabled())
+                nv2a_vk_rc_coverage_record(dr.rc_reason, dr.rc_stage, dr.rc_mode,
+                                           b->combiner->stage_program,
+                                           vb_cube_mask(b));
+        }
     }
 
     drawn = vb_submit(&dr, b->vertices, dr.key.rc ? b->extra : NULL, b->count);
@@ -5577,7 +5610,7 @@ static int vb_stopped(void)
 }
 
 static const Nv2aBackend s_vk_backend = { vb_clear, vb_draw, vb_flip, vb_draw_program,
-                                          vb_stopped };
+                                          vb_stopped, nv2a_vk_rc_coverage_report };
 
 void nv2a_vk_backend_program_stats(Nv2aVkProgramStats *out)
 {

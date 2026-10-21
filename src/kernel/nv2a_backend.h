@@ -156,6 +156,13 @@ typedef struct {
      * one are already in guest memory, so this is per target, not whole-frame atomicity.
      * Read-only, same thread; a back end that reports it stays stopped. */
     int (*stopped)(void);
+    /* Optional (NULL: no back-end coverage counters). Prints the back end's own
+     * diagnostic coverage lines, if it has any. Called from nv2a_pb_exec_report()
+     * with the PFIFO lock held (submission-walk thread), only while
+     * RECOMP_PB_COVERAGE=1 is in effect, and immediately before the executor's
+     * own [PBCOV] lines. Observation only: it must not block, allocate, or feed
+     * a rendering decision. */
+    void (*coverage_report)(void);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
@@ -229,6 +236,100 @@ void nv2a_pb_exec_timing(Nv2aPbExecTiming *out);
  * means the register never arrived. Same THREADING CONTRACT as above. */
 typedef struct { uint32_t writes, disables, last, enabled; } Nv2aPbExecTex0;   /* enabled = current s_tex0_enabled */
 void nv2a_pb_exec_tex0_control(Nv2aPbExecTex0 *out);
+
+/* ── Diagnostic coverage latches (RECOMP_PB_COVERAGE=1) ───────────────────
+ *
+ * Which rendering features the title actually asks for, so a later step sizes
+ * its work from the title's own state rather than from a guess. Nothing here
+ * feeds rendering: this is an observation seam, and with the gate off every
+ * count and every first record stays 0 (only the identity fields are set).
+ *
+ * A BATCH, for every count below, is one call to raster_batch() that passed the
+ * existing backend_stopped() and idx_count < 3 early returns. draw_primitive is
+ * its only caller and every submission form (vertex arrays, INLINE_ARRAY,
+ * immediate mode) reaches it exactly once, so a batch is counted once whether
+ * the program path, the CPU fallback or a registered back end executes it. A
+ * batch increments each counter at most once; batches stopped by either guard
+ * are not counted.
+ *
+ * OWNER: the submission-walk thread (the same thread as the counters above),
+ * which writes every field. Readers obey the same THREADING CONTRACT as
+ * nv2a_pb_exec_counters. There is NO reset after the gate is first sampled: the
+ * counts are cumulative for the process (fixtures use one process per case).
+ *
+ * FIRST RECORDS are claimed by the first qualifying batch. The payload is
+ * written first and `valid = 1` last; a claimed record is never rewritten.
+ * One exception is first_b.bump_seen_mask: it is an OR of deliveries, so it may
+ * gain bits after the record is claimed (each bit is set once, never cleared).
+ * `draw` is s_gpu.draws, the ordinal of the draw_primitive() that submitted the
+ * batch.
+ *
+ * All counts are uint64_t and count batches, not vertices, except the stage
+ * histogram and the per-stage split: those count (batch, stage) incidences, so
+ * sum(stage_mode_hist) >= stage_ge6_batches and the same holds for
+ * stage_ge6_by_stage (one batch can have several stages >= 6).
+ */
+#define NV2A_PB_COVERAGE_MAGIC 0x4F434250u   /* 'PBCO' */
+
+typedef struct {
+    uint32_t magic;      /* NV2A_PB_COVERAGE_MAGIC */
+    uint32_t version;    /* 1 */
+    uint32_t size;       /* sizeof(Nv2aPbCoverageLedger): checked before reading */
+    uint32_t enabled;    /* 1 once RECOMP_PB_COVERAGE=1 was sampled on */
+
+    /* (a) Fixed-function batches using texgen and/or the texture matrix. */
+    uint64_t ff_texgen_batches;
+    uint64_t ff_texmat_batches;
+    uint64_t ff_texgen_texmat_batches;
+    struct {
+        uint32_t valid;               /* written LAST */
+        uint32_t draw;
+        uint32_t texmat_enable;       /* raw SET_TEXTURE_MATRIX_ENABLE (0x420) */
+        uint32_t texgen[4];           /* raw 0x3C0..0x3CC: TEXGEN S/T/R/Q, stage 0 */
+        uint32_t texture_matrix[16];  /* raw 0x6C0..0x6FC */
+    } first_a;
+
+    /* (b) Batches with any texture stage mode >= 6 (bump env / dot product). */
+    uint64_t stage_ge6_batches;        /* once per batch if ANY stage qualifies */
+    uint64_t stage_ge6_by_stage[4];    /* per qualifying (batch, stage) */
+    uint64_t stage_mode_hist[32];      /* bucket = 5-bit mode 6..31; per incidence */
+    struct {
+        uint32_t valid;               /* written LAST */
+        uint32_t draw;
+        uint32_t stage_program;       /* raw SET_SHADER_STAGE_PROGRAM (0x1E70) */
+        uint32_t modes[4];            /* decoded 5-bit stage modes */
+        uint32_t bump_mat[4][4];      /* raw 0x1B28 + 0x40*s .. +0x34 */
+        uint32_t bump_scale[4];       /* raw 0x1B38 + 0x40*s */
+        uint32_t bump_offset[4];      /* raw 0x1B3C + 0x40*s */
+        uint32_t bump_seen_mask;      /* bit stage*3 + {0 mat,1 scale,2 offset}:
+                                       * set when that method was DELIVERED at
+                                       * any time (write-once per bit) */
+        uint32_t vp_first_word;       /* first dword of the current vertex
+                                       * program, 0 if none */
+    } first_b;
+
+    /* (c) Lit fixed-function batches with specular and/or a spot light. */
+    uint64_t lit_specular_batches;
+    uint64_t lit_spot_batches;
+    uint64_t lit_both_batches;
+    struct {
+        uint32_t valid;               /* written LAST */
+        uint32_t draw;
+        uint32_t lighting_enable;     /* raw 0x314 */
+        uint32_t specular_enable;     /* raw 0x3B8 */
+        uint32_t light_mask;          /* raw 0x3BC */
+        uint32_t light_kind[8];       /* decoded 2-bit kinds, lights 0..7 */
+        int32_t  spot_light;          /* index of the first spot light, or -1 */
+        uint32_t spot_falloff[3];     /* 0x1040 + 0x80*i .. */
+        uint32_t spot_direction[3];   /* 0x104C + 0x80*i .. */
+        uint32_t local_attenuation[3];/* 0x1068 + 0x80*i .. */
+    } first_c;
+
+    uint32_t reserved[4];             /* layout slack */
+} Nv2aPbCoverageLedger;
+
+extern Nv2aPbCoverageLedger g_nv2a_pb_coverage;   /* stable name, PDB readable */
+const Nv2aPbCoverageLedger *nv2a_pb_exec_coverage(void);
 
 /* Register the executor as the GPU core's committed-method consumer. Called
  * once at bring-up (before the guest runs) and gated on RECOMP_PB_EXEC by
