@@ -260,18 +260,30 @@ void nv2a_pb_exec_tex0_control(Nv2aPbExecTex0 *out);
  * FIRST RECORDS are claimed by the first qualifying batch. The payload is
  * written first and `valid = 1` last; a claimed record is never rewritten, by
  * any later method, batch or report. Each record freezes BOTH its raw sampled
- * values AND the per-word delivery masks in force when it was claimed
+ * values AND the per-word availability in force when it was claimed
  * (`*_seen`), so availability is never re-read from live state afterwards.
  * `draw` is s_gpu.draws, the ordinal of the draw_primitive() that submitted the
  * batch.
  *
  * RAW ZERO vs UNKNOWN. A raw value is an observation only when its seen bit is
- * set. An undelivered method leaves the register shadow at 0, and that 0 is
- * UNKNOWN, not an observed zero; a clear seen bit also covers methods the
- * production method table does not admit yet (texgen Q, texture matrices for
- * stages 2/3, the bump-environment words for stage 0, and every spot/light
- * parameter word). A set seen bit means the method was committed to this
- * executor at some point before the record was claimed.
+ * set. A method never committed to this executor (and, for the coverage
+ * counters, never committed on subchannel 0) leaves the coverage shadow at 0,
+ * and that 0 is UNKNOWN, not an observed zero; a clear seen bit also covers
+ * methods the production method table does not admit yet (texgen Q, texture
+ * matrices for stages 2/3, the bump-environment words for stage 0, and every
+ * spot/light parameter word). A set seen bit means the method was committed to
+ * this executor at some point before the record was claimed.
+ *
+ * VERTEX-PROGRAM FIRST WORD. first_b.vp_start is the raw
+ * SET_TRANSFORM_PROGRAM_START (0x1EA0) selected at the claim, and
+ * vp_first_word is dword 0 of that same slot at that instant.
+ * vp_first_word_seen is not a method-delivery bit: it is 1 only when an
+ * accepted, in-range SET_TRANSFORM_PROGRAM upload wrote component 0 (dword0)
+ * into that same slot before the claim. A raw zero with the bit clear is
+ * UNKNOWN; a zero with the bit set is an observed zero. An upload past
+ * NV2A_VSH_SLOTS and a component 1..3 write cannot establish dword0
+ * availability, and a component-0 write through any adjacent port method
+ * (0x0B10, 0x0B20, ... 0x0B70) is still a component-0 write.
  *
  * All counts are uint64_t and count batches, not vertices, except the stage
  * histogram and the per-stage split: those count (batch, stage) incidences, so
@@ -282,7 +294,8 @@ void nv2a_pb_exec_tex0_control(Nv2aPbExecTex0 *out);
 
 typedef struct {
     uint32_t magic;      /* NV2A_PB_COVERAGE_MAGIC */
-    uint32_t version;    /* 2: first records freeze per-word seen masks */
+    uint32_t version;    /* 3: first_b adds vp_start and component-0 upload
+                          *    provenance; counters read the committed shadow */
     uint32_t size;       /* sizeof(Nv2aPbCoverageLedger): checked before reading */
     uint32_t enabled;    /* 1 once RECOMP_PB_COVERAGE=1 was sampled on */
 
@@ -323,10 +336,19 @@ typedef struct {
                                        * 0x1B28+0x40*s+4*k, k=4 scale, k=5
                                        * offset. Stage 0 is not admitted, so
                                        * bits 0..5 are always clear. */
-        uint32_t vp_first_word;       /* first dword of the current vertex
-                                       * program, 0 if none */
-        uint32_t vp_first_word_seen;  /* 1 if any of 0x0B00/0B04/0B08/0B0C was
-                                       * delivered */
+        uint32_t vp_start;            /* raw SET_TRANSFORM_PROGRAM_START
+                                       * (0x1EA0) at the claim */
+        uint32_t vp_first_word;       /* dword 0 of the slot at vp_start at
+                                       * the claim; 0 when vp_start is out of
+                                       * range (UNKNOWN, seen also clear) */
+        uint32_t vp_first_word_seen;  /* 1 only if an accepted, in-range
+                                       * program upload wrote component 0
+                                       * (dword0) into that same slot before
+                                       * the claim. A raw zero with this clear
+                                       * is UNKNOWN; zero with it set is an
+                                       * observed zero. An out-of-range upload
+                                       * or a component 1..3 write cannot set
+                                       * it. */
     } first_b;
 
     /* (c) Lit fixed-function batches with specular and/or a spot light. */

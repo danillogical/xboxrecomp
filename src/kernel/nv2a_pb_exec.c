@@ -90,7 +90,7 @@ void nv2a_pb_exec_report(void);
  * The ledger is statically initialised so a reader can validate it even when
  * the gate is off; the payload fields are only written from this thread. */
 Nv2aPbCoverageLedger g_nv2a_pb_coverage = {
-    NV2A_PB_COVERAGE_MAGIC, 2u, (uint32_t)sizeof(Nv2aPbCoverageLedger), 0u
+    NV2A_PB_COVERAGE_MAGIC, 3u, (uint32_t)sizeof(Nv2aPbCoverageLedger), 0u
 };
 
 static int pb_coverage(void)
@@ -822,12 +822,29 @@ static struct {
     uint32_t prog_load, prog_start, const_load;
 } s_vp;
 
+/* Coverage provenance for the vertex program's first dword.
+ *
+ * s_vp.prog[slot][0] reads zero for two very different reasons: an accepted
+ * upload wrote zero, or no accepted upload ever addressed component 0 of that
+ * slot. The raw method-seen bits cannot tell them apart -- a component 1..3
+ * write leaves dword 0 untouched, a write past NV2A_VSH_SLOTS is dropped, and
+ * a component-0 write may arrive through any of the port method addresses.
+ * So this map is set ONLY by an accepted, in-range upload of component 0
+ * (dword0), on the cursor slot it was actually stored into; it is never set by
+ * a dropped write or by another component. Diagnostic only: no renderer, the
+ * cursor or the interpreter reads it. */
+static uint8_t s_pb_vp_word0[NV2A_VSH_SLOTS];
+
 static void vp_program_method(uint32_t method, uint32_t param)
 {
     uint32_t slot = (method - NV097_SET_TRANSFORM_PROGRAM) / 4;
 
     if (s_vp.prog_load < NV2A_VSH_SLOTS) {
         s_vp.prog[s_vp.prog_load][slot % 4] = param;
+        /* The enclosing test proves the cursor slot is in range, so this is
+         * exactly the accepted component-0 write. */
+        if (pb_coverage() && slot % 4 == 0)
+            s_pb_vp_word0[s_vp.prog_load] = 1;
         nv2a_vsh_set_instruction(s_vp.prog_load, s_vp.prog[s_vp.prog_load]);
     }
     if (slot % 4 == 3)
@@ -4042,10 +4059,13 @@ static void raster_batch_screen(uint32_t before, uint32_t px_before)
  * file does not include it, because its NV097_* names collide with the method
  * table declared here (see the commit-seam note at the top).
  *
- * Values come from s_reg[], the last-value shadow that nv2a_pb_exec_method()
- * updates for EVERY method delivered to this executor, and from
- * s_gpu.rc.stage_program. No second copy of rendering state is kept, and no
- * rendering decision reads these fields.
+ * Values come from s_pb_reg[], the coverage copy of the register shadow made at
+ * the committed seam (subchannel 0, gate on) by pb_coverage_note_method(), and
+ * from s_gpu.rc.stage_program. s_reg[] itself is written at the top of
+ * nv2a_pb_exec_method(), BEFORE the nonzero-subchannel filter (existing
+ * rendering behavior, unchanged), so it can hold a value that was never
+ * committed to the 3D class; the coverage shadow cannot. No rendering decision
+ * reads any of these fields.
  *
  * Method layout, from xemu (hw/xbox/nv2a/pgraph/methods.h.inc and pgraph.c);
  * facts only, the implementation stays here:
@@ -4101,27 +4121,46 @@ static void raster_batch_screen(uint32_t before, uint32_t px_before)
 #define PBCOV_STAGE_STRIDE                 0x40
 #define PBCOV_LIGHT_STRIDE                 0x80
 
-/* LIVE delivery state, the only coverage state that may grow after a first
- * record is claimed. Indexed by s_reg[] slot (one byte per method, every NV2A
- * method being dword-aligned); 0x2000 covers the highest method sampled here
- * (0x1BFC). A claim copies what is set at that instant and never looks back,
- * which is what makes the first records immutable. */
+/* LIVE delivery state and its committed-value shadow, the only coverage state
+ * that may grow after a first record is claimed. s_pb_seen is one byte per
+ * method, indexed by s_reg[] slot (every NV2A method being dword-aligned);
+ * 0x2000 covers the highest method sampled here (0x1BFC). A claim copies what
+ * is set at that instant and never looks back, which is what makes the first
+ * records immutable. */
 #define PBCOV_SEEN_METHOD_SPAN             0x2000u
 static uint8_t s_pb_seen[PBCOV_SEEN_METHOD_SPAN / 4];
+
+/* Committed-value shadow for the coverage counters.
+ *
+ * nv2a_pb_exec_method() stores into s_reg[] at the very top of the call,
+ * BEFORE its nonzero-subchannel filter, because the existing rendering path
+ * consumes that shadow for every delivered method (unchanged behavior). A
+ * method on another subchannel can therefore overwrite s_reg[] without ever
+ * being committed to the 3D class. pb_coverage_note_method() copies the slot
+ * into this shadow at the committed seam -- after the subchannel filter and
+ * the gate, in the same call that sets s_pb_seen -- and pb_coverage_batch()
+ * reads only this shadow. Slot indexing matches s_reg[]; the counters are
+ * driven by the values that actually reached the executor as subchannel-0
+ * methods. */
+static uint32_t s_pb_reg[0x2000 / 4];
 
 static int pb_seen(uint32_t method)
 {
     return method < PBCOV_SEEN_METHOD_SPAN && s_pb_seen[method / 4] != 0;
 }
 
-/* Remember that a method was DELIVERED to this executor; availability metadata
- * only. Counters read raw s_reg[] values and never require a delivery bit (a
- * fixture that injects state directly must still count). The caller has already
- * dropped other subchannels and applied the gate. */
+/* Remember that a method was DELIVERED to this executor and freeze its
+ * committed value for the coverage counters; availability metadata and the
+ * counter input, nothing else. The caller has already dropped other
+ * subchannels and applied the gate, so s_reg[] still holds this same call's
+ * parameter here -- after the top-of-function store but before dispatch. A
+ * value written by a filtered subchannel is never copied. */
 static void pb_coverage_note_method(uint32_t method)
 {
-    if (method < PBCOV_SEEN_METHOD_SPAN)
+    if (method < PBCOV_SEEN_METHOD_SPAN) {
         s_pb_seen[method / 4] = 1;
+        s_pb_reg[(method & 0x1FFCu) / 4] = s_reg[(method & 0x1FFCu) / 4];
+    }
 }
 
 /* Count one batch and claim any first record it qualifies for.
@@ -4146,9 +4185,9 @@ static void pb_coverage_note_method(uint32_t method)
  *   - lit batch: batch_is_ffp() AND raw 0x314 != 0 AND (raw 0x3B8 != 0 OR any
  *     2-bit light kind in 0x3BC is 3 = SPOT; kinds 0 off, 1 infinite, 2 local).
  *
- * The counts are driven by observed raw state only. The delivery map is read
- * solely to freeze each first record's seen masks, so a fixture that injects
- * s_reg[] directly still counts.
+ * The counts are driven by s_pb_reg[], the committed seam's values, so a
+ * filtered subchannel that overwrote s_reg[] cannot move a counter. The
+ * delivery map is read solely to freeze each first record's seen masks.
  */
 static void pb_coverage_batch(void)
 {
@@ -4169,7 +4208,7 @@ static void pb_coverage_batch(void)
         for (c = 0; c < 4; c++) {
             uint32_t m = PBCOV_SET_TEXGEN_S + PBCOV_TEXGEN_STAGE_STRIDE * s
                        + PBCOV_TEXGEN_COMP_STRIDE * c;
-            texgen[s][c] = s_reg[m / 4];
+            texgen[s][c] = s_pb_reg[m / 4];
             if (pb_seen(m))
                 texgen_seen |= 1u << (s * 4 + c);
             if (texgen[s][c])
@@ -4177,7 +4216,7 @@ static void pb_coverage_batch(void)
         }
         {
             uint32_t m = PBCOV_SET_TEXTURE_MATRIX_ENABLE + PBCOV_MATRIX_ENABLE_STRIDE * s;
-            mat_enable[s] = s_reg[m / 4];
+            mat_enable[s] = s_pb_reg[m / 4];
             if (pb_seen(m))
                 mat_enable_seen |= 1u << s;
             if (mat_enable[s])
@@ -4186,7 +4225,7 @@ static void pb_coverage_batch(void)
         for (j = 0; j < 16; j++) {
             uint32_t m = PBCOV_SET_TEXTURE_MATRIX
                        + PBCOV_TEXTURE_MATRIX_STAGE_STRIDE * s + 4u * j;
-            texture_matrix[s][j] = s_reg[m / 4];
+            texture_matrix[s][j] = s_pb_reg[m / 4];
             if (pb_seen(m))
                 matrix_seen |= (uint64_t)1 << (s * 16 + j);
         }
@@ -4240,38 +4279,42 @@ static void pb_coverage_batch(void)
             for (i = 0; i < 4; i++) {
                 uint32_t m = PBCOV_SET_TEXTURE_SET_BUMP_ENV_MAT
                            + s * PBCOV_STAGE_STRIDE + 4u * i;
-                L->first_b.bump_mat[s][i] = s_reg[m / 4];
+                L->first_b.bump_mat[s][i] = s_pb_reg[m / 4];
                 if (pb_seen(m))
                     bump_seen |= 1u << (s * 6 + i);
             }
             {
                 uint32_t m = PBCOV_SET_TEXTURE_SET_BUMP_ENV_SCALE
                            + s * PBCOV_STAGE_STRIDE;
-                L->first_b.bump_scale[s] = s_reg[m / 4];
+                L->first_b.bump_scale[s] = s_pb_reg[m / 4];
                 if (pb_seen(m))
                     bump_seen |= 1u << (s * 6 + 4);
             }
             {
                 uint32_t m = PBCOV_SET_TEXTURE_SET_BUMP_ENV_OFFSET
                            + s * PBCOV_STAGE_STRIDE;
-                L->first_b.bump_offset[s] = s_reg[m / 4];
+                L->first_b.bump_offset[s] = s_pb_reg[m / 4];
                 if (pb_seen(m))
                     bump_seen |= 1u << (s * 6 + 5);
             }
         }
         L->first_b.bump_seen = bump_seen;
-        L->first_b.vp_first_word = s_vp.prog_start < NV2A_VSH_SLOTS
-                                 ? s_vp.prog[s_vp.prog_start][0] : 0;
+        /* One slot, one instant: the selected start, the word and its
+         * availability are all read at the claim, from the same slot. */
+        L->first_b.vp_start = s_vp.prog_start;
+        L->first_b.vp_first_word =
+            L->first_b.vp_start < NV2A_VSH_SLOTS
+                ? s_vp.prog[L->first_b.vp_start][0] : 0;
         L->first_b.vp_first_word_seen =
-            (pb_seen(0x0B00u) || pb_seen(0x0B04u)
-             || pb_seen(0x0B08u) || pb_seen(0x0B0Cu)) ? 1u : 0u;
+            (L->first_b.vp_start < NV2A_VSH_SLOTS
+             && s_pb_vp_word0[L->first_b.vp_start]) ? 1u : 0u;
         L->first_b.valid = 1;            /* LAST */
     }
 
     /* (c) Lit fixed-function batch with specular and/or a spot light. */
-    lighting = s_reg[PBCOV_SET_LIGHTING_ENABLE / 4];
-    specular = s_reg[PBCOV_SET_SPECULAR_ENABLE / 4];
-    light_mask = s_reg[PBCOV_SET_LIGHT_ENABLE_MASK / 4];
+    lighting = s_pb_reg[PBCOV_SET_LIGHTING_ENABLE / 4];
+    specular = s_pb_reg[PBCOV_SET_SPECULAR_ENABLE / 4];
+    light_mask = s_pb_reg[PBCOV_SET_LIGHT_ENABLE_MASK / 4];
     spot = 0xFFFFFFFFu;
     for (i = 0; i < 8; i++) {
         kinds[i] = (light_mask >> (i * 2)) & 3u;
@@ -4309,9 +4352,9 @@ static void pb_coverage_batch(void)
                             + PBCOV_LIGHT_STRIDE * spot + 4u * i;
                 uint32_t ma = PBCOV_SET_LIGHT_LOCAL_ATTENUATION
                             + PBCOV_LIGHT_STRIDE * spot + 4u * i;
-                L->first_c.spot_falloff[i] = s_reg[mf / 4];
-                L->first_c.spot_direction[i] = s_reg[md / 4];
-                L->first_c.local_attenuation[i] = s_reg[ma / 4];
+                L->first_c.spot_falloff[i] = s_pb_reg[mf / 4];
+                L->first_c.spot_direction[i] = s_pb_reg[md / 4];
+                L->first_c.local_attenuation[i] = s_pb_reg[ma / 4];
                 if (pb_seen(mf))
                     spot_seen |= 1u << i;
                 if (pb_seen(md))
@@ -4391,13 +4434,14 @@ static void pb_report_coverage(void)
     } else {
         fprintf(stderr, "[PBCOV] first_b=draw=%u stage_program=%08X"
                         " stage_program_seen=%u modes=%u,%u,%u,%u"
-                        " bump_seen=%06X vp_first_word=%08X vp_first_word_seen=%u"
-                        " bump_mat=",
+                        " bump_seen=%06X vp_start=%u vp_first_word=%08X"
+                        " vp_first_word_seen=%u bump_mat=",
                 L->first_b.draw, (unsigned)L->first_b.stage_program,
                 (unsigned)L->first_b.stage_program_seen,
                 L->first_b.modes[0], L->first_b.modes[1],
                 L->first_b.modes[2], L->first_b.modes[3],
                 (unsigned)L->first_b.bump_seen,
+                (unsigned)L->first_b.vp_start,
                 (unsigned)L->first_b.vp_first_word,
                 (unsigned)L->first_b.vp_first_word_seen);
         for (i = 0; i < 4; i++) {
