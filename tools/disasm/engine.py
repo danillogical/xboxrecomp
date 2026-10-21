@@ -466,6 +466,40 @@ class DisasmEngine:
                 return ops[0].imm & 0xFFFFFFFF
         return None
 
+    def block_ends_in_indirect_jump(self, addr: int, max_insns: int = 256) -> bool:
+        """
+        Whether the straight-line block at `addr` ends in an indirect jmp.
+
+        The sibling of block_tail_jump for the jumps it cannot name: a tail
+        call through a vtable slot (`mov ecx, [eax]; jmp [ecx+0x20]`) or a
+        switch through a table. For a branch target already reached from
+        inside a function, that is the block's terminator. Read the same way
+        as block_tail_jump: conditional branches are passed over, a ret first
+        means no.
+        """
+        section = self.image.get_section_at_va(addr)
+        if section is None or not section.executable:
+            return False
+        data = self.image.read_bytes_at_va(addr, max_insns * 8)
+        if not data:
+            return False
+
+        count = 0
+        for decoded in self._cs.disasm(data, addr):
+            count += 1
+            if count > max_insns:
+                return False
+            mnemonic = decoded.mnemonic.lower()
+            if mnemonic in config.RET_MNEMONICS:
+                return False
+            if mnemonic in config.JMP_MNEMONICS:
+                try:
+                    ops = decoded.operands
+                except Exception:
+                    return False
+                return bool(ops) and ops[0].type != CS_OP_IMM
+        return False
+
     def probes_as_returning_body(self, addr: int,
                                  max_insns: int = 64) -> bool:
         """

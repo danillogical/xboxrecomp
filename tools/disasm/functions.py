@@ -175,9 +175,11 @@ class FunctionDetector:
         # `src not inside any known function` for every one of its branches.
         self._pass_cond_branch_orphans_after(sections)
 
-        # Tail jumps into gaps from bodies made after the last tail-jump
-        # closure: the alias orphan and conditional-branch passes above.
-        self._pass_late_tail_jumps(sections)
+        # Tail jumps and conditional branches into gaps from bodies the passes
+        # above did not reach. A recovered block can itself branch into
+        # another body's interior, so the conditional-branch pass looks again.
+        if self._pass_late_tail_jumps(sections):
+            self._pass_cond_branch_orphans_after(sections)
 
         self._build_alias_entries()
 
@@ -1180,6 +1182,17 @@ class FunctionDetector:
         _build_alias_entries measures it. Repeats, since a recovered body can
         tail-jump onward itself. Like pass 6 it follows only instructions that
         recursive descent reaches.
+
+        A jcc out of a late body into a gap was missed the same way, and
+        _pass_cond_branch_orphans refuses a block that ends in an indirect jmp.
+        It is taken here with that pass's acceptance test, because a jcc past
+        a body's end can also mean the body was measured short: the target
+        must decode to a returning body, a vcall thunk, or a block ending in a
+        jmp -- direct, or indirect (a tail call through a vtable slot, or a
+        switch). Jet Set Radio Future had two: a method's `je` to a block
+        forwarding to `[ecx+0x20]` (0x001783FE, so esp came back 12 low
+        through the stub), and a switch arm's `je` to its function's shared
+        epilogue (0x001296C7, `add esp, 0xc04; ret` never ran).
         """
         added = 0
         while True:
@@ -1219,7 +1232,7 @@ class FunctionDetector:
                 for insn in self.engine.get_instructions_in_range(lo, hi):
                     if insn.address not in reachable:
                         continue
-                    if not insn.is_jump or insn.is_cond_jump:
+                    if not (insn.is_jump or insn.is_cond_jump):
                         continue
                     target = insn.jump_target
                     if target is None or lo <= target < hi:
@@ -1234,6 +1247,8 @@ class FunctionDetector:
                     section = self.image.get_section_at_va(target)
                     if section is None or not section.executable:
                         continue
+                    if insn.is_cond_jump and not self._branch_block_ends(target):
+                        continue                # maybe a body measured short
                     k = bisect.bisect_right(all_starts, target)
                     self._alias_entries[target] = (
                         all_starts[k] if k < len(all_starts)
@@ -1243,8 +1258,15 @@ class FunctionDetector:
                 break
             added += new
         if added:
-            print(f"  {added} tail-jump target(s) from late bodies recovered as alias entries")
+            print(f"  {added} branch target(s) from late bodies recovered as alias entries")
         return added > 0
+
+    def _branch_block_ends(self, target: int) -> bool:
+        """Whether a conditional-branch target in a gap ends like a block of code."""
+        return (self.engine.probes_as_returning_body(target, max_insns=256)
+                or self.engine.probes_as_vcall_thunk(target)
+                or self.engine.block_tail_jump(target) is not None
+                or self.engine.block_ends_in_indirect_jump(target))
 
     def _build_alias_entries(self) -> None:
         """
