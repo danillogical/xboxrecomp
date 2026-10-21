@@ -4303,7 +4303,7 @@ static uint32_t vb_cube_mask(const Nv2aBatch *b)
 
 /* Can the combiner pipeline draw this batch? gb_rc_key's rule: bump-environment and
  * dot-product stage modes (> 5) and true cube maps are not interpreted. The rule
- * itself lives in nv2a_vk_rc_coverage.c so a fixture and this back end share one
+ * itself lives in nv2a_vk_rc_coverage.h so a fixture and this back end share one
  * definition; behavior here is unchanged. */
 static int vb_rc_supported(const Nv2aBatch *b)
 {

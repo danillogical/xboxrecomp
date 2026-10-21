@@ -258,11 +258,20 @@ void nv2a_pb_exec_tex0_control(Nv2aPbExecTex0 *out);
  * counts are cumulative for the process (fixtures use one process per case).
  *
  * FIRST RECORDS are claimed by the first qualifying batch. The payload is
- * written first and `valid = 1` last; a claimed record is never rewritten.
- * One exception is first_b.bump_seen_mask: it is an OR of deliveries, so it may
- * gain bits after the record is claimed (each bit is set once, never cleared).
+ * written first and `valid = 1` last; a claimed record is never rewritten, by
+ * any later method, batch or report. Each record freezes BOTH its raw sampled
+ * values AND the per-word delivery masks in force when it was claimed
+ * (`*_seen`), so availability is never re-read from live state afterwards.
  * `draw` is s_gpu.draws, the ordinal of the draw_primitive() that submitted the
  * batch.
+ *
+ * RAW ZERO vs UNKNOWN. A raw value is an observation only when its seen bit is
+ * set. An undelivered method leaves the register shadow at 0, and that 0 is
+ * UNKNOWN, not an observed zero; a clear seen bit also covers methods the
+ * production method table does not admit yet (texgen Q, texture matrices for
+ * stages 2/3, the bump-environment words for stage 0, and every spot/light
+ * parameter word). A set seen bit means the method was committed to this
+ * executor at some point before the record was claimed.
  *
  * All counts are uint64_t and count batches, not vertices, except the stage
  * histogram and the per-stage split: those count (batch, stage) incidences, so
@@ -273,20 +282,28 @@ void nv2a_pb_exec_tex0_control(Nv2aPbExecTex0 *out);
 
 typedef struct {
     uint32_t magic;      /* NV2A_PB_COVERAGE_MAGIC */
-    uint32_t version;    /* 1 */
+    uint32_t version;    /* 2: first records freeze per-word seen masks */
     uint32_t size;       /* sizeof(Nv2aPbCoverageLedger): checked before reading */
     uint32_t enabled;    /* 1 once RECOMP_PB_COVERAGE=1 was sampled on */
 
-    /* (a) Fixed-function batches using texgen and/or the texture matrix. */
+    /* (a) Fixed-function batches using texgen and/or the texture matrix.
+     * Layout per stage: texgen 0x3C0 + 0x10*s + 0x04*c (c = S,T,R,Q), one
+     * matrix-enable word 0x420 + 0x04*s, and a 16-dword matrix
+     * 0x6C0 + 0x40*s + 0x04*j. */
     uint64_t ff_texgen_batches;
     uint64_t ff_texmat_batches;
     uint64_t ff_texgen_texmat_batches;
     struct {
         uint32_t valid;               /* written LAST */
         uint32_t draw;
-        uint32_t texmat_enable;       /* raw SET_TEXTURE_MATRIX_ENABLE (0x420) */
-        uint32_t texgen[4];           /* raw 0x3C0..0x3CC: TEXGEN S/T/R/Q, stage 0 */
-        uint32_t texture_matrix[16];  /* raw 0x6C0..0x6FC */
+        uint32_t texgen[4][4];        /* raw [stage][S,T,R,Q] */
+        uint32_t texgen_seen;         /* bit s*4+c: that word was delivered */
+        uint32_t mat_enable[4];       /* raw 0x420 + 0x04*s (one enable/stage) */
+        uint32_t mat_enable_seen;     /* bit s: 0x420 + 0x04*s was delivered */
+        uint32_t texture_matrix[4][16]; /* raw [stage][j] */
+        uint64_t matrix_seen;         /* bit s*16+j: that dword was delivered;
+                                       * stages 2/3 are not admitted, so their
+                                       * bits are always clear */
     } first_a;
 
     /* (b) Batches with any texture stage mode >= 6 (bump env / dot product). */
@@ -297,15 +314,19 @@ typedef struct {
         uint32_t valid;               /* written LAST */
         uint32_t draw;
         uint32_t stage_program;       /* raw SET_SHADER_STAGE_PROGRAM (0x1E70) */
+        uint32_t stage_program_seen;  /* 1 if 0x1E70 was delivered */
         uint32_t modes[4];            /* decoded 5-bit stage modes */
-        uint32_t bump_mat[4][4];      /* raw 0x1B28 + 0x40*s .. +0x34 */
+        uint32_t bump_mat[4][4];      /* raw [stage][MAT00,01,10,11] */
         uint32_t bump_scale[4];       /* raw 0x1B38 + 0x40*s */
         uint32_t bump_offset[4];      /* raw 0x1B3C + 0x40*s */
-        uint32_t bump_seen_mask;      /* bit stage*3 + {0 mat,1 scale,2 offset}:
-                                       * set when that method was DELIVERED at
-                                       * any time (write-once per bit) */
+        uint32_t bump_seen;           /* bit s*6+k: k 0..3 MAT00/01/10/11 at
+                                       * 0x1B28+0x40*s+4*k, k=4 scale, k=5
+                                       * offset. Stage 0 is not admitted, so
+                                       * bits 0..5 are always clear. */
         uint32_t vp_first_word;       /* first dword of the current vertex
                                        * program, 0 if none */
+        uint32_t vp_first_word_seen;  /* 1 if any of 0x0B00/0B04/0B08/0B0C was
+                                       * delivered */
     } first_b;
 
     /* (c) Lit fixed-function batches with specular and/or a spot light. */
@@ -318,11 +339,16 @@ typedef struct {
         uint32_t lighting_enable;     /* raw 0x314 */
         uint32_t specular_enable;     /* raw 0x3B8 */
         uint32_t light_mask;          /* raw 0x3BC */
+        uint32_t enable_seen;         /* bit0 0x314, bit1 0x3B8, bit2 0x3BC */
         uint32_t light_kind[8];       /* decoded 2-bit kinds, lights 0..7 */
         int32_t  spot_light;          /* index of the first spot light, or -1 */
         uint32_t spot_falloff[3];     /* 0x1040 + 0x80*i .. */
         uint32_t spot_direction[3];   /* 0x104C + 0x80*i .. */
         uint32_t local_attenuation[3];/* 0x1068 + 0x80*i .. */
+        uint32_t spot_seen;           /* bits 0..2 falloff, 3..5 direction,
+                                       * 6..8 attenuation, for spot_light's
+                                       * words. Not admitted today, so clear;
+                                       * the raw words stay UNKNOWN. */
     } first_c;
 
     uint32_t reserved[4];             /* layout slack */

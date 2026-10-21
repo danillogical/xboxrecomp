@@ -90,7 +90,7 @@ void nv2a_pb_exec_report(void);
  * The ledger is statically initialised so a reader can validate it even when
  * the gate is off; the payload fields are only written from this thread. */
 Nv2aPbCoverageLedger g_nv2a_pb_coverage = {
-    NV2A_PB_COVERAGE_MAGIC, 1u, (uint32_t)sizeof(Nv2aPbCoverageLedger), 0u
+    NV2A_PB_COVERAGE_MAGIC, 2u, (uint32_t)sizeof(Nv2aPbCoverageLedger), 0u
 };
 
 static int pb_coverage(void)
@@ -4047,27 +4047,51 @@ static void raster_batch_screen(uint32_t before, uint32_t px_before)
  * s_gpu.rc.stage_program. No second copy of rendering state is kept, and no
  * rendering decision reads these fields.
  *
- * NOTE: several of the registers this latch samples are absent from the
- * admitted set in src/nv2a/nv2a_method_table.c today, so their shadow values
- * are currently always 0 and cannot be observed here yet:
- *   - the bump-environment group 0x1B28/0x1B38/0x1B3C + 0x40*stage (0x1B24
- *     and 0x1B40 are admitted; these are not), so `bump_seen_mask` stays clear;
- *   - TEXGEN_Q (0x3CC);
- *   - all light methods past light 0's 0x1000..0x103C range, which includes
- *     every SPOT_FALLOFF/SPOT_DIRECTION/LOCAL_ATTENUATION word (0x1040+0x80*i)
- *     and lights 1..7. The lit predicates still work because LIGHT_ENABLE_MASK
- *     (0x3BC) is admitted, so a spot light's KIND is visible even though its
- *     raw parameters are not delivered.
- * That is a finding for a later step, not something this diagnostic changes. */
+ * Method layout, from xemu (hw/xbox/nv2a/pgraph/methods.h.inc and pgraph.c);
+ * facts only, the implementation stays here:
+ *   - texgen: DEF_METHOD_CASE_4(SET_TEXGEN_S/T/R/Q, 16) -- four components,
+ *     16 bytes per stage, 4 per component: 0x3C0 + 0x10*s + 0x04*c with
+ *     c = 0..3 for S,T,R,Q. Stages 1..3 are 0x3D0.., 0x3E0.., 0x3F0...
+ *   - matrix enable: DEF_METHOD_CASE_4(SET_TEXTURE_MATRIX_ENABLE, 4) -- one
+ *     word per stage, 0x420 + 0x04*s, and pgraph.c stores the parameter
+ *     directly as that slot's enable (pg->texture_matrix_enable[slot]), so
+ *     the word IS the enable and NOT a four-stage bitfield.
+ *   - texture matrix: 16 dwords per stage, 64 bytes apart:
+ *     0x6C0 + 0x40*s + 0x04*j.
+ *
+ * HONEST AVAILABILITY. The production method table src/nv2a/nv2a_method_table.c
+ * admits (verified against it, not changed here):
+ *   - texgen S/T/R for all four stages; TEXGEN_Q (0x3CC/0x3DC/0x3EC/0x3FC) is
+ *     NOT admitted;
+ *   - all four matrix-enable words 0x420/0x424/0x428/0x42C;
+ *   - texture-matrix dwords for stages 0 and 1 (0x6C0..0x6FC, 0x700..0x73C);
+ *     stages 2 and 3 (0x740..0x77C, 0x780..0x7BC) are NOT admitted;
+ *   - the bump-environment words for stages 1..3 only; stage 0's
+ *     0x1B28/0x1B38/0x1B3C are NOT admitted;
+ *   - no light method past 0x103C, so every SPOT_FALLOFF/SPOT_DIRECTION/
+ *     LOCAL_ATTENUATION word (0x1040+0x80*i) is NOT admitted. The lit
+ *     predicates still work because LIGHT_ENABLE_MASK (0x3BC) is admitted, so
+ *     a spot light's KIND is visible even though its raw parameters are not.
+ * The per-word delivered masks in each first record show exactly which of
+ * these arrived; a raw zero behind a clear bit is UNKNOWN, never an observed
+ * zero. That is a finding for a later step, not something this diagnostic
+ * changes. */
 #define PBCOV_SET_LIGHTING_ENABLE          0x0314  /* NV097_SET_LIGHTING_ENABLE */
 #define PBCOV_SET_SPECULAR_ENABLE          0x03B8  /* NV097_SET_SPECULAR_ENABLE */
 #define PBCOV_SET_LIGHT_ENABLE_MASK        0x03BC  /* NV097_SET_LIGHT_ENABLE_MASK */
-#define PBCOV_SET_TEXGEN_S                 0x03C0  /* NV097_SET_TEXGEN_S */
-#define PBCOV_SET_TEXGEN_T                 0x03C4  /* NV097_SET_TEXGEN_T */
-#define PBCOV_SET_TEXGEN_R                 0x03C8  /* NV097_SET_TEXGEN_R */
-#define PBCOV_SET_TEXGEN_Q                 0x03CC  /* NV097_SET_TEXGEN_Q */
-#define PBCOV_SET_TEXTURE_MATRIX_ENABLE    0x0420  /* NV097_SET_TEXTURE_MATRIX_ENABLE */
-#define PBCOV_SET_TEXTURE_MATRIX           0x06C0  /* NV097_SET_TEXTURE_MATRIX, 16 dwords */
+/* Texgen: 0x3C0 + 0x10*s + 0x04*c, c = 0 S, 1 T, 2 R, 3 Q (stage-0 S is
+ * 0x3C0, stage-1 S is 0x3D0, and so on). */
+#define PBCOV_SET_TEXGEN_S                 0x03C0
+#define PBCOV_TEXGEN_STAGE_STRIDE          0x10   /* per stage */
+#define PBCOV_TEXGEN_COMP_STRIDE           0x04   /* per component */
+/* One enable word per stage: 0x420 + 0x04*s. The word is that stage's enable,
+ * not a bitfield. */
+#define PBCOV_SET_TEXTURE_MATRIX_ENABLE    0x0420
+#define PBCOV_MATRIX_ENABLE_STRIDE         0x04
+/* 16 dwords per stage: 0x6C0 + 0x40*s + 0x04*j. */
+#define PBCOV_SET_TEXTURE_MATRIX           0x06C0
+#define PBCOV_TEXTURE_MATRIX_STAGE_STRIDE  0x40
+#define PBCOV_SET_SHADER_STAGE_PROGRAM     0x1E70
 #define PBCOV_SET_LIGHT_SPOT_FALLOFF       0x1040  /* + 0x80 * light, 3 dwords */
 #define PBCOV_SET_LIGHT_SPOT_DIRECTION     0x104C  /* + 0x80 * light, 3 dwords */
 #define PBCOV_SET_LIGHT_LOCAL_ATTENUATION  0x1068  /* + 0x80 * light, 3 dwords */
@@ -4077,28 +4101,27 @@ static void raster_batch_screen(uint32_t before, uint32_t px_before)
 #define PBCOV_STAGE_STRIDE                 0x40
 #define PBCOV_LIGHT_STRIDE                 0x80
 
-/* Remember that a bump-environment method was DELIVERED, for the write-once
- * `bump_seen_mask` in the first (b) record. Called only when the gate is on.
- * The MAT method is a four-dword group; any of its words sets the same bit. */
+/* LIVE delivery state, the only coverage state that may grow after a first
+ * record is claimed. Indexed by s_reg[] slot (one byte per method, every NV2A
+ * method being dword-aligned); 0x2000 covers the highest method sampled here
+ * (0x1BFC). A claim copies what is set at that instant and never looks back,
+ * which is what makes the first records immutable. */
+#define PBCOV_SEEN_METHOD_SPAN             0x2000u
+static uint8_t s_pb_seen[PBCOV_SEEN_METHOD_SPAN / 4];
+
+static int pb_seen(uint32_t method)
+{
+    return method < PBCOV_SEEN_METHOD_SPAN && s_pb_seen[method / 4] != 0;
+}
+
+/* Remember that a method was DELIVERED to this executor; availability metadata
+ * only. Counters read raw s_reg[] values and never require a delivery bit (a
+ * fixture that injects state directly must still count). The caller has already
+ * dropped other subchannels and applied the gate. */
 static void pb_coverage_note_method(uint32_t method)
 {
-    uint32_t st, base;
-
-    for (st = 0; st < 4; st++) {
-        base = PBCOV_SET_TEXTURE_SET_BUMP_ENV_MAT + st * PBCOV_STAGE_STRIDE;
-        if (method >= base && method < base + 0x10u) {
-            g_nv2a_pb_coverage.first_b.bump_seen_mask |= 1u << (st * 3);
-            return;
-        }
-        if (method == PBCOV_SET_TEXTURE_SET_BUMP_ENV_SCALE + st * PBCOV_STAGE_STRIDE) {
-            g_nv2a_pb_coverage.first_b.bump_seen_mask |= 1u << (st * 3 + 1);
-            return;
-        }
-        if (method == PBCOV_SET_TEXTURE_SET_BUMP_ENV_OFFSET + st * PBCOV_STAGE_STRIDE) {
-            g_nv2a_pb_coverage.first_b.bump_seen_mask |= 1u << (st * 3 + 2);
-            return;
-        }
-    }
+    if (method < PBCOV_SEEN_METHOD_SPAN)
+        s_pb_seen[method / 4] = 1;
 }
 
 /* Count one batch and claim any first record it qualifies for.
@@ -4112,35 +4135,62 @@ static void pb_coverage_note_method(uint32_t method)
  * Predicates, and where they come from:
  *   - fixed-function batch: the existing batch_is_ffp() (composite set,
  *     xf_mode != PROGRAM, not inline) -- deliberately not a second definition.
- *   - texgen enabled: any of the four TEXGEN mode words 0x3C0/0x3C4/0x3C8/0x3CC
- *     is nonzero. 0 is NV097_SET_TEXGEN_*_DISABLE (nv2a_regs.h ~1054-1063).
- *     Those are the stage-0 TEXGEN registers; texture stages 1..3 have no
- *     separate TEXGEN method range in this executor.
- *   - texture matrix enabled: (raw 0x420 & 0xF) != 0. 0x420 carries one enable
- *     bit for each of the four texture stages; the raw word is retained.
+ *   - texgen enabled: any of the 16 texgen words at 0x3C0+0x10*s+0x04*c
+ *     (four stages, S/T/R/Q) is nonzero. 0 is
+ *     NV097_SET_TEXGEN_*_DISABLE (nv2a_regs.h ~1054-1063).
+ *   - texture matrix enabled: any of the four per-stage enable words
+ *     0x420+0x04*s is nonzero. Each word is that stage's enable, not a bit of
+ *     a bitfield; every raw word is retained.
  *   - stage mode: (stage_program >> (stage * 5)) & 0x1F, the decoding the CPU
  *     combiner already uses in count_texture_stage().
  *   - lit batch: batch_is_ffp() AND raw 0x314 != 0 AND (raw 0x3B8 != 0 OR any
  *     2-bit light kind in 0x3BC is 3 = SPOT; kinds 0 off, 1 infinite, 2 local).
+ *
+ * The counts are driven by observed raw state only. The delivery map is read
+ * solely to freeze each first record's seen masks, so a fixture that injects
+ * s_reg[] directly still counts.
  */
 static void pb_coverage_batch(void)
 {
     Nv2aPbCoverageLedger *L = &g_nv2a_pb_coverage;
-    uint32_t texgen[4], texmat, texmat_on, i, st, prog;
+    uint32_t texgen[4][4], mat_enable[4], texture_matrix[4][16];
+    uint32_t texgen_seen = 0, mat_enable_seen = 0, bump_seen = 0;
+    uint32_t enable_seen = 0, spot_seen = 0;
+    uint64_t matrix_seen = 0;
     uint32_t lighting, specular, light_mask, kinds[8], spot;
-    uint32_t modes[4], any_ge6 = 0;
-    int ffp, texgen_on = 0, spec, spot_on;
+    uint32_t modes[4], any_ge6 = 0, prog;
+    uint32_t i, s, c, j;
+    int ffp, texgen_on = 0, texmat_on = 0, spec, spot_on;
 
-    /* (a) Fixed-function texgen / texture matrix. */
-    texmat = s_reg[PBCOV_SET_TEXTURE_MATRIX_ENABLE / 4];
-    texmat_on = (texmat & 0xFu) != 0;
-    texgen[0] = s_reg[PBCOV_SET_TEXGEN_S / 4];
-    texgen[1] = s_reg[PBCOV_SET_TEXGEN_T / 4];
-    texgen[2] = s_reg[PBCOV_SET_TEXGEN_R / 4];
-    texgen[3] = s_reg[PBCOV_SET_TEXGEN_Q / 4];
-    for (i = 0; i < 4; i++)
-        if (texgen[i])
-            texgen_on = 1;
+    /* (a) Fixed-function texgen / texture matrix, every stage and every word.
+     * texgen_on and texmat_on are each decided once for the batch, so a batch
+     * can raise each counter at most once. */
+    for (s = 0; s < 4; s++) {
+        for (c = 0; c < 4; c++) {
+            uint32_t m = PBCOV_SET_TEXGEN_S + PBCOV_TEXGEN_STAGE_STRIDE * s
+                       + PBCOV_TEXGEN_COMP_STRIDE * c;
+            texgen[s][c] = s_reg[m / 4];
+            if (pb_seen(m))
+                texgen_seen |= 1u << (s * 4 + c);
+            if (texgen[s][c])
+                texgen_on = 1;
+        }
+        {
+            uint32_t m = PBCOV_SET_TEXTURE_MATRIX_ENABLE + PBCOV_MATRIX_ENABLE_STRIDE * s;
+            mat_enable[s] = s_reg[m / 4];
+            if (pb_seen(m))
+                mat_enable_seen |= 1u << s;
+            if (mat_enable[s])
+                texmat_on = 1;
+        }
+        for (j = 0; j < 16; j++) {
+            uint32_t m = PBCOV_SET_TEXTURE_MATRIX
+                       + PBCOV_TEXTURE_MATRIX_STAGE_STRIDE * s + 4u * j;
+            texture_matrix[s][j] = s_reg[m / 4];
+            if (pb_seen(m))
+                matrix_seen |= (uint64_t)1 << (s * 16 + j);
+        }
+    }
     ffp = batch_is_ffp();
     if (ffp) {
         if (texgen_on)
@@ -4151,11 +4201,16 @@ static void pb_coverage_batch(void)
             L->ff_texgen_texmat_batches++;
         if (!L->first_a.valid && (texgen_on || texmat_on)) {
             L->first_a.draw = s_gpu.draws;
-            L->first_a.texmat_enable = texmat;
-            for (i = 0; i < 4; i++)
-                L->first_a.texgen[i] = texgen[i];
-            for (i = 0; i < 16; i++)
-                L->first_a.texture_matrix[i] = s_reg[(PBCOV_SET_TEXTURE_MATRIX + 4u * i) / 4];
+            for (s = 0; s < 4; s++) {
+                for (c = 0; c < 4; c++)
+                    L->first_a.texgen[s][c] = texgen[s][c];
+                L->first_a.mat_enable[s] = mat_enable[s];
+                for (j = 0; j < 16; j++)
+                    L->first_a.texture_matrix[s][j] = texture_matrix[s][j];
+            }
+            L->first_a.texgen_seen = texgen_seen;
+            L->first_a.mat_enable_seen = mat_enable_seen;
+            L->first_a.matrix_seen = matrix_seen;
             L->first_a.valid = 1;        /* LAST */
         }
     }
@@ -4163,14 +4218,14 @@ static void pb_coverage_batch(void)
     /* (b) A stage mode >= 6, counted once per batch, then per (batch, stage)
      * and per mode. A batch increments stage_ge6_batches at most once. */
     prog = s_gpu.rc.stage_program;
-    for (st = 0; st < 4; st++) {
-        uint32_t m = (prog >> (st * 5)) & 0x1Fu;
-        modes[st] = m;
+    for (i = 0; i < 4; i++) {
+        uint32_t m = (prog >> (i * 5)) & 0x1Fu;
+        modes[i] = m;
         if (m >= 6) {
             if (!any_ge6)
                 L->stage_ge6_batches++;
             any_ge6 = 1;
-            L->stage_ge6_by_stage[st]++;
+            L->stage_ge6_by_stage[i]++;
             if (m < 32)
                 L->stage_mode_hist[m]++;
         }
@@ -4178,18 +4233,38 @@ static void pb_coverage_batch(void)
     if (any_ge6 && !L->first_b.valid) {
         L->first_b.draw = s_gpu.draws;
         L->first_b.stage_program = prog;
-        for (st = 0; st < 4; st++) {
-            L->first_b.modes[st] = modes[st];
-            for (i = 0; i < 4; i++)
-                L->first_b.bump_mat[st][i] = s_reg[(PBCOV_SET_TEXTURE_SET_BUMP_ENV_MAT
-                                                    + st * PBCOV_STAGE_STRIDE + 4u * i) / 4];
-            L->first_b.bump_scale[st] = s_reg[(PBCOV_SET_TEXTURE_SET_BUMP_ENV_SCALE
-                                               + st * PBCOV_STAGE_STRIDE) / 4];
-            L->first_b.bump_offset[st] = s_reg[(PBCOV_SET_TEXTURE_SET_BUMP_ENV_OFFSET
-                                                + st * PBCOV_STAGE_STRIDE) / 4];
+        L->first_b.stage_program_seen =
+            pb_seen(PBCOV_SET_SHADER_STAGE_PROGRAM) ? 1u : 0u;
+        for (s = 0; s < 4; s++) {
+            L->first_b.modes[s] = modes[s];
+            for (i = 0; i < 4; i++) {
+                uint32_t m = PBCOV_SET_TEXTURE_SET_BUMP_ENV_MAT
+                           + s * PBCOV_STAGE_STRIDE + 4u * i;
+                L->first_b.bump_mat[s][i] = s_reg[m / 4];
+                if (pb_seen(m))
+                    bump_seen |= 1u << (s * 6 + i);
+            }
+            {
+                uint32_t m = PBCOV_SET_TEXTURE_SET_BUMP_ENV_SCALE
+                           + s * PBCOV_STAGE_STRIDE;
+                L->first_b.bump_scale[s] = s_reg[m / 4];
+                if (pb_seen(m))
+                    bump_seen |= 1u << (s * 6 + 4);
+            }
+            {
+                uint32_t m = PBCOV_SET_TEXTURE_SET_BUMP_ENV_OFFSET
+                           + s * PBCOV_STAGE_STRIDE;
+                L->first_b.bump_offset[s] = s_reg[m / 4];
+                if (pb_seen(m))
+                    bump_seen |= 1u << (s * 6 + 5);
+            }
         }
+        L->first_b.bump_seen = bump_seen;
         L->first_b.vp_first_word = s_vp.prog_start < NV2A_VSH_SLOTS
                                  ? s_vp.prog[s_vp.prog_start][0] : 0;
+        L->first_b.vp_first_word_seen =
+            (pb_seen(0x0B00u) || pb_seen(0x0B04u)
+             || pb_seen(0x0B08u) || pb_seen(0x0B0Cu)) ? 1u : 0u;
         L->first_b.valid = 1;            /* LAST */
     }
 
@@ -4216,21 +4291,38 @@ static void pb_coverage_batch(void)
         L->first_c.lighting_enable = lighting;
         L->first_c.specular_enable = specular;
         L->first_c.light_mask = light_mask;
+        if (pb_seen(PBCOV_SET_LIGHTING_ENABLE))
+            enable_seen |= 1u;
+        if (pb_seen(PBCOV_SET_SPECULAR_ENABLE))
+            enable_seen |= 2u;
+        if (pb_seen(PBCOV_SET_LIGHT_ENABLE_MASK))
+            enable_seen |= 4u;
+        L->first_c.enable_seen = enable_seen;
         for (i = 0; i < 8; i++)
             L->first_c.light_kind[i] = kinds[i];
         if (spot != 0xFFFFFFFFu) {
             L->first_c.spot_light = (int32_t)spot;
             for (i = 0; i < 3; i++) {
-                L->first_c.spot_falloff[i] =
-                    s_reg[(PBCOV_SET_LIGHT_SPOT_FALLOFF + PBCOV_LIGHT_STRIDE * spot + 4u * i) / 4];
-                L->first_c.spot_direction[i] =
-                    s_reg[(PBCOV_SET_LIGHT_SPOT_DIRECTION + PBCOV_LIGHT_STRIDE * spot + 4u * i) / 4];
-                L->first_c.local_attenuation[i] =
-                    s_reg[(PBCOV_SET_LIGHT_LOCAL_ATTENUATION + PBCOV_LIGHT_STRIDE * spot + 4u * i) / 4];
+                uint32_t mf = PBCOV_SET_LIGHT_SPOT_FALLOFF
+                            + PBCOV_LIGHT_STRIDE * spot + 4u * i;
+                uint32_t md = PBCOV_SET_LIGHT_SPOT_DIRECTION
+                            + PBCOV_LIGHT_STRIDE * spot + 4u * i;
+                uint32_t ma = PBCOV_SET_LIGHT_LOCAL_ATTENUATION
+                            + PBCOV_LIGHT_STRIDE * spot + 4u * i;
+                L->first_c.spot_falloff[i] = s_reg[mf / 4];
+                L->first_c.spot_direction[i] = s_reg[md / 4];
+                L->first_c.local_attenuation[i] = s_reg[ma / 4];
+                if (pb_seen(mf))
+                    spot_seen |= 1u << i;
+                if (pb_seen(md))
+                    spot_seen |= 1u << (3 + i);
+                if (pb_seen(ma))
+                    spot_seen |= 1u << (6 + i);
             }
         } else {
             L->first_c.spot_light = -1;
         }
+        L->first_c.spot_seen = spot_seen;
         L->first_c.valid = 1;            /* LAST */
     }
 }
@@ -4273,27 +4365,44 @@ static void pb_report_coverage(void)
     if (!L->first_a.valid) {
         fprintf(stderr, "[PBCOV] first_a=none\n");
     } else {
-        fprintf(stderr, "[PBCOV] first_a=draw=%u texmat_enable=%08X texgen=",
-                L->first_a.draw, (unsigned)L->first_a.texmat_enable);
-        pb_print_words(L->first_a.texgen, 4);
+        fprintf(stderr, "[PBCOV] first_a=draw=%u texgen_seen=%04X mat_enable_seen=%X"
+                        " matrix_seen=%016llX texgen=",
+                L->first_a.draw, (unsigned)L->first_a.texgen_seen,
+                (unsigned)L->first_a.mat_enable_seen,
+                (unsigned long long)L->first_a.matrix_seen);
+        for (i = 0; i < 4; i++) {
+            if (i)
+                fputc(';', stderr);
+            pb_print_words(L->first_a.texgen[i], 4);
+        }
+        fprintf(stderr, " mat_enable=");
+        pb_print_words(L->first_a.mat_enable, 4);
         fprintf(stderr, " texture_matrix=");
-        pb_print_words(L->first_a.texture_matrix, 16);
+        for (i = 0; i < 4; i++) {
+            if (i)
+                fputc(';', stderr);
+            pb_print_words(L->first_a.texture_matrix[i], 16);
+        }
         fputc('\n', stderr);
     }
 
     if (!L->first_b.valid) {
         fprintf(stderr, "[PBCOV] first_b=none\n");
     } else {
-        fprintf(stderr, "[PBCOV] first_b=draw=%u stage_program=%08X modes=%u,%u,%u,%u"
-                        " bump_seen_mask=%03X vp_first_word=%08X bump_mat=",
+        fprintf(stderr, "[PBCOV] first_b=draw=%u stage_program=%08X"
+                        " stage_program_seen=%u modes=%u,%u,%u,%u"
+                        " bump_seen=%06X vp_first_word=%08X vp_first_word_seen=%u"
+                        " bump_mat=",
                 L->first_b.draw, (unsigned)L->first_b.stage_program,
+                (unsigned)L->first_b.stage_program_seen,
                 L->first_b.modes[0], L->first_b.modes[1],
                 L->first_b.modes[2], L->first_b.modes[3],
-                (unsigned)L->first_b.bump_seen_mask,
-                (unsigned)L->first_b.vp_first_word);
+                (unsigned)L->first_b.bump_seen,
+                (unsigned)L->first_b.vp_first_word,
+                (unsigned)L->first_b.vp_first_word_seen);
         for (i = 0; i < 4; i++) {
             if (i)
-                fputc(',', stderr);
+                fputc(';', stderr);
             pb_print_words(L->first_b.bump_mat[i], 4);
         }
         fprintf(stderr, " bump_scale=");
@@ -4307,9 +4416,11 @@ static void pb_report_coverage(void)
         fprintf(stderr, "[PBCOV] first_c=none\n");
     } else {
         fprintf(stderr, "[PBCOV] first_c=draw=%u lighting_enable=%08X"
-                        " specular_enable=%08X light_mask=%08X light_kind=",
+                        " specular_enable=%08X light_mask=%08X enable_seen=%X"
+                        " light_kind=",
                 L->first_c.draw, (unsigned)L->first_c.lighting_enable,
-                (unsigned)L->first_c.specular_enable, (unsigned)L->first_c.light_mask);
+                (unsigned)L->first_c.specular_enable, (unsigned)L->first_c.light_mask,
+                (unsigned)L->first_c.enable_seen);
         pb_print_words(L->first_c.light_kind, 8);
         fprintf(stderr, " spot_light=%d spot_falloff=", (int)L->first_c.spot_light);
         pb_print_words(L->first_c.spot_falloff, 3);
@@ -4317,6 +4428,7 @@ static void pb_report_coverage(void)
         pb_print_words(L->first_c.spot_direction, 3);
         fprintf(stderr, " local_attenuation=");
         pb_print_words(L->first_c.local_attenuation, 3);
+        fprintf(stderr, " spot_seen=%03X", (unsigned)L->first_c.spot_seen);
         fputc('\n', stderr);
     }
 }
@@ -5156,9 +5268,11 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         note_unhandled(method, param);
         return;
     }
-    /* Coverage only: remember that a bump-environment method was delivered.
-     * Off the gate this branch has no effect and writes nothing. Kept after the
-     * subchannel filter so a method on another subchannel cannot claim a bit. */
+    /* Coverage only: remember that this method was delivered, for the frozen
+     * seen masks of the first records (availability metadata, never a counter
+     * input). Off the gate this branch has no effect and writes nothing. Kept
+     * after the subchannel filter so a method on another subchannel cannot
+     * claim a bit. */
     if (pb_coverage())
         pb_coverage_note_method(method);
     capture_render_state(method, param);
