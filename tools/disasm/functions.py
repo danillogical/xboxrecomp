@@ -175,6 +175,10 @@ class FunctionDetector:
         # `src not inside any known function` for every one of its branches.
         self._pass_cond_branch_orphans_after(sections)
 
+        # Tail jumps into gaps from bodies made after the last tail-jump
+        # closure: the alias orphan and conditional-branch passes above.
+        self._pass_late_tail_jumps(sections)
+
         self._build_alias_entries()
 
         # Populate call graph
@@ -1151,6 +1155,96 @@ class FunctionDetector:
         if added_any:
             print("  blocks recovered that alias bodies branch to")
         return added_any
+
+    def _pass_late_tail_jumps(self, sections: Optional[List[SectionInfo]] = None) -> bool:
+        """
+        A tail jump into a gap from a body that pass 6 never saw.
+
+        _pass_tail_jump_targets takes the target of every jmp that leaves its
+        function, over the bodies that exist when _close_tail_jump_targets
+        runs. _pass_alias_branch_orphans and _pass_cond_branch_orphans_after
+        make alias bodies after the last closure, and their jmps into a gap
+        were looked at by nobody: the alias orphan pass asks a short probe to
+        reach a ret, which a long function never does. The target was then
+        lowered to an unresolved-target stub, so the function never ran.
+
+        Jet Set Radio Future hit it seven times before late tail jumps were
+        closed over the gap-prologue bodies too. One runs on every frame of the
+        attract demo: a state handler reached through a 119-entry table
+        (0x0005BB31, a gap prologue) ends in `jmp 0x00054750`, an ordinary
+        function aligned after nop padding that nothing ever calls.
+
+        The evidence is the same as pass 6's -- an unconditional jmp out of its
+        own body is a tail call -- so no probe is asked. The target becomes an
+        alias entry rather than a candidate, which cannot cut any body short;
+        _build_alias_entries measures it. Repeats, since a recovered body can
+        tail-jump onward itself. Like pass 6 it follows only instructions that
+        recursive descent reaches.
+        """
+        added = 0
+        while True:
+            bodies = sorted((f.start, f.end) for f in self.functions.values())
+            starts = [b[0] for b in bodies]
+
+            def claimed(addr: int) -> bool:
+                i = bisect.bisect_right(starts, addr) - 1
+                return i >= 0 and addr < bodies[i][1]
+
+            # Function bodies, plus aliases sitting in a gap, measured as their
+            # own bodies (an alias inside a body is covered by that body).
+            all_starts = sorted(set(starts) | set(self._alias_entries))
+            sources = list(bodies)
+            for alias, bound in sorted(self._alias_entries.items()):
+                if alias in self.functions or claimed(alias):
+                    continue
+                k = bisect.bisect_right(all_starts, alias)
+                upper = min(bound, all_starts[k]) if k < len(all_starts) else bound
+                sources.append((alias, self._find_function_end(alias, upper, upper)))
+            gap_bodies = sorted(s for s in sources if s[0] not in self.functions)
+
+            def in_gap_body(addr: int) -> bool:
+                return any(lo <= addr < hi for lo, hi in gap_bodies)
+
+            # Only instructions control can reach: bytes after a body's last
+            # jmp lie in its measured range too, and may decode as a branch.
+            entries = list(self.functions) + list(self._alias_entries)
+            for table in self.engine.jump_tables:
+                entries.extend(self.engine.jump_table_entries(table))
+            bounds = ([(sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+                       for sec in sections] if sections else [(0, 1 << 32)])
+            reachable = self.engine.recursive_descent(entries, bounds)
+
+            new = 0
+            for lo, hi in sources:
+                for insn in self.engine.get_instructions_in_range(lo, hi):
+                    if insn.address not in reachable:
+                        continue
+                    if not insn.is_jump or insn.is_cond_jump:
+                        continue
+                    target = insn.jump_target
+                    if target is None or lo <= target < hi:
+                        continue                # intra-body
+                    if (target in self.functions or target in self._candidates
+                            or target in self._alias_entries):
+                        continue
+                    if claimed(target) or in_gap_body(target):
+                        continue                # into a body: other passes
+                    if target not in self.engine.instructions:
+                        continue                # not on an instruction boundary
+                    section = self.image.get_section_at_va(target)
+                    if section is None or not section.executable:
+                        continue
+                    k = bisect.bisect_right(all_starts, target)
+                    self._alias_entries[target] = (
+                        all_starts[k] if k < len(all_starts)
+                        else section.virtual_addr + section.virtual_size)
+                    new += 1
+            if not new:
+                break
+            added += new
+        if added:
+            print(f"  {added} tail-jump target(s) from late bodies recovered as alias entries")
+        return added > 0
 
     def _build_alias_entries(self) -> None:
         """
