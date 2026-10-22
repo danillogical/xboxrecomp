@@ -319,7 +319,10 @@ typedef struct {
                                        * bits are always clear */
     } first_a;
 
-    /* (b) Batches with any texture stage mode >= 6 (bump env / dot product). */
+    /* (b) Batches with any texture stage mode >= 6. This is a diagnostic
+     * bucket over the title's state, NOT a refusal count: modes 6/7 are the
+     * bump-environment pair the renderer now interprets, 8..31 are the
+     * dot-product modes it still refuses. stage_mode_hist splits them. */
     uint64_t stage_ge6_batches;        /* once per batch if ANY stage qualifies */
     uint64_t stage_ge6_by_stage[4];    /* per qualifying (batch, stage) */
     uint64_t stage_mode_hist[32];      /* bucket = 5-bit mode 6..31; per incidence */

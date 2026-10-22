@@ -4341,7 +4341,11 @@ static void pb_coverage_batch(void)
     }
 
     /* (b) A stage mode >= 6, counted once per batch, then per (batch, stage)
-     * and per mode. A batch increments stage_ge6_batches at most once. */
+     * and per mode. A batch increments stage_ge6_batches at most once.
+     * This is a DIAGNOSTIC bucket, not a refusal count: since the bump
+     * environment modes 6 and 7 are interpreted, a mode 6/7 incidence here
+     * says the title used the bump-environment path, while 8..31 still means
+     * the dot-product modes the renderer refuses. Split by stage_mode_hist. */
     prog = s_gpu.rc.stage_program;
     for (i = 0; i < 4; i++) {
         uint32_t m = (prog >> (i * 5)) & 0x1Fu;
