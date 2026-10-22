@@ -13,3 +13,8 @@ add_executable(win32_compat_posix_test test_main.c)
 target_link_libraries(win32_compat_posix_test PRIVATE platform m)
 enable_testing()
 add_test(NAME win32_compat_posix_test COMMAND win32_compat_posix_test)
+
+# Interlocked ops, MemoryBarrier and GetThreadId: Win32 semantics, not layout.
+add_executable(win32_interlocked_posix_test test_interlocked.c)
+target_link_libraries(win32_interlocked_posix_test PRIVATE platform m)
+add_test(NAME win32_interlocked_posix_test COMMAND win32_interlocked_posix_test)
