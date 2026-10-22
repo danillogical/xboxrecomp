@@ -36,10 +36,26 @@ set(CMAKE_REQUIRED_FLAGS "-fsanitize=address")
 check_c_source_compiles("int main(void){return 0;}" XBR_HAVE_ASAN)
 unset(CMAKE_REQUIRED_FLAGS)
 if(XBR_HAVE_ASAN)
-    add_executable(win32_handle_lifetime_asan_test test_handle_lifetime_asan.c)
-    target_compile_options(win32_handle_lifetime_asan_test PRIVATE -fsanitize=address -g -O1)
+    # The shim must be INSTRUMENTED, not merely linked. `platform` above was
+    # built by add_subdirectory() without -fsanitize=address, so linking the
+    # ASAN test against it would instrument only the test's own translation
+    # unit -- and every defect this target exists to catch (a use-after-free
+    # inside the shim, a double free, a leaked object) happens in the shim's
+    # code, where an uninstrumented binary reports nothing. Compile the shim
+    # sources again for this target, with the sanitizer on.
+    add_executable(win32_handle_lifetime_asan_test
+        test_handle_lifetime_asan.c
+        ../../src/platform/win32_compat.c
+        ../../src/platform/recomp_exit_hook.c)
+    target_include_directories(win32_handle_lifetime_asan_test PRIVATE
+        ../../src ../../src/platform)
+    target_compile_options(win32_handle_lifetime_asan_test PRIVATE
+        -fsanitize=address -fno-omit-frame-pointer -g -O1)
     target_link_options(win32_handle_lifetime_asan_test PRIVATE -fsanitize=address)
-    target_link_libraries(win32_handle_lifetime_asan_test PRIVATE platform m)
+    # No `platform` here: linking it would also pull the unsanitized copies of
+    # the same symbols in and duplicate every definition.
+    find_package(Threads REQUIRED)
+    target_link_libraries(win32_handle_lifetime_asan_test PRIVATE Threads::Threads m)
     add_test(NAME win32_handle_lifetime_asan_test COMMAND win32_handle_lifetime_asan_test)
     set_tests_properties(win32_handle_lifetime_asan_test PROPERTIES TIMEOUT 180)
 else()
