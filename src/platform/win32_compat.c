@@ -315,6 +315,13 @@ typedef struct w32_object {
     int             fd;
     SIZE_T          map_size;
     char           *file_path;
+
+    /* live-handle registry (POSIX only): intrusive bucket link plus the
+     * number of public HANDLE aliases. Embedding these removes the separate
+     * allocation a registry entry would need, so publishing an object cannot
+     * fail and an entry can never outlive the object it names. */
+    struct w32_object *reg_next;
+    unsigned long      public_refs;
 } w32_object;
 
 /* pseudo handles for "current thread"/"current process" */
@@ -325,6 +332,182 @@ typedef struct w32_object {
 static __thread w32_object *t_self_obj = NULL;
 static __thread DWORD       t_tid      = 0;
 static volatile LONG        s_next_tid = 1000;
+
+static void obj_release(w32_object *o);
+
+/*
+ * Live-handle registry.
+ *
+ * POSIX has no kernel handle table, so this table is the only authority for
+ * whether a HANDLE value names a live object. Public APIs look a handle up
+ * here BEFORE touching the pointed-to object; an arbitrary, stale, forged or
+ * zeroed pointer is not in the table and is rejected without a dereference.
+ * Handles keep their historical pointer values (the guest bridge maps them as
+ * opaque 32-bit values), so this is a provenance check on the value, not a
+ * replacement handle scheme.
+ *
+ * Lifetime has two counts and they are deliberately different:
+ *
+ *   refcount     total lifetime references: one per public alias, plus
+ *                internal pins (an API call's pin, a running thread
+ *                trampoline, a timer helper). The object is freed when it
+ *                reaches zero.
+ *   public_refs  public HANDLE aliases only. The entry stays in the table
+ *                while this is non-zero, so a duplicate stays usable until its
+ *                LAST public alias is closed -- but an internal reference
+ *                never keeps a closed handle alive, because the last close
+ *                withdraws the value from the table before releasing.
+ *
+ * Every successful public close drops exactly one lifetime reference, whether
+ * or not it was the last alias. Withdrawing on the last alias happens under
+ * the table lock, before that release, so a concurrent lookup either pins the
+ * object first or fails afterwards; it can never pin an object that is
+ * already being freed, and a value can never be resurrected once withdrawn.
+ *
+ * The table lock is never held across a blocking wait, an object lock, a
+ * callback or user code.
+ */
+#define W32_REG_BUCKETS 256
+static pthread_mutex_t  s_reg_lock = PTHREAD_MUTEX_INITIALIZER;
+static w32_object      *s_reg[W32_REG_BUCKETS];
+
+static unsigned reg_bucket(const w32_object *o)
+{
+    return (unsigned)(((uintptr_t)o >> 4) % W32_REG_BUCKETS);
+}
+
+/* Caller holds s_reg_lock. */
+static int reg_linked_locked(const w32_object *o)
+{
+    for (const w32_object *p = s_reg[reg_bucket(o)]; p; p = p->reg_next)
+        if (p == o) return 1;
+    return 0;
+}
+
+/* Publish a newly allocated object with one public alias. Caller holds the
+ * only reference, so nothing can race this. */
+static void reg_add(w32_object *o)
+{
+    pthread_mutex_lock(&s_reg_lock);
+    unsigned b = reg_bucket(o);
+    o->reg_next   = s_reg[b];
+    o->public_refs = 1;
+    s_reg[b]      = o;
+    pthread_mutex_unlock(&s_reg_lock);
+}
+
+/* Pin a live object for the duration of an API call, or return NULL.
+ *
+ * The pin is a lifetime reference taken under the same lock that decides
+ * liveness, so a caller can never observe an object a concurrent close has
+ * already withdrawn and is about to free. Nothing is dereferenced here: the
+ * table is keyed by the handle's value alone. */
+static w32_object *reg_lookup_pin(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    if (!o) return NULL;
+    pthread_mutex_lock(&s_reg_lock);
+    int live = reg_linked_locked(o);
+    if (live) InterlockedIncrement(&o->refcount);
+    pthread_mutex_unlock(&s_reg_lock);
+    return live ? o : NULL;
+}
+
+/* Add one public alias to an object that is ALREADY published. A value that
+ * is not live stays not live: DuplicateHandle must never resurrect a closed
+ * or forged handle. */
+static int reg_alias(w32_object *o)
+{
+    int ok = 0;
+    pthread_mutex_lock(&s_reg_lock);
+    if (reg_linked_locked(o)) {
+        o->public_refs++;
+        InterlockedIncrement(&o->refcount);
+        ok = 1;
+    }
+    pthread_mutex_unlock(&s_reg_lock);
+    return ok;
+}
+
+/* Publish an INTERNAL object the caller itself owns -- today only the calling
+ * thread's own w32_object, whose lifetime the thread holds. DuplicateHandle
+ * uses this for the current-thread pseudo handle, which Win32 lets produce a
+ * real handle even after the original public handle was closed. Never called
+ * with a caller-supplied value. */
+static int reg_publish_internal(w32_object *o)
+{
+    int ok = 0;
+    pthread_mutex_lock(&s_reg_lock);
+    if (reg_linked_locked(o)) {
+        o->public_refs++;
+        InterlockedIncrement(&o->refcount);
+        ok = 1;
+    } else {
+        unsigned b = reg_bucket(o);
+        o->reg_next    = s_reg[b];
+        o->public_refs = 1;
+        s_reg[b]       = o;
+        InterlockedIncrement(&o->refcount);
+        ok = 1;
+    }
+    pthread_mutex_unlock(&s_reg_lock);
+    return ok;
+}
+
+/* Withdraw one public alias.
+ *
+ * Returns the object whenever the handle WAS live, because the caller owes
+ * exactly one obj_release for it -- one lifetime reference per successful
+ * public close, final or not. The object leaves the table as soon as its last
+ * public alias goes, before the caller releases. Returns NULL when the value
+ * names no live public handle, so CloseHandle can report the failure. */
+static w32_object *reg_withdraw(HANDLE h)
+{
+    w32_object *o = (w32_object *)h;
+    w32_object *live = NULL;
+    if (!o) return NULL;
+    pthread_mutex_lock(&s_reg_lock);
+    w32_object **pp = &s_reg[reg_bucket(o)];
+    while (*pp && *pp != o) pp = &(*pp)->reg_next;
+    if (*pp) {
+        if (--o->public_refs == 0) *pp = o->reg_next;
+        live = o;
+    }
+    pthread_mutex_unlock(&s_reg_lock);
+    return live;
+}
+
+/* Pin the object behind a caller-supplied HANDLE, or NULL (with
+ * ERROR_INVALID_HANDLE) when the value is not a live shim handle. Every
+ * object-based entry point starts here; the pin is dropped with obj_unpin. */
+static w32_object *obj_pin(HANDLE h)
+{
+    w32_object *o = reg_lookup_pin(h);
+    if (!o) SetLastError(ERROR_INVALID_HANDLE);
+    return o;
+}
+
+static void obj_unpin(w32_object *o)
+{
+    if (o) obj_release(o);
+}
+
+/* Pin a THREAD handle. The current-thread pseudo handle, and the value
+ * GetCurrentThread() reports for this thread, name this thread's own object,
+ * whose lifetime the thread itself holds; both are pinned directly rather
+ * than through the public table. That keeps them working after a guest closed
+ * the real handle, which is how Win32 behaves and what an idle worker pool
+ * does -- create, close, then suspend itself through the pseudo handle. */
+static w32_object *thread_pin(HANDLE h)
+{
+    if (h == PSEUDO_CURRENT_THREAD || (w32_object *)h == t_self_obj) {
+        w32_object *self = t_self_obj;
+        if (self) InterlockedIncrement(&self->refcount);
+        else SetLastError(ERROR_INVALID_HANDLE);
+        return self;
+    }
+    return obj_pin(h);
+}
 
 DWORD GetCurrentThreadId(void)
 {
@@ -337,9 +520,13 @@ DWORD GetCurrentThreadId(void)
 DWORD GetThreadId(HANDLE h)
 {
     if (h == PSEUDO_CURRENT_THREAD) return GetCurrentThreadId();
-    w32_object *o = (w32_object *)h;
-    if (!o || o == (w32_object *)PSEUDO_CURRENT_PROCESS || o->kind != K_THREAD) return 0;
-    return o->tid;
+    if (h == PSEUDO_CURRENT_PROCESS) { SetLastError(ERROR_INVALID_HANDLE); return 0; }
+    w32_object *o = thread_pin(h);
+    if (!o) return 0;
+    DWORD tid = (o->kind == K_THREAD) ? o->tid : 0;
+    if (o->kind != K_THREAD) SetLastError(ERROR_INVALID_HANDLE);
+    obj_unpin(o);
+    return tid;
 }
 
 DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
@@ -349,11 +536,16 @@ HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 static w32_object *obj_alloc(w32_kind kind)
 {
     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
+    if (!o) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return NULL;
+    }
     o->kind     = kind;
     o->refcount = 1;
     pthread_mutex_init(&o->lock, NULL);
     pthread_cond_init(&o->cond, NULL);
     pthread_cond_init(&o->gate, NULL);
+    reg_add(o);   /* one public alias, owned by the caller */
     return o;
 }
 
@@ -379,57 +571,142 @@ static void obj_release(w32_object *o)
 HANDLE w32_open_handle(int fd, const char *host_path)
 {
     w32_object *o = obj_alloc(K_FILE);
+    if (!o) {
+        if (fd >= 0) close(fd);
+        return NULL;
+    }
     o->fd        = fd;
     o->file_path = host_path ? strdup(host_path) : NULL;
     return (HANDLE)o;
 }
 
+/*
+ * The three accessors below are BORROWED views for the file-I/O HLE: they
+ * return the descriptor or the path string, not a handle. Each pins the
+ * object for the duration of the lookup, so a concurrent CloseHandle cannot
+ * free it mid-call, but the result itself is not lifetime-protected -- a
+ * caller that keeps the fd or the path across a close of the same handle is
+ * on its own, exactly as a Win32 caller holding a raw fd would be. The
+ * descriptor is closed once, when the last reference goes.
+ */
 int w32_handle_fd(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    return (o && o->kind == K_FILE) ? o->fd : -1;
+    w32_object *o = obj_pin(h);
+    int fd = -1;
+    if (o) {
+        fd = (o->kind == K_FILE) ? o->fd : -1;
+        if (fd < 0) SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+    }
+    return fd;
 }
 
 const char *w32_handle_path(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    return (o && o->kind == K_FILE) ? o->file_path : NULL;
+    w32_object *o = obj_pin(h);
+    const char *path = NULL;
+    if (o) {
+        path = (o->kind == K_FILE) ? o->file_path : NULL;
+        obj_unpin(o);
+    }
+    return path;
 }
 
 void w32_handle_set_path(HANDLE h, const char *host_path)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_pin(h);
     char *old;
 
-    if (!o || o->kind != K_FILE)
+    if (!o) return;
+    if (o->kind != K_FILE) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
         return;
+    }
     old = o->file_path;
     o->file_path = host_path ? strdup(host_path) : NULL;
     free(old);
+    obj_unpin(o);
 }
 
+/*
+ * Close one public alias.
+ *
+ * Withdrawing from the table and dropping the lifetime reference are one
+ * operation from the caller's point of view: the last public alias leaves the
+ * table before the object can be freed, so a lookup that starts after this
+ * call fails, and one that started before it already holds a pin. A close
+ * that names no live handle reports ERROR_INVALID_HANDLE instead of freeing
+ * whatever the value happens to point at -- a double close, a stale value or
+ * a forged one cannot corrupt the heap.
+ *
+ * Pseudo handles are not closable resources here and stay successful, as
+ * before: the kernel HLE closes them routinely.
+ */
 BOOL CloseHandle(HANDLE h)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
         h == INVALID_HANDLE_VALUE)
         return TRUE;
-    obj_release((w32_object *)h);
+    w32_object *o = reg_withdraw(h);
+    if (!o) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    obj_release(o);   /* exactly one lifetime reference, final or not */
     return TRUE;
 }
 
+/*
+ * Duplicate a handle.
+ *
+ * This shim keeps the historical behaviour of returning the SAME value: the
+ * guest's 32-bit token table maps by value, and changing that is an ABI
+ * change this repair does not make. The duplicate is therefore an alias, and
+ * the object stays usable until its last public alias is closed -- closing
+ * one alias of two leaves the value live. Both counts move together so the
+ * lifetime accounting stays exact.
+ *
+ * The source must be live. Duplicating a closed, forged or zeroed value fails
+ * with ERROR_INVALID_HANDLE rather than publishing it. The current-thread and
+ * current-process pseudo handles keep their previous results.
+ */
 BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
                      DWORD access, BOOL inherit, DWORD options)
 {
     (void)srcProc; (void)dstProc; (void)access; (void)inherit;
-    if (!dst) return FALSE;
-    if (src == PSEUDO_CURRENT_THREAD)  src = GetCurrentThread();
+    if (!dst) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
     if (src == PSEUDO_CURRENT_PROCESS) { *dst = src; return TRUE; }
-    if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
+    if (!src) { *dst = src; return TRUE; }
+
+    if (src == PSEUDO_CURRENT_THREAD) {
+        w32_object *self = t_self_obj;
+        if (!self) { *dst = PSEUDO_CURRENT_THREAD; return TRUE; }
+        if (!reg_publish_internal(self)) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+        *dst = (HANDLE)self;
+        if (options & DUPLICATE_CLOSE_SOURCE) {
+            w32_object *closed = reg_withdraw((HANDLE)self);
+            if (closed) obj_release(closed);
+        }
+        return TRUE;
+    }
+
     w32_object *o = (w32_object *)src;
-    InterlockedIncrement(&o->refcount);
+    if (!reg_alias(o)) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
     *dst = src;
-    if (options & DUPLICATE_CLOSE_SOURCE)
-        obj_release(o);
+    if (options & DUPLICATE_CLOSE_SOURCE) {
+        w32_object *closed = reg_withdraw(src);
+        if (closed) obj_release(closed);
+    }
     return TRUE;
 }
 
@@ -483,7 +760,8 @@ static int waitable_due(w32_object *o)
 }
 
 /*
- * Wait on a single object. The object lock must NOT be held.
+ * Wait on a single object. The object lock must NOT be held, and the caller
+ * holds a pin, so the object cannot be freed under this wait.
  * Returns WAIT_OBJECT_0 / WAIT_TIMEOUT.
  */
 static DWORD wait_single(w32_object *o, DWORD ms)
@@ -543,9 +821,18 @@ static DWORD wait_single(w32_object *o, DWORD ms)
 
 DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
+    /* A null or pseudo handle keeps answering "already signalled": the kernel
+     * HLE waits on pseudo handles for the current thread/process, and those
+     * are not resources this layer can signal or block on. */
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
-    return wait_single((w32_object *)h, ms);
+    /* thread_pin also resolves this thread's own object, which stays waitable
+     * after the guest closed the handle for it, as on Windows. */
+    w32_object *o = thread_pin(h);
+    if (!o) return WAIT_FAILED;
+    DWORD result = wait_single(o, ms);
+    obj_unpin(o);
+    return result;
 }
 
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
@@ -571,30 +858,65 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
     int timed = (ms != INFINITE);
     if (timed) deadline_from_ms(ms, &ts);
 
+    if (!handles || count == 0 || count > 64) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return WAIT_FAILED;
+    }
+
+    /*
+     * Every handle is pinned for the whole wait, once, before the polling
+     * loop: resolving them per iteration would let a concurrent close free an
+     * object between two polls and turn a wait into a use-after-free. A bad
+     * handle fails the call the way Win32 does, rather than being skipped --
+     * a silently ignored entry can make wait-all report success it did not
+     * observe.
+     */
+    w32_object *pins[64];
+    for (DWORD i = 0; i < count; i++) {
+        HANDLE h = handles[i];
+        pins[i] = (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
+                  ? NULL : obj_pin(h);
+        if (!pins[i] && h) {
+            for (DWORD j = 0; j < i; j++) obj_unpin(pins[j]);
+            return WAIT_FAILED;
+        }
+    }
+
+    DWORD result = WAIT_TIMEOUT;
     for (;;) {
-        if (alertable && drain_apcs() > 0)
-            return WAIT_IO_COMPLETION;
+        if (alertable && drain_apcs() > 0) { result = WAIT_IO_COMPLETION; break; }
 
         if (waitAll) {
             DWORD got = 0;
             for (DWORD i = 0; i < count; i++)
-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) got++;
-            if (got == count) return WAIT_OBJECT_0;
+                if (!pins[i] || wait_single(pins[i], 0) == WAIT_OBJECT_0) got++;
+            if (got == count) { result = WAIT_OBJECT_0; break; }
         } else {
-            for (DWORD i = 0; i < count; i++)
-                if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0)
-                    return WAIT_OBJECT_0 + i;
+            int hit = 0;
+            for (DWORD i = 0; i < count; i++) {
+                if (!pins[i] || wait_single(pins[i], 0) == WAIT_OBJECT_0) {
+                    result = WAIT_OBJECT_0 + i;
+                    hit = 1;
+                    break;
+                }
+            }
+            if (hit) break;
         }
 
         if (timed) {
             struct timespec now;
             clock_gettime(CLOCK_REALTIME, &now);
             if (now.tv_sec > ts.tv_sec ||
-                (now.tv_sec == ts.tv_sec && now.tv_nsec >= ts.tv_nsec))
-                return WAIT_TIMEOUT;
+                (now.tv_sec == ts.tv_sec && now.tv_nsec >= ts.tv_nsec)) {
+                result = WAIT_TIMEOUT;
+                break;
+            }
         }
         usleep(1000);
     }
+
+    for (DWORD i = 0; i < count; i++) obj_unpin(pins[i]);
+    return result;
 }
 
 /* ===================================================================== */
@@ -605,6 +927,7 @@ HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
 {
     (void)sa; (void)name;
     w32_object *o = obj_alloc(K_EVENT);
+    if (!o) return NULL;
     o->manual_reset = manualReset ? 1 : 0;
     o->signaled     = initialState ? 1 : 0;
     return (HANDLE)o;
@@ -615,36 +938,63 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
     return CreateEventA(sa, manualReset, initialState, NULL);
 }
 
+/*
+ * Event state changes.
+ *
+ * Each starts with a provenance pin: an arbitrary, zeroed, stale or
+ * wrong-kind value fails with ERROR_INVALID_HANDLE instead of being
+ * dereferenced. The pin is held across the object lock, so a concurrent
+ * CloseHandle cannot free the event mid-operation, and it is dropped after
+ * the lock -- never while holding it.
+ */
 BOOL SetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_EVENT) return FALSE;
+    w32_object *o = obj_pin(h);
+    if (!o) return FALSE;
+    if (o->kind != K_EVENT) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return FALSE;
+    }
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
     pthread_cond_broadcast(&o->cond);
     pthread_mutex_unlock(&o->lock);
+    obj_unpin(o);
     return TRUE;
 }
 
 BOOL ResetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_EVENT) return FALSE;
+    w32_object *o = obj_pin(h);
+    if (!o) return FALSE;
+    if (o->kind != K_EVENT) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return FALSE;
+    }
     pthread_mutex_lock(&o->lock);
     o->signaled = 0;
     pthread_mutex_unlock(&o->lock);
+    obj_unpin(o);
     return TRUE;
 }
 
 BOOL PulseEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_EVENT) return FALSE;
+    w32_object *o = obj_pin(h);
+    if (!o) return FALSE;
+    if (o->kind != K_EVENT) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return FALSE;
+    }
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
     pthread_cond_broadcast(&o->cond);
     o->signaled = 0;
     pthread_mutex_unlock(&o->lock);
+    obj_unpin(o);
     return TRUE;
 }
 
@@ -656,6 +1006,7 @@ HANDLE CreateSemaphoreA(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LP
 {
     (void)sa; (void)name;
     w32_object *o = obj_alloc(K_SEM);
+    if (!o) return NULL;
     o->sem_count = initial;
     o->sem_max   = maximum;
     return (HANDLE)o;
@@ -668,14 +1019,20 @@ HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LP
 
 BOOL ReleaseSemaphore(HANDLE h, LONG releaseCount, PLONG previousCount)
 {
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_SEM) return FALSE;
+    w32_object *o = obj_pin(h);
+    if (!o) return FALSE;
+    if (o->kind != K_SEM) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return FALSE;
+    }
     pthread_mutex_lock(&o->lock);
     if (previousCount) *previousCount = (LONG)o->sem_count;
     o->sem_count += releaseCount;
     if (o->sem_max && o->sem_count > o->sem_max) o->sem_count = o->sem_max;
     pthread_cond_broadcast(&o->cond);
     pthread_mutex_unlock(&o->lock);
+    obj_unpin(o);
     return TRUE;
 }
 
@@ -687,6 +1044,7 @@ HANDLE CreateMutexA(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCSTR name)
 {
     (void)sa; (void)name;
     w32_object *o = obj_alloc(K_MUTEX);
+    if (!o) return NULL;
     if (initialOwner) { o->mtx_owner = GetCurrentThreadId(); o->mtx_recursion = 1; }
     return (HANDLE)o;
 }
@@ -698,15 +1056,18 @@ HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
 
 BOOL ReleaseMutex(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_MUTEX) {
+    w32_object *o = obj_pin(h);
+    if (!o) return FALSE;
+    if (o->kind != K_MUTEX) {
         SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
         return FALSE;
     }
     pthread_mutex_lock(&o->lock);
     if (o->mtx_owner != GetCurrentThreadId()) {
         pthread_mutex_unlock(&o->lock);
         SetLastError(ERROR_NOT_OWNER);
+        obj_unpin(o);
         return FALSE;
     }
     if (--o->mtx_recursion <= 0) {
@@ -715,6 +1076,7 @@ BOOL ReleaseMutex(HANDLE h)
         pthread_cond_broadcast(&o->cond);
     }
     pthread_mutex_unlock(&o->lock);
+    obj_unpin(o);
     return TRUE;
 }
 
@@ -753,6 +1115,7 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
 {
     (void)sa;
     w32_object *o = obj_alloc(K_THREAD);
+    if (!o) return NULL;
     o->start         = start;
     o->start_param   = param;
     o->tid           = (DWORD)InterlockedIncrement(&s_next_tid);
@@ -766,9 +1129,12 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
 
     if (pthread_create(&o->thread, &attr, thread_trampoline, o) != 0) {
         pthread_attr_destroy(&attr);
+        /* No trampoline exists, so the caller is the only owner. Withdraw the
+         * handle obj_alloc published, then drop that one reference: a failed
+         * creation leaves no live handle and no leak. */
         o->refcount = 1;
-        obj_release(o);
-        SetLastError(8 /* ERROR_NOT_ENOUGH_MEMORY */);
+        if (reg_withdraw((HANDLE)o)) obj_release(o);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
     pthread_attr_destroy(&attr);
@@ -795,23 +1161,39 @@ VOID ExitThread(DWORD exitCode)
 
 BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_THREAD || !exitCode) return FALSE;
+    if (!exitCode) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    w32_object *o = thread_pin(h);
+    if (!o) return FALSE;
+    if (o->kind != K_THREAD) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return FALSE;
+    }
     pthread_mutex_lock(&o->lock);
     *exitCode = o->exited ? o->exit_code : STILL_ACTIVE;
     pthread_mutex_unlock(&o->lock);
+    obj_unpin(o);
     return TRUE;
 }
 
 DWORD ResumeThread(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_THREAD) return (DWORD)-1;
+    w32_object *o = thread_pin(h);
+    if (!o) return (DWORD)-1;
+    if (o->kind != K_THREAD) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return (DWORD)-1;
+    }
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     if (o->suspend_count > 0 && --o->suspend_count == 0)
         pthread_cond_broadcast(&o->gate);
     pthread_mutex_unlock(&o->lock);
+    obj_unpin(o);
     return prev;
 }
 
@@ -823,10 +1205,13 @@ DWORD SuspendThread(HANDLE h)
      * CREATE_SUSPENDED uses until a ResumeThread brings the count to zero.
      * Worker pools idle that way; returning at once turned one title's pool
      * into a suspend/check spin of millions of calls a second. */
-    if (h == PSEUDO_CURRENT_THREAD) h = GetCurrentThread();
-    w32_object *o = (w32_object *)h;
-    if (!o || o == (w32_object *)PSEUDO_CURRENT_THREAD || o->kind != K_THREAD)
+    w32_object *o = thread_pin(h);
+    if (!o) return (DWORD)-1;
+    if (o->kind != K_THREAD) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
         return (DWORD)-1;
+    }
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     o->suspend_count++;
@@ -834,13 +1219,19 @@ DWORD SuspendThread(HANDLE h)
         while (o->suspend_count > 0)
             pthread_cond_wait(&o->gate, &o->lock);
     pthread_mutex_unlock(&o->lock);
+    obj_unpin(o);
     return prev;
 }
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_THREAD) return FALSE;
+    w32_object *o = thread_pin(h);
+    if (!o) return FALSE;
+    if (o->kind != K_THREAD) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return FALSE;
+    }
     pthread_cancel(o->thread);
     pthread_mutex_lock(&o->lock);
     o->exit_code = exitCode;
@@ -848,28 +1239,56 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
     o->signaled  = 1;
     pthread_cond_broadcast(&o->cond);
     pthread_mutex_unlock(&o->lock);
+    obj_unpin(o);
     return TRUE;
 }
 
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
-    if (o && o->kind == K_THREAD) o->priority = priority;
-    return TRUE;   /* real RT priorities need privileges; tracked only */
+    /* The main thread never created a w32_object for itself, and the pseudo
+     * handle used to be accepted there as a tracked no-op. Keep that: real RT
+     * priorities need privileges and this layer only records the value. */
+    if (h == PSEUDO_CURRENT_THREAD && !t_self_obj)
+        return TRUE;
+    w32_object *o = thread_pin(h);
+    if (!o) return FALSE;
+    if (o->kind != K_THREAD) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return FALSE;
+    }
+    o->priority = priority;   /* real RT priorities need privileges; tracked only */
+    obj_unpin(o);
+    return TRUE;
 }
 
 int GetThreadPriority(HANDLE h)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
-    return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
+    if (h == PSEUDO_CURRENT_THREAD && !t_self_obj)
+        return THREAD_PRIORITY_NORMAL;
+    w32_object *o = thread_pin(h);
+    if (!o) return THREAD_PRIORITY_NORMAL;
+    if (o->kind != K_THREAD) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return THREAD_PRIORITY_NORMAL;
+    }
+    int priority = o->priority;
+    obj_unpin(o);
+    return priority;
 }
 
 VOID SwitchToThread(void) { sched_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
-    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)thread;
-    if (!o || o->kind != K_THREAD) return 0;
+    w32_object *o = thread_pin(thread);
+    if (!o) return 0;
+    if (o->kind != K_THREAD) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return 0;
+    }
     pthread_mutex_lock(&o->lock);
     DWORD ok = 0;
     if (o->apc_count < W32_MAX_APC) {
@@ -879,6 +1298,7 @@ DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
         ok = 1;
     }
     pthread_mutex_unlock(&o->lock);
+    obj_unpin(o);
     return ok;
 }
 
@@ -944,6 +1364,7 @@ BOOL CreateTimerQueueTimer(PHANDLE newTimer, HANDLE timerQueue,
     (void)timerQueue;
     if (flags & WT_EXECUTEONLYONCE) period = 0;
     w32_object *o = obj_alloc(K_TIMER);
+    if (!o) return FALSE;
     o->timer_cb     = callback;
     o->timer_param  = param;
     o->timer_due    = dueTime;
@@ -951,8 +1372,11 @@ BOOL CreateTimerQueueTimer(PHANDLE newTimer, HANDLE timerQueue,
     o->refcount     = 2;   /* caller + timer thread */
 
     if (pthread_create(&o->thread, NULL, timer_thread, o) != 0) {
+        /* No helper thread exists, so the caller is the only owner: withdraw
+         * the published handle and drop that one reference. */
         o->refcount = 1;
-        obj_release(o);
+        if (reg_withdraw((HANDLE)o)) obj_release(o);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return FALSE;
     }
     pthread_detach(o->thread);
@@ -963,21 +1387,45 @@ BOOL CreateTimerQueueTimer(PHANDLE newTimer, HANDLE timerQueue,
 BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG period)
 {
     (void)timerQueue;
-    w32_object *o = (w32_object *)timer;
-    if (!o || o->kind != K_TIMER) return FALSE;
+    w32_object *o = obj_pin(timer);
+    if (!o) return FALSE;
+    if (o->kind != K_TIMER) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return FALSE;
+    }
     o->timer_due    = dueTime;
     o->timer_period = period;
+    obj_unpin(o);
     return TRUE;
 }
 
+/*
+ * DeleteTimerQueueTimer both cancels and RELEASES the caller's handle, which
+ * is how the kernel HLE uses it. It therefore has to withdraw the handle as
+ * well: releasing the reference alone would leave the value in the live
+ * table, and the next lookup would pin an object that may already be freed.
+ * The timer thread keeps its own reference until it observes the cancel, so
+ * the object outlives this call when the callback is still running.
+ */
 BOOL DeleteTimerQueueTimer(HANDLE timerQueue, HANDLE timer, HANDLE completionEvent)
 {
     (void)timerQueue;
-    w32_object *o = (w32_object *)timer;
-    if (!o || o->kind != K_TIMER) return FALSE;
+    w32_object *o = obj_pin(timer);
+    if (!o) return FALSE;
+    if (o->kind != K_TIMER) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return FALSE;
+    }
     o->timer_cancel = 1;
-    if (completionEvent) SetEvent(completionEvent);
-    obj_release(o);
+    obj_unpin(o);
+    /* Win32 uses INVALID_HANDLE_VALUE here to mean "do not signal anything
+     * when the callback finishes"; it is not a handle to signal. */
+    if (completionEvent && completionEvent != INVALID_HANDLE_VALUE)
+        SetEvent(completionEvent);
+    w32_object *closed = reg_withdraw(timer);
+    if (closed) obj_release(closed);
     return TRUE;
 }
 
@@ -1013,6 +1461,7 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR 
     (void)sa;
     (void)name;
     w32_object *o = obj_alloc(K_WAITABLE_TIMER);
+    if (!o) return NULL;
     o->waitable_manual_reset = manualReset;
     return (HANDLE)o;
 }
@@ -1020,9 +1469,18 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR 
 BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
                       PTIMERAPCROUTINE completion, PVOID arg, BOOL resume)
 {
-    w32_object *o = (w32_object *)h;
     (void)completion; (void)arg; (void)resume;
-    if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
+    if (!dueTime) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    w32_object *o = obj_pin(h);
+    if (!o) return FALSE;
+    if (o->kind != K_WAITABLE_TIMER) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return FALSE;
+    }
     pthread_mutex_lock(&o->lock);
     /* Win32 100ns units: negative is relative to now, positive is an absolute
      * FILETIME. ponytail: period is ignored -- one-shot only, revisit if a
@@ -1045,19 +1503,26 @@ BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
     (void)period;
     o->waitable_armed = 1;
     o->waitable_triggered = 0;
-    pthread_mutex_unlock(&o->lock);
     pthread_cond_broadcast(&o->cond);
+    pthread_mutex_unlock(&o->lock);
+    obj_unpin(o);
     return TRUE;
 }
 
 BOOL CancelWaitableTimer(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
+    w32_object *o = obj_pin(h);
+    if (!o) return FALSE;
+    if (o->kind != K_WAITABLE_TIMER) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return FALSE;
+    }
     pthread_mutex_lock(&o->lock);
     o->waitable_triggered = 0;
     o->waitable_armed = 0;
     pthread_mutex_unlock(&o->lock);
+    obj_unpin(o);
     return TRUE;
 }
 
@@ -1683,6 +2148,10 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
     }
 
     w32_object *o = obj_alloc(K_FILEMAP);
+    if (!o) {
+        close(fd);
+        return NULL;
+    }
     o->fd       = fd;
     o->map_size = size;
     return (HANDLE)o;
@@ -1698,8 +2167,13 @@ HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
 LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
                        SIZE_T count, LPVOID baseAddr)
 {
-    w32_object *o = (w32_object *)mapping;
-    if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
+    w32_object *o = obj_pin(mapping);
+    if (!o) return NULL;
+    if (o->kind != K_FILEMAP) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        obj_unpin(o);
+        return NULL;
+    }
 
     off_t  off = ((off_t)offHigh << 32) | offLow;
     SIZE_T len = count ? count : (o->map_size - (SIZE_T)off);
@@ -1722,6 +2196,7 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
          * MAP_FIXED below can then only replace the placeholder we now own. */
         if (mach_map_fixed(baseAddr, len, PROT_READ | PROT_WRITE) == MAP_FAILED) {
             SetLastError(ERROR_INVALID_ADDRESS);
+            obj_unpin(o);
             return NULL;
         }
         placeholder = 1;
@@ -1738,6 +2213,7 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
          * later attempt at this address would be refused as occupied. */
         if (placeholder) munmap(baseAddr, len);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        obj_unpin(o);
         return NULL;
     }
     if (baseAddr && p != baseAddr) {
@@ -1745,9 +2221,11 @@ LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow
          * failing on some kernels; treat that as the refusal it means. */
         munmap(p, len);
         SetLastError(ERROR_INVALID_ADDRESS);
+        obj_unpin(o);
         return NULL;
     }
     view_register(p, len);
+    obj_unpin(o);
     return p;
 }
 
