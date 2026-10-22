@@ -10023,12 +10023,17 @@ static void a2h_install_witness(const char *site, uint32_t va, uint32_t value, u
  * install store, exactly where it would have continued had the diagnostic never raised. */
 static LONG CALLBACK a2h_handshake_veh(PEXCEPTION_POINTERS ep)
 {
+#if defined(_WIN32)
     if (ep->ExceptionRecord->ExceptionCode != A2H_DR_HANDSHAKE_CODE)
         return EXCEPTION_CONTINUE_SEARCH;   /* never shadow anyone else's exception */
     fprintf(stderr, "  [A2HSLOT] handshake VEH entered code=%08X\n",
             (unsigned)ep->ExceptionRecord->ExceptionCode);
     fflush(stderr);
     return EXCEPTION_CONTINUE_EXECUTION;
+#else
+    (void)ep;   /* no vectored exceptions off Windows; the handler never runs */
+    return EXCEPTION_CONTINUE_SEARCH;
+#endif
 }
 
 static void *g_a2h_handshake_veh = NULL;

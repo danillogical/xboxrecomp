@@ -15,3 +15,6 @@ int mcpx_apu_test_tone_active(void) { return 0; }
 /* No guest memory is mapped, so every VP and GP DMA address fails closed. */
 size_t xbox_GetMappedSize(void) { return 0; }
 uint32_t xbox_ContiguousAllocatedBytes(void) { return 0; }
+
+/* No guest memory is mapped, so no physical page is answered as low RAM. */
+int xbox_PhysIsLowRamAnswer(uint32_t p, uint32_t l) { (void)p; (void)l; return 0; }

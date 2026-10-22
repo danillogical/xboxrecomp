@@ -450,6 +450,7 @@ static void ac97_clear_reset_bits(void)
 
 static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 {
+#if defined(_WIN32)
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     DWORD old;
 
@@ -522,6 +523,10 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
+#else
+    (void)ep;
+    return EXCEPTION_CONTINUE_SEARCH;
+#endif
 }
 
 /* Arm the trap. Called once the MCPX aperture exists, and only alongside the
@@ -2327,6 +2332,7 @@ static int watch_is_code(uint32_t va)
 /* "module+0xOFFSET" for a native address, into buf. */
 static const char *watch_native_name(uintptr_t addr, char *buf, size_t len)
 {
+#if defined(_WIN32)
     HMODULE mod = NULL;
     char path[MAX_PATH] = "?";
     const char *base;
@@ -2340,6 +2346,11 @@ static const char *watch_native_name(uintptr_t addr, char *buf, size_t len)
     snprintf(buf, len, "%s+0x%llX", base,
              (unsigned long long)(addr - (uintptr_t)mod));
     return buf;
+#else
+    /* Module lookup is Win32-only; off Windows name the bare address. */
+    snprintf(buf, len, "0x%llX", (unsigned long long)addr);
+    return buf;
+#endif
 }
 
 /* RECOMP_WATCH_WHO: which native code made the store, and on which thread.
@@ -2354,10 +2365,14 @@ static void watch_report_who(uint32_t esp)
             watch_native_name((uintptr_t)s_watch_rip, name, sizeof name));
     if (!esp) {
         void *frames[12];
+#if defined(_WIN32)
         USHORT n = RtlCaptureStackBackTrace(0, 12, frames, NULL), k;
         for (k = 0; k < n; k++)
             fprintf(stderr, "         native[%u] %s\n", (unsigned)k,
                     watch_native_name((uintptr_t)frames[k], name, sizeof name));
+#else
+        (void)frames;   /* no native stack capture off Windows */
+#endif
     }
 }
 
@@ -2409,6 +2424,7 @@ static void watch_report(void)
 
 static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
 {
+#if defined(_WIN32)
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     DWORD old;
 
@@ -2438,6 +2454,10 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
+#else
+    (void)ep;
+    return EXCEPTION_CONTINUE_SEARCH;
+#endif
 }
 
 /* The target, which may be reached through pointers that do not exist yet.
@@ -2693,6 +2713,7 @@ static void ro_guard_report(void)
 
 static LONG CALLBACK ro_guard_veh(PEXCEPTION_POINTERS ep)
 {
+#if defined(_WIN32)
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     DWORD old;
 
@@ -2764,6 +2785,10 @@ static LONG CALLBACK ro_guard_veh(PEXCEPTION_POINTERS ep)
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     return EXCEPTION_CONTINUE_SEARCH;
+#else
+    (void)ep;
+    return EXCEPTION_CONTINUE_SEARCH;
+#endif
 }
 
 void xbox_RdataGuardArm(void)
@@ -2784,7 +2809,9 @@ void xbox_RdataGuardArm(void)
     for (v = 0; v < XBOX_NUM_MIRRORS; v++)
         if (g_mirror_views[v])
             views++;
+#if defined(_WIN32)
     g_ro_guard_exe = (uintptr_t)GetModuleHandleA(NULL);
+#endif
     armed = (uint8_t *)calloc(g_memory_size >> 12, 1);
     g_ro_guard_left = (volatile LONG *)calloc(g_memory_size >> 12, sizeof(LONG));
     if (!armed || !g_ro_guard_left)
@@ -4122,6 +4149,7 @@ static int a2h_alias_on(void)
 
 static LONG CALLBACK a2h_alias_veh(PEXCEPTION_POINTERS ep)
 {
+#if defined(_WIN32)
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     DWORD old;
 
@@ -4174,6 +4202,10 @@ static LONG CALLBACK a2h_alias_veh(PEXCEPTION_POINTERS ep)
         }
     }
     return EXCEPTION_CONTINUE_SEARCH;
+#else
+    (void)ep;
+    return EXCEPTION_CONTINUE_SEARCH;
+#endif
 }
 
 /* Arm the census. Called before the toolkit installs its thunk table, so every mirror page is
@@ -4513,6 +4545,7 @@ static int s_a2h_slotw_image_read = 0;
 
 static void a2h_slotw_read_image_bounds(void)
 {
+#if defined(_WIN32)
     /* ⚠ `__ImageBase` IS A LINKER-PROVIDED SYMBOL AND IS NOT DECLARED BY <windows.h>. MSVC emits it
      * for every image (EXE or DLL) and it names THIS module's own PE header, which is the one address
      * that cannot be wrong about which image a RIP belongs to -- no API call, no symbol lookup and no
@@ -4538,6 +4571,10 @@ static void a2h_slotw_read_image_bounds(void)
         return;
     s_a2h_slotw_image_lo = (uint64_t)(uintptr_t)base;
     s_a2h_slotw_image_hi = s_a2h_slotw_image_lo + (uint64_t)nt->OptionalHeader.SizeOfImage;
+#else
+    /* No PE headers off Windows: the bounds stay unknown. */
+    s_a2h_slotw_image_read = 1;
+#endif
 }
 
 void xbox_A2hSlotWatchSetRecompBounds(uint64_t lo, uint64_t hi, uint32_t probes, uint32_t valid)
@@ -4834,6 +4871,7 @@ static uint32_t a2h_slotw_slot_va(void)
  * keeping the bits separate. */
 static void a2h_slotw_service_own(PEXCEPTION_POINTERS ep)
 {
+#if defined(_WIN32)
     XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
     DWORD old;
     uint32_t alias = s_a2h_slotw_pending_alias;
@@ -4948,10 +4986,14 @@ static void a2h_slotw_service_own(PEXCEPTION_POINTERS ep)
     s_a2h_slotw_pending_range = 0;
     s_a2h_slotw_pending_form = 0;
     A2H_SLOTW_INC64(&L->loss.db_own_serviced);
+#else
+    (void)ep;
+#endif
 }
 
 static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
 {
+#if defined(_WIN32)
     DWORD code = ep->ExceptionRecord->ExceptionCode;
     XboxA2hSlotwLedger *L = &g_xbox_a2h_slotw;
 
@@ -5181,6 +5223,10 @@ static LONG CALLBACK a2h_slotw_veh(PEXCEPTION_POINTERS ep)
      * else's. Counted so a reader can see the stream was read, then passed on untouched. */
     A2H_SLOTW_INC64(&L->loss.unexpected_exception);
     return EXCEPTION_CONTINUE_SEARCH;
+#else
+    (void)ep;
+    return EXCEPTION_CONTINUE_SEARCH;
+#endif
 }
 
 uint32_t xbox_A2hSlotWatchArm(void)
@@ -5864,6 +5910,7 @@ int xbox_A2hSlotWatchFixturePublishWrite(uint32_t slot_hit, uint32_t range_class
 LONG xbox_A2hSlotWatchFixtureDeliver(DWORD code, ULONG_PTR info0, ULONG_PTR info1,
                                      void *context, ULONG_PTR *params, DWORD nparams)
 {
+#if defined(_WIN32)
     EXCEPTION_RECORD rec;
     EXCEPTION_POINTERS ep;
 
@@ -5878,12 +5925,17 @@ LONG xbox_A2hSlotWatchFixtureDeliver(DWORD code, ULONG_PTR info0, ULONG_PTR info
     ep.ExceptionRecord = &rec;
     ep.ContextRecord = (CONTEXT *)context;
     return a2h_slotw_veh(&ep);
+#else
+    (void)code; (void)info0; (void)info1; (void)context; (void)params; (void)nparams;
+    return EXCEPTION_CONTINUE_SEARCH;
+#endif
 }
 
 /* The same, for the REAL AC'97 handler: the fixture needs both halves of the overlap. */
 LONG xbox_A2hSlotWatchFixtureDeliverAc97(DWORD code, ULONG_PTR info0, ULONG_PTR info1,
                                          void *context, DWORD nparams)
 {
+#if defined(_WIN32)
     EXCEPTION_RECORD rec;
     EXCEPTION_POINTERS ep;
 
@@ -5896,6 +5948,10 @@ LONG xbox_A2hSlotWatchFixtureDeliverAc97(DWORD code, ULONG_PTR info0, ULONG_PTR 
     ep.ExceptionRecord = &rec;
     ep.ContextRecord = (CONTEXT *)context;
     return ac97_write_veh(&ep);
+#else
+    (void)code; (void)info0; (void)info1; (void)context; (void)nparams;
+    return EXCEPTION_CONTINUE_SEARCH;
+#endif
 }
 
 /* Point the AC'97 trap at a scratch page inside guest RAM so the overlap fixture can arm BOTH
@@ -6026,7 +6082,9 @@ static DWORD WINAPI a2h_slotw_census_thread(LPVOID param)
     L->thread_count = seen_count;
 
     while (!InterlockedCompareExchange(&g_a2h_slotw_census_stop, 0, 0)) {
+#if defined(_WIN32)
         HANDLE snap;
+#endif
         /* DEFERRED ARM. The device is allocated at runtime, so the pointer is polled here until it
          * names a plausible object; the slot is then derived from THAT read. Retried at the census
          * cadence rather than once, because a single early attempt would simply miss.
@@ -6040,6 +6098,7 @@ static DWORD WINAPI a2h_slotw_census_thread(LPVOID param)
                     g_xbox_a2h_slotw.arm_base, g_xbox_a2h_slotw.arm_slot);
         L->thread_count = seen_count;
 
+#if defined(_WIN32)
         snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if (snap != INVALID_HANDLE_VALUE) {
             THREADENTRY32 te;
@@ -6093,6 +6152,7 @@ static DWORD WINAPI a2h_slotw_census_thread(LPVOID param)
                 }
             }
         }
+#endif
         Sleep(A2H_SLOTW_CENSUS_MS);
     }
     return 0;

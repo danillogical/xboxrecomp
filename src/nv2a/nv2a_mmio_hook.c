@@ -30,11 +30,16 @@ static volatile LONG g_mmio_owner_active = 0;
 static HANDLE g_ptimer_wake_event = NULL;
 static HANDLE g_ptimer_thread = NULL;
 static volatile LONG g_ptimer_stopping = 0;
+#if defined(_WIN32)
+#  define NV2A_MMIO_EXPORT __declspec(dllexport)
+#else
+#  define NV2A_MMIO_EXPORT __attribute__((visibility("default"), used))
+#endif
 /* The external collector reads only this published model snapshot. An even
  * generation is stable; odd means the process was frozen during publication. */
-__declspec(dllexport) uint8_t g_nv2a_mmio_snapshot[NV2A_MMIO_SIZE];
-__declspec(dllexport) volatile LONG g_nv2a_mmio_snapshot_generation = 0;
-__declspec(dllexport) volatile LONG g_nv2a_mmio_snapshot_available = 0;
+NV2A_MMIO_EXPORT uint8_t g_nv2a_mmio_snapshot[NV2A_MMIO_SIZE];
+NV2A_MMIO_EXPORT volatile LONG g_nv2a_mmio_snapshot_generation = 0;
+NV2A_MMIO_EXPORT volatile LONG g_nv2a_mmio_snapshot_available = 0;
 static uint8_t g_nv2a_owner_storage[NV2A_MMIO_SIZE - 0x00800000u];
 extern volatile LONG g_nv2a_ack_enabled;
 extern void xbox_Nv2aClaimRegisterOwner(void);
@@ -1230,6 +1235,7 @@ void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
 { (void)xbox_mem_offset; }
 bool nv2a_hook_install_aperture(void *aperture, size_t size)
 { (void)aperture; (void)size; return false; }
+bool nv2a_hook_owner_active(void) { return false; }
 void nv2a_hook_disable_aperture(void) {}
 void nv2a_hook_shutdown(void) {}
 bool nv2a_hook_run_decoder_tests(void) { return false; }

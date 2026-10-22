@@ -92,6 +92,11 @@ LONG InterlockedExchangeAdd(volatile LONG *Addend, LONG Value);
 LONG InterlockedCompareExchange(volatile LONG *Dest, LONG Exchange, LONG Comparand);
 LONGLONG InterlockedCompareExchange64(volatile LONGLONG *Dest, LONGLONG Exchange, LONGLONG Comparand);
 PVOID InterlockedCompareExchangePointer(PVOID volatile *Dest, PVOID Exchange, PVOID Comparand);
+LONG InterlockedOr(volatile LONG *Destination, LONG Value);
+LONG InterlockedAnd(volatile LONG *Destination, LONG Value);
+LONGLONG InterlockedIncrement64(volatile LONGLONG *Addend);
+LONGLONG InterlockedExchange64(volatile LONGLONG *Target, LONGLONG Value);
+VOID MemoryBarrier(void);
 
 /* ---- Critical sections ------------------------------------------------- */
 VOID InitializeCriticalSection(LPCRITICAL_SECTION cs);
@@ -164,6 +169,7 @@ DWORD  ResumeThread(HANDLE h);
 DWORD  SuspendThread(HANDLE h);
 BOOL   TerminateThread(HANDLE h, DWORD exitCode);
 DWORD  GetCurrentThreadId(void);
+DWORD  GetThreadId(HANDLE Thread);
 HANDLE GetCurrentThread(void);
 HANDLE GetCurrentProcess(void);
 DWORD  GetCurrentProcessId(void);

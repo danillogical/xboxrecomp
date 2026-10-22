@@ -74,6 +74,16 @@ PVOID InterlockedCompareExchangePointer(PVOID volatile *p, PVOID xchg, PVOID cmp
     return cmp;
 }
 
+/* Win32 InterlockedOr/And return the value held before the operation. */
+LONG InterlockedOr(volatile LONG *p, LONG v)  { return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); }
+LONG InterlockedAnd(volatile LONG *p, LONG v) { return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); }
+
+/* The 64-bit increment returns the new value, the exchange the old one, as on Win32. */
+LONGLONG InterlockedIncrement64(volatile LONGLONG *p)            { return __atomic_add_fetch(p, 1, __ATOMIC_SEQ_CST); }
+LONGLONG InterlockedExchange64(volatile LONGLONG *p, LONGLONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
+
+VOID MemoryBarrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
+
 /* ===================================================================== */
 /* Critical sections (recursive pthread mutex)                           */
 /* ===================================================================== */
@@ -321,6 +331,15 @@ DWORD GetCurrentThreadId(void)
     if (t_tid == 0)
         t_tid = (DWORD)InterlockedIncrement(&s_next_tid);
     return t_tid;
+}
+
+/* Returns 0 for an invalid handle, as Win32 does. */
+DWORD GetThreadId(HANDLE h)
+{
+    if (h == PSEUDO_CURRENT_THREAD) return GetCurrentThreadId();
+    w32_object *o = (w32_object *)h;
+    if (!o || o == (w32_object *)PSEUDO_CURRENT_PROCESS || o->kind != K_THREAD) return 0;
+    return o->tid;
 }
 
 DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
