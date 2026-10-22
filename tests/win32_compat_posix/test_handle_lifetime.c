@@ -22,6 +22,12 @@
  *                  GetCurrentThread() reports stay usable
  *   5. pinning     a public call in progress keeps the object alive across a
  *                  close of its last alias
+ *   6. multi-wait  WaitForMultipleObjects(Ex) resolves each entry the way the
+ *                  single-object wait does: NULL and the two pseudo handles
+ *                  are always ready, this thread's own GetCurrentThread()
+ *                  value stays waitable after its public alias closed, and a
+ *                  real value that is not live fails the whole call with
+ *                  ERROR_INVALID_HANDLE instead of being read as "ready"
  *
  * "Never touch memory" is checked by construction, not by inspection: the
  * forged values are an unmapped address and a zeroed heap block, so a shim
@@ -33,8 +39,10 @@
  * Controls hook: a private harness re-runs this binary against deliberately
  * weakened copies of the shim. A crash on the first forged row would hide
  * every row after it, so W32_HANDLE_TEST_ONLY=invalid-addr|zeroed runs that
- * one negative row and nothing else. Unset -- the normal case, and what CI
- * runs -- the whole file runs.
+ * one negative row and nothing else, and W32_HANDLE_TEST_ONLY=multiwait runs
+ * the multi-object block alone (so a mutant of the wait path is not masked by
+ * an unrelated negative). Unset -- the normal case, and what CI runs -- the
+ * whole file runs.
  */
 #include "win32_compat.h"
 
@@ -788,6 +796,387 @@ static void test_inflight_close(void)
 }
 
 /* ===================================================================== */
+/* 6. Multi-object waits: sentinels, the own-thread value, dead entries  */
+/* ===================================================================== */
+
+/*
+ * WaitForMultipleObjects(Ex) resolves each entry the way the single-object
+ * wait does, and the two halves of that are decided by different rows.
+ *
+ * Sentinels. NULL and the two pseudo handles are values this layer answers
+ * without an object at all: the single wait has always returned WAIT_OBJECT_0
+ * for them, so the multi-object form must call them ready -- in wait-any AND
+ * wait-all, through both entry points, alertable or not -- and a wait that
+ * mixes one with a real event must not fail. A shim that sends them down the
+ * ordinary handle path reports WAIT_FAILED for the whole call.
+ *
+ * Liveness. An ordinary value goes through the same self/lifetime-aware
+ * resolution the single wait uses: this thread's own GetCurrentThread() value
+ * keeps working after its public alias closed, while the SAME value seen from
+ * another thread, a closed value and a forged value all still fail with
+ * ERROR_INVALID_HANDLE. The negative rows place the bad entry AFTER live,
+ * already-pinned entries, which is the shape that leaks a pin if the failure
+ * path forgets to release what it took (the ASAN companion decides that half).
+ *
+ * "Ready" is not faked by treating an unresolved entry as satisfied: the
+ * wait-all rows pair a sentinel with an UNSIGNALLED event and require
+ * WAIT_TIMEOUT. A shim that answered "everything is ready" would pass the
+ * sentinel rows and fail those.
+ */
+
+#define PSEUDO_THREAD  ((HANDLE)(LONG_PTR)-2)
+#define PSEUDO_PROCESS ((HANDLE)(LONG_PTR)-1)
+
+static void test_multiwait_sentinels(void)
+{
+    HANDLE off = CreateEventA(NULL, TRUE, FALSE, NULL);
+    HANDLE on  = CreateEventA(NULL, TRUE, TRUE, NULL);
+    check(off != NULL && on != NULL, "CreateEventA for the sentinel rows");
+    if (!off || !on) return;
+
+    HANDLE one_null[1] = { NULL };
+    HANDLE one_thr[1]  = { PSEUDO_THREAD };
+    HANDLE one_proc[1] = { PSEUDO_PROCESS };
+    HANDLE all_three[3] = { NULL, PSEUDO_THREAD, PSEUDO_PROCESS };
+
+    /* One sentinel, one entry, both wait modes. */
+    check(WaitForMultipleObjects(1, one_null, FALSE, 0) == WAIT_OBJECT_0,
+          "multi(any, {NULL}) is WAIT_OBJECT_0");
+    check(WaitForMultipleObjects(1, one_null, TRUE, 0) == WAIT_OBJECT_0,
+          "multi(all, {NULL}) is WAIT_OBJECT_0");
+    check(WaitForMultipleObjects(1, one_thr, FALSE, 0) == WAIT_OBJECT_0,
+          "multi(any, {(HANDLE)-2}) is WAIT_OBJECT_0");
+    check(WaitForMultipleObjects(1, one_thr, TRUE, 0) == WAIT_OBJECT_0,
+          "multi(all, {(HANDLE)-2}) is WAIT_OBJECT_0");
+    check(WaitForMultipleObjects(1, one_proc, FALSE, 0) == WAIT_OBJECT_0,
+          "multi(any, {(HANDLE)-1}) is WAIT_OBJECT_0");
+    check(WaitForMultipleObjects(1, one_proc, TRUE, 0) == WAIT_OBJECT_0,
+          "multi(all, {(HANDLE)-1}) is WAIT_OBJECT_0");
+
+    /* The Ex entry point, alertable and not. No APC is queued here, so the
+     * result must be the same as the non-alertable one. */
+    check(WaitForMultipleObjectsEx(1, one_thr, FALSE, 0, FALSE) == WAIT_OBJECT_0,
+          "multiEx(any, {(HANDLE)-2}, alertable=FALSE) is WAIT_OBJECT_0");
+    check(WaitForMultipleObjectsEx(1, one_thr, TRUE, 0, FALSE) == WAIT_OBJECT_0,
+          "multiEx(all, {(HANDLE)-2}, alertable=FALSE) is WAIT_OBJECT_0");
+    check(WaitForMultipleObjectsEx(1, one_proc, FALSE, 0, TRUE) == WAIT_OBJECT_0,
+          "multiEx(any, {(HANDLE)-1}, alertable=TRUE) is WAIT_OBJECT_0");
+    check(WaitForMultipleObjectsEx(3, all_three, TRUE, 0, TRUE) == WAIT_OBJECT_0,
+          "multiEx(all, {NULL,-2,-1}, alertable=TRUE) is WAIT_OBJECT_0");
+
+    /* Mixed with a real event. The unsignalled event is first, so wait-any
+     * must skip it and report the sentinel's index. Each row also requires
+     * that the call did not leave ERROR_INVALID_HANDLE behind: that is the
+     * exact defect the sentinel branch exists to prevent, and a return-value
+     * check alone would not name it. */
+    HANDLE mix_thr[2]  = { off, PSEUDO_THREAD };
+    HANDLE mix_proc[2] = { off, PSEUDO_PROCESS };
+    HANDLE mix_null[2] = { off, NULL };
+    HANDLE mix_first[2] = { PSEUDO_THREAD, off };
+
+    DWORD r, e;
+
+    SetLastError(0);
+    r = WaitForMultipleObjects(2, mix_null, FALSE, 0); e = GetLastError();
+    check(r == WAIT_OBJECT_0 + 1 && e != ERROR_INVALID_HANDLE,
+          "multi(any, {unsignalled event, NULL}) reports index 1 (ret=0x%08X err=%lu)",
+          r, (unsigned long)e);
+    SetLastError(0);
+    r = WaitForMultipleObjects(2, mix_thr, FALSE, 0); e = GetLastError();
+    check(r == WAIT_OBJECT_0 + 1 && e != ERROR_INVALID_HANDLE,
+          "multi(any, {unsignalled event, (HANDLE)-2}) reports index 1 (ret=0x%08X err=%lu)",
+          r, (unsigned long)e);
+    SetLastError(0);
+    r = WaitForMultipleObjects(2, mix_proc, FALSE, 0); e = GetLastError();
+    check(r == WAIT_OBJECT_0 + 1 && e != ERROR_INVALID_HANDLE,
+          "multi(any, {unsignalled event, (HANDLE)-1}) reports index 1 (ret=0x%08X err=%lu)",
+          r, (unsigned long)e);
+    SetLastError(0);
+    r = WaitForMultipleObjects(2, mix_first, FALSE, 0); e = GetLastError();
+    check(r == WAIT_OBJECT_0 && e != ERROR_INVALID_HANDLE,
+          "multi(any, {(HANDLE)-2, unsignalled event}) reports index 0 (ret=0x%08X err=%lu)",
+          r, (unsigned long)e);
+    SetLastError(0);
+    r = WaitForMultipleObjectsEx(2, mix_thr, FALSE, 0, FALSE); e = GetLastError();
+    check(r == WAIT_OBJECT_0 + 1 && e != ERROR_INVALID_HANDLE,
+          "multiEx(any, {unsignalled event, (HANDLE)-2}) reports index 1 (ret=0x%08X err=%lu)",
+          r, (unsigned long)e);
+    SetLastError(0);
+    r = WaitForMultipleObjectsEx(2, mix_proc, FALSE, 0, TRUE); e = GetLastError();
+    check(r == WAIT_OBJECT_0 + 1 && e != ERROR_INVALID_HANDLE,
+          "multiEx(any, {unsignalled event, (HANDLE)-1}, alertable) reports index 1 (ret=0x%08X err=%lu)",
+          r, (unsigned long)e);
+
+    /* wait-all with a signalled event and every sentinel: satisfied. */
+    HANDLE all_on[4] = { on, NULL, PSEUDO_THREAD, PSEUDO_PROCESS };
+    check(WaitForMultipleObjects(4, all_on, TRUE, 0) == WAIT_OBJECT_0,
+          "multi(all, {signalled event, NULL,-2,-1}) is WAIT_OBJECT_0");
+    check(WaitForMultipleObjectsEx(4, all_on, TRUE, 0, FALSE) == WAIT_OBJECT_0,
+          "multiEx(all, {signalled event, NULL,-2,-1}) is WAIT_OBJECT_0");
+
+    /* wait-all with an UNSIGNALLED event and a sentinel: the sentinel is
+     * ready but the event is not, so the call must time out. This is the row
+     * that stops "treat every entry as ready" from passing the block above. */
+    HANDLE all_off_thr[2]  = { off, PSEUDO_THREAD };
+    HANDLE all_off_null[3] = { off, NULL, PSEUDO_PROCESS };
+    check(WaitForMultipleObjects(2, all_off_thr, TRUE, 20) == WAIT_TIMEOUT,
+          "multi(all, {unsignalled event, (HANDLE)-2}) times out");
+    check(WaitForMultipleObjects(3, all_off_null, TRUE, 20) == WAIT_TIMEOUT,
+          "multi(all, {unsignalled event, NULL, (HANDLE)-1}) times out");
+    check(WaitForMultipleObjectsEx(2, all_off_thr, TRUE, 20, FALSE) == WAIT_TIMEOUT,
+          "multiEx(all, {unsignalled event, (HANDLE)-2}) times out");
+
+    check(CloseHandle(off) == TRUE && CloseHandle(on) == TRUE,
+          "CloseHandle of the sentinel-row events succeeds");
+}
+
+/* ---- this thread's own value, after its public alias closed ------------ */
+
+static volatile LONG g_mw_ready;
+static volatile LONG g_mw_phase;
+static volatile LONG g_mw_any;      /* any: {self, unsignalled event} */
+static volatile LONG g_mw_all;      /* all: {self, signalled event}   */
+static volatile LONG g_mw_ex;       /* Ex, alertable, same as g_mw_any */
+static volatile LONG g_mw_single;   /* single wait on self, reference  */
+static volatile LONG g_mw_done;
+static HANDLE         g_mw_self;
+static HANDLE         g_mw_off;
+static HANDLE         g_mw_on;
+
+static DWORD WINAPI multiwait_self_worker(LPVOID unused)
+{
+    (void)unused;
+    HANDLE self = GetCurrentThread();
+    g_mw_self = self;
+    InterlockedExchange(&g_mw_ready, 1);
+
+    /* Main closes the public handle for this thread here. */
+    if (!wait_flag(&g_mw_phase, 1, 5000)) return 21;
+
+    HANDLE any_set[2] = { self, g_mw_off };
+    HANDLE all_set[2] = { self, g_mw_on };
+
+    SetLastError(0);
+    InterlockedExchange(&g_mw_any, (LONG)WaitForMultipleObjects(2, any_set, FALSE, 60));
+    SetLastError(0);
+    InterlockedExchange(&g_mw_all, (LONG)WaitForMultipleObjects(2, all_set, TRUE, 0));
+    SetLastError(0);
+    InterlockedExchange(&g_mw_ex,
+                        (LONG)WaitForMultipleObjectsEx(2, any_set, FALSE, 60, TRUE));
+    SetLastError(0);
+    InterlockedExchange(&g_mw_single, (LONG)WaitForSingleObject(self, 0));
+
+    InterlockedExchange(&g_mw_done, 1);
+    return 0;
+}
+
+static void test_multiwait_own_thread_value(void)
+{
+    g_mw_ready = 0;
+    g_mw_phase = 0;
+    g_mw_any = -1;
+    g_mw_all = -1;
+    g_mw_ex = -1;
+    g_mw_single = -1;
+    g_mw_done = 0;
+    g_mw_self = NULL;
+
+    g_mw_off = CreateEventA(NULL, TRUE, FALSE, NULL);
+    g_mw_on  = CreateEventA(NULL, TRUE, TRUE, NULL);
+    check(g_mw_off != NULL && g_mw_on != NULL,
+          "CreateEventA for the own-thread multi-wait rows");
+    if (!g_mw_off || !g_mw_on) return;
+
+    DWORD tid = 0;
+    HANDLE th = CreateThread(NULL, 0, multiwait_self_worker, NULL, 0, &tid);
+    check(th != NULL, "CreateThread for the own-thread multi-wait rows");
+    if (!th) {
+        CloseHandle(g_mw_off);
+        CloseHandle(g_mw_on);
+        return;
+    }
+
+    check(wait_flag(&g_mw_ready, 1, 3000),
+          "the worker reports the value GetCurrentThread() gave it");
+    check(g_mw_self == th,
+          "inside the worker that value is the thread's own handle value");
+
+    check(CloseHandle(th) == TRUE,
+          "the public handle for the worker's thread object closes");
+
+    /* The SAME value from THIS thread names no live public handle any more.
+     * A multi-wait must say so, exactly as the single wait does. This is what
+     * separates "this thread's own value" from "any thread object". */
+    HANDLE foreign[2] = { g_mw_on, th };
+    SetLastError(0);
+    check(WaitForMultipleObjects(2, foreign, FALSE, 0) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_HANDLE,
+          "the same value from another thread fails with ERROR_INVALID_HANDLE");
+
+    InterlockedExchange(&g_mw_phase, 1);
+    check(wait_flag(&g_mw_done, 1, 5000),
+          "the worker's four post-close waits all return");
+
+    check(g_mw_any == (LONG)WAIT_TIMEOUT,
+          "multi(any, {own value, unsignalled event}) times out after the close (%ld)",
+          (long)g_mw_any);
+    check(g_mw_all == (LONG)WAIT_TIMEOUT,
+          "multi(all, {own value, signalled event}) times out: self has not exited (%ld)",
+          (long)g_mw_all);
+    check(g_mw_ex == (LONG)WAIT_TIMEOUT,
+          "multiEx(any, alertable, own value) times out after the close (%ld)",
+          (long)g_mw_ex);
+    check(g_mw_single == (LONG)WAIT_TIMEOUT,
+          "the single wait on the own value agrees (%ld)", (long)g_mw_single);
+
+    /* The thread object is still alive (its trampoline holds it), so the
+     * events must be unharmed by the failed call from this thread. */
+    check(WaitForSingleObject(g_mw_on, 0) == WAIT_OBJECT_0,
+          "the signalled event is unharmed by the rejected multi-wait");
+    check(CloseHandle(g_mw_off) == TRUE && CloseHandle(g_mw_on) == TRUE,
+          "CloseHandle of the own-thread-row events succeeds");
+}
+
+/* ---- values that name no live object, after live pinned entries ------- */
+
+/*
+ * Each array puts one or two LIVE entries first, so the shim has already
+ * pinned something when it reaches the bad entry. Win32 fails the whole call,
+ * and the shim must fail it with ERROR_INVALID_HANDLE -- not ERROR_INVALID_
+ * PARAMETER, and not by skipping the entry and reporting a result it did not
+ * observe. The live entries must be untouched afterwards, which is also what
+ * a leaked pin on this path would eventually show as (ASAN decides that).
+ */
+static void multiwait_dead_row(HANDLE bad, const char *label, HANDLE on, HANDLE off)
+{
+    HANDLE any_set[3] = { on, off, bad };
+    HANDLE all_set[3] = { on, off, bad };
+
+    SetLastError(0);
+    check(WaitForMultipleObjects(3, any_set, FALSE, 0) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_HANDLE,
+          "multi(any, {live, live, %s}) fails with ERROR_INVALID_HANDLE", label);
+    SetLastError(0);
+    check(WaitForMultipleObjects(3, all_set, TRUE, 0) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_HANDLE,
+          "multi(all, {live, live, %s}) fails with ERROR_INVALID_HANDLE", label);
+    SetLastError(0);
+    check(WaitForMultipleObjectsEx(3, any_set, FALSE, 0, TRUE) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_HANDLE,
+          "multiEx(any, {live, live, %s}) fails with ERROR_INVALID_HANDLE", label);
+    SetLastError(0);
+    check(WaitForMultipleObjectsEx(3, all_set, TRUE, 0, FALSE) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_HANDLE,
+          "multiEx(all, {live, live, %s}) fails with ERROR_INVALID_HANDLE", label);
+
+    /* Dead first, live after: the same failure, so nothing depends on the
+     * order of the bad entry. */
+    HANDLE bad_first[3] = { bad, on, off };
+    SetLastError(0);
+    check(WaitForMultipleObjects(3, bad_first, FALSE, 0) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_HANDLE,
+          "multi(any, {%s, live, live}) fails with ERROR_INVALID_HANDLE", label);
+
+    /* The live entries are still usable: a failed call released its pins and
+     * changed nothing about them. */
+    check(WaitForSingleObject(on, 0) == WAIT_OBJECT_0 && SetEvent(off) == TRUE,
+          "the live entries survive the failed call with %s", label);
+}
+
+static void test_multiwait_dead_entries(HANDLE zeroed)
+{
+    HANDLE on  = CreateEventA(NULL, TRUE, TRUE, NULL);
+    HANDLE off = CreateEventA(NULL, TRUE, FALSE, NULL);
+    check(on != NULL && off != NULL, "CreateEventA for the dead-entry rows");
+    if (!on || !off) return;
+
+    multiwait_dead_row(FORGED, "forged 0x03fffffe", on, off);
+    multiwait_dead_row(zeroed, "zeroed 4 KiB calloc block", on, off);
+
+    /* A value that looks like a pseudo handle but is not one of the three the
+     * shim supports: no special meaning, so it fails like any dead value. */
+    multiwait_dead_row((HANDLE)(LONG_PTR)-3, "(HANDLE)-3", on, off);
+
+    /* A real object whose last public alias was closed. Nothing is allocated
+     * between the close and the call, so the value cannot have been reused. */
+    HANDLE gone = CreateEventA(NULL, TRUE, FALSE, NULL);
+    check(gone != NULL, "CreateEventA for the closed-value row");
+    if (gone) {
+        check(CloseHandle(gone) == TRUE, "the closed-value event closes");
+        multiwait_dead_row(gone, "a closed event", on, off);
+    }
+
+    /* A single dead entry, no live neighbours. */
+    HANDLE only_bad[1] = { FORGED };
+    SetLastError(0);
+    check(WaitForMultipleObjects(1, only_bad, FALSE, 0) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_HANDLE,
+          "multi(any, {forged}) alone fails with ERROR_INVALID_HANDLE");
+
+    check(CloseHandle(on) == TRUE && CloseHandle(off) == TRUE,
+          "CloseHandle of the dead-entry-row events succeeds");
+}
+
+/* ---- parameter validation --------------------------------------------- */
+
+static void test_multiwait_parameters(void)
+{
+    HANDLE ev = CreateEventA(NULL, TRUE, TRUE, NULL);
+    check(ev != NULL, "CreateEventA for the parameter rows");
+    if (!ev) return;
+
+    HANDLE many[MAXIMUM_WAIT_OBJECTS + 1];
+    for (int i = 0; i < MAXIMUM_WAIT_OBJECTS + 1; i++) many[i] = ev;
+    HANDLE one[1] = { ev };
+
+    SetLastError(0);
+    check(WaitForMultipleObjects(0, one, FALSE, 0) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_PARAMETER,
+          "multi(count=0) fails with ERROR_INVALID_PARAMETER");
+    SetLastError(0);
+    check(WaitForMultipleObjects(0, NULL, FALSE, 0) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_PARAMETER,
+          "multi(count=0, handles=NULL) fails with ERROR_INVALID_PARAMETER");
+    SetLastError(0);
+    check(WaitForMultipleObjects(1, NULL, FALSE, 0) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_PARAMETER,
+          "multi(count=1, handles=NULL) fails with ERROR_INVALID_PARAMETER");
+    SetLastError(0);
+    check(WaitForMultipleObjects(MAXIMUM_WAIT_OBJECTS + 1, many, FALSE, 0) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_PARAMETER,
+          "multi(count=%d) fails with ERROR_INVALID_PARAMETER", MAXIMUM_WAIT_OBJECTS + 1);
+    SetLastError(0);
+    check(WaitForMultipleObjects(MAXIMUM_WAIT_OBJECTS + 1, many, TRUE, 0) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_PARAMETER,
+          "multi(all, count=%d) fails with ERROR_INVALID_PARAMETER",
+          MAXIMUM_WAIT_OBJECTS + 1);
+
+    SetLastError(0);
+    check(WaitForMultipleObjectsEx(0, one, FALSE, 0, FALSE) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_PARAMETER,
+          "multiEx(count=0) fails with ERROR_INVALID_PARAMETER");
+    SetLastError(0);
+    check(WaitForMultipleObjectsEx(1, NULL, TRUE, 0, TRUE) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_PARAMETER,
+          "multiEx(handles=NULL) fails with ERROR_INVALID_PARAMETER");
+    SetLastError(0);
+    check(WaitForMultipleObjectsEx(MAXIMUM_WAIT_OBJECTS + 1, many, TRUE, 0, FALSE)
+              == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_PARAMETER,
+          "multiEx(count=%d) fails with ERROR_INVALID_PARAMETER",
+          MAXIMUM_WAIT_OBJECTS + 1);
+
+    /* The boundary itself is accepted: MAXIMUM_WAIT_OBJECTS entries, all the
+     * same signalled event, is a legal wait-all. */
+    HANDLE full[MAXIMUM_WAIT_OBJECTS];
+    for (int i = 0; i < MAXIMUM_WAIT_OBJECTS; i++) full[i] = ev;
+    check(WaitForMultipleObjects(MAXIMUM_WAIT_OBJECTS, full, TRUE, 0) == WAIT_OBJECT_0,
+          "multi(all, count=%d) is accepted and satisfied", MAXIMUM_WAIT_OBJECTS);
+
+    check(CloseHandle(ev) == TRUE, "CloseHandle of the parameter-row event succeeds");
+}
+
+/* ===================================================================== */
 /* main                                                                  */
 /* ===================================================================== */
 
@@ -808,7 +1197,15 @@ int main(void)
             negatives_pointer(FORGED, "forged 0x03fffffe");
         else if (strcmp(only_row, "zeroed") == 0)
             negatives_pointer(zeroed, "zeroed 4 KiB calloc block");
-        else {
+        else if (strcmp(only_row, "multiwait") == 0) {
+            /* The multi-object block on its own: a mutant of the wait path
+             * cannot be masked by a crash in an unrelated negative row. */
+            printf("\nmulti-object waits\n");
+            test_multiwait_sentinels();
+            test_multiwait_own_thread_value();
+            test_multiwait_dead_entries(zeroed);
+            test_multiwait_parameters();
+        } else {
             printf("unknown W32_HANDLE_TEST_ONLY value\n");
             free(zeroed);
             return 2;
@@ -845,6 +1242,12 @@ int main(void)
 
     printf("\nin-flight pin\n");
     test_inflight_close();
+
+    printf("\nmulti-object waits\n");
+    test_multiwait_sentinels();
+    test_multiwait_own_thread_value();
+    test_multiwait_dead_entries(zeroed);
+    test_multiwait_parameters();
 
     free(zeroed);
 

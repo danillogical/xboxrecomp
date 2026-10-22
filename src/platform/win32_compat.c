@@ -843,6 +843,64 @@ DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
 }
 
 /*
+ * One entry of a multi-object wait.
+ *
+ * A resolved entry is EITHER a supported sentinel or a pinned object, and the
+ * two are never the same thing: `obj == NULL` alone cannot mean "ready", or a
+ * failed lookup would be silently treated as satisfied. `sentinel` records
+ * that the caller passed one of the values this layer answers without an
+ * object at all.
+ *
+ * Sentinels are NULL and the two pseudo handles. Win32 has no signalled state
+ * for a process/thread pseudo handle here, and this shim's single-object wait
+ * has always answered them WAIT_OBJECT_0; the multi-object form has to agree,
+ * because a wait that mixes a real event with NtCurrentThread is exactly what
+ * the kernel HLE issues.
+ */
+typedef struct {
+    w32_object *obj;        /* pinned object, or NULL for a sentinel */
+    int         sentinel;   /* 1 when the value is a supported sentinel */
+} w32_wait_entry;
+
+/*
+ * Resolve one handle into `e`. Returns 0 only for a REAL value that is not a
+ * live object; the caller turns that into WAIT_FAILED with the
+ * ERROR_INVALID_HANDLE `thread_pin` already set. An unpublished, forged, dead
+ * or wrong-kind value is a failure, not a sentinel.
+ *
+ * Ordinary values go through thread_pin, the same self/lifetime-aware
+ * resolution WaitForSingleObject uses: that is what makes this thread's own
+ * GetCurrentThread() value keep working after its public alias was closed,
+ * while a closed handle for another object still fails.
+ */
+static int wait_entry_resolve(HANDLE h, w32_wait_entry *e)
+{
+    e->obj      = NULL;
+    e->sentinel = 0;
+    if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS) {
+        e->sentinel = 1;
+        return 1;
+    }
+    e->obj = thread_pin(h);
+    return e->obj != NULL;
+}
+
+static void wait_entry_release(w32_wait_entry *e)
+{
+    if (e->obj) obj_unpin(e->obj);
+    e->obj      = NULL;
+    e->sentinel = 0;
+}
+
+/* Ready right now? A sentinel is always ready; an object asks its own state.
+ * The caller holds a pin, and the object lock is not held here. */
+static int wait_entry_ready(const w32_wait_entry *e)
+{
+    if (e->sentinel) return 1;
+    return wait_single(e->obj, 0) == WAIT_OBJECT_0;
+}
+
+/*
  * WaitForMultipleObjects: polling implementation. Adequate for the light
  * multi-object waits the Xbox kernel HLE issues; not a high-throughput path.
  */
@@ -864,20 +922,23 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
     }
 
     /*
-     * Every handle is pinned for the whole wait, once, before the polling
-     * loop: resolving them per iteration would let a concurrent close free an
-     * object between two polls and turn a wait into a use-after-free. A bad
-     * handle fails the call the way Win32 does, rather than being skipped --
-     * a silently ignored entry can make wait-all report success it did not
-     * observe.
+     * Every handle is resolved and pinned ONCE for the whole wait, before the
+     * polling loop: resolving per iteration would let a concurrent close free
+     * an object between two polls and turn a wait into a use-after-free. A
+     * real handle that is not live fails the call the way Win32 does, rather
+     * than being skipped -- a silently ignored entry can make wait-all report
+     * success it did not observe.
+     *
+     * `entries` is zeroed first so the release path below is correct even when
+     * resolution fails part-way through, and so every exit -- success, timeout,
+     * alertable completion or failure -- drops exactly the pins it took.
      */
-    w32_object *pins[64];
+    w32_wait_entry entries[64];
+    memset(entries, 0, sizeof(entries[0]) * count);
+
     for (DWORD i = 0; i < count; i++) {
-        HANDLE h = handles[i];
-        pins[i] = (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
-                  ? NULL : obj_pin(h);
-        if (!pins[i] && h) {
-            for (DWORD j = 0; j < i; j++) obj_unpin(pins[j]);
+        if (!wait_entry_resolve(handles[i], &entries[i])) {
+            for (DWORD j = 0; j < count; j++) wait_entry_release(&entries[j]);
             return WAIT_FAILED;
         }
     }
@@ -889,12 +950,12 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
         if (waitAll) {
             DWORD got = 0;
             for (DWORD i = 0; i < count; i++)
-                if (!pins[i] || wait_single(pins[i], 0) == WAIT_OBJECT_0) got++;
+                if (wait_entry_ready(&entries[i])) got++;
             if (got == count) { result = WAIT_OBJECT_0; break; }
         } else {
             int hit = 0;
             for (DWORD i = 0; i < count; i++) {
-                if (!pins[i] || wait_single(pins[i], 0) == WAIT_OBJECT_0) {
+                if (wait_entry_ready(&entries[i])) {
                     result = WAIT_OBJECT_0 + i;
                     hit = 1;
                     break;
@@ -915,7 +976,7 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
         usleep(1000);
     }
 
-    for (DWORD i = 0; i < count; i++) obj_unpin(pins[i]);
+    for (DWORD i = 0; i < count; i++) wait_entry_release(&entries[i]);
     return result;
 }
 

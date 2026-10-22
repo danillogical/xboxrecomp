@@ -24,6 +24,13 @@
  *   4. pinned wait  a thread inside WaitForSingleObject while the last alias
  *                   closes: the wait must return rather than run on freed
  *                   memory. A blocking wait, so the pin is provably held.
+ *   5. multi-wait   WaitForMultipleObjects(Ex) pins every live entry once for
+ *                   the whole call and releases each pin on EVERY exit --
+ *                   success, timeout, alertable completion and mid-resolution
+ *                   failure. A pin the failure path forgets keeps the object's
+ *                   refcount above zero, so the later close frees nothing and
+ *                   the value (already withdrawn from the registry) becomes an
+ *                   unreachable allocation LeakSanitizer reports.
  *
  * Everything is bounded: fixed iteration counts, fixed thread counts, and
  * waits with deadlines. Run with -fsanitize=address; leaks are reported by
@@ -354,6 +361,324 @@ static void test_timer_delete_lifetime(void)
 }
 
 /* ===================================================================== */
+/* 6. Multi-object waits: every exit path drops exactly the pins it took */
+/* ===================================================================== */
+
+/*
+ * WaitForMultipleObjects(Ex) pins every live entry once, before polling, so
+ * a concurrent close cannot free an object under the wait. Those pins have to
+ * come back on EVERY exit:
+ *
+ *   success           wait-any finds a ready entry, wait-all sees all ready
+ *   timeout           nothing is ready before the deadline
+ *   alertable         an APC is drained first, so the call ends there
+ *   failure           a later entry names no live object
+ *
+ * The failure path is the one a plain binary cannot decide. There the shim
+ * has already pinned the entries BEFORE the bad one; if it returns without
+ * releasing them, every one of those objects keeps a lifetime reference. The
+ * caller's CloseHandle still withdraws the value from the registry (so the
+ * close succeeds and the value is dead), but the object is then unreachable
+ * with a non-zero refcount -- never freed, and reported here as a leak.
+ *
+ * Every round closes every handle it created, so a leak in this section is
+ * the shim's and nothing else's.
+ */
+
+#define MW_ROUNDS 100
+
+/* The two pseudo handles this layer answers without an object at all. */
+#define PSEUDO_THREAD  ((HANDLE)(LONG_PTR)-2)
+#define PSEUDO_PROCESS ((HANDLE)(LONG_PTR)-1)
+
+static void test_multiwait_pin_cleanup(void)
+{
+    int success_ok = 1, timeout_ok = 1, fail_ok = 1, closed_ok = 1, alive_ok = 1;
+
+    for (int i = 0; i < MW_ROUNDS; i++) {
+        HANDLE on  = CreateEventA(NULL, TRUE, TRUE, NULL);
+        HANDLE off = CreateEventA(NULL, TRUE, FALSE, NULL);
+        if (!on || !off) { alive_ok = 0; break; }
+
+        /* success, wait-any: index 1 */
+        HANDLE any_set[2] = { off, on };
+        if (WaitForMultipleObjects(2, any_set, FALSE, 0) != WAIT_OBJECT_0 + 1)
+            success_ok = 0;
+
+        /* success, wait-all: both ready */
+        HANDLE all_set[2] = { on, on };
+        if (WaitForMultipleObjects(2, all_set, TRUE, 0) != WAIT_OBJECT_0)
+            success_ok = 0;
+
+        /* The same shapes with the sentinels mixed in. A sentinel takes no
+         * pin, so the release loop must skip it; releasing a NULL entry (or
+         * treating a sentinel as a pinned object) shows up here as a wrong
+         * result, a double free or a leak. */
+        HANDLE sent_any[3] = { off, PSEUDO_THREAD, PSEUDO_PROCESS };
+        HANDLE sent_all[3] = { on, NULL, PSEUDO_PROCESS };
+        if (WaitForMultipleObjects(3, sent_any, FALSE, 0) != WAIT_OBJECT_0 + 1)
+            success_ok = 0;
+        if (WaitForMultipleObjects(3, sent_all, TRUE, 0) != WAIT_OBJECT_0)
+            success_ok = 0;
+        if (WaitForMultipleObjectsEx(3, sent_any, FALSE, 0, TRUE) != WAIT_OBJECT_0 + 1)
+            success_ok = 0;
+
+        /* timeout, both modes */
+        HANDLE none_any[2] = { off, off };
+        HANDLE none_all[2] = { on, off };
+        if (WaitForMultipleObjects(2, none_any, FALSE, 0) != WAIT_TIMEOUT)
+            timeout_ok = 0;
+        if (WaitForMultipleObjects(2, none_all, TRUE, 0) != WAIT_TIMEOUT)
+            timeout_ok = 0;
+        if (WaitForMultipleObjectsEx(2, none_any, TRUE, 0, FALSE) != WAIT_TIMEOUT)
+            timeout_ok = 0;
+        HANDLE none_sent[3] = { off, PSEUDO_THREAD, off };
+        if (WaitForMultipleObjects(3, none_sent, TRUE, 0) != WAIT_TIMEOUT)
+            timeout_ok = 0;
+
+        /* failure with two live entries pinned before the bad one */
+        HANDLE bad_tail[3] = { on, off, (HANDLE)(LONG_PTR)0x03fffffe };
+        SetLastError(0);
+        if (WaitForMultipleObjects(3, bad_tail, FALSE, 0) != WAIT_FAILED ||
+            GetLastError() != ERROR_INVALID_HANDLE)
+            fail_ok = 0;
+        SetLastError(0);
+        if (WaitForMultipleObjectsEx(3, bad_tail, TRUE, 0, TRUE) != WAIT_FAILED ||
+            GetLastError() != ERROR_INVALID_HANDLE)
+            fail_ok = 0;
+
+        /* failure with a sentinel in front: the sentinel holds no pin, so the
+         * release loop has to walk past it and free the real pins only. */
+        HANDLE bad_after_sent[4] = { PSEUDO_THREAD, on, off,
+                                     (HANDLE)(LONG_PTR)0x03fffffe };
+        SetLastError(0);
+        if (WaitForMultipleObjects(4, bad_after_sent, FALSE, 0) != WAIT_FAILED ||
+            GetLastError() != ERROR_INVALID_HANDLE)
+            fail_ok = 0;
+
+        /* failure where the dead entry is a value this round already closed,
+         * again after two live entries */
+        HANDLE gone = CreateEventA(NULL, TRUE, FALSE, NULL);
+        if (!gone) { alive_ok = 0; }
+        if (gone) {
+            if (!CloseHandle(gone)) alive_ok = 0;
+            HANDLE closed_tail[3] = { on, off, gone };
+            SetLastError(0);
+            if (WaitForMultipleObjects(3, closed_tail, FALSE, 0) != WAIT_FAILED ||
+                GetLastError() != ERROR_INVALID_HANDLE)
+                closed_ok = 0;
+        }
+
+        /* The pinned entries are still live and usable: a release that ran
+         * twice would have freed them here. */
+        if (!SetEvent(off) || !ResetEvent(off) ||
+            WaitForSingleObject(on, 0) != WAIT_OBJECT_0)
+            alive_ok = 0;
+
+        if (!CloseHandle(on) || !CloseHandle(off)) alive_ok = 0;
+    }
+
+    check(success_ok, "wait-any/wait-all success paths drop their pins (%d rounds)",
+          MW_ROUNDS);
+    check(timeout_ok, "the timeout path drops its pins (%d rounds)", MW_ROUNDS);
+    check(fail_ok, "mid-resolution failure reports ERROR_INVALID_HANDLE (%d rounds)",
+          MW_ROUNDS);
+    check(closed_ok, "a closed entry after live ones fails the same way");
+    check(alive_ok, "every round's objects stay live, usable and closable");
+}
+
+/* ---- the alertable exit path ------------------------------------------ */
+
+/*
+ * WAIT_IO_COMPLETION is the exit a timeout-only test never reaches: the loop
+ * drains the APC queue BEFORE it looks at readiness, so the call ends with
+ * every entry pinned. The APC has to be queued on a thread this shim created,
+ * because only such a thread has a w32_object to queue against.
+ */
+static volatile LONG g_mw_apc_ran;
+static volatile LONG g_mw_apc_result;
+static volatile LONG g_mw_apc_err;
+
+static VOID WINAPI mw_apc(ULONG_PTR param)
+{
+    (void)param;
+    InterlockedIncrement(&g_mw_apc_ran);
+}
+
+static DWORD WINAPI mw_apc_worker(LPVOID unused)
+{
+    (void)unused;
+    HANDLE on = CreateEventA(NULL, TRUE, TRUE, NULL);
+    HANDLE off = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!on || !off) return 31;
+
+    HANDLE set[2] = { on, off };
+    if (!QueueUserAPC(mw_apc, GetCurrentThread(), 0)) return 32;
+
+    SetLastError(0);
+    DWORD w = WaitForMultipleObjectsEx(2, set, FALSE, 0, TRUE);
+    InterlockedExchange(&g_mw_apc_err, (LONG)GetLastError());
+    InterlockedExchange(&g_mw_apc_result, (LONG)w);
+
+    /* Still live after the completion path released its pins. */
+    if (!SetEvent(off) || WaitForSingleObject(on, 0) != WAIT_OBJECT_0) return 33;
+    if (!CloseHandle(on) || !CloseHandle(off)) return 34;
+    return 0;
+}
+
+static void test_multiwait_alertable_exit(void)
+{
+    DWORD tid = 0, code = 0;
+    g_mw_apc_ran = 0;
+    g_mw_apc_result = -1;
+    g_mw_apc_err = -1;
+
+    HANDLE th = CreateThread(NULL, 0, mw_apc_worker, NULL, 0, &tid);
+    check(th != NULL, "CreateThread for the alertable multi-wait row");
+    if (!th) return;
+
+    check(WaitForSingleObject(th, 5000) == WAIT_OBJECT_0,
+          "the alertable-row worker finishes");
+    check(GetExitCodeThread(th, &code) == TRUE && code == 0,
+          "the worker's own rows passed (exit code %lu)", (unsigned long)code);
+    check(g_mw_apc_ran == 1, "the queued APC ran exactly once");
+    check(g_mw_apc_result == (LONG)WAIT_IO_COMPLETION,
+          "multiEx(alertable) returns WAIT_IO_COMPLETION (%ld)",
+          (long)g_mw_apc_result);
+    check(g_mw_apc_err != (LONG)ERROR_INVALID_HANDLE,
+          "the completion path did not report a bad handle (%ld)",
+          (long)g_mw_apc_err);
+    check(CloseHandle(th) == TRUE, "CloseHandle of the alertable-row thread");
+}
+
+/* ---- a multi-wait pinned across the last close ------------------------ */
+
+static HANDLE        g_mw_pin_handle;
+static HANDLE        g_mw_pin_other;
+static volatile LONG g_mw_pin_entered;
+static volatile LONG g_mw_pin_result;
+
+static void *mw_pinned_waiter(void *unused)
+{
+    (void)unused;
+    HANDLE set[2] = { g_mw_pin_handle, g_mw_pin_other };
+    InterlockedExchange(&g_mw_pin_entered, 1);
+    /* Long enough that the closes below land inside the wait; the deadline
+     * keeps the row bounded. */
+    DWORD w = WaitForMultipleObjects(2, set, FALSE, 1500);
+    InterlockedExchange(&g_mw_pin_result, (LONG)w);
+    return NULL;
+}
+
+static void test_multiwait_pinned_across_close(void)
+{
+    pthread_t t;
+
+    g_mw_pin_handle = CreateEventA(NULL, TRUE, FALSE, NULL);
+    g_mw_pin_other  = CreateEventA(NULL, TRUE, FALSE, NULL);
+    check(g_mw_pin_handle != NULL && g_mw_pin_other != NULL,
+          "CreateEventA for the pinned multi-wait case");
+    if (!g_mw_pin_handle || !g_mw_pin_other) return;
+
+    g_mw_pin_entered = 0;
+    g_mw_pin_result = -1;
+
+    if (pthread_create(&t, NULL, mw_pinned_waiter, NULL) != 0) {
+        check(0, "pthread_create for the pinned multi-waiter");
+        CloseHandle(g_mw_pin_handle);
+        CloseHandle(g_mw_pin_other);
+        return;
+    }
+    while (InterlockedExchangeAdd(&g_mw_pin_entered, 0) == 0)
+        sched_yield();
+    /* 20 ms after the waiter announced itself, against a 1500 ms wait. */
+    Sleep(20);
+
+    check(CloseHandle(g_mw_pin_handle) == TRUE &&
+          CloseHandle(g_mw_pin_other) == TRUE,
+          "both aliases close while the multi-wait is inside the shim");
+    pthread_join(t, NULL);
+
+    check(g_mw_pin_result == (LONG)WAIT_TIMEOUT,
+          "the pinned multi-wait ran to its own deadline (%ld)",
+          (long)g_mw_pin_result);
+    SetLastError(0);
+    check(WaitForMultipleObjects(2, (HANDLE[]){ g_mw_pin_handle, g_mw_pin_other },
+                                 FALSE, 0) == WAIT_FAILED &&
+          GetLastError() == ERROR_INVALID_HANDLE,
+          "a later multi-wait on the same values fails cleanly");
+}
+
+/* ---- this thread's own value inside a multi-wait ---------------------- */
+
+static volatile LONG g_mw_self_ready;
+static volatile LONG g_mw_self_phase;
+static volatile LONG g_mw_self_result;
+static volatile LONG g_mw_self_done;
+static HANDLE        g_mw_self_value;
+
+/* Poll a shim atomic up to `ms` milliseconds (Sleep yields the CPU). */
+static int wait_flag_local(volatile LONG *flag, LONG want, int ms)
+{
+    for (int i = 0; i <= ms; i++) {
+        if (InterlockedExchangeAdd(flag, 0) == want) return 1;
+        if (i < ms) Sleep(1);
+    }
+    return 0;
+}
+
+static DWORD WINAPI mw_self_worker(LPVOID unused)
+{
+    (void)unused;
+    HANDLE self = GetCurrentThread();
+    g_mw_self_value = self;
+    InterlockedExchange(&g_mw_self_ready, 1);
+
+    /* Main closes the public alias for this thread object here. */
+    if (!wait_flag_local(&g_mw_self_phase, 1, 5000)) return 41;
+
+    HANDLE off = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!off) return 42;
+    HANDLE set[2] = { self, off };
+    SetLastError(0);
+    DWORD w = WaitForMultipleObjectsEx(2, set, FALSE, 50, TRUE);
+    InterlockedExchange(&g_mw_self_result, (LONG)w);
+    if (!CloseHandle(off)) return 43;
+    InterlockedExchange(&g_mw_self_done, 1);
+    return 0;
+}
+
+static void test_multiwait_own_value_lifetime(void)
+{
+    DWORD tid = 0;
+    g_mw_self_ready = 0;
+    g_mw_self_phase = 0;
+    g_mw_self_result = -1;
+    g_mw_self_done = 0;
+    g_mw_self_value = NULL;
+
+    HANDLE th = CreateThread(NULL, 0, mw_self_worker, NULL, 0, &tid);
+    check(th != NULL, "CreateThread for the own-value multi-wait case");
+    if (!th) return;
+
+    check(wait_flag_local(&g_mw_self_ready, 1, 3000),
+          "the worker reports the value GetCurrentThread() gave it");
+    check(g_mw_self_value == th,
+          "that value is the thread's own public handle value");
+    check(CloseHandle(th) == TRUE,
+          "the public alias closes while the worker still holds the value");
+    InterlockedExchange(&g_mw_self_phase, 1);
+
+    /* The thread object cannot be waited on any more (its alias is closed and
+     * this thread is not its owner), so completion is observed on a flag. */
+    check(wait_flag_local(&g_mw_self_done, 1, 5000),
+          "the worker's post-close multi-wait returns");
+    check(g_mw_self_result == (LONG)WAIT_TIMEOUT,
+          "the own value still waits in a multi-wait after the alias closed (%ld)",
+          (long)g_mw_self_result);
+}
+
+/* ===================================================================== */
 /* main                                                                  */
 /* ===================================================================== */
 
@@ -371,6 +696,14 @@ int main(void)
     test_pinned_blocking_wait();
     printf("\n");
     test_timer_delete_lifetime();
+    printf("\n");
+    test_multiwait_pin_cleanup();
+    printf("\n");
+    test_multiwait_alertable_exit();
+    printf("\n");
+    test_multiwait_pinned_across_close();
+    printf("\n");
+    test_multiwait_own_value_lifetime();
 
     printf("\n%s: %d failure(s)\n", failures ? "FAIL" : "PASS", failures);
     return failures ? 1 : 0;
