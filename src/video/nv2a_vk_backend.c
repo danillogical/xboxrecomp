@@ -78,7 +78,7 @@
  *     start. Nothing new is translated or compiled: the cache only stores what the driver
  *     made from the same shaders. RECOMP_VK_PIPELINE_CACHE names the file (unset: one file per
  *     device, vk-pipeline-cache-<vendorID>-<deviceID>.bin in the xboxrecomp folder under
- *     %LOCALAPPDATA% on Windows, disabled elsewhere; `off` or `0` disables it). The file is a 20-byte header (magic, version, blob length, CRC-32) and the
+ *     %LOCALAPPDATA% on Windows, $XDG_CACHE_HOME (macOS: ~/Library/Caches, else ~/.cache) elsewhere; `off` or `0` disables it). The file is a 20-byte header (magic, version, blob length, CRC-32) and the
  *     raw vkGetPipelineCacheData blob; a file that is missing, damaged or from another device
  *     or driver is rejected and the run starts cold. There is no shutdown hook, so vb_flip saves
  *     the cache during the run, at most every VB_PCACHE_SAVE_MS and only after new pipelines, through
@@ -233,6 +233,8 @@ void nv2a_vk_backend_memory_stats(Nv2aVkMemoryStats *out)
 #else
 
 #define VK_NO_PROTOTYPES
+/* VkPhysicalDevicePortabilitySubsetFeaturesKHR lives in the beta header. */
+#define VK_ENABLE_BETA_EXTENSIONS
 #include <vulkan/vulkan.h>
 
 #if defined(_WIN32)
@@ -329,6 +331,12 @@ typedef char vb_vertex_is_28_bytes[sizeof(Nv2aVertex) == 28 ? 1 : -1];
     X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkGetPhysicalDeviceFormatProperties) \
     X(vkCreateDevice) X(vkGetDeviceProcAddr)
 
+/* Core 1.1 entry points, optional here: a NULL one only drops the driver name and the
+ * portability-subset report. */
+#define VB_INSTANCE_OPT_FNS(X) \
+    X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceFeatures2) \
+    X(vkEnumerateDeviceExtensionProperties)
+
 #define VB_DEVICE_FNS(X) \
     X(vkGetDeviceQueue) X(vkCreateCommandPool) X(vkAllocateCommandBuffers) \
     X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkResetCommandBuffer) X(vkQueueSubmit) \
@@ -357,6 +365,7 @@ typedef char vb_vertex_is_28_bytes[sizeof(Nv2aVertex) == 28 ? 1 : -1];
 static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr;
 VB_GLOBAL_FNS(VB_DECLARE)
 VB_INSTANCE_FNS(VB_DECLARE)
+VB_INSTANCE_OPT_FNS(VB_DECLARE)
 VB_DEVICE_FNS(VB_DECLARE)
 static PFN_vkCreateDebugUtilsMessengerEXT vkCreateDebugUtilsMessengerEXT;
 
@@ -2702,8 +2711,9 @@ static int vb_pc_ieq(const char *a, const char *b)
     return *a == *b;
 }
 
-/* Decide where the cache lives. `env` is RECOMP_VK_PIPELINE_CACHE, `appdata` is %LOCALAPPDATA%
- * (NULL off Windows) and `vendor`/`device` name the chosen physical device, so each device has
+/* Decide where the cache lives. `env` is RECOMP_VK_PIPELINE_CACHE, `appdata` is the per-user
+ * cache base (%LOCALAPPDATA% on Windows; off Windows $XDG_CACHE_HOME or the platform's cache
+ * folder, NULL when there is none) and `vendor`/`device` name the chosen physical device, so each device has
  * its own default file. Returns 1 and fills `out` with a path, 0 for off, -1 for a path that does
  * not fit `cap`. An explicit path is used as given. */
 static int vb_pcache_resolve(const char *env, const char *appdata, uint32_t vendor,
@@ -2716,8 +2726,13 @@ static int vb_pcache_resolve(const char *env, const char *appdata, uint32_t vend
             return 0;
         n = snprintf(out, cap, "%s", env);
     } else if (appdata && *appdata) {
+#if defined(_WIN32)
         n = snprintf(out, cap, "%s\\xboxrecomp\\vk-pipeline-cache-%08x-%08x.bin", appdata,
                      (unsigned)vendor, (unsigned)device);
+#else
+        n = snprintf(out, cap, "%s/xboxrecomp/vk-pipeline-cache-%08x-%08x.bin", appdata,
+                     (unsigned)vendor, (unsigned)device);
+#endif
     } else {
         return 0;
     }
@@ -2738,6 +2753,15 @@ static void vb_pcache_mkparent(const char *path)
 #if defined(_WIN32)
     CreateDirectoryA(dir, NULL);
 #else
+    /* The base itself may be missing (a fresh ~/.cache): make its folder first, best effort. */
+    {
+        char *slash = strrchr(dir, '/');
+        if (slash && slash != dir) {
+            *slash = 0;
+            mkdir(dir, 0777);
+            *slash = '/';
+        }
+    }
     mkdir(dir, 0777);
 #endif
 }
@@ -2788,6 +2812,28 @@ static uint8_t *vb_pcache_load(const void **blob, size_t *blob_n, char *outcome,
     return buf;
 }
 
+#if !defined(_WIN32)
+/* The per-user cache folder off Windows: an absolute $XDG_CACHE_HOME, else ~/Library/Caches on
+ * macOS and ~/.cache elsewhere; NULL (cache off) without either variable or when it will not fit. */
+static const char *vb_pcache_posix_base(char *buf, size_t cap)
+{
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    const char *home = getenv("HOME");
+    int n;
+
+    if (xdg && xdg[0] == '/')
+        return xdg;
+    if (!home || !*home)
+        return NULL;
+#if defined(__APPLE__)
+    n = snprintf(buf, cap, "%s/Library/Caches", home);
+#else
+    n = snprintf(buf, cap, "%s/.cache", home);
+#endif
+    return n > 0 && (size_t)n < cap ? buf : NULL;
+}
+#endif
+
 /* Decide the knob and read the file. Runs before the cache is created; the caller prints the
  * one decision line (vb_pcache_report) once it knows whether the driver took the data. */
 static void vb_pcache_init(const void **blob, size_t *blob_n, uint8_t **file, char *outcome,
@@ -2797,7 +2843,8 @@ static void vb_pcache_init(const void **blob, size_t *blob_n, uint8_t **file, ch
 #if defined(_WIN32)
     const char *appdata = getenv("LOCALAPPDATA");
 #else
-    const char *appdata = NULL;
+    char appdata_buf[1024];
+    const char *appdata = vb_pcache_posix_base(appdata_buf, sizeof appdata_buf);
 #endif
     int r = 0;
 
@@ -5012,10 +5059,36 @@ static int vb_load_loader(void)
         vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)(void (*)(void))
                                 GetProcAddress(m, "vkGetInstanceProcAddr");
 #else
-    static const char *names[] = { "libvulkan.so.1", "libvulkan.so", "libvulkan.1.dylib" };
+    static const char *names[] = { "libvulkan.so.1", "libvulkan.so", "libvulkan.1.dylib",
+                                   "libvulkan.dylib" };
     unsigned i;
     for (i = 0; i < sizeof names / sizeof names[0] && !g.lib; i++)
         g.lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+#if defined(__APPLE__)
+    /* macOS has no loader on the default search path: look in the Vulkan SDK ($VULKAN_SDK, the
+     * variable its setup script exports) and the usual Homebrew/installer prefixes. */
+    if (!g.lib) {
+        static const char *dirs[] = { "/opt/homebrew/lib", "/usr/local/lib" };
+        const char *sdk = getenv("VULKAN_SDK");
+        char path[1024];
+        unsigned d;
+        for (d = 0; d < 1 + sizeof dirs / sizeof dirs[0] && !g.lib; d++) {
+            unsigned k;
+            for (k = 0; k < 2 && !g.lib; k++) {
+                int n;
+                if (d == 0) {
+                    if (!sdk || !*sdk)
+                        break;
+                    n = snprintf(path, sizeof path, "%s/lib/%s", sdk, names[k + 2]);
+                } else {
+                    n = snprintf(path, sizeof path, "%s/%s", dirs[d - 1], names[k + 2]);
+                }
+                if (n > 0 && (size_t)n < sizeof path)
+                    g.lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+            }
+        }
+    }
+#endif
     if (g.lib)
         *(void **)&vkGetInstanceProcAddr = dlsym(g.lib, "vkGetInstanceProcAddr");
 #endif
@@ -5038,27 +5111,38 @@ static int vb_create_instance(void)
     VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     VkExtensionProperties *ext = NULL;
     const char *want = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
-    uint32_t n = 0, i;
-    int debug = 0;
+    const char *names[2];
+    uint32_t n = 0, i, nnames = 0;
+    int debug = 0, portability = 0;
     VkResult r;
 
-    /* Messages from layers the environment enables (VK_INSTANCE_LAYERS) are printed. */
+    /* Messages from layers the environment enables (VK_INSTANCE_LAYERS) are printed.
+     * VK_KHR_portability_enumeration, when offered, is enabled with its flag: without it the
+     * loader hides portability drivers (MoltenVK). VK_KHR_get_physical_device_properties2,
+     * which VK_KHR_portability_subset depends on, is core in the 1.1 instance requested below. */
     if (vkEnumerateInstanceExtensionProperties(NULL, &n, NULL) == VK_SUCCESS && n) {
         ext = (VkExtensionProperties *)calloc(n, sizeof *ext);
         if (ext && vkEnumerateInstanceExtensionProperties(NULL, &n, ext) == VK_SUCCESS)
-            for (i = 0; i < n; i++)
+            for (i = 0; i < n; i++) {
                 if (strcmp(ext[i].extensionName, want) == 0)
                     debug = 1;
+                if (strcmp(ext[i].extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0)
+                    portability = 1;
+            }
         free(ext);
     }
     app.pApplicationName = "xboxrecomp";
     app.pEngineName = "nv2a_vk_backend";
     app.apiVersion = VK_API_VERSION_1_1;
     ici.pApplicationInfo = &app;
-    if (debug) {
-        ici.enabledExtensionCount = 1;
-        ici.ppEnabledExtensionNames = &want;
+    if (debug)
+        names[nnames++] = want;
+    if (portability) {
+        names[nnames++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+        ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     }
+    ici.enabledExtensionCount = nnames;
+    ici.ppEnabledExtensionNames = nnames ? names : NULL;
     r = vkCreateInstance(&ici, NULL, &g.inst);
     if (r != VK_SUCCESS) {
         vb_fail("vkCreateInstance", r);
@@ -5066,6 +5150,7 @@ static int vb_create_instance(void)
     }
 #define VB_LOAD_INSTANCE(fn) fn = (PFN_##fn)vkGetInstanceProcAddr(g.inst, #fn);
     VB_INSTANCE_FNS(VB_LOAD_INSTANCE)
+    VB_INSTANCE_OPT_FNS(VB_LOAD_INSTANCE)
     if (!vkCreateDevice || !vkGetDeviceProcAddr) {
         fprintf(stderr, "[GPUVK] instance functions missing\n");
         return -1;
@@ -5146,20 +5231,57 @@ static VkQueueFlags vb_family_flags(VkPhysicalDevice pd, uint32_t family)
     return family < n ? qf[family].queueFlags : 0;
 }
 
-/* RECOMP_VK_DEVICE picks by name; otherwise discrete > integrated > virtual > other,
+/* The chosen device's driver, for the device line: VkPhysicalDeviceDriverProperties through
+ * properties2 when the device is Vulkan 1.2 or lists VK_KHR_driver_properties. Empty when the
+ * device cannot say. */
+static void vb_driver_info(VkPhysicalDevice pd, const VkPhysicalDeviceProperties *p, char *name,
+                           size_t ncap, char *info, size_t icap)
+{
+    VkPhysicalDeviceDriverProperties dp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+    VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+    int ok = p->apiVersion >= VK_API_VERSION_1_2;
+
+    name[0] = info[0] = 0;
+    if (!vkGetPhysicalDeviceProperties2)
+        return;
+    if (!ok && vkEnumerateDeviceExtensionProperties) {
+        VkExtensionProperties *ext = NULL;
+        uint32_t n = 0, i;
+        if (vkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL) == VK_SUCCESS && n &&
+            (ext = (VkExtensionProperties *)calloc(n, sizeof *ext)) != NULL &&
+            vkEnumerateDeviceExtensionProperties(pd, NULL, &n, ext) == VK_SUCCESS)
+            for (i = 0; i < n; i++)
+                if (!strcmp(ext[i].extensionName, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME))
+                    ok = 1;
+        free(ext);
+    }
+    if (!ok)
+        return;
+    p2.pNext = &dp;
+    vkGetPhysicalDeviceProperties2(pd, &p2);
+    snprintf(name, ncap, "%s", dp.driverName);
+    snprintf(info, icap, "%s", dp.driverInfo);
+}
+
+/* RECOMP_VK_DEVICE picks by name and RECOMP_VK_DRIVER by driver name or info (both
+ * case-insensitive substrings; together a device must match both); otherwise discrete > integrated > virtual > other,
  * never a CPU device. Devices below Vulkan 1.1, without a graphics family, without compute
  * on that family (the pack kernel's dispatch), or whose uniform alignment the stream cannot
  * meet are passed over, and the line says which of those it was. */
 static int vb_pick_device(void)
 {
     const char *want = getenv("RECOMP_VK_DEVICE");
+    const char *want_drv = getenv("RECOMP_VK_DRIVER");
     VkPhysicalDevice devs[16];
     uint32_t n = 16, i, family = 0;
     int best = -1, best_score = 0;
     VkPhysicalDeviceProperties p;
+    char drv[VK_MAX_DRIVER_NAME_SIZE], drv_info[VK_MAX_DRIVER_INFO_SIZE];
 
     if (want && !*want)
         want = NULL;
+    if (want_drv && !*want_drv)
+        want_drv = NULL;
     if (vkEnumeratePhysicalDevices(g.inst, &n, devs) < 0 || !n) {
         fprintf(stderr, "[GPUVK] no Vulkan devices\n");
         return -1;
@@ -5179,13 +5301,15 @@ static int vb_pick_device(void)
             why = " unusable (minUniformBufferOffsetAlignment exceeds the stream's alignment)";
         usable = !*why;
         score = vb_device_score(p.deviceType);
-        fprintf(stderr, "[GPUVK] found device %u: %s (type %d, api %u.%u)%s\n", i, p.deviceName,
+        vb_driver_info(devs[i], &p, drv, sizeof drv, drv_info, sizeof drv_info);
+        fprintf(stderr, "[GPUVK] found device %u: %s (type %d, api %u.%u)%s%s%s\n", i, p.deviceName,
                 (int)p.deviceType, VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion),
-                why);
+                why, drv[0] ? " driver: " : "", drv);
         if (!usable)
             continue;
-        if (want) {
-            if (best < 0 && vb_name_has(p.deviceName, want))
+        if (want || want_drv) {
+            if (best < 0 && (!want || vb_name_has(p.deviceName, want)) &&
+                (!want_drv || vb_name_has(drv, want_drv) || vb_name_has(drv_info, want_drv)))
                 best = (int)i;
         } else if (score > best_score) {
             best_score = score;
@@ -5193,9 +5317,14 @@ static int vb_pick_device(void)
         }
     }
     if (best < 0) {
-        fprintf(stderr, want ? "[GPUVK] no usable device matches RECOMP_VK_DEVICE=%s\n"
-                             : "[GPUVK] no usable non-CPU device%s (RECOMP_VK_DEVICE picks one by name)\n",
-                want ? want : "");
+        if (want || want_drv)
+            fprintf(stderr, "[GPUVK] no usable device matches%s%s%s%s%s\n",
+                    want ? " RECOMP_VK_DEVICE=" : "", want ? want : "",
+                    want && want_drv ? " and" : "", want_drv ? " RECOMP_VK_DRIVER=" : "",
+                    want_drv ? want_drv : "");
+        else
+            fprintf(stderr, "[GPUVK] no usable non-CPU device (RECOMP_VK_DEVICE picks one by name,"
+                            " RECOMP_VK_DRIVER by driver)\n");
         return -1;
     }
     g.pd = devs[best];
@@ -5205,11 +5334,85 @@ static int vb_pick_device(void)
      * the range rule would touch a shared block's neighbours, and this is what the
      * specification fixes the granularity at. 0 means the device reports none. */
     g.atom = p.limits.nonCoherentAtomSize ? p.limits.nonCoherentAtomSize : 1;
-    fprintf(stderr, "[GPUVK] device: %s (type %d, api %u.%u.%u, driver 0x%X)%s\n", p.deviceName,
-            (int)p.deviceType, VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion),
-            VK_VERSION_PATCH(p.apiVersion), p.driverVersion,
-            want ? " picked by RECOMP_VK_DEVICE" : "");
+    vb_driver_info(g.pd, &p, drv, sizeof drv, drv_info, sizeof drv_info);
+    /* Scripts read the name up to " (type"; new fields only ever go at the end. */
+    fprintf(stderr, "[GPUVK] device: %s (type %d, api %u.%u.%u, driver 0x%X)%s%s%s%s%s%s%s\n",
+            p.deviceName, (int)p.deviceType, VK_VERSION_MAJOR(p.apiVersion),
+            VK_VERSION_MINOR(p.apiVersion), VK_VERSION_PATCH(p.apiVersion), p.driverVersion,
+            want ? " picked by RECOMP_VK_DEVICE" : "",
+            want_drv ? (want ? " and RECOMP_VK_DRIVER" : " picked by RECOMP_VK_DRIVER") : "",
+            drv[0] ? " driver: " : "", drv, drv_info[0] ? " (" : "", drv_info,
+            drv_info[0] ? ")" : "");
     return 0;
+}
+
+static int vb_device_has_ext(VkPhysicalDevice pd, const char *want)
+{
+    VkExtensionProperties *ext = NULL;
+    uint32_t n = 0, i;
+    int found = 0;
+
+    if (!vkEnumerateDeviceExtensionProperties ||
+        vkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL) != VK_SUCCESS || !n)
+        return 0;
+    ext = (VkExtensionProperties *)calloc(n, sizeof *ext);
+    if (ext && vkEnumerateDeviceExtensionProperties(pd, NULL, &n, ext) == VK_SUCCESS)
+        for (i = 0; i < n; i++)
+            if (!strcmp(ext[i].extensionName, want))
+                found = 1;
+    free(ext);
+    return found;
+}
+
+/* Log every VK_KHR_portability_subset feature the device lacks, and refuse (-1) when the
+ * back end relies on one. What it relies on, checked against its own use:
+ *   triangleFans                 no: topology is TRIANGLE_LIST only
+ *   constantAlphaColorBlendFactors no: only CONSTANT_COLOR / ONE_MINUS_CONSTANT_COLOR
+ *   separateStencilMaskRef       no: every stencil state is set for FRONT_AND_BACK
+ *   imageViewFormatSwizzle       no: every view uses the identity mapping
+ *   imageViewFormatReinterpretation no: views use their image's own format
+ *   samplerMipLodBias            no: mipLodBias stays 0
+ *   vertexAttributeAccessBeyondStride no: every attribute lies inside its stride
+ *   pointPolygons, tessellation*, events, multisampleArrayImage, imageView2DOn3DImage,
+ *   mutableComparisonSamplers, shaderSampleRateInterpolationFunctions: unused.
+ * So no feature is required today; `need` is where a future use of one goes. */
+static int vb_portability_check(void)
+{
+    VkPhysicalDevicePortabilitySubsetFeaturesKHR pf =
+        { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR };
+    VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+    struct { const char *name; VkBool32 have; int need; } t[15];
+    unsigned i, n = 0, missing = 0;
+    int refuse = 0;
+
+    if (!vkGetPhysicalDeviceFeatures2) {
+        fprintf(stderr, "[GPUVK] portability subset: features not queryable (no properties2)\n");
+        return 0;
+    }
+    f2.pNext = &pf;
+    vkGetPhysicalDeviceFeatures2(g.pd, &f2);
+#define VB_PF(field) t[n].name = #field; t[n].have = pf.field; t[n].need = 0; n++;
+    VB_PF(constantAlphaColorBlendFactors) VB_PF(events) VB_PF(imageViewFormatReinterpretation)
+    VB_PF(imageViewFormatSwizzle) VB_PF(imageView2DOn3DImage) VB_PF(multisampleArrayImage)
+    VB_PF(mutableComparisonSamplers) VB_PF(pointPolygons) VB_PF(samplerMipLodBias)
+    VB_PF(separateStencilMaskRef) VB_PF(shaderSampleRateInterpolationFunctions)
+    VB_PF(tessellationIsolines) VB_PF(tessellationPointMode) VB_PF(triangleFans)
+    VB_PF(vertexAttributeAccessBeyondStride)
+#undef VB_PF
+    for (i = 0; i < n; i++) {
+        if (t[i].have)
+            continue;
+        missing++;
+        fprintf(stderr, "[GPUVK] portability subset: %s = false%s\n", t[i].name,
+                t[i].need ? " (REQUIRED by the back end)" : "");
+        if (t[i].need)
+            refuse = 1;
+    }
+    fprintf(stderr, "[GPUVK] portability subset: enabled, %u of %u features missing\n", missing, n);
+    if (refuse)
+        fprintf(stderr, "[GPUVK] refusing this device: it lacks a portability feature the back end"
+                        " needs\n");
+    return refuse ? -1 : 0;
 }
 
 static int vb_create_device(void)
@@ -5218,9 +5421,20 @@ static int vb_create_device(void)
     VkDeviceQueueCreateInfo qi = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
     VkDeviceCreateInfo di = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
     VkFormatProperties fp;
+    const char *dev_ext[1];
+    uint32_t n_ext = 0;
     float prio = 1.0f;
     VkResult r;
 
+    /* A portability driver (MoltenVK) lists VK_KHR_portability_subset, and the spec requires
+     * enabling it then; its feature flags name what the device cannot do. */
+    if (vb_device_has_ext(g.pd, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
+        dev_ext[n_ext++] = VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME;
+        if (vb_portability_check() != 0)
+            return -1;
+    }
+    di.enabledExtensionCount = n_ext;
+    di.ppEnabledExtensionNames = n_ext ? dev_ext : NULL;
     vkGetPhysicalDeviceFeatures(g.pd, &have);
     memset(&on, 0, sizeof on);
     on.depthClamp = have.depthClamp;

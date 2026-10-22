@@ -19,6 +19,8 @@
 #   XBR_DXC            dxc executable (Vulkan SDK)
 #   XBR_SPIRV_VAL      spirv-val executable (Vulkan SDK)
 #   XBR_VK_SW_ICD      cache path of a software Vulkan ICD json (default empty)
+#   XBR_VK_TEST_DRIVER cache path of the ICD json the macOS MoltenVK test variants pin
+#                      (default: MoltenVK_icd.json under $VULKAN_SDK or the loader's prefix, when found)
 #
 #   xbr_add_spirv(<target> SOURCE <file.hlsl> ENTRY <fn> PROFILE <vs_6_0|ps_6_0|...>
 #                 [SYMBOL <name>] [INVERT_Y] [TARGET_ENV <vulkan1.1>]
@@ -26,6 +28,9 @@
 
 set(XBR_VK_SW_ICD "$ENV{XBR_VK_SW_ICD}" CACHE FILEPATH
     "Software Vulkan ICD manifest (e.g. lavapipe lvp_icd.x86_64.json); empty skips the software-ICD tests")
+
+set(XBR_VK_TEST_DRIVER "$ENV{XBR_VK_TEST_DRIVER}" CACHE FILEPATH
+    "ICD manifest the macOS MoltenVK test variants pin (default: the Vulkan SDK's MoltenVK_icd.json)")
 
 # ONE decision, recomputed from scratch: every input is found (or re-found) here,
 # and both entries below are FORCE-refreshed, so this configure's answer is this

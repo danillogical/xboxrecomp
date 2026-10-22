@@ -29,11 +29,14 @@
  *
  * RECOMP_VK_DEVICE=<substring> picks the device whose name contains it (case
  * insensitive, CPU devices included); otherwise the first discrete GPU, then
- * integrated, virtual and other, never a CPU device.
+ * integrated, virtual and other, never a CPU device. RECOMP_VK_DRIVER=<substring> does the
+ * same on the driver's name or info (VkPhysicalDeviceDriverProperties; e.g. MoltenVK or
+ * KosmicKrisp, which both call the device "Apple ..."); with both, a device must match both.
+ * Portability drivers (MoltenVK) are enumerated through VK_KHR_portability_enumeration.
  *
  * RECOMP_VK_PIPELINE_CACHE=<file> persists the driver's VkPipelineCache in that file (unset:
- * %LOCALAPPDATA%\xboxrecomp\vk-pipeline-cache-<vendorID>-<deviceID>.bin on Windows, off
- * elsewhere; `off` or `0` disables it). A missing, damaged or foreign file starts the run cold.
+ * %LOCALAPPDATA%\xboxrecomp\vk-pipeline-cache-<vendorID>-<deviceID>.bin on Windows,
+ * $XDG_CACHE_HOME (macOS: ~/Library/Caches, else ~/.cache) elsewhere; `off` or `0` disables it). A missing, damaged or foreign file starts the run cold.
  * It stores only the driver's own builds of the ahead-of-time shaders.
  *
  * The device it picks must have ONE queue family with both VK_QUEUE_GRAPHICS_BIT

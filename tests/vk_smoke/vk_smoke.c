@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#define VK_ENABLE_BETA_EXTENSIONS   /* VK_KHR_portability_subset's name lives in the beta header */
 #include <vulkan/vulkan.h>
 
 #include "xbr_smoke_tri_vs.spv.h"
@@ -64,6 +65,22 @@ int main(int argc, char **argv)
     app.apiVersion = VK_API_VERSION_1_1;
     VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     ici.pApplicationInfo = &app;
+    /* A portability driver (MoltenVK) is hidden by the loader unless the instance enables
+     * VK_KHR_portability_enumeration with its flag. */
+    const char *inst_ext[1];
+    uint32_t nie = 0;
+    uint32_t ninst = 0;
+    vkEnumerateInstanceExtensionProperties(NULL, &ninst, NULL);
+    VkExtensionProperties *iext = calloc(ninst ? ninst : 1, sizeof *iext);
+    if (iext && vkEnumerateInstanceExtensionProperties(NULL, &ninst, iext) == VK_SUCCESS)
+        for (uint32_t i = 0; i < ninst; i++)
+            if (!strcmp(iext[i].extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+                inst_ext[nie++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+                ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+            }
+    free(iext);
+    ici.enabledExtensionCount = nie;
+    ici.ppEnabledExtensionNames = nie ? inst_ext : NULL;
     VkInstance inst;
     VkResult ir = vkCreateInstance(&ici, NULL, &inst);
     if (ir != VK_SUCCESS) {
@@ -95,6 +112,24 @@ int main(int argc, char **argv)
     vkGetPhysicalDeviceProperties(pd, &props);
     printf("vk_smoke: using device: %s (type %d, api %u.%u.%u)\n", props.deviceName, (int)props.deviceType,
            VK_VERSION_MAJOR(props.apiVersion), VK_VERSION_MINOR(props.apiVersion), VK_VERSION_PATCH(props.apiVersion));
+    int drv_props = props.apiVersion >= VK_API_VERSION_1_2;   /* else VK_KHR_driver_properties */
+    if (!drv_props) {
+        uint32_t nx = 0;
+        vkEnumerateDeviceExtensionProperties(pd, NULL, &nx, NULL);
+        VkExtensionProperties *xp = calloc(nx ? nx : 1, sizeof *xp);
+        if (xp && vkEnumerateDeviceExtensionProperties(pd, NULL, &nx, xp) == VK_SUCCESS)
+            for (uint32_t i = 0; i < nx; i++)
+                if (!strcmp(xp[i].extensionName, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME))
+                    drv_props = 1;
+        free(xp);
+    }
+    if (drv_props) {
+        VkPhysicalDeviceDriverProperties dp = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+        VkPhysicalDeviceProperties2 p2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        p2.pNext = &dp;
+        vkGetPhysicalDeviceProperties2(pd, &p2);
+        printf("vk_smoke: driver: %s (%s)\n", dp.driverName, dp.driverInfo);
+    }
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(pd, &mp);
 
@@ -112,6 +147,18 @@ int main(int argc, char **argv)
     qci.queueFamilyIndex = (uint32_t)family; qci.queueCount = 1; qci.pQueuePriorities = &prio;
     VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
     dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
+    /* A device that lists VK_KHR_portability_subset must have it enabled. */
+    const char *dev_ext[1];
+    uint32_t nde = 0, ndev = 0;
+    vkEnumerateDeviceExtensionProperties(pd, NULL, &ndev, NULL);
+    VkExtensionProperties *dext = calloc(ndev ? ndev : 1, sizeof *dext);
+    if (dext && vkEnumerateDeviceExtensionProperties(pd, NULL, &ndev, dext) == VK_SUCCESS)
+        for (uint32_t i = 0; i < ndev; i++)
+            if (!strcmp(dext[i].extensionName, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME))
+                dev_ext[nde++] = VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME;
+    free(dext);
+    dci.enabledExtensionCount = nde;
+    dci.ppEnabledExtensionNames = nde ? dev_ext : NULL;
     VkDevice dev;
     CHECK(vkCreateDevice(pd, &dci, NULL, &dev));
     VkQueue queue;
