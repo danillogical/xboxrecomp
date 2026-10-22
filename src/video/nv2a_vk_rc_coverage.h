@@ -2,7 +2,7 @@
  * Diagnostic coverage of the Vulkan back end's rc pipeline refusals.
  *
  * `vb_rc_supported` in nv2a_vk_backend.c refuses a combiner batch whose texture
- * stage mode is > 5 (bump environment, dot product) or whose stage mode 3 uses
+ * stage mode is > 7 (the dot-product modes) or whose stage mode 3 uses
  * a true cube map; such a batch is drawn stage-0 style and counted in
  * `[GPUVK] ... rc_fallback`. This header records WHICH rule refused the batch
  * the first time, so a later step can size the work from the title's own state.
@@ -45,7 +45,7 @@
 #define NV2A_VK_RC_COVERAGE_MAGIC   0x43524B56u   /* 'VKRC' */
 #define NV2A_VK_RC_COVERAGE_VERSION 1u
 
-/* first_reason: 1 = stage mode > 5, 2 = stage mode 3 with a cube texture.
+/* first_reason: 1 = stage mode > 7, 2 = stage mode 3 with a cube texture.
  * first_stage_program is the raw SET_SHADER_STAGE_PROGRAM value. cube_mask has
  * one bit per texture stage (bit 0 = stage 0) for the stages that carried a
  * cube texture in that batch. */
@@ -54,10 +54,11 @@ typedef struct {
     uint32_t version;    /* NV2A_VK_RC_COVERAGE_VERSION */
     uint32_t size;       /* sizeof(Nv2aVkRcCoverage) */
     uint64_t total;      /* == the back end's aggregate rc_fallback */
-    uint64_t mode_gt5;
+    uint64_t mode_gt5;   /* stage modes 8..31; the name is kept for ABI/report
+                          * stability although the threshold is now 7 */
     uint64_t cube_mode3;
     uint32_t first_valid;          /* written LAST */
-    uint32_t first_reason;         /* 1 mode > 5, 2 cube-mode 3 */
+    uint32_t first_reason;         /* 1 mode 8..31, 2 cube-mode 3 */
     uint32_t first_stage;
     uint32_t first_mode;
     uint32_t first_stage_program;  /* raw */
@@ -87,9 +88,9 @@ static inline int nv2a_vk_rc_coverage_enabled(void)
 /* The SINGLE rule the back end and its fixtures share: can the register-combiner
  * pipeline draw `stage_program` with the given cube-texture mask?
  *
- * Returns 0 when every stage is supported, 1 for a stage mode > 5, 2 for stage
+ * Returns 0 when every stage is supported, 1 for a stage mode > 7, 2 for stage
  * mode 3 with a cube texture. Stages are scanned 0..3, and for each stage the
- * mode > 5 test comes before the cube test, exactly as vb_rc_supported did. Only
+ * mode > 7 test comes before the cube test, exactly as vb_rc_supported did. Only
  * bits 0..19 can decide a 5-bit mode, so the caller need not mask the word.
  * On a refusal *stage / *mode name the refusing stage (either may be NULL); on a
  * supported result both are set to 0. */
@@ -105,9 +106,10 @@ static inline uint32_t nv2a_vk_rc_refusal(uint32_t stage_program, uint32_t cube_
     for (st = 0; st < 4; st++) {
         uint32_t m = (stage_program >> (st * 5)) & 0x1Fu;
 
-        /* Per stage the mode > 5 test comes first: a bump-environment mode is
-         * refused as such even if the same stage also has a cube texture. */
-        if (m > 5) {
+        /* Per stage the mode > 7 test comes first: an unimplemented
+         * dot-product mode is refused as such even if the same stage also has
+         * a cube texture. */
+        if (m > 7) {
             if (stage)
                 *stage = st;
             if (mode)

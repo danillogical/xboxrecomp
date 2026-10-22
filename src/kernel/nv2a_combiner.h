@@ -27,6 +27,21 @@ typedef struct {
     uint32_t final_c0, final_c1;            /* SET_SPECULAR_FOG_FACTOR */
     uint32_t control;                       /* SET_COMBINER_CONTROL */
     uint32_t stage_program;                 /* SET_SHADER_STAGE_PROGRAM */
+    /* Bump environment: what stage modes 6 (BUMPENVMAP) and 7
+     * (BUMPENVMAP_LUM) read. The matrix is stored canonically as
+     * [m00, m01, m10, m11] per stage even though the method stream carries it
+     * swizzled; see nv2a_pb_exec.c. Stage 0's words are discarded on the way
+     * in (xemu pgraph.c), so its row keeps the documented D3D default 0.0 --
+     * which is why a stage-0 mode 7 multiplies its texel by 0. */
+    float bump_mat[4][4];               /* SET_TEXTURE_SET_BUMP_ENV_MAT
+                                         * 0x1B28 + 4*i, i = 0..3; +0x40*stage */
+    float bump_scale[4];                /* SET_TEXTURE_SET_BUMP_ENV_SCALE
+                                         * 0x1B38; +0x40*stage */
+    float bump_offset[4];               /* SET_TEXTURE_SET_BUMP_ENV_OFFSET
+                                         * 0x1B3C; +0x40*stage */
+    uint32_t other_stage_input;         /* SET_SHADER_OTHER_STAGE_INPUT 0x1E78:
+                                         * bits 16-19 stage 2's delta source,
+                                         * bits 20-23 stage 3's */
 } Nv2aCombiner;
 
 /* One pixel. Colours are r,g,b,a in [0,1]; `fog` is (fog colour, factor).

@@ -28,7 +28,7 @@
  *     register combiners (shaders/nv2a_vk_rc.hlsl): one uber shader that interprets the
  *     batch's Nv2aCombiner, uploaded per draw to a stream-backed dynamic uniform buffer,
  *     as nv2a_rc_eval does. A batch whose texture stages it cannot interpret (gb_rc_key's
- *     rule: modes > 5, true cube maps) is drawn the stage-0 way and counted as
+ *     rule: modes > 7, true cube maps) is drawn the stage-0 way and counted as
  *     rc_fallback.
  *   - Vertex programs (draw_program, plan V5): a program batch is looked up in an
  *     ahead-of-time corpus (nv2a_vsh_aot.h) by hash, its identity re-checked against
@@ -479,13 +479,21 @@ typedef struct {
     float    ts[4][4];                  /* 432: per texture stage: scale x,y; z 1 if bound; w 0 */
     uint32_t ctl[4];                    /* 496: stages, flags, stage_program, clip_plane_mode */
     uint32_t fin[4];                    /* 512: final0, final1, 0, 0 */
-} VbRcConstants;                        /* 528 */
-typedef char vb_rc_constants_528[sizeof(VbRcConstants) == 528 ? 1 : -1];
+    float    bumpmat[4][4];             /* 528: per stage m00, m01, m10, m11 */
+    float    bumpscl[4];                /* 592: BUMPENVLSCALE per stage */
+    float    bumpofs[4];                /* 608: BUMPENVLOFFSET per stage */
+    uint32_t misc[4];                   /* 624: x = SET_SHADER_OTHER_STAGE_INPUT, rest 0 */
+} VbRcConstants;                        /* 640 */
+typedef char vb_rc_constants_640[sizeof(VbRcConstants) == 640 ? 1 : -1];
 /* The corpus shaders' second cbuffer (binding 10); its HLSL is float4 g_xf, float4 g_fog. */
 typedef char vb_vsh_xf_is_32_bytes[sizeof(Nv2aVshHlslXf) == 32 ? 1 : -1];
 typedef char vb_rc_ts_at_432[offsetof(VbRcConstants, ts) == 432 ? 1 : -1];
 typedef char vb_rc_ctl_at_496[offsetof(VbRcConstants, ctl) == 496 ? 1 : -1];
 typedef char vb_rc_fin_at_512[offsetof(VbRcConstants, fin) == 512 ? 1 : -1];
+typedef char vb_rc_bumpmat_at_528[offsetof(VbRcConstants, bumpmat) == 528 ? 1 : -1];
+typedef char vb_rc_bumpscl_at_592[offsetof(VbRcConstants, bumpscl) == 592 ? 1 : -1];
+typedef char vb_rc_bumpofs_at_608[offsetof(VbRcConstants, bumpofs) == 608 ? 1 : -1];
+typedef char vb_rc_misc_at_624[offsetof(VbRcConstants, misc) == 624 ? 1 : -1];
 
 typedef struct {
     VkImage img;
@@ -4348,8 +4356,8 @@ static uint32_t vb_cube_mask(const Nv2aBatch *b)
     return mask;
 }
 
-/* Can the combiner pipeline draw this batch? gb_rc_key's rule: bump-environment and
- * dot-product stage modes (> 5) and true cube maps are not interpreted. The rule
+/* Can the combiner pipeline draw this batch? gb_rc_key's rule: the unimplemented
+ * dot-product stage modes (> 7) and true cube maps are not interpreted. The rule
  * itself lives in nv2a_vk_rc_coverage.h so a fixture and this back end share one
  * definition; behavior here is unchanged. */
 static int vb_rc_supported(const Nv2aBatch *b)
@@ -4386,12 +4394,23 @@ static void vb_rc_prepare(VbDraw *dr, const Nv2aBatch *b)
     k->ctl[3] = b->clip_plane_mode & 0xFFFF;
     k->fin[0] = rc->final0;
     k->fin[1] = rc->final1;
+    for (i = 0; i < 4; i++) {
+        k->bumpmat[i][0] = rc->bump_mat[i][0];      /* m00 */
+        k->bumpmat[i][1] = rc->bump_mat[i][1];      /* m01 */
+        k->bumpmat[i][2] = rc->bump_mat[i][2];      /* m10 */
+        k->bumpmat[i][3] = rc->bump_mat[i][3];      /* m11 */
+        k->bumpscl[i] = rc->bump_scale[i];
+        k->bumpofs[i] = rc->bump_offset[i];
+    }
+    k->misc[0] = rc->other_stage_input;
+    k->misc[1] = k->misc[2] = k->misc[3] = 0;
     for (st = 0; st < 4; st++) {
         const Nv2aTexture *tx = b->textures[st];
         uint32_t m = (prog >> (st * 5)) & 0x1F;
         float iw = 1.0f, ih = 1.0f;
         k->ts[st][0] = k->ts[st][1] = 1.0f;
-        if (!tx || m < 1 || m > 3)
+        /* Modes 6/7 sample a texture of their own, so they bind like 1..3. */
+        if (!tx || m < 1 || m > 7)
             continue;
         dr->views[st] = vb_texture(tx, dr->t, &dr->view_layouts[st], &iw, &ih);
         dr->samps[st] = vb_sampler(tx);

@@ -249,6 +249,17 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_TEXTURE_ADDRESS         0x1B08
 #define NV097_SET_TEXTURE_CONTROL1        0x1B10
 #define NV097_SET_TEXTURE_IMAGE_RECT      0x1B1C
+/* Bump environment, the registers D3D's D3DTSS_BUMPENVMAT00/01/10/11,
+ * BUMPENVLSCALE and BUMPENVLOFFSET compile to. Stage i's copies are
+ * 0x1B28/0x1B38/0x1B3C + 0x40*i. Stage 0's do not exist: xemu's
+ * SET_TEXTURE_SET_BUMP_ENV_* handlers discard the first stage's slot
+ * (pgraph.c), so writes there leave the D3D defaults 0.0 in place. */
+#define NV097_SET_TEXTURE_SET_BUMP_ENV_MAT    0x1B28   /* 4 dwords, swizzled */
+#define NV097_SET_TEXTURE_SET_BUMP_ENV_SCALE  0x1B38
+#define NV097_SET_TEXTURE_SET_BUMP_ENV_OFFSET 0x1B3C
+/* Which stage's texel a bump/dot-product stage reads its delta from:
+ * bits 16-19 stage 2, bits 20-23 stage 3 (xemu psh.c input_tex). */
+#define NV097_SET_SHADER_OTHER_STAGE_INPUT    0x1E78
 /* The buffer flip. A title double-buffers by telling the GPU which buffer
  * the CRTC reads and which it draws into, advancing the write index and
  * then stalling until the flip has happened. Ignoring these means the
@@ -3102,9 +3113,40 @@ static void rc_texel(const Texture *t, uint32_t face, float u, float v,
         out[0] = out[1] = out[2] = out[3] = 1.0f;
 }
 
+/* A UNORM channel read as a signed 8-bit bump delta, xemu psh.c sign3:
+ *   x *= 255; return x >= 128 ? (x - 256)/127 : x/127;
+ * Applied to the texel's decoded float, so the sign comes from the byte the
+ * bump map stores (bump-map-pixel-formats.md: DU/DV are signed -1..+1). */
+static float rc_sign3(float x)
+{
+    x *= 255.0f;
+    return x >= 128.0f ? (x - 256.0f) / 127.0f : x / 127.0f;
+}
+
+/* Which EARLIER stage's texel a bump stage takes its delta from, or -1.
+ * xemu psh.c input_tex: stage 1 reads stage 0, stages 2 and 3 read the nibble
+ * SET_SHADER_OTHER_STAGE_INPUT carries for them (bits 16-19, 20-23), and stage
+ * 0 has no source. A nibble naming a stage that is not before this one means
+ * "no source" rather than an out-of-order read, so no index can go out of
+ * bounds and no undefined state is read. */
+static int rc_bump_source(int st)
+{
+    uint32_t src;
+
+    if (st < 1)
+        return -1;
+    if (st == 1)
+        return 0;
+    src = (s_gpu.rc.other_stage_input >> (st == 2 ? 16 : 20)) & 0xFu;
+    return src < (uint32_t)st ? (int)src : -1;
+}
+
 /* What texture stage `st` contributes, by its SHADER_STAGE_PROGRAM mode
- * (xemu psh.c). Returns 0 when a clip-plane stage kills the pixel. */
-static int rc_stage_fetch(int st, const float c[4], float out[4])
+ * (xemu psh.c). `tprev` is every stage's result, filled in ascending order, so
+ * a bump stage can read an earlier stage's texel. Returns 0 when a clip-plane
+ * stage kills the pixel. */
+static int rc_stage_fetch(int st, const float c[4], const float tprev[4][4],
+                          float out[4])
 {
     const Texture *t = &s_gpu.texs[st];
     uint32_t mode = (s_gpu.rc.stage_program >> (st * 5)) & 0x1F, j;
@@ -3150,9 +3192,46 @@ static int rc_stage_fetch(int st, const float c[4], float out[4])
                 return 0;
         }
         return 1;
+    case 6: case 7: {                             /* BUMPENVMAP / _LUM */
+        /* xemu psh.c: du/dv are the source texel's blue and green read as
+         * signed 8-bit, transformed by the stage's 2x2 matrix. GLSL's mat2 is
+         * column-major, so `m * d` is
+         *   x = m00*du + m10*dv,  y = m01*du + m11*dv,
+         * which is what the canonical [m00, m01, m10, m11] row expresses.
+         * The deltas move the coordinate this stage would otherwise sample
+         * (modes 1/2), so they are added after the perspective divide. */
+        const float *m = s_gpu.rc.bump_mat[st];
+        int src = rc_bump_source(st);
+        /* No source: the delta source is the NONE texel (0,0,0,1), the same
+         * value an absent stage's result holds, so du/dv are 0 and L is 0.
+         * Stage 0's bump registers do not exist on the hardware (xemu pgraph.c
+         * discards them), so m is the D3D default 0.0 there and the stage
+         * samples unperturbed; for mode 7 the default scale and offset are
+         * also 0.0, so its texel is multiplied by 0. That is a discarded
+         * register, not a chosen default. */
+        float du = 0.0f, dv = 0.0f, dsdt[2], lum = 0.0f;
+
+        if (src >= 0) {
+            du = rc_sign3(tprev[src][2]);             /* blue */
+            dv = rc_sign3(tprev[src][1]);             /* green */
+            if (mode == 7)                            /* red is unsigned */
+                lum = tprev[src][0];
+        }
+        dsdt[0] = m[0] * du + m[2] * dv;
+        dsdt[1] = m[1] * du + m[3] * dv;
+        /* A cube texture follows modes 1/2/4: the 2D face-0 projection. */
+        rc_texel(t, 0, c[0] / q + dsdt[0], c[1] / q + dsdt[1], out);
+        if (mode == 7) {
+            float k = s_gpu.rc.bump_scale[st] * lum + s_gpu.rc.bump_offset[st];
+            for (j = 0; j < 4; j++)
+                out[j] *= k;                          /* every channel, xemu */
+        }
+        return 1;
+    }
     default:
-        /* ponytail: bump-env and dot-product modes read zero; they are water
-         * and bump effects -- add them when a title's look depends on one. */
+        /* ponytail: the dot-product modes (8..31) read zero; they are specular
+         * and reflection effects -- add them when a title's look depends on
+         * one. */
         out[0] = out[1] = out[2] = out[3] = 0.0f;
         return 1;
     }
@@ -3256,16 +3335,23 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
                             d1[k] = l0 * va->d1[k] + l1 * vb->d1[k] + l2 * vc->d1[k];
                         fog[0] = T->fogc[0]; fog[1] = T->fogc[1]; fog[2] = T->fogc[2];
                         fog[3] = l0 * T->vfog[0] + l1 * T->vfog[1] + l2 * T->vfog[2];
+                        /* Every stage's result starts at the NONE value, so a
+                         * bump stage reading an earlier stage that produced
+                         * nothing sees (0,0,0,1) rather than stale bytes. The
+                         * loop fills them in ascending order, which is what
+                         * makes an earlier stage's texel available to a later
+                         * bump stage. */
+                        for (st = 0; st < 4; st++) {
+                            t[st][0] = t[st][1] = t[st][2] = 0.0f;
+                            t[st][3] = 1.0f;
+                        }
                         for (st = 0; st < 4 && keep; st++) {
-                            if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F)) {
-                                t[st][0] = t[st][1] = t[st][2] = 0.0f;
-                                t[st][3] = 1.0f;
+                            if (!((s_gpu.rc.stage_program >> (st * 5)) & 0x1F))
                                 continue;
-                            }
                             for (j = 0; j < 4; j++)
                                 tc[j] = (l0 * T->stc[0][st][j] + l1 * T->stc[1][st][j]
                                        + l2 * T->stc[2][st][j]) / pw;
-                            keep = rc_stage_fetch(st, tc, t[st]);
+                            keep = rc_stage_fetch(st, tc, t, t[st]);
                         }
                         if (!keep)
                             continue;
@@ -5192,6 +5278,29 @@ static void tex_stage_method(uint32_t method, uint32_t param)
     case 0x1B14:                                  /* SET_TEXTURE_FILTER */
         t->filter = param;
         break;
+    case NV097_SET_TEXTURE_SET_BUMP_ENV_MAT + 0x00:
+    case NV097_SET_TEXTURE_SET_BUMP_ENV_MAT + 0x04:
+    case NV097_SET_TEXTURE_SET_BUMP_ENV_MAT + 0x08:
+    case NV097_SET_TEXTURE_SET_BUMP_ENV_MAT + 0x0C: {
+        /* The four words arrive swizzled: xemu's handler writes
+         * method 0x1B28+4i to BUMPMAT00/01/11/10 in that order
+         * (pgraph.c), so i = 0,1,2,3 carries m00, m01, m11, m10. Stored
+         * canonically as [m00, m01, m10, m11]. Stage 0's slot is
+         * discarded on hardware and here, leaving the D3D default 0.0. */
+        static const int slot_of[4] = { 0, 1, 3, 2 };
+        int i = (int)(reg - NV097_SET_TEXTURE_SET_BUMP_ENV_MAT) / 4;
+        if (stage != 0)
+            memcpy(&s_gpu.rc.bump_mat[stage][slot_of[i]], &param, 4);
+        break;
+    }
+    case NV097_SET_TEXTURE_SET_BUMP_ENV_SCALE:
+        if (stage != 0)                           /* stage 0 discarded */
+            memcpy(&s_gpu.rc.bump_scale[stage], &param, 4);
+        break;
+    case NV097_SET_TEXTURE_SET_BUMP_ENV_OFFSET:
+        if (stage != 0)                           /* stage 0 discarded */
+            memcpy(&s_gpu.rc.bump_offset[stage], &param, 4);
+        break;
     case NV097_SET_TEXTURE_CONTROL0:
         /* Stage 0's enable bit gates its sampling (tex_update_valid).
          * Default 1 so a title that never writes CONTROL0 keeps the
@@ -5372,6 +5481,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         s_gpu.rc_seen = 1;
         break;
     case 0x1E70: s_gpu.rc.stage_program = param; break;
+    case 0x1E78:                                  /* SET_SHADER_OTHER_STAGE_INPUT */
+        /* Which stage's texel a bump stage reads its delta from: bits 16-19
+         * name stage 2's source, bits 20-23 stage 3's (xemu psh.c input_tex).
+         * Stage 1 always reads stage 0 and stage 0 has no source. */
+        s_gpu.rc.other_stage_input = param;
+        break;
     case 0x17F8: s_gpu.clip_plane_mode = param; break;
 
     /* Alpha test and fog. */
