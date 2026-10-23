@@ -4409,8 +4409,10 @@ static void vb_rc_prepare(VbDraw *dr, const Nv2aBatch *b)
         uint32_t m = (prog >> (st * 5)) & 0x1F;
         float iw = 1.0f, ih = 1.0f;
         k->ts[st][0] = k->ts[st][1] = 1.0f;
-        /* Modes 6/7 sample a texture of their own, so they bind like 1..3. */
-        if (!tx || m < 1 || m > 7)
+        /* Modes 1..3 and 6/7 sample a texture of their own. Modes 4 (PASSTHRU) and
+         * 5 (CLIPPLANE) do not sample an image at all, so they must not upload
+         * or bind one. */
+        if (!tx || !(m == 1 || m == 2 || m == 3 || m == 6 || m == 7))
             continue;
         dr->views[st] = vb_texture(tx, dr->t, &dr->view_layouts[st], &iw, &ih);
         dr->samps[st] = vb_sampler(tx);

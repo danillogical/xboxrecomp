@@ -3198,8 +3198,10 @@ static int rc_stage_fetch(int st, const float c[4], const float tprev[4][4],
          * column-major, so `m * d` is
          *   x = m00*du + m10*dv,  y = m01*du + m11*dv,
          * which is what the canonical [m00, m01, m10, m11] row expresses.
-         * The deltas move the coordinate this stage would otherwise sample
-         * (modes 1/2), so they are added after the perspective divide. */
+         * The deltas are added to the stage's own incoming 2D coordinate: this
+         * mode does NOT apply PROJECT2D's texture-q division. The reference's
+         * bump paths sample pT.xy + dsdt directly, while only its PROJECT2D
+         * path projects. */
         const float *m = s_gpu.rc.bump_mat[st];
         int src = rc_bump_source(st);
         /* No source: the delta source is the NONE texel (0,0,0,1), the same
@@ -3220,7 +3222,7 @@ static int rc_stage_fetch(int st, const float c[4], const float tprev[4][4],
         dsdt[0] = m[0] * du + m[2] * dv;
         dsdt[1] = m[1] * du + m[3] * dv;
         /* A cube texture follows modes 1/2/4: the 2D face-0 projection. */
-        rc_texel(t, 0, c[0] / q + dsdt[0], c[1] / q + dsdt[1], out);
+        rc_texel(t, 0, c[0] + dsdt[0], c[1] + dsdt[1], out);
         if (mode == 7) {
             float k = s_gpu.rc.bump_scale[st] * lum + s_gpu.rc.bump_offset[st];
             for (j = 0; j < 4; j++)

@@ -181,11 +181,12 @@ float4 fetch(uint st, Texture2D tx, SamplerState sm, float4 t, float4 earlier[4]
         }
         dsdt.x = bm.x * du + bm.z * dv;
         dsdt.y = bm.y * du + bm.w * dv;
-        // The deltas move the coordinate this stage would otherwise sample (modes 1/2), so they are
-        // added after the perspective divide. A cube texture follows modes 1/2/4: face-0 projection.
-        float q = t.w != 0.0 ? t.w : 1.0;
+        // The deltas are added to the stage's own incoming 2D coordinate: this mode does NOT apply
+        // PROJECT2D's texture-q division. The reference's bump paths sample pT.xy + dsdt directly,
+        // while only its PROJECT2D path projects. A cube texture follows modes 1/2/4: face-0
+        // projection.
         float4 s = ts.z > 0.5
-                 ? tx.SampleLevel(sm, float2(t.x / q + dsdt.x, t.y / q + dsdt.y) * ts.xy, 0)
+                 ? tx.SampleLevel(sm, float2(t.x + dsdt.x, t.y + dsdt.y) * ts.xy, 0)
                  : float4(1, 1, 1, 1);
         if (m == 7)
             s *= rc.bumpscl[st] * lum + rc.bumpofs[st];   // every channel, as xemu
