@@ -102,6 +102,14 @@ LGPL-2.1-or-later — extracted from xemu
     src/apu/fpconv.h      (c) 2020-2025 Matt Borgerson
     src/nv2a/nv2a_regs.h  NV2A register definitions
                           (c) 2012 espes; 2015 Jannik Vogel
+    src/nv2a/nv2a_core.c  NV2A core register handlers, adapted
+                          (c) 2012 espes; 2015 Jannik Vogel;
+                          2018-2025 Matt Borgerson
+    src/nv2a/nv2a_state.h NV2A device state, adapted from nv2a_int.h
+                          (c) 2012 espes; 2015 Jannik Vogel;
+                          2018-2025 Matt Borgerson
+    src/apu/apu.h         MCPX APU public API
+                          (header has no copyright line)
 
   Also under LGPL-2.1-or-later, added by A4b1 from the same pin: the **DMA layer
   and the GP/EP device model**, which xemu licenses more permissively than the

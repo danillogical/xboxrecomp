@@ -515,6 +515,9 @@ VOID __stdcall xbox_RtlEnterCriticalSection(PRTL_CRITICAL_SECTION CriticalSectio
         fflush(stderr);
     }
 #endif
+    /* Contended: the holder is a guest thread that needs the CPU to leave
+     * it (RECOMP_GUEST_LOCK), so tell the waiters the CPU is free now. */
+    xbox_GuestCpuBlocked();
     EnterCriticalSection(cs);
     xbox_cs_note_owner(cs);
     recomp_diag_record(6, (uint32_t)((uintptr_t)CriticalSection - g_xbox_mem_offset), g_xbox_kernel_caller, 0);

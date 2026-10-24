@@ -53,8 +53,10 @@ def test_every_guest_call_is_bracketed():
 
 def test_kernel_dispatch_leaves_and_restores():
     src = "\n".join(_lines(SITES[0]))
-    m = re.search(r"static void kernel_thunk_dispatch\(void\)\n\{.*?\n\}", src, re.S)
-    assert m, "could not locate kernel_thunk_dispatch"
+    # The meter is in the body; kernel_thunk_dispatch wraps it for the guest
+    # CPU lock (kernel_guest_cpu.c).
+    m = re.search(r"static void kernel_thunk_dispatch_body\(void\)\n\{.*?\n\}", src, re.S)
+    assert m, "could not locate kernel_thunk_dispatch_body"
     body = m.group(0)
     returns = body.count("return;")
     restores = body.count("xbox_GuestMeterRestore(gm, XBOX_GM_KERNEL);")

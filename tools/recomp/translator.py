@@ -215,14 +215,17 @@ def flag_gaps(lifter):
                   for (addr, form), (func, setter) in lifter.flag_gaps.items())
 
 
-def _stub_definition(name: str, addr: int, popped: int) -> str:
+def _stub_definition(name: str, addr: int, popped: int, hit: bool = False) -> str:
     """One unresolved-target stub: report, then return as a `ret popped` would.
 
     The report is recomp_icall_fail_log, which a project implements; it is
-    the stub's only sign that it ran, and a project can make it fatal.
+    the stub's only sign that it ran, and a project can make it fatal. hit
+    puts upstream's RECOMP_STUB_LOG one-shot line (RECOMP_STUB_HIT, defined
+    in the stub file) before it, so the line is out before a fatal report.
     """
     note = f"ret {popped}" if popped else "not detected"
-    return (f"void {name}(void) {{ recomp_icall_fail_log(0x{addr:08X}u); "
+    log = f"RECOMP_STUB_HIT(0x{addr:08X}u); " if hit else ""
+    return (f"void {name}(void) {{ {log}recomp_icall_fail_log(0x{addr:08X}u); "
             f"g_esp += {4 + popped}; /* 0x{addr:08X}: {note} */ }}")
 
 
@@ -501,30 +504,6 @@ _FLAG_WRITERS = frozenset({
 })
 
 
-_GOTO_TARGET = re.compile(r"goto loc_([0-9A-F]{8});")
-
-
-def _mark_back_edges(stmts, func_start, jump_address):
-    """Put RECOMP_BACKEDGE() before each goto that jumps back in the function.
-
-    A block ends at its jump, so a goto from it to an address at or before
-    that jump, and not before the function, is a loop back-edge. Serial
-    guest mode lets one host thread run guest code at a time; a guest loop
-    that spins without calling the kernel would hold the lock until a
-    waiter's bounded wait ran out, and the back-edge is where it can offer
-    the lock instead. Switch-table dispatch lines are left alone. The hook
-    only reads a flag when serial mode is off (templates/runtime/recomp_types.h).
-    """
-    out = []
-    for stmt in stmts:
-        if not stmt.startswith("if (_jt =="):
-            targets = [int(t, 16) for t in _GOTO_TARGET.findall(stmt)]
-            if any(func_start <= t <= jump_address for t in targets):
-                out.append("RECOMP_BACKEDGE();")
-        out.append(stmt)
-    return out
-
-
 def load_label_db(labels_json_path):
     """addr -> name from labels.json, for naming call targets and functions.
 
@@ -544,6 +523,37 @@ def load_label_db(labels_json_path):
                 continue
             label_db[int(lbl["address"], 16)] = lbl["name"]
     return label_db
+
+_BACK_EDGE_GOTO_RE = re.compile(r"goto loc_([0-9A-Fa-f]{8});")
+
+
+def _mark_back_edges(bb, stmts):
+    """The block's statements with every jump back to the block's start or
+    earlier -- a loop's back edge -- calling RECOMP_BACK_EDGE first, the guest
+    CPU's quantum check (templates/runtime/recomp_types.h): with the lock on,
+    a thread that has run its quantum with another waiting hands over there,
+    as the console's timer tick preempted it; otherwise it is one relaxed
+    load and a branch not taken. Blocks have one entry, so a target at or
+    before the block's start is the only backward target a jump at its end
+    can have."""
+    va = bb.instructions[-1].address if bb.instructions else bb.start
+
+    def mark(m):
+        target = int(m.group(1), 16)
+        if target > bb.start:
+            return m.group(0)
+        return "{ RECOMP_BACK_EDGE(0x%08Xu); goto loc_%08X; }" % (va, target)
+
+    out = None
+    for i, stmt in enumerate(stmts):
+        if "goto loc_" not in stmt:
+            continue
+        new = _BACK_EDGE_GOTO_RE.sub(mark, stmt)
+        if new != stmt:
+            if out is None:
+                out = list(stmts)
+            out[i] = new
+    return stmts if out is None else out
 
 
 class FunctionTranslator:
@@ -565,9 +575,8 @@ class FunctionTranslator:
                  backedge_yield=False):
         """
         xbe_data: bytes - raw XBE file contents
-        backedge_yield: emit RECOMP_BACKEDGE() before every jump back to an
-                     earlier address in the function (serial guest mode's
-                     preemption point; see _mark_back_edges)
+        backedge_yield: the fork's spelling of back_edge_yield (RECOMP_BACK_EDGE
+                     at every loop back edge; see _mark_back_edges)
         icall_sites: dict - call-site VA -> [target VAs] a recorded run saw
                      that site reach (tools.recomp.icall_feedback merge)
         func_db: dict - addr → function info from functions.json
@@ -584,7 +593,6 @@ class FunctionTranslator:
         self.abi_db = abi_db or {}
         self.trace_functions = set(trace_functions or ())
         self.force_returns = dict(force_returns or {})
-        self.backedge_yield = bool(backedge_yield)
         self.disasm = Disassembler()
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
                              xbe_data=xbe_data, seh_prolog=seh_prolog,
@@ -600,6 +608,16 @@ class FunctionTranslator:
         self._weak_function_starts = set()
         self._reach_memo = {}
         self._ownership_ready = False
+        # (start, end) bodies already reported as ending past their code
+        # section's readable bytes, so each is named once.
+        self._unreadable_reported = set()
+        # (end, last instruction) of cut bodies already warned about: the
+        # tail_jump_aliases that share a cut parent's end would repeat it.
+        self._teardown_reported = set()
+        # The guest CPU's quantum check at every loop back edge
+        # (RECOMP_BACK_EDGE), with --back-edge-yield or the fork's
+        # --backedge-yield; off, edges stay bare.
+        self.back_edge_yield = bool(backedge_yield)
 
     def discover_static_indirect_targets(self, *, coalescing=False):
         """Recover callbacks and the gap entries their bodies reference."""
@@ -776,7 +794,9 @@ class FunctionTranslator:
                          if s.va <= target < s.va + s.va_size), None)
             if home is None:
                 continue
-            bound = home.va + min(home.va_size, home.raw_size)
+            # readable_end: a callback whose last instruction crosses the
+            # raw end into the loader's zero fill keeps that instruction.
+            bound = min(home.va + home.va_size, _config.readable_end(home))
             if next_start is not None:
                 bound = min(bound, next_start)
             if bound <= target:
@@ -1042,7 +1062,7 @@ class FunctionTranslator:
         sections = [section for section in _config._SECTIONS
                     if section.is_code and section.va <= target
                     and end <= section.va + section.va_size
-                    and end <= section.va + section.raw_size]
+                    and end <= _config.readable_end(section)]
         if not sections:
             reject("extent is not backed by one code section")
 
@@ -1079,7 +1099,7 @@ class FunctionTranslator:
         # checks below still fail closed if decoded code reaches past ``end``.
         current_starts = sorted(self.func_db)
         next_index = bisect.bisect_left(current_starts, end)
-        analysis_end = min(sections[0].va + sections[0].raw_size,
+        analysis_end = min(_config.readable_end(sections[0]),
                            sections[0].va + sections[0].va_size)
         if next_index < len(current_starts):
             analysis_end = min(analysis_end, current_starts[next_index])
@@ -1586,6 +1606,11 @@ class FunctionTranslator:
         if following >= len(bounds) or bounds[following] <= end:
             return None
         upper = bounds[following]
+        # The next start can be in the next section (Spartan's last D3D
+        # function before D3DX); the arms and tables never are.
+        section = _config.section_at(start)
+        if section is not None and section.is_code:
+            upper = min(upper, _config.readable_end(section))
         raw_bytes = self._read_func_bytes(start, end)
         if not raw_bytes or not any(
                 insn.mnemonic == "jmp" and insn.jump_target is None
@@ -1797,6 +1822,36 @@ class FunctionTranslator:
                     return 0
         return 0
 
+    def _stub_epilogue(self, addr, max_insns=8):
+        """The registers popped, then the `ret N` immediate, when the code at
+        `addr` is nothing but a function epilogue (`pop r32`* then `ret`).
+
+        Such an address is a branch target into another function's shared
+        exit -- `jne <epilogue>` from a switch arm that was split off as its
+        own function. A stub that only moves esp leaves every popped
+        callee-saved register holding the jumper's value, so its caller
+        carries on with the wrong esi/edi/ebx; SSX 3's Options menu crashed
+        that way. Returns None for anything else.
+        """
+        offset = va_to_file_offset(addr)
+        if offset is None or not self.xbe_data:
+            return None
+        window = self.xbe_data[offset:offset + max_insns * 3]
+        regs = []
+        try:
+            for insn in self.disasm._cs.disasm(window, addr):
+                mnemonic = insn.mnemonic.lower()
+                if mnemonic == "pop" and insn.op_str in (
+                        "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp"):
+                    regs.append(insn.op_str)
+                    continue
+                if mnemonic in ("ret", "retn"):
+                    return regs, (int(insn.op_str, 0) if insn.op_str else 0)
+                return None
+        except Exception:
+            return None
+        return None
+
     def _read_local_jump_table(self, table_va, lower, upper,
                                max_entries=256, min_entry_va=None):
         """Read the contiguous pointer cluster around an indexed-jump base."""
@@ -1830,10 +1885,35 @@ class FunctionTranslator:
         return backward + forward
 
     def _read_func_bytes(self, start_va, end_va):
-        """Read raw bytes for a function from the XBE."""
+        """Read raw bytes for a function from the XBE.
+
+        Past raw_size the loader zero-fills every section, and the file bytes
+        there belong to whatever follows the section on disk, so the read is
+        zero-filled; the disassembler decodes the same zeros (a FORCE_DATA
+        *Xlate section is flagged executable and gets the fill too). A code
+        section is readable for one instruction past raw_size
+        (config.readable_end); a body ending further comes from a bad seed
+        or coalesce request, not from the detector, so it is refused.
+        """
         offset = va_to_file_offset(start_va)
         if offset is None:
             return None
+        section = _config.section_at(start_va)
+        raw_end = section.va + section.raw_size if section else end_va
+        if section is not None and end_va > raw_end:
+            readable = _config.readable_end(section)
+            if section.is_code and end_va > readable:
+                key = (start_va, end_va)
+                if key not in self._unreadable_reported:
+                    self._unreadable_reported.add(key)
+                    print(f"  WARN: sub_{start_va:08X} ends at 0x{end_va:08X}, "
+                          f"past {section.name}'s readable end "
+                          f"0x{readable:08X}; not read", file=sys.stderr)
+                return None
+            file_end = section.raw_addr + section.raw_size
+            if file_end > len(self.xbe_data):
+                return None
+            return self.xbe_data[offset:file_end] + bytes(end_va - raw_end)
         size = end_va - start_va
         if offset + size > len(self.xbe_data):
             return None
@@ -1870,6 +1950,10 @@ class FunctionTranslator:
                 cc = m[3:]
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
+            elif m in ("pushfd", "lahf"):
+                # Both copy CF out of the tracked setter, through _cf when
+                # that setter keeps its carry there.
+                cc = "b"
             if (cc in FunctionTranslator._CARRY_CC
                     and (last_setter in CF_TRACKED
                          or last_setter in ("inc", "dec")
@@ -1883,7 +1967,8 @@ class FunctionTranslator:
                 # after one needs it declared. Anything else starting "rep"
                 # (movs/stos) leaves the flags and the setter alone.
                 last_setter = "rep-compare"
-            elif m in _FLAGS_UNDEFINED:
+            elif m in _FLAGS_UNDEFINED or m == "popfd":
+                # A carry test after popfd reads g_eflags, not _cf.
                 last_setter = None
         return False
 
@@ -1895,6 +1980,29 @@ class FunctionTranslator:
                 instructions[0].op_str == "ebp" and
                 instructions[1].mnemonic == "mov" and
                 instructions[1].op_str == "ebp, esp")
+
+    def _func_has_offset_frame(self, instructions):
+        """Check for MSVC's offset frame: push ebp; lea ebp, [esp +/- N].
+
+        MSVC biases ebp into a large frame so more locals fit in a signed
+        8-bit displacement: "push ebp; lea ebp, [esp-0x70]; sub esp, 0x274;
+        ... add ebp, 0x70; leave". The frame is as real as a classic one, and
+        it has to be published across calls for the same reasons -- most
+        sharply for setjmp, which saves g_seh_ebp into the jmp_buf. Left
+        unpublished, that slot held the caller's frame, so the longjmp resumed
+        with the wrong ebp and the "add ebp, N; leave" epilogue returned with
+        esp moved. One case is libjpeg's error recovery in D3DX's JPEG
+        loader: a texture that is not a JPEG longjmps out, the loader returns
+        0x90 bytes high, and the caller pops ebx = 0xFFFFFFFF and spins
+        forever counting a mip chain that never meets it.
+        """
+        if len(instructions) < 2:
+            return False
+        return (instructions[0].mnemonic == "push" and
+                instructions[0].op_str == "ebp" and
+                instructions[1].mnemonic == "lea" and
+                instructions[1].op_str.replace(" ", "").startswith(
+                    ("ebp,[esp+", "ebp,[esp-")))
 
     def _func_owns_a_frame(self, instructions):
         """True when the function has a frame, however it got one.
@@ -1914,6 +2022,8 @@ class FunctionTranslator:
         a pointer.
         """
         if self._func_has_prologue(instructions):
+            return True
+        if self._func_has_offset_frame(instructions):
             return True
         seh_prologs = _seh_prologs_of(self.lifter)
         if not seh_prologs:
@@ -2513,6 +2623,10 @@ class FunctionTranslator:
         self.lifter.imm_code_refs = imm_refs
 
         # Build basic blocks
+        forced = getattr(self, "_forced_leaders", None)
+        if forced:
+            switch_leaders = set(switch_leaders or ()) | {
+                a for a in forced if start < a < end}
         blocks = self.disasm.build_basic_blocks(
             instructions, start, end,
             extra_leaders=switch_leaders if switch_leaders else None,
@@ -2543,6 +2657,57 @@ class FunctionTranslator:
                         and block.last_insn.address not in debug_slide_int3s):
                     block.successors = []
         return instructions, blocks
+
+    def entry_stub(self, addr, name):
+        """C for a call/jump target in the middle of another function.
+
+        tools.disasm sometimes splits one function in two (a switch arm, a
+        shared epilogue), so a jump between the halves becomes a call to an
+        address that is no function start. A stub that only returns skips that
+        code silently -- SSX 3's Options menu crashed on one, Equip Gear went
+        wrong on others. Instead: the containing function translated again
+        with `addr` forced to a block leader, renamed, entered with a goto.
+        Registers are the globals; ebp is the jumper's frame (g_seh_ebp, set
+        before every tail jump), exactly the state a guest jump arrives with.
+        Returns None when addr is not an instruction of a known function.
+        """
+        if not hasattr(self, "_entry_index"):
+            self._entry_index = sorted(
+                (a, info) for a, info in self.func_db.items())
+            self._entry_starts = [a for a, _ in self._entry_index]
+        import bisect as _bisect
+        i = _bisect.bisect_right(self._entry_starts, addr) - 1
+        if i < 0:
+            return None
+        fstart, finfo = self._entry_index[i]
+        fend = finfo.get("end") or fstart + finfo.get("size", 0)
+        recovered = self._recovered_cfg.get(fstart)
+        if recovered:
+            fend = recovered["end"]
+        if not (fstart < addr < fend):
+            return None
+        self._forced_leaders = {addr}
+        try:
+            code = self.translate_function(fstart, finfo)
+        except Exception:
+            code = None
+        finally:
+            self._forced_leaders = None
+        label = f"loc_{addr:08X}:"
+        if not code or label not in code:
+            return None
+        fname = _func_ident(fstart, finfo.get("name", f"sub_{fstart:08X}"))
+        head = f"void {fname}(void)"
+        if head not in code:
+            return None
+        code = code.replace(head, f"void {name}(void)", 1)
+        first = code.find("\nloc_")
+        if first < 0:
+            return None
+        frame = "    ebp = g_seh_ebp;\n" if "uint32_t ebp" in code[:first] else ""
+        entry = (f"\n    /* entered at 0x{addr:08X}, inside 0x{fstart:08X} */\n"
+                 f"{frame}    goto loc_{addr:08X};\n")
+        return code[:first] + entry + code[first:]
 
     def translate_function(self, func_addr, func_info):
         """
@@ -2645,6 +2810,25 @@ class FunctionTranslator:
                 fallthrough_target = None
             else:
                 fallthrough_target = end
+        # `leave` and `pop ebp` tear a frame down and in compiler output only
+        # ever precede a ret, so a body that ends on one with nowhere to fall
+        # is cut short, not data: Spartan's D3DXMatrixLookAtLH lost its
+        # `ret 0x10` to a raw size one byte short, and its translation
+        # returned without popping its arguments. Generation goes on, but say
+        # so -- the caller's callee-saved registers come back as stack garbage.
+        if (continues_past_end and fallthrough_target is None
+                and (last_insn.mnemonic == "leave"
+                     or (last_insn.mnemonic == "pop"
+                         and last_insn.op_str.strip() == "ebp"))
+                and (end, last_insn.address) not in self._teardown_reported):
+            self._teardown_reported.add((end, last_insn.address))
+            section = _config.section_at(start)
+            raw_end = (f"0x{section.va + section.raw_size:08X}"
+                       if section else "unknown")
+            text = f"{last_insn.mnemonic} {last_insn.op_str}".strip()
+            print(f"  WARN: sub_{start:08X} ends on `{text}` at "
+                  f"0x{last_insn.address:08X} with no terminator "
+                  f"(section raw end {raw_end})", file=sys.stderr)
 
         # Ensure ebp tracked if function has tail jumps (lifter emits
         # g_seh_ebp = ebp before external jmp, external jcc, and indirect jmp,
@@ -2817,7 +3001,7 @@ class FunctionTranslator:
                                  "lock cmpxchg", "xadd", "lock xadd", "inc", "dec",
                                  "sahf", "fcomi", "fcomip", "fcompi", "fucomi",
                                  "fucomip", "fucompi")
-               or insn.mnemonic in _RESULT_SNAPSHOT_SETTERS
+               or insn.mnemonic.removeprefix("lock ") in _RESULT_SNAPSHOT_SETTERS
                for insn in instructions):
             lines.append("    uint32_t _fa = 0, _fb = 0;")
             lines.append("    int32_t _fas = 0, _fbs = 0;")
@@ -3036,8 +3220,8 @@ class FunctionTranslator:
             stmts, out_state[bb.start] = lift_basic_block(
                 self.lifter, bb, flag_state=incoming,
                 materialise=sorted(materialise.get(bb.start, ())))
-            if self.backedge_yield:
-                stmts = _mark_back_edges(stmts, start, bb.last_insn.address)
+            if self.back_edge_yield:
+                stmts = _mark_back_edges(bb, stmts)
             # A jump ends its block, so the block's last instruction is the
             # site of any goto in it. Tag the goto with it for the label
             # validator below, which strips the tag again.
@@ -3184,13 +3368,24 @@ class FunctionTranslator:
 class BatchTranslator:
     """Translates multiple functions and writes C source files."""
 
+    entry_stubs = False     # --entry-stubs; see translate_batch_split
+
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
-                 icall_sites_json_path=None, backedge_yield=False):
+                 icall_sites_json_path=None, back_edge_yield=False,
+                 entry_stubs=False, backedge_yield=False):
+        """back_edge_yield: RECOMP_BACK_EDGE at every loop back edge
+        (--back-edge-yield; off by default). backedge_yield is the same switch
+        under the fork's spelling (--backedge-yield), which the JSRF regen
+        command uses. entry_stubs: an unresolved target inside a function
+        enters a copy of it (--entry-stubs)."""
+        back_edge_yield = bool(back_edge_yield or backedge_yield)
         self.xbe_path = xbe_path
+        self.back_edge_yield = back_edge_yield
+        self.entry_stubs = entry_stubs
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
         self.icall_sites = {}
@@ -3249,8 +3444,8 @@ class BatchTranslator:
             self.classification_db, self.abi_db,
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions,
-            force_returns=force_returns, icall_sites=self.icall_sites,
-            backedge_yield=backedge_yield)
+            force_returns=force_returns, icall_sites=self.icall_sites)
+        self.translator.back_edge_yield = self.back_edge_yield
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
         for explicit_helper in (seh_prolog, seh_epilog):
@@ -3929,10 +4124,13 @@ class BatchTranslator:
                 "",
                 "#define RECOMP_GENERATED_CODE",
                 f'#include "{header_name}"',
+                '#include <math.h>',
                 "",
             ]
             stub_lines.append(
-                "/* Each stub consumes the return address its caller pushed,")
+                "/* A target inside another function is that function's code entered")
+            stub_lines.append(
+                " * at the target (entry_stub). The rest: each stub consumes the return address its caller pushed,")
             stub_lines.append(
                 " * exactly as a real 'ret' would. An empty body leaves esp 4 bytes")
             stub_lines.append(
@@ -3948,17 +4146,72 @@ class BatchTranslator:
             stub_lines.append(
                 " * esp off by N on every call. */")
             stub_lines.append("")
+            # A stub skips whatever code really lives at its address, so one
+            # reached at runtime is a likely cause of a silent stall or a wrong
+            # result far downstream. RECOMP_STUB_LOG=1 names each stub the
+            # first time it runs, with the return address on the guest stack
+            # (for a tail jump, that is the caller's caller). Off by default:
+            # the check is one cached getenv per stub per process.
+            stub_lines += [
+                "#include <stdio.h>",
+                "#include <stdlib.h>",
+                "",
+                "static int recomp_stub_log_on(void)",
+                "{",
+                "    static int on = -1;",
+                "    if (on < 0) {",
+                '        const char *e = getenv("RECOMP_STUB_LOG");',
+                "        on = e && *e && *e != '0';",
+                "    }",
+                "    return on;",
+                "}",
+                "",
+                "#define RECOMP_STUB_HIT(va) do { static int _seen; \\",
+                "    if (!_seen && recomp_stub_log_on()) { _seen = 1; \\",
+                '        fprintf(stderr, "[STUB] unresolved 0x%08X reached, " \\',
+                '                "return 0x%08X esp 0x%08X\\n", (unsigned)(va), \\',
+                "                (unsigned)MEM32(g_esp), (unsigned)g_esp); \\",
+                "        fflush(stderr); } } while (0)",
+                "",
+            ]
+            entry_n = 0
             for addr in sorted(unresolved):
+                # --entry-stubs: re-emit the containing function from addr.
+                # Opt-in: each target is a full copy of its function, so a
+                # title with many targets in one function grows by that much.
+                code = (self.translator.entry_stub(addr, unresolved[addr])
+                        if self.entry_stubs else None)
+                if code:
+                    stub_lines.append(code)
+                    entry_n += 1
+                    continue
+                epi = self.translator._stub_epilogue(addr)
+                if epi and epi[0]:
+                    # A shared epilogue: run it -- restore the registers it
+                    # pops, then return (address + N bytes of arguments).
+                    regs, n = epi
+                    body = " ".join(f"g_{r} = MEM32(g_esp); g_esp += 4;"
+                                    for r in regs)
+                    note = "; ".join(f"pop {r}" for r in regs) + f"; ret {n}"
+                    stub_lines.append(
+                        f"void {unresolved[addr]}(void) {{ "
+                        f"RECOMP_STUB_HIT(0x{addr:08X}u); "
+                        f"recomp_icall_fail_log(0x{addr:08X}u); "
+                        f"{body} g_esp += {4 + n}; "
+                        f"/* 0x{addr:08X}: {note} */ }}"
+                    )
+                    continue
                 popped = self.translator._stub_ret_bytes(addr)
-                stub_lines.append(_stub_definition(unresolved[addr], addr, popped))
+                stub_lines.append(_stub_definition(unresolved[addr], addr, popped,
+                                                   hit=True))
             stub_lines.append("")
 
             write_if_changed(stub_path, "\n".join(stub_lines))
             generated_files.append(stub_path)
 
             if verbose:
-                print(f"  Wrote {stub_path} ({len(unresolved)} stubs)",
-                      file=sys.stderr)
+                print(f"  Wrote {stub_path} ({len(unresolved)} stubs, "
+                      f"{entry_n} entry)", file=sys.stderr)
 
         # Generate dispatch table.
         #

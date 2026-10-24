@@ -71,7 +71,7 @@ NATIVE_TESTS = [
     ('guest_meter', ['tests/guest_meter_test.c', 'src/kernel/guest_meter.c', PLATFORM],
      ['XBOXRECOMP_GMETER_TEST_BUILD'], [('guest_meter', {})]),
     ('irql_tracking', ['tests/kernel_irql_tracking_test.c', 'src/kernel/kernel_hal.c',
-                       'src/kernel/guest_meter.c', PLATFORM], [],
+                       'src/kernel/guest_meter.c', 'src/platform/host_time.c', PLATFORM], [],
      [('irql_tracking', {'RECOMP_GUEST_SERIAL': '1'})]),
     ('adpcm_decode', ['tests/adpcm_decode/test_main.c'] + APU, [], [('adpcm_decode', {})]),
     ('apu_mixdown', ['tests/apu_mixdown/test_main.c', 'src/apu/apu_mixdown.c',

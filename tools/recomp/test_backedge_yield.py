@@ -1,12 +1,14 @@
-"""Loop back-edges carry RECOMP_BACKEDGE() when the translator is asked to.
+"""--backedge-yield, the fork's spelling of --back-edge-yield, marks loop back-edges.
 
 Serial guest mode (RECOMP_GUEST_SERIAL=1) lets one host thread run lifted code
 at a time, released across kernel calls. A guest loop that spins without
 calling the kernel -- polling a flag another thread sets -- would hold the lock
-until a waiter's bounded wait ran out, then run concurrently anyway. With
---backedge-yield, every jump back to an earlier address in the function is
-preceded by RECOMP_BACKEDGE(), which offers the lock through
-xbox_GuestSerialYield when serial mode is on and reads one flag when it is off.
+until a waiter's bounded wait ran out, then run concurrently anyway. The
+translator's backedge_yield is upstream's back_edge_yield under the fork's
+name: every loop back edge becomes `{ RECOMP_BACK_EDGE(va); goto ...; }`, and
+the runtime's RECOMP_BACK_EDGE also runs RECOMP_BACKEDGE(), which offers the
+lock through xbox_GuestSerialYield when serial mode is on and reads one flag
+when it is off.
 
 The flag is opt-in because targeted relifts write bodies into existing chunks
 whose recomp_types.h may predate the macro.
@@ -63,41 +65,57 @@ def _translate(image, **kw):
 
 
 def _hook_lines(code):
-    return [i for i, line in enumerate(code.splitlines()) if "RECOMP_BACKEDGE();" in line]
+    return [line for line in code.splitlines() if "RECOMP_BACK_EDGE(" in line]
 
 
 def test_off_by_default():
-    assert "RECOMP_BACKEDGE" not in _translate(COUNTED)
-    assert "RECOMP_BACKEDGE" not in _translate(JMP_BACK)
+    assert "RECOMP_BACK" not in _translate(COUNTED)
+    assert "RECOMP_BACK" not in _translate(JMP_BACK)
+
+
+def test_the_fork_spelling_is_upstreams_switch():
+    assert _translate(COUNTED, backedge_yield=True) == \
+        _translate_upstream(COUNTED)
 
 
 def test_a_conditional_back_edge_is_marked():
-    code = _translate(COUNTED, backedge_yield=True)
-    lines = code.splitlines()
-    hooks = _hook_lines(code)
-    assert len(hooks) == 1, code
-    assert "goto loc_00010000" in lines[hooks[0] + 1], code
+    hooks = _hook_lines(_translate(COUNTED, backedge_yield=True))
+    assert len(hooks) == 1, hooks
+    assert "{ RECOMP_BACK_EDGE(0x00010002u); goto loc_00010000; }" in hooks[0], hooks
 
 
 def test_an_unconditional_back_edge_is_marked_and_a_forward_exit_is_not():
-    code = _translate(JMP_BACK, backedge_yield=True)
-    lines = code.splitlines()
-    hooks = _hook_lines(code)
-    assert len(hooks) == 1, code
-    assert "goto loc_00010002" in lines[hooks[0] + 1], code
-    assert not any("goto loc_00010008" in lines[i + 1] for i in hooks), code
+    hooks = _hook_lines(_translate(JMP_BACK, backedge_yield=True))
+    assert len(hooks) == 1, hooks
+    assert "goto loc_00010002; }" in hooks[0], hooks
+    assert not any("goto loc_00010008" in line for line in hooks), hooks
 
 
 def test_forward_jumps_are_not_marked():
-    assert "RECOMP_BACKEDGE" not in _translate(FORWARD, backedge_yield=True)
+    assert "RECOMP_BACK" not in _translate(FORWARD, backedge_yield=True)
+
+
+def _translate_upstream(image):
+    config._install(
+        [config.Section(".text", BASE, len(image), 0x0000, len(image), True)],
+        entry_point=BASE, kernel_thunk_addr=BASE, origin="backedge-test")
+    db = {BASE: {"start": f"0x{BASE:08X}", "end": BASE + len(image),
+                 "_addr": BASE, "size": len(image)}}
+    t = FunctionTranslator(image, db)
+    t.back_edge_yield = True
+    return t.translate_function(BASE, db[BASE])
 
 
 def _backedge_macro():
-    """The runtime header's RECOMP_BACKEDGE block, verbatim."""
+    """The runtime header's two hooks, verbatim: the serial-mode RECOMP_BACKEDGE
+    block and the RECOMP_BACK_EDGE that lifted code calls."""
     text = open(HEADER, encoding="utf-8").read()
     start = text.index("extern volatile int g_xbox_guest_serial_on;")
     end = text.index("} while (0)", start) + len("} while (0)")
-    return text[start:end]
+    serial = text[start:end]
+    start = text.index("extern int32_t g_xbox_guest_cpu_preempt;")
+    end = text.index("} while (0)", text.index("#define RECOMP_BACK_EDGE(va)"))
+    return serial + "\n" + text[start:end + len("} while (0)")]
 
 
 PRELUDE = r"""
@@ -112,6 +130,10 @@ static inline int recomp_parity8(uint32_t x){x&=0xFFu;x^=x>>4;x^=x>>2;x^=x>>1;re
 volatile int g_xbox_guest_serial_on;
 static unsigned yields;
 void xbox_GuestSerialYield(void) { yields++; }
+#define RECOMP_LOAD_RELAXED32(p) __atomic_load_n((p), __ATOMIC_RELAXED)
+int32_t g_xbox_guest_cpu_preempt;
+static unsigned preempts;
+void xbox_GuestCpuPreempt(uint32_t va) { (void)va; preempts++; }
 """
 
 
@@ -122,7 +144,8 @@ def _flag_macros():
     return text[start:end]
 
 
-def test_the_hook_yields_once_per_iteration_only_in_serial_mode():
+def test_the_hook_yields_once_per_taken_back_edge_only_in_serial_mode():
+    # Five iterations take the back edge four times; the last jnz falls out.
     cc = shutil.which("clang") or shutil.which("gcc") or shutil.which("cc")
     if not cc:
         import pytest
@@ -137,7 +160,7 @@ int main(void) {
     eax = 0; ecx = 5; edx = 0;
     g_xbox_guest_serial_on = 1; yields = 0;
     sub_00010000();
-    if (eax != 5 || yields != 5) { printf("FAIL on: eax=%u yields=%u\n", eax, yields); return 1; }
+    if (eax != 5 || yields != 4 || preempts) { printf("FAIL on: eax=%u yields=%u\n", eax, yields); return 1; }
     printf("OK\n");
     return 0;
 }

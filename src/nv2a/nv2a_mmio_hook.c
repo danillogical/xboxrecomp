@@ -16,6 +16,7 @@
 #define NV2A_VRAM_BASE  0xF0000000u
 #define NV2A_VRAM_SIZE  (64 * 1024 * 1024)  /* 64MB Xbox VRAM */
 #define NV2A_RAMIN_SIZE (1 * 1024 * 1024)   /* 1MB RAMIN */
+#define NV2A_PVIDEO_MMIO 0x8000u            /* PVIDEO's 4 KB register block */
 
 static ptrdiff_t g_mem_offset = 0;
 static uint8_t *g_nv2a_vram = NULL;
@@ -49,6 +50,36 @@ extern void xbox_Nv2aClaimRegisterOwner(void);
  * outside the Win32 guard. */
 
 #if defined(_WIN32)
+
+/* PVIDEO's registers are written by the title's thread through the MMIO
+ * hook and read by the window thread for scanout. */
+static SRWLOCK g_pvideo_lock = SRWLOCK_INIT;
+
+bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
+{
+    NV2AState *state = nv2a_get_state();
+    unsigned i;
+    if (!state) return false;
+    AcquireSRWLockShared(&g_pvideo_lock);
+    for (i = 0; i < 0x1000 / 4; ++i)
+        regs[i] = state->pvideo.regs[i * 4];
+    ReleaseSRWLockShared(&g_pvideo_lock);
+    return true;
+}
+
+/* The scanout has taken the bank: clear its pending bit in BUFFER, which is
+ * what the title polls before it reuses the memory. */
+void nv2a_hook_pvideo_consume(unsigned bank)
+{
+    NV2AState *state = nv2a_get_state();
+    uint64_t buffer;
+    if (!state || bank > 1) return;
+    AcquireSRWLockExclusive(&g_pvideo_lock);
+    buffer = nv2a_mmio_read(state, NV2A_PVIDEO_MMIO + NV_PVIDEO_BUFFER, 4);
+    nv2a_mmio_write(state, NV2A_PVIDEO_MMIO + NV_PVIDEO_BUFFER,
+                    buffer & ~(uint64_t)(1u << (bank * 4)), 4);
+    ReleaseSRWLockExclusive(&g_pvideo_lock);
+}
 
 /* ============================================================
  * x86-64 register access helpers
@@ -473,6 +504,12 @@ void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
 
     fprintf(stderr, "[NV2A] MMIO hook initialized: VRAM=%p RAMIN=%p\n",
             (void*)g_nv2a_vram, (void*)ramin_ptr);
+
+    /* Upstream faults the PVIDEO page here so a title's writes reach the
+     * model. In this fork the model owns the whole aperture once
+     * nv2a_hook_install_aperture has trapped it, PVIDEO included, and a
+     * page trapped while no owner is installed would fault with nobody to
+     * handle it, so nothing is protected here. */
 }
 
 static uint64_t owner_read(NV2AState *nv2a, uint32_t offset, unsigned size)
@@ -1135,7 +1172,14 @@ bool nv2a_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
      * NV_USER_DMA_PUT, and it runs inside the owner-lock region that the ptimer
      * thread needs in order to pulse vblank -- so the hold measured below is
      * the quantity that decides whether a long walk can starve the display. */
+    /* PVIDEO's registers are also read and handed back by the window
+     * thread's scanout (nv2a_hook_pvideo_snapshot/_consume), under their own
+     * lock. */
+    bool pvideo = mmio_offset >= NV2A_PVIDEO_MMIO &&
+                  mmio_offset < NV2A_PVIDEO_MMIO + 0x1000u;
+    if (pvideo) AcquireSRWLockExclusive(&g_pvideo_lock);
     bool handled = decode_and_handle(ctx, mmio_offset, is_write);
+    if (pvideo) ReleaseSRWLockExclusive(&g_pvideo_lock);
     if (handled && (is_write ||
         ptimer_pending_before != nv2a->ptimer.pending_interrupts ||
         pmc_pending_before != nv2a->pmc.pending_interrupts)) {
@@ -1230,6 +1274,9 @@ bool nv2a_hook_handle_vram(uintptr_t fault_addr, uint32_t fault_xbox_va)
 bool nv2a_claim_instance_memory_threadsafe(uint32_t guest_base,
                                            uint8_t *host_ptr, uint32_t size)
 { return nv2a_bind_instance_memory(guest_base, host_ptr, size); }
+bool nv2a_hook_pvideo_snapshot(uint32_t regs[0x1000 / 4])
+{ (void)regs; return false; }
+void nv2a_hook_pvideo_consume(unsigned bank) { (void)bank; }
 
 void nv2a_hook_init(ptrdiff_t xbox_mem_offset)
 { (void)xbox_mem_offset; }

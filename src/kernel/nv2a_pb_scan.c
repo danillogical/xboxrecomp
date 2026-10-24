@@ -126,7 +126,7 @@ static void note(uint32_t subch, uint32_t method)
 
 /* NV097 (Kelvin 3D class) methods worth naming. The point of the survey is to
  * decide what a translator has to implement, and a bare method number does not
- * answer that -- "0x1808 x412" only means something once it reads
+ * answer that -- "0x1818 x412" only means something once it reads
  * INLINE_ARRAY. Unnamed ones still get counted. */
 static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x0000, "SET_OBJECT" },
@@ -157,8 +157,9 @@ static const struct { uint32_t m; const char *name; } NV097_NAMES[] = {
     { 0x1760, "SET_VERTEX_DATA_ARRAY_FORMAT" },
     { 0x17FC, "SET_BEGIN_END" },
     { 0x1800, "ARRAY_ELEMENT16" },
-    { 0x1808, "INLINE_ARRAY" },
+    { 0x1808, "ARRAY_ELEMENT32" },
     { 0x1810, "DRAW_ARRAYS" },
+    { 0x1818, "INLINE_ARRAY" },
     { 0x1B00, "SET_TEXTURE_OFFSET" },
     { 0x1B04, "SET_TEXTURE_FORMAT" },
     { 0x1B08, "SET_TEXTURE_ADDRESS" },
@@ -265,6 +266,10 @@ static int pb_bad_target(uint32_t w, uint32_t at, uint32_t target, uint32_t put)
 static uint32_t s_get = 0xFFFFFFFFu, s_ret;
 static int      s_in_call;
 
+/* Whether the walk is inside a pushbuffer CALL, for the executor: a flip
+ * hold is only armed at the top level (nv2a_pb_exec.c). */
+int nv2a_pb_scan_in_call(void) { return s_in_call; }
+
 /* A method whose parameters the walk has not all reached: the header said
  * `count` words and PUT came first. The DMA engine stalls at PUT and carries
  * on with the same method when PUT moves; reading the next word as a new
@@ -331,6 +336,10 @@ void nv2a_pb_scan(uint32_t put_phys)
         return;
     }
 
+    if (s_exec_enabled && !suppress_exec) {
+        extern void nv2a_pb_exec_walk_begin(void);
+        nv2a_pb_exec_walk_begin();      /* the flip hold's vblank */
+    }
     pb_consume(mem, put, &words);             /* the method PUT stalled inside */
 
     while (s_get != put) {

@@ -24,6 +24,20 @@ bool nv2a_hook_pci_config_write(uint32_t offset, const void *buffer, uint32_t le
 void xbox_log(int level, const char *subsystem, const char *fmt, ...)
 { (void)level; (void)subsystem; (void)fmt; }
 uint32_t xbox_VblankCount(void) { return 0; }   /* the port model's field pin */
+/* The one-CPU gate's holder state (kernel_hal.c): the register file it saves
+ * around a posted ISR, and the DPC queue and worker stacks it runs them with.
+ * The gate is off here, so none of them is used. */
+RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_ebp;
+RECOMP_TLS uint32_t g_seh_ebp, g_eflags, g_fs_base;
+RECOMP_TLS int g_df, g_fp_top, g_fp_cmp;
+RECOMP_TLS double g_fp_stack[8];
+RECOMP_TLS uint16_t g_fp_control_word, g_fp_cc;
+RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3, g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3, g_mm4, g_mm5, g_mm6, g_mm7;
+int xbox_DpcPending(void) { return 0; }
+int xbox_DpcDrainHere(void) { return 0; }
+int xbox_worker_stack_alloc(void) { return -1; }
+void xbox_worker_stack_free(int slot) { (void)slot; }
 
 static unsigned checks, failures;
 
