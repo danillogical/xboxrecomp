@@ -28,5 +28,7 @@ and they pass again if the fork adopts it.
 `adpcm_decode`, `apu_mixdown`: `gp_ep.h(24,1): error C1083: Cannot open
 include file: 'qemu/osdep.h'`. Their include directories predate the pinned
 DSP56300 core (`src/apu/dsp`), whose headers need `src/apu/dsp/shim`; adding
-it, as `apu_vp` does, is the fix. `tools/posix_check.py native` builds both
+it, as `apu_vp` does, is the fix. (`apu_vp`, upstream's, also takes
+`fork_compat.h` and `fork_stubs.c` for the two names this fork's APU spells
+differently.) `tools/posix_check.py native` builds both
 with the right directories and they pass there.
