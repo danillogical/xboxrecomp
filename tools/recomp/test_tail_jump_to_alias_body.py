@@ -18,8 +18,10 @@ reports every trap (`JUMPS:`), fails when one had a callable target, and
 
 An alias is folded into its owner only when the owner's body contains it, which
 needs the owner to start first. An abutting fold names the entry that starts where
-the alias ends, whose body never contains the alias: that alias keeps no body and
-its dispatch wrapper is fatal (`ALIASES:` lists it).
+the alias ends, whose body never contains the alias. When no real body covers the
+alias and its bytes end in a ret or jmp, it is a complete routine (a C++ unwind
+handler, a callback named by an immediate) and keeps its own body. Otherwise it
+keeps no body and its dispatch wrapper is fatal (`ALIASES:` lists it).
 
 These tests drive the real CLI over a synthetic image, so they exercise the
 batch pass that decides which entries keep a body rather than a copy of it.
@@ -49,6 +51,13 @@ THUNK_TO_MANUAL = BASE + 0x0E0
 MANUAL_ALIAS = BASE + 0x100         # tail_jump_alias, hand-written
 LATE_ALIAS = BASE + 0x120           # tail_jump_alias ending where LATE_OWNER starts
 LATE_OWNER = BASE + 0x130
+LATE_HANDLER = BASE + 0x140         # unwind handler: mov ecx,[ebp-X]; jmp REAL_ENTRY
+LATE_THUNK = BASE + 0x148           # frame-handler thunk starting where it ends
+PADDED_HANDLER = BASE + 0x160       # mov eax,imm; jmp REAL_ENTRY; int3 padding
+PADDED_OWNER = BASE + 0x170
+INTERIOR_HOST = BASE + 0x180        # real body whose interior LATE_INTERIOR starts in
+LATE_INTERIOR = BASE + 0x184        # ends in a ret, but where INTERIOR_OWNER starts
+INTERIOR_OWNER = BASE + 0x190
 PARENT_END = BASE + 0x052
 SECTION_SIZE = 0x400
 
@@ -59,6 +68,11 @@ def _thunk(at, target):
     rel = target - (jmp_at + 5)
     code = bytes.fromhex("836c240404") + b"\xe9" + struct.pack("<i", rel)
     return code + b"\xcc" * (16 - len(code))
+
+
+def _jmp(at, target):
+    """jmp rel32 at `at`."""
+    return b"\xe9" + struct.pack("<i", target - (at + 5))
 
 
 def _image():
@@ -78,8 +92,18 @@ def _image():
     put(REAL_ENTRY, bytes.fromhex("c20800"))
     put(THUNK_TO_MANUAL, _thunk(THUNK_TO_MANUAL, MANUAL_ALIAS))
     put(MANUAL_ALIAS, bytes.fromhex("c3"))
-    put(LATE_ALIAS, bytes.fromhex("40c3"))                # inc eax; ret
+    # inc eax x16: no ret or jmp, so control runs on into LATE_OWNER.
+    put(LATE_ALIAS, b"\x40" * (LATE_OWNER - LATE_ALIAS))
     put(LATE_OWNER, bytes.fromhex("c3"))
+    put(LATE_HANDLER, bytes.fromhex("8b4df0") + _jmp(LATE_HANDLER + 3, REAL_ENTRY))
+    put(LATE_THUNK, bytes.fromhex("b8204e1e00") + _jmp(LATE_THUNK + 5, REAL_ENTRY))
+    put(PADDED_HANDLER,
+        bytes.fromhex("b82c541e00") + _jmp(PADDED_HANDLER + 5, REAL_ENTRY))
+    put(PADDED_OWNER, bytes.fromhex("c3"))
+    # nop x7; ret -- LATE_INTERIOR starts on the fifth nop.
+    put(INTERIOR_HOST, b"\x90" * 7 + b"\xc3")
+    put(INTERIOR_HOST + 8, b"\x40" * 7 + b"\xc3")
+    put(INTERIOR_OWNER, bytes.fromhex("c3"))
     return bytes(img)
 
 
@@ -102,6 +126,13 @@ ENTRIES = {
     "manual_alias": _entry(MANUAL_ALIAS, MANUAL_ALIAS + 1, "tail_jump_alias"),
     "late_alias": _entry(LATE_ALIAS, LATE_OWNER, "tail_jump_alias"),
     "late_owner": _entry(LATE_OWNER, LATE_OWNER + 1),
+    "late_handler": _entry(LATE_HANDLER, LATE_THUNK, "tail_jump_alias"),
+    "late_thunk": _entry(LATE_THUNK, LATE_THUNK + 10, "imm_ref_target"),
+    "padded_handler": _entry(PADDED_HANDLER, PADDED_OWNER, "tail_jump_alias"),
+    "padded_owner": _entry(PADDED_OWNER, PADDED_OWNER + 1),
+    "interior_host": _entry(INTERIOR_HOST, INTERIOR_HOST + 8),
+    "late_interior": _entry(LATE_INTERIOR, INTERIOR_OWNER, "tail_jump_alias"),
+    "interior_owner": _entry(INTERIOR_OWNER, INTERIOR_OWNER + 1),
 }
 
 
@@ -276,6 +307,7 @@ def test_an_alias_whose_owner_starts_after_it_is_fatal_not_folded(
     Dispatching the alias to that owner runs a different function (JSRF
     0x000C42E0 ran the constructor at 0x000C44D0). The alias keeps no body, its
     slot in the dispatch table stays, and its wrapper fails instead of calling.
+    This alias never reaches a ret or jmp, so it is not a routine of its own.
     """
     code, err, gen = _generate(tmp_path, capsys, ["late_alias", "late_owner"])
     assert code == 0, err
@@ -311,3 +343,51 @@ def test_strict_jumps_does_not_fail_on_a_fatal_alias_alone(tmp_path, capsys):
     code, err, _ = _generate(tmp_path, capsys, ["late_alias", "late_owner"],
                              extra_args=["--strict-jumps"])
     assert code == 0, (code, err)
+
+
+@pytest.mark.parametrize("keys,alias,owner", [
+    pytest.param(["late_handler", "late_thunk", "real"], LATE_HANDLER,
+                 LATE_THUNK, id="jmp-at-owner-start"),
+    pytest.param(["padded_handler", "padded_owner", "real"], PADDED_HANDLER,
+                 PADDED_OWNER, id="jmp-then-padding"),
+])
+def test_a_late_owner_alias_that_is_a_complete_routine_keeps_its_body(
+        tmp_path, capsys, keys, alias, owner):
+    """A gap alias ending in a jmp is a routine, not a fragment of its owner.
+
+    JSRF's C++ unwind handlers (`mov ecx, [ebp-X]; jmp <dtor>`, named only by
+    .rdata) and frame-handler thunks (`mov eax, <FuncInfo>; jmp
+    __CxxFrameHandler`) sit in gaps that end where the next entry starts. A
+    fatal wrapper there aborts the first exception unwind; the body runs the
+    jump as a tail call.
+    """
+    code, err, gen = _generate(tmp_path, capsys, keys)
+    assert code == 0, err
+    body = _function(gen, alias)
+    assert body is not None, err
+    assert f"sub_{REAL_ENTRY:08X}(); return;" in body, body
+    assert "RECOMP_JUMP_TRAP" not in body, body
+    assert _function(gen, owner) is not None
+    assert _alias_wrapper(gen, alias) is None, _dispatch(gen)
+    entry = re.search(rf"\{{\s*0x{alias:08X}u\s*,\s*\(recomp_func_t\)\s*(\w+)\s*\}}",
+                      _dispatch(gen))
+    assert entry and entry.group(1) == f"sub_{alias:08X}", _dispatch(gen)
+    assert "ALIASES:" not in err, err
+
+
+def test_a_late_owner_alias_inside_another_body_is_still_fatal(tmp_path, capsys):
+    """Ending in a ret is not enough when a real body covers the alias's start.
+
+    Such an alias is a label in that body whose measured end ran past it, so
+    its bytes are not a routine of their own.
+    """
+    code, err, gen = _generate(tmp_path, capsys,
+                               ["interior_host", "late_interior",
+                                "interior_owner"])
+    assert code == 0, err
+    assert _function(gen, LATE_INTERIOR) is None
+    wrapper = _alias_wrapper(gen, LATE_INTERIOR)
+    assert wrapper is not None, _dispatch(gen)
+    assert f"recomp_icall_fail_log(0x{LATE_INTERIOR:08X}u); abort();" in wrapper, \
+        wrapper
+    assert f"0x{LATE_INTERIOR:08X} -> owner 0x{INTERIOR_OWNER:08X}" in err, err

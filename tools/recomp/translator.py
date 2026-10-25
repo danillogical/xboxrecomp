@@ -3769,9 +3769,10 @@ class BatchTranslator:
         # next entry instead, and on JSRF that silently replaced whole functions
         # (0x000C42E0, slot 7 of a .data handler table, dispatched to the
         # unrelated sub_000C44D0). Such an alias is either a label inside some
-        # other body or a function the detector missed; this pass cannot tell
-        # which, so its entry is made fatal and reported, and the project
-        # recovers the ones that are functions.
+        # other body or a function the detector missed. A complete routine in a
+        # gap keeps its own body (_complete_routine); for the rest this pass
+        # cannot tell which, so its entry is made fatal and reported, and the
+        # project recovers the ones that are functions.
         _late_owner = {}
         # The parent's *name* is needed for the dispatch tuple, and func_list is
         # consumed as an iterator below, so index it first.
@@ -3832,6 +3833,47 @@ class BatchTranslator:
         for _addr, _info in func_list:
             if _info.get("detection_method") != "tail_jump_alias":
                 _real_by_start.setdefault(_addr, _info)
+
+        # An abutting alias that no real body covers, and whose own bytes leave
+        # by a ret or jmp, is a complete routine rather than a fragment: the
+        # detector labels every gap entry tail_jump_alias, including C++ unwind
+        # handlers named only by .rdata and callbacks named by an immediate.
+        # Such an alias keeps its own body, as upstream emits every alias; only
+        # the rest are folded and made fatal below.
+        _real_spans = sorted(_batch_span(item) for item in func_list
+                             if item[1].get("detection_method")
+                             != "tail_jump_alias")
+        _real_starts = [s for s, _ in _real_spans]
+        _reach = []                    # furthest real end among starts so far
+        for _s, _e in _real_spans:
+            _reach.append(max(_e, _reach[-1]) if _reach else _e)
+        _inner = getattr(self, "translator", self)
+        _padding = ("int3", "nop")
+        _lea_filler = re.compile(r"(\w+), \[\1(?: \+ 0)?\]$")
+
+        def _complete_routine(addr, end):
+            i = bisect.bisect_left(_real_starts, addr) - 1
+            if i >= 0 and _reach[i] > addr:
+                return False           # inside a real body: a label there
+            recovered = (getattr(_inner, "_recovered_cfg", None) or {}).get(addr)
+            if recovered:
+                insns = list(recovered.get("instructions") or [])
+            else:
+                raw = _inner._read_func_bytes(addr, end)
+                insns = (_inner.disasm.disassemble_function(raw, addr, end)
+                         if raw else [])
+            # Alignment filler after the last instruction is not reached.
+            while insns and (insns[-1].mnemonic in _padding
+                             or (insns[-1].mnemonic == "lea"
+                                 and _lea_filler.match(insns[-1].op_str))
+                             or (insns[-1].mnemonic == "mov"
+                                 and insns[-1].op_str.replace(" ", "")
+                                 == "edi,edi")):
+                insns.pop()
+            return bool(insns) and (
+                insns[-1].is_terminator
+                or insns[-1].mnemonic in ("ud2", "hlt", "iret", "iretd"))
+
         for _addr, _info in func_list:
             if _info.get("detection_method") != "tail_jump_alias":
                 continue
@@ -3846,6 +3888,8 @@ class BatchTranslator:
             if _owner_info.get("section") and _info.get("section") \
                     and _owner_info["section"] != _info["section"]:
                 continue
+            if _complete_routine(_addr, _end):
+                continue                       # emitted as its own body
             alias_parent[_addr] = _end
 
         # Tell the lifter which entries will have a symbol of their own: every
