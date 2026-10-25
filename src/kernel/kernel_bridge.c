@@ -2074,6 +2074,20 @@ static void callback_regs_restore(const CallbackRegs *r, int keep_eax)
     g_ebx = r->ebx; g_esi = r->esi; g_edi = r->edi; g_esp = r->esp;
 }
 
+/* Fork delta: the bridge's timer-thread ISRs and DPCs are put at their IRQL
+ * only with the one-CPU gate on (RECOMP_DISPATCH_GATE); off, they run with no
+ * IRQL change, as ledger L11 records. */
+static int bridge_irql_enter(int level)
+{
+    return xbox_DispatchGateOn() ? xbox_IrqlEnterInterrupt(level) : -1;
+}
+
+static void bridge_irql_leave(int saved)
+{
+    if (saved >= 0)
+        xbox_IrqlLeaveInterrupt(saved);
+}
+
 static void bridge_NtUserIoApcDispatcher(void)
 {
     uint32_t apc_context = STACK_ARG(0);
@@ -2361,11 +2375,11 @@ static int kernel_run_dpc(uint32_t dpc_va, uint32_t arg1, uint32_t arg2,
         g_esp -= 4; BRIDGE_MEM32(g_esp) = context;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = dpc_va;
         g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
-        irql = xbox_IrqlEnterInterrupt(2);
+        irql = bridge_irql_enter(2);
         gm = xbox_GuestMeterEnter(gm_source);
         fn();
         xbox_GuestMeterRestore(gm, gm_source);
-        xbox_IrqlLeaveInterrupt(irql);
+        bridge_irql_leave(irql);
         callback_regs_restore(&saved, 0);
     }
     return 1;
@@ -2610,11 +2624,11 @@ static int kernel_call_isr(uint32_t vector)
     g_esp -= 4; BRIDGE_MEM32(g_esp) = kint;
     g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
     {
-        int irql = xbox_IrqlEnterInterrupt(16);
+        int irql = bridge_irql_enter(16);
         int gm = xbox_GuestMeterEnter(XBOX_GM_ISR);
         fn();
         xbox_GuestMeterRestore(gm, XBOX_GM_ISR);
-        xbox_IrqlLeaveInterrupt(irql);
+        bridge_irql_leave(irql);
     }
     return (int)(g_eax & 1u);
 }

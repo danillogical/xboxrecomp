@@ -1067,11 +1067,6 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;
-    /* Fork delta: only with the one-CPU gate on. Off, host-run ISRs and DPCs
-     * leave IRQL as the fork has always run them (no IRQL gate, ledger L11),
-     * and the -1 makes the matching leave a no-op. */
-    if (!xbox_DispatchGateOn())
-        return -1;
     if (g_current_irql != (KIRQL)level) {
         /* A DPC (DISPATCH_LEVEL) goes through the gate; a device ISR does
          * not (see s_dispatch_gate). */
@@ -1085,8 +1080,6 @@ int xbox_IrqlEnterInterrupt(int level)
 
 void xbox_IrqlLeaveInterrupt(int saved)
 {
-    if (saved < 0)
-        return;                 /* entered with the gate off (fork delta) */
     if (g_current_irql != (KIRQL)saved) {
         irql_track(g_current_irql, (KIRQL)saved, IRQL_CALLER());
         g_current_irql = (KIRQL)saved;
