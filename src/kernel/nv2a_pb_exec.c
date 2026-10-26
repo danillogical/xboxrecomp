@@ -2502,6 +2502,141 @@ static const VertexAttr *texcoord_attr(void)
     return &s_gpu.attr[9];
 }
 
+/* ---- Fixed-function texgen and texture matrices (begin) -----------------
+ *
+ * On a fixed-function batch the NV2A computes each stage's s,t,r,q before the
+ * rasteriser sees them: per component texgen replaces the attribute value,
+ * then an enabled texture matrix transforms all four. Facts from xemu
+ * (hw/xbox/nv2a/pgraph/glsl/vsh-ff.c and pgraph.c); the code is ours.
+ *
+ * Every matrix is applied with its words in delivery order as rows,
+ * out[j] = sum_i W[4j+i] * in[i], the composite's layout (xemu loads word
+ * 4j+i into constant row j, component i, and computes v * mat4(rows)):
+ *   e = MV * pos            MODEL_VIEW_MATRIX 0 words, all four components;
+ *   n = IMV * (nrm, 0)      INVERSE_MODEL_VIEW words, which the runtime
+ *                           supplies so this is the inverse transpose; unit
+ *                           length only under NORMALIZATION_ENABLE bit 0;
+ *   EYE_LINEAR      plane . e     (plane words used as delivered)
+ *   OBJECT_LINEAR   plane . pos
+ *   SPHERE_MAP      u = normalize(e.xyz), r = u - 2(n.u)n,
+ *                   s,t = r.xy / (2 |r + (0,0,1)|) + 0.5   (S and T only)
+ *   REFLECTION_MAP  r.x, r.y, r.z
+ *   NORMAL_MAP      n.x, n.y, n.z
+ *   matrix          T * (s,t,r,q); q is transformed too and never divided.
+ * The result stands in for the attribute, so Nv2aVertexExtra.tex stays raw and
+ * fetch_texcoord scales it to texels exactly as it scales an attribute.
+ *
+ * Limitations:
+ *   - Q always keeps the attribute value: TEXGEN_Q is not admitted.
+ *   - Stage 2/3 matrices are not admitted, so an enabled one is ignored.
+ *   - Local viewer always (u from the eye position): TEXGEN_VIEW_MODEL is not
+ *     admitted, its reset value 0 is LOCAL_VIEWER, and xemu never reads it.
+ *   - Model-view matrix 0 only, so a skinned batch generates from matrix 0.
+ *   - A missing normal array reads (0,0,0) as any missing attribute does
+ *     (fetch_attr), so NORMAL_MAP yields 0 and the reflection is u itself.
+ *   - An unknown mode, or SPHERE_MAP on R, keeps the attribute value. */
+/* Method offsets and texgen modes (nv2a_regs.h names, local like the rest of this file). */
+#define FFTG_NORMALIZATION_ENABLE  0x03A4
+#define FFTG_TEXGEN_S              0x03C0   /* + 0x10 * stage + 4 * component */
+#define FFTG_MATRIX_ENABLE         0x0420   /* + 4 * stage */
+#define FFTG_MODEL_VIEW            0x0480
+#define FFTG_INVERSE_MODEL_VIEW    0x0580
+#define FFTG_MATRIX                0x06C0   /* + 0x40 * stage */
+#define FFTG_PLANE_S               0x0840   /* + 0x40 * stage + 0x10 * component */
+#define FFTG_EYE_LINEAR            0x2400
+#define FFTG_OBJECT_LINEAR         0x2401
+#define FFTG_SPHERE_MAP            0x2402
+#define FFTG_NORMAL_MAP            0x8511
+#define FFTG_REFLECTION_MAP        0x8512
+
+static const VertexAttr *texcoord_attr_stage(int st);
+
+/* Stage st's raw texgen word for component c (0 S, 1 T, 2 R). */
+static uint32_t ff_texgen_mode(int st, int c)
+{
+    return s_reg[(FFTG_TEXGEN_S + 0x10u * (uint32_t)st + 4u * (uint32_t)c) / 4];
+}
+
+/* Does stage st generate s or t itself? Then it has coordinates without an array. */
+static int ff_texgen_generates(int st)
+{
+    return batch_is_ffp() && (ff_texgen_mode(st, 0) || ff_texgen_mode(st, 1));
+}
+
+/* Stage st's s,t,r,q for one vertex: the attribute, then texgen and the matrix on
+ * fixed-function batches. Returns 0 when the stage has neither an array nor s/t texgen. */
+static int ff_texcoord(int st, uint32_t index, float out[4])
+{
+    int ok = fetch_attr(texcoord_attr_stage(st), index, out);
+    uint32_t mode[3];
+    int c, i;
+
+    if (!batch_is_ffp())
+        return ok;
+    for (c = 0; c < 3; c++)
+        mode[c] = ff_texgen_mode(st, c);
+    if (mode[0] || mode[1] || mode[2]) {
+        const float *mv = (const float *)&s_reg[FFTG_MODEL_VIEW / 4];
+        const float *imv = (const float *)&s_reg[FFTG_INVERSE_MODEL_VIEW / 4];
+        float pos[4], nrm[4], e[4], n[3], r[3], len, ndu, m;
+
+        fetch_attr(&s_gpu.attr[0], index, pos);
+        fetch_attr(&s_gpu.attr[2], index, nrm);
+        for (i = 0; i < 4; i++)
+            e[i] = mv[4 * i] * pos[0] + mv[4 * i + 1] * pos[1]
+                 + mv[4 * i + 2] * pos[2] + mv[4 * i + 3] * pos[3];
+        for (i = 0; i < 3; i++)
+            n[i] = imv[4 * i] * nrm[0] + imv[4 * i + 1] * nrm[1] + imv[4 * i + 2] * nrm[2];
+        len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if ((s_reg[FFTG_NORMALIZATION_ENABLE / 4] & 1) && len > 1e-8f)
+            for (i = 0; i < 3; i++)
+                n[i] /= len;
+        len = sqrtf(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
+        for (i = 0; i < 3; i++)
+            r[i] = len > 1e-8f ? e[i] / len : 0.0f;
+        ndu = n[0] * r[0] + n[1] * r[1] + n[2] * r[2];
+        for (i = 0; i < 3; i++)
+            r[i] -= 2.0f * ndu * n[i];
+        m = 2.0f * sqrtf(r[0] * r[0] + r[1] * r[1] + (r[2] + 1.0f) * (r[2] + 1.0f));
+        for (c = 0; c < 3; c++) {
+            const float *pl = (const float *)&s_reg[(FFTG_PLANE_S
+                              + 0x40u * (uint32_t)st + 0x10u * (uint32_t)c) / 4];
+            switch (mode[c]) {
+            case FFTG_EYE_LINEAR:
+                out[c] = pl[0] * e[0] + pl[1] * e[1] + pl[2] * e[2] + pl[3] * e[3];
+                break;
+            case FFTG_OBJECT_LINEAR:
+                out[c] = pl[0] * pos[0] + pl[1] * pos[1] + pl[2] * pos[2] + pl[3] * pos[3];
+                break;
+            case FFTG_SPHERE_MAP:
+                if (c < 2)
+                    out[c] = m > 1e-8f ? r[c] / m + 0.5f : 0.5f;
+                break;
+            case FFTG_REFLECTION_MAP:
+                out[c] = r[c];
+                break;
+            case FFTG_NORMAL_MAP:
+                out[c] = n[c];
+                break;
+            default:                                /* DISABLE or unknown */
+                break;
+            }
+        }
+        ok |= mode[0] || mode[1];
+    }
+    if (st < 2 && s_reg[(FFTG_MATRIX_ENABLE + 4u * (uint32_t)st) / 4]) {
+        const float *t = (const float *)&s_reg[(FFTG_MATRIX + 0x40u * (uint32_t)st) / 4];
+        float in[4];
+
+        memcpy(in, out, sizeof in);
+        for (i = 0; i < 4; i++)
+            out[i] = t[4 * i] * in[0] + t[4 * i + 1] * in[1]
+                   + t[4 * i + 2] * in[2] + t[4 * i + 3] * in[3];
+    }
+    return ok;
+}
+/* ---- Fixed-function texgen and texture matrices (end) ------------------- */
+
 /* Texel coordinates, whichever convention the title used.
  *
  * The two are not interchangeable and the format decides which is in force: a
@@ -2518,7 +2653,7 @@ static int fetch_texcoord(uint32_t index, float out[2])
 {
     float t[4];
 
-    if (!fetch_attr(texcoord_attr(), index, t))
+    if (!ff_texcoord(0, index, t))
         return 0;
     out[0] = t[0];
     out[1] = t[1];
@@ -2884,7 +3019,7 @@ static void backend_vertex_extra(uint32_t index, Nv2aVertexExtra *out)
     out->specular = pack_color(c);
     out->fog = 1.0f;
     for (st = 0; st < 4; st++)
-        fetch_attr(texcoord_attr_stage(st), index, out->tex[st]);
+        ff_texcoord(st, index, out->tex[st]);
 }
 
 static int backend_vertex(uint32_t index, Nv2aVertex *out)
@@ -3027,7 +3162,7 @@ static void backend_batch(void)
     batch.state = &s_gpu.rs;
     for (st = 0; st < 4; st++) {
         const VertexAttr *tc = texcoord_attr_stage(st);
-        usable[st] = s_gpu.texs[st].valid && tc->offset && tc->stride;
+        usable[st] = s_gpu.texs[st].valid && ((tc->offset && tc->stride) || ff_texgen_generates(st));
     }
     if (usable[0]) {
         backend_texture(0, &tex);
