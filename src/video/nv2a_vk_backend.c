@@ -499,6 +499,7 @@ typedef struct {
     VkImage img;
     VbAlloc mem;
     VkImageView view;
+    VkImageView one;                    /* lazily made: the same image with alpha read as 1.0 */
 } VbImage;
 
 typedef struct {
@@ -558,6 +559,7 @@ typedef struct {
 typedef struct {
     VkImage img;
     VkImageView view;
+    VkImageView one;
     VbAlloc mem;
     VkBuffer buf;
     VkFramebuffer fb;
@@ -644,6 +646,7 @@ static struct {
     VkFormat depth_format;
     int bc, depth_clamp;                /* features enabled on the device */
     int shader_clip;                    /* shaderClipDistance; the program path needs it */
+    int no_swizzle;                     /* portability subset without imageViewFormatSwizzle */
     VkCommandPool pool;
     /* The buffer for a recording that is not possible: allocated from the same pool, begun once
      * at install and then never ended, submitted or reset. vb_cmd returns it while the current
@@ -1728,6 +1731,7 @@ static void vb_garbage_destroy(VbGarbage *e)
     if (e->fb) vkDestroyFramebuffer(g.dev, e->fb, NULL);
     if (e->pipe) vkDestroyPipeline(g.dev, e->pipe, NULL);
     if (e->view) vkDestroyImageView(g.dev, e->view, NULL);
+    if (e->one) vkDestroyImageView(g.dev, e->one, NULL);
     if (e->img) vkDestroyImage(g.dev, e->img, NULL);
     if (e->buf) vkDestroyBuffer(g.dev, e->buf, NULL);
 }
@@ -1804,8 +1808,9 @@ static void vb_image_discard(VbImage *im)
     memset(&e, 0, sizeof e);
     e.img = im->img;
     e.view = im->view;
+    e.one = im->one;
     e.mem = im->mem;
-    if (e.img || e.view || e.mem.mem)
+    if (e.img || e.view || e.one || e.mem.mem)
         vb_discard(e);
     memset(im, 0, sizeof *im);
     im->mem.pool = -1;                  /* an empty VbAlloc is "no memory", not "pool 0" */
@@ -2982,11 +2987,34 @@ fail:
 
 /* ── Images, framebuffers, render passes ─────────────────────────────── */
 
+/* A 2D view of `img`; `alpha_one` makes alpha read as 1.0 whatever is stored. */
+static VkImageView vb_view_create(VkImage img, VkFormat fmt, VkImageAspectFlags aspect,
+                                  int alpha_one)
+{
+    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    VkImageView v = VK_NULL_HANDLE;
+    VkResult r;
+
+    vi.image = img;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = fmt;
+    if (alpha_one)
+        vi.components.a = VK_COMPONENT_SWIZZLE_ONE;
+    vi.subresourceRange.aspectMask = aspect;
+    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.layerCount = 1;
+    r = vkCreateImageView(g.dev, &vi, NULL, &v);
+    if (r != VK_SUCCESS) {
+        vb_fail("vkCreateImageView", r);
+        return VK_NULL_HANDLE;
+    }
+    return v;
+}
+
 static int vb_image_create(VbImage *im, uint32_t w, uint32_t h, VkFormat fmt,
                            VkImageUsageFlags usage, VkImageAspectFlags aspect)
 {
     VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
     VkMemoryRequirements mr;
     int reqd = 0, prefd = 0;
     VkResult r;
@@ -3035,20 +3063,27 @@ static int vb_image_create(VbImage *im, uint32_t w, uint32_t h, VkFormat fmt,
         vb_image_discard(im);
         return 0;
     }
-    vi.image = im->img;
-    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vi.format = fmt;
-    vi.subresourceRange.aspectMask = aspect;
-    vi.subresourceRange.levelCount = 1;
-    vi.subresourceRange.layerCount = 1;
-    r = vkCreateImageView(g.dev, &vi, NULL, &im->view);
-    if (r != VK_SUCCESS) {
-        vb_fail("vkCreateImageView", r);
-        im->view = VK_NULL_HANDLE;
+    im->view = vb_view_create(im->img, fmt, aspect, 0);
+    if (!im->view) {
         vb_image_discard(im);
         return 0;
     }
     return 1;
+}
+
+/* The view of a B8G8R8A8 target image that reads alpha as 1.0, made on first use. */
+static VkImageView vb_image_view_one(VbImage *im)
+{
+    if (g.no_swizzle) {                 /* identity view only: the stored alpha is read */
+        static int said;
+        if (!said++)
+            fprintf(stderr, "[GPUVK] no imageViewFormatSwizzle: LIN_X8R8G8B8 render-target"
+                            " aliases read their stored alpha\n");
+        return im->view;
+    }
+    if (!im->one)
+        im->one = vb_view_create(im->img, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+    return im->one;
 }
 
 /* Forget (and destroy after the submission) every framebuffer using `view`. */
@@ -3959,7 +3994,7 @@ static VkImageView vb_texture(const Nv2aTexture *tx, VbTarget *out, VkImageLayou
         *inv_h = 1.0f / (float)t->h;
         *layout = VK_IMAGE_LAYOUT_GENERAL;
         if (t != out)
-            return t->im.view;
+            return tx->color == 0x1E ? vb_image_view_one(&t->im) : t->im.view;
         /* Sampling the target being drawn: read a snapshot of it instead. */
         if (!t->copy.view) {
             if (!vb_image_create(&t->copy, t->w, t->h, VK_FORMAT_B8G8R8A8_UNORM,
@@ -3994,7 +4029,7 @@ static VkImageView vb_texture(const Nv2aTexture *tx, VbTarget *out, VkImageLayou
                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT
                | VK_ACCESS_TRANSFER_WRITE_BIT);
         g.st.rt_copies++;
-        return t->copy.view;
+        return tx->color == 0x1E ? vb_image_view_one(&t->copy) : t->copy.view;
     }
 
     span = nv2a_backend_texture_span(tx);
@@ -5420,7 +5455,8 @@ static int vb_device_has_ext(VkPhysicalDevice pd, const char *want)
  *   triangleFans                 no: topology is TRIANGLE_LIST only
  *   constantAlphaColorBlendFactors no: only CONSTANT_COLOR / ONE_MINUS_CONSTANT_COLOR
  *   separateStencilMaskRef       no: every stencil state is set for FRONT_AND_BACK
- *   imageViewFormatSwizzle       no: every view uses the identity mapping
+ *   imageViewFormatSwizzle       no: only the alpha-one view of an aliased LIN_X8R8G8B8 target
+ *                                uses it, and without it that alias reads its stored alpha
  *   imageViewFormatReinterpretation no: views use their image's own format
  *   samplerMipLodBias            no: mipLodBias stays 0
  *   vertexAttributeAccessBeyondStride no: every attribute lies inside its stride
@@ -5442,6 +5478,7 @@ static int vb_portability_check(void)
     }
     f2.pNext = &pf;
     vkGetPhysicalDeviceFeatures2(g.pd, &f2);
+    g.no_swizzle = !pf.imageViewFormatSwizzle;
 #define VB_PF(field) t[n].name = #field; t[n].have = pf.field; t[n].need = 0; n++;
     VB_PF(constantAlphaColorBlendFactors) VB_PF(events) VB_PF(imageViewFormatReinterpretation)
     VB_PF(imageViewFormatSwizzle) VB_PF(imageView2DOn3DImage) VB_PF(multisampleArrayImage)
