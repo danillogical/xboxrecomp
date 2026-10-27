@@ -90,7 +90,55 @@ typedef struct {
     uint32_t stencil_write_mask, stencil_read_mask;      /* low 8 bits */
     uint32_t stencil_func, stencil_ref;
     uint32_t stencil_op_fail, stencil_op_zfail, stencil_op_zpass;
+    /* Window clip (NV097 0x02B4, 0x02C0.., 0x02E0..) as sent, in logical pixels. All zero
+     * until a window-clip method arrives: no clip. wclip_h[i]: xmin bits 0-11, xmax bits
+     * 16-27; wclip_v[i] likewise for y. Draws only; clears ignore it. */
+    uint32_t wclip_set;                                  /* 1 once any method was written */
+    uint32_t wclip_exclusive;                            /* 0 inclusive, 1 exclusive */
+    uint32_t wclip_h[8], wclip_v[8];
 } Nv2aRenderState;
+
+/* The window clip as one rectangle [*x0, *x1) x [*y0, *y1) in real pixels (sx, sy are the
+ * anti-aliasing factors). Returns 0: no clip; 1: the rectangle is exact (it may be empty);
+ * 2: only approximate -- inclusive with distinct rectangles gives their bounding box, and
+ * exclusive gives no bounds (the whole range). A rectangle with max < min covers nothing. */
+static inline int nv2a_wclip_bounds(const Nv2aRenderState *rs, uint32_t sx, uint32_t sy,
+                                    uint32_t *x0, uint32_t *y0, uint32_t *x1, uint32_t *y1)
+{
+    uint32_t bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+    int i, n = 0, distinct = 0;
+
+    *x0 = *y0 = 0;
+    *x1 = *y1 = 0xFFFFFFFFu;
+    if (!rs->wclip_set)
+        return 0;
+    for (i = 0; i < 8; i++) {
+        uint32_t h = rs->wclip_h[i], v = rs->wclip_v[i];
+        uint32_t xa = h & 0xFFF, xb = (h >> 16) & 0xFFF;
+        uint32_t ya = v & 0xFFF, yb = (v >> 16) & 0xFFF;
+        uint32_t rx0, ry0, rx1, ry1;
+
+        if (xb < xa || yb < ya)
+            continue;
+        rx0 = xa * sx; rx1 = (xb + 1) * sx;
+        ry0 = ya * sy; ry1 = (yb + 1) * sy;
+        if (!n) {
+            bx0 = rx0; by0 = ry0; bx1 = rx1; by1 = ry1;
+        } else {
+            if (rx0 != bx0 || ry0 != by0 || rx1 != bx1 || ry1 != by1)
+                distinct = 1;
+            if (rx0 < bx0) bx0 = rx0;
+            if (ry0 < by0) by0 = ry0;
+            if (rx1 > bx1) bx1 = rx1;
+            if (ry1 > by1) by1 = ry1;
+        }
+        n++;
+    }
+    if (rs->wclip_exclusive)
+        return n ? 2 : 0;
+    *x0 = bx0; *y0 = by0; *x1 = bx1; *y1 = by1;     /* n == 0: empty, nothing passes */
+    return distinct ? 2 : 1;
+}
 
 /* What the register combiners read per vertex beyond Nv2aVertex, one entry
  * per vertex of the batch, in the same order. */

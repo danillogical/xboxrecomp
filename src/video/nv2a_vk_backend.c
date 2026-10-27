@@ -591,7 +591,7 @@ typedef struct {
 } VbSlot;
 
 typedef struct {
-    uint64_t draws, tris, clears, dropped_tris, skipped, cull_draws, cull_all;
+    uint64_t draws, tris, clears, dropped_tris, skipped, cull_draws, cull_all, wclip_approx;
     uint64_t tex_uploads, tex_hits, tex_undecodable, rt_aliases, rt_copies;
     uint64_t rt_loads, readbacks, readback_ns, rc_draws, rc_fallback, pipelines, submits;
     uint64_t validation_errors, validation_warnings;
@@ -4323,6 +4323,33 @@ static int vb_scissor(const Nv2aSurface *s, const VbTarget *t, VkRect2D *r)
     return 1;
 }
 
+/* Intersect a draw's scissor with the window clip. Exact for a single rectangle, the bounding
+ * box for inclusive distinct rectangles, nothing for exclusive; the last two are counted as
+ * approximate. Returns 0 if the intersection is empty. Draws only: clears use vb_scissor. */
+static int vb_wclip(const Nv2aSurface *s, const Nv2aRenderState *rs, VkRect2D *r)
+{
+    uint32_t x0, y0, x1, y1, sx0, sy0, sx1, sy1;
+    int kind = nv2a_wclip_bounds(rs, s->aa_sx, s->aa_sy, &x0, &y0, &x1, &y1);
+
+    if (!kind)
+        return 1;
+    if (kind == 2)
+        g.st.wclip_approx++;
+    sx0 = (uint32_t)r->offset.x; sy0 = (uint32_t)r->offset.y;
+    sx1 = sx0 + r->extent.width; sy1 = sy0 + r->extent.height;
+    if (x0 > sx0) sx0 = x0;
+    if (y0 > sy0) sy0 = y0;
+    if (x1 < sx1) sx1 = x1;
+    if (y1 < sy1) sy1 = y1;
+    if (sx0 >= sx1 || sy0 >= sy1)
+        return 0;
+    r->offset.x = (int32_t)sx0;
+    r->offset.y = (int32_t)sy0;
+    r->extent.width = sx1 - sx0;
+    r->extent.height = sy1 - sy0;
+    return 1;
+}
+
 static int vb_cull_mode(const Nv2aRenderState *rs)
 {
     if (!rs->cull_enable) return 0;
@@ -4443,6 +4470,8 @@ static int vb_setup(VbDraw *dr, const Nv2aSurface *s, const Nv2aBatch *b, int rc
     dr->key.ccw = dr->key.cull && rs->front_face == 0x901;
     dr->t = vb_target_for(s);
     if (!dr->t || !vb_scissor(s, dr->t, &dr->scissor))
+        return 0;
+    if (!vb_wclip(s, rs, &dr->scissor))
         return 0;
     vb_target_load(dr->t);
     if (rs->zeta_va)
@@ -4942,7 +4971,7 @@ static void vb_stats(int force)
                     " rt_loads=%llu readbacks=%llu readback_ms=%.1f dropped_tris=%llu"
                     " skipped=%llu rc_draws=%llu rc_fallback=%llu pipelines=%llu submits=%llu"
                     " reuse_waits=%llu drain_waits=%llu splits=%llu overflows=%llu max_inflight=%u"
-                    " cull_draws=%llu cull_all=%llu validation_errors=%llu"
+                    " cull_draws=%llu cull_all=%llu wclip_approx=%llu validation_errors=%llu"
                     " validation_warnings=%llu vsh_hits=%llu vsh_misses=%llu"
                     " vsh_identity_fail=%llu vsh_declines=%llu vsh_tris=%llu"
                     " vsh_const_uploads=%llu rb_batches=%llu rb_packs=%llu rb_pixels=%llu"
@@ -4974,6 +5003,7 @@ static void vb_stats(int force)
             (unsigned long long)g.st.reuse_waits, (unsigned long long)g.st.drain_waits,
             (unsigned long long)g.st.splits, (unsigned long long)g.st.overflows, g.max_inflight,
             (unsigned long long)g.st.cull_draws, (unsigned long long)g.st.cull_all,
+            (unsigned long long)g.st.wclip_approx,
             (unsigned long long)g.st.validation_errors,
             (unsigned long long)g.st.validation_warnings,
             (unsigned long long)g.st.vsh_hits, (unsigned long long)g.st.vsh_misses,

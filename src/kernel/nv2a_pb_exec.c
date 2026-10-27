@@ -237,6 +237,9 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 
 #define NV097_SET_SURFACE_CLIP_HORIZONTAL 0x0200
 #define NV097_SET_SURFACE_CLIP_VERTICAL   0x0204
+#define NV097_SET_WINDOW_CLIP_TYPE        0x02B4
+#define NV097_SET_WINDOW_CLIP_HORIZONTAL  0x02C0   /* + 4*i, i = 0..7 */
+#define NV097_SET_WINDOW_CLIP_VERTICAL    0x02E0   /* + 4*i, i = 0..7 */
 #define NV097_SET_SURFACE_FORMAT          0x0208
 #define NV097_SET_SURFACE_PITCH           0x020C
 #define NV097_SET_SURFACE_COLOR_OFFSET    0x0210
@@ -2373,6 +2376,92 @@ static void put_pixel(uint8_t *mem, uint32_t bpp, int x, int y, uint32_t argb)
     }
 }
 
+/* The window clip as one draw sees it: the rectangles that still need a per-pixel test
+ * after the draw's bounds were clamped. n == 0: nothing to test. */
+typedef struct {
+    int n, exclusive;
+    int x0[8], y0[8], x1[8], y1[8];     /* [x0, x1) x [y0, y1), real pixels */
+} WClip;
+
+/* Fold the window clip into the draw bounds [*minx, *maxx) x [*miny, *maxy). Returns 0 when
+ * it clips the whole draw away. Off, or a single rectangle, costs no per-pixel work. */
+static int wclip_setup(WClip *w, int *minx, int *miny, int *maxx, int *maxy)
+{
+    const Nv2aRenderState *rs = &s_gpu.rs;
+    uint32_t sx = s_gpu.aa_sx > 1.5f ? 2 : 1, sy = s_gpu.aa_sy > 1.5f ? 2 : 1;
+    uint32_t bx0, by0, bx1, by1;
+    int i, covers = 0, ux0 = 0, uy0 = 0, ux1 = 0, uy1 = 0;
+
+    w->n = 0;
+    w->exclusive = (int)(rs->wclip_exclusive & 1);
+    if (!rs->wclip_set)
+        return 1;
+    if (nv2a_wclip_bounds(rs, sx, sy, &bx0, &by0, &bx1, &by1) == 1) {
+        if (bx0 >= bx1 || by0 >= by1)
+            return 0;
+        if ((int64_t)bx0 > *minx) *minx = (int)bx0;
+        if ((int64_t)by0 > *miny) *miny = (int)by0;
+        if ((int64_t)bx1 < *maxx) *maxx = (int)bx1;
+        if ((int64_t)by1 < *maxy) *maxy = (int)by1;
+        return *minx < *maxx && *miny < *maxy;
+    }
+    for (i = 0; i < 8; i++) {
+        uint32_t h = rs->wclip_h[i], v = rs->wclip_v[i];
+        int xa = (int)(h & 0xFFF), xb = (int)((h >> 16) & 0xFFF);
+        int ya = (int)(v & 0xFFF), yb = (int)((v >> 16) & 0xFFF);
+        int rx0, ry0, rx1, ry1, k;
+
+        if (xb < xa || yb < ya)
+            continue;
+        rx0 = xa * (int)sx; rx1 = (xb + 1) * (int)sx;
+        ry0 = ya * (int)sy; ry1 = (yb + 1) * (int)sy;
+        if (rx1 <= *minx || rx0 >= *maxx || ry1 <= *miny || ry0 >= *maxy)
+            continue;                   /* misses the draw */
+        for (k = 0; k < w->n; k++)
+            if (w->x0[k] == rx0 && w->y0[k] == ry0 && w->x1[k] == rx1 && w->y1[k] == ry1)
+                break;
+        if (k < w->n)
+            continue;                   /* a repeat of an earlier slot */
+        if (rx0 <= *minx && ry0 <= *miny && rx1 >= *maxx && ry1 >= *maxy)
+            covers = 1;
+        if (!w->n) {
+            ux0 = rx0; uy0 = ry0; ux1 = rx1; uy1 = ry1;
+        } else {
+            if (rx0 < ux0) ux0 = rx0;
+            if (ry0 < uy0) uy0 = ry0;
+            if (rx1 > ux1) ux1 = rx1;
+            if (ry1 > uy1) uy1 = ry1;
+        }
+        w->x0[w->n] = rx0; w->y0[w->n] = ry0; w->x1[w->n] = rx1; w->y1[w->n] = ry1;
+        w->n++;
+    }
+    if (w->exclusive) {
+        if (covers)
+            return 0;                   /* one rectangle swallows the draw */
+        return 1;
+    }
+    if (!w->n)
+        return 0;                       /* no rectangle touches the draw */
+    if (ux0 > *minx) *minx = ux0;
+    if (uy0 > *miny) *miny = uy0;
+    if (ux1 < *maxx) *maxx = ux1;
+    if (uy1 < *maxy) *maxy = uy1;
+    if (covers || w->n == 1)
+        w->n = 0;                       /* the bounds already say it all */
+    return 1;
+}
+
+/* Per-pixel window-clip test, for a WClip that kept rectangles. */
+static inline int wclip_pass(const WClip *w, int x, int y)
+{
+    int k;
+
+    for (k = 0; k < w->n; k++)
+        if (x >= w->x0[k] && x < w->x1[k] && y >= w->y0[k] && y < w->y1[k])
+            return !w->exclusive;
+    return w->exclusive;
+}
+
 /* Half-space fill. Barycentric edge functions rather than scanline slopes:
  * the same test decides both windings, so a title that emits clockwise
  * triangles does not silently render nothing. */
@@ -2385,6 +2474,7 @@ static void raster_triangle(const float a[2], const float b[2],
     float area;
     int minx, maxx, miny, maxy, x, y;
     int textured = uv && s_gpu.texs[0].valid;
+    WClip wc;
 
     if (bpp != 4 && bpp != 2)
         return;
@@ -2408,7 +2498,7 @@ static void raster_triangle(const float a[2], const float b[2],
     if (miny < (int)s_gpu.clip_y) miny = (int)s_gpu.clip_y;
     if (maxx > (int)(s_gpu.clip_x + s_gpu.clip_w)) maxx = (int)(s_gpu.clip_x + s_gpu.clip_w);
     if (maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
-    if (minx >= maxx || miny >= maxy) {
+    if (minx >= maxx || miny >= maxy || !wclip_setup(&wc, &minx, &miny, &maxx, &maxy)) {
         s_gpu.tris_skipped_offscreen++;
         return;
     }
@@ -2421,6 +2511,8 @@ static void raster_triangle(const float a[2], const float b[2],
             float w2 = (a[0] - c[0]) * (py - c[1]) - (a[1] - c[1]) * (px - c[0]);
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
                || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
+                continue;
+            if (wc.n && !wclip_pass(&wc, x, y))
                 continue;
             if (textured) {
                 /* Barycentric, straight from the edge functions already
@@ -3526,6 +3618,7 @@ typedef struct {
     float iw[3], uv[3][2], stc[3][4][4], vfog[3], fogc[4], inv_area;
     float *zb;
     int minx, maxx, miny, maxy, use_rc, textured;
+    WClip wc;
 } XfTri;
 
 typedef struct { uint64_t depth_fail, pixels; uint32_t zpass; } XfCount;
@@ -3548,6 +3641,8 @@ static void xf_rows(const XfTri *T, int y0, int step, XfCount *cnt)
             if (!((w0 >= 0 && w1 >= 0 && w2 >= 0)
                || (w0 <= 0 && w1 <= 0 && w2 <= 0)))
                 continue;
+            if (T->wc.n && !wclip_pass(&T->wc, x, y))
+                continue;               /* before any depth or colour write */
             /* w1 is opposite a, w2 opposite b, w0 opposite c. */
             l0 = w1 * T->inv_area; l1 = w2 * T->inv_area; l2 = w0 * T->inv_area;
             z = l0 * a[2] + l1 * b[2] + l2 * c[2];
@@ -3893,7 +3988,8 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
     if (T.maxy > (int)(s_gpu.clip_y + s_gpu.clip_h)) T.maxy = (int)(s_gpu.clip_y + s_gpu.clip_h);
     if (T.maxx > NV_ZBUF_W) T.maxx = NV_ZBUF_W;
     if (T.maxy > NV_ZBUF_H) T.maxy = NV_ZBUF_H;
-    if (T.minx >= T.maxx || T.miny >= T.maxy) {
+    if (T.minx >= T.maxx || T.miny >= T.maxy
+        || !wclip_setup(&T.wc, &T.minx, &T.miny, &T.maxx, &T.maxy)) {
         s_gpu.tris_skipped_offscreen++;
         s_gpu.xf_offscreen++;
         return;
@@ -5590,6 +5686,10 @@ static void capture_render_state(uint32_t method, uint32_t param)
     case 0x0394: memcpy(&f, &param, 4); r->depth_min = f; break; /* SET_CLIP_MIN */
     case 0x0398: memcpy(&f, &param, 4); r->depth_max = f; break; /* SET_CLIP_MAX */
     case 0x0214: r->zeta_va = param ? dma_resolve(param) : 0; break; /* ZETA_OFFSET */
+    case NV097_SET_WINDOW_CLIP_TYPE:
+        r->wclip_exclusive = param & 1;
+        r->wclip_set = 1;
+        break;
     case 0x032C: r->stencil_test_enable = param; break; /* SET_STENCIL_TEST_ENABLE */
     case 0x0360: r->stencil_write_mask  = param; break; /* SET_STENCIL_MASK */
     case 0x0364: r->stencil_func        = param; break; /* SET_STENCIL_FUNC */
@@ -5598,7 +5698,22 @@ static void capture_render_state(uint32_t method, uint32_t param)
     case 0x0370: r->stencil_op_fail     = param; break; /* SET_STENCIL_OP_FAIL */
     case 0x0374: r->stencil_op_zfail    = param; break; /* SET_STENCIL_OP_ZFAIL */
     case 0x0378: r->stencil_op_zpass    = param; break; /* SET_STENCIL_OP_ZPASS */
-    default:     break;
+    default:
+        /* Writing slot i writes slots i..7. */
+        if (method >= NV097_SET_WINDOW_CLIP_HORIZONTAL
+            && method < NV097_SET_WINDOW_CLIP_HORIZONTAL + 32 && !(method & 3)) {
+            uint32_t i = (method - NV097_SET_WINDOW_CLIP_HORIZONTAL) >> 2;
+            for (; i < 8; i++)
+                r->wclip_h[i] = param;
+            r->wclip_set = 1;
+        } else if (method >= NV097_SET_WINDOW_CLIP_VERTICAL
+                   && method < NV097_SET_WINDOW_CLIP_VERTICAL + 32 && !(method & 3)) {
+            uint32_t i = (method - NV097_SET_WINDOW_CLIP_VERTICAL) >> 2;
+            for (; i < 8; i++)
+                r->wclip_v[i] = param;
+            r->wclip_set = 1;
+        }
+        break;
     }
 }
 /* The texture stage registers, all four stages. Stage i's registers are
