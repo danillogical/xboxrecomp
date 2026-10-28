@@ -391,7 +391,9 @@ static void test_serial_handover(void)
            "a kernel call did not let the waiter in");
     SetEvent(w.release);
     xbox_GuestMeterRestore(k, XBOX_GM_KERNEL);   /* waits for the worker to leave */
-    EXPECT(WaitForSingleObject(w.done, 0) == WAIT_OBJECT_0,
+    /* The worker signals done after it leaves, so a return that waited can still
+     * beat that signal; the meter's high-water mark is what shows an overlap. */
+    EXPECT(WaitForSingleObject(w.done, SERIAL_LONG_MS) == WAIT_OBJECT_0 && snap().max_inside == 1,
            "the kernel return re-entered while the worker was inside");
     gate_finish(&w, th);
 
@@ -452,12 +454,14 @@ static void test_serial_overrun(void)
 }
 
 /* The yield acts once per 4096 calls, and only with a waiter. */
+#define YIELD_MAX_ROUNDS 100
+
 static void test_serial_yield(void)
 {
     GATE_WORKER w;
     HANDLE th;
     xbox_gserial_record g;
-    int t, i;
+    int t, i, rounds = 0;
 
     xbox_GuestMeterTestReset(0);
     xbox_GuestSerialTestReset(1, SERIAL_LONG_MS);
@@ -469,15 +473,20 @@ static void test_serial_yield(void)
     th = gate_start(&w, XBOX_GM_DPC);
     EXPECT(wait_contended(1), "yield: the worker never waited");
     SetEvent(w.release);                         /* it leaves as soon as it is in */
-    for (i = 0; i < 4096; i++)
-        xbox_GuestSerialYield();
-    EXPECT(WaitForSingleObject(w.done, 0) == WAIT_OBJECT_0,
+    /* A woken waiter that is not scheduled within the hand-off grace loses the lock to
+     * the yielder, which stays a holder with a waiter; the next round hands over again. */
+    do {
+        for (i = 0; i < 4096; i++)
+            xbox_GuestSerialYield();
+        rounds++;
+    } while (WaitForSingleObject(w.inside, 0) != WAIT_OBJECT_0 && rounds < YIELD_MAX_ROUNDS);
+    EXPECT(WaitForSingleObject(w.inside, 0) == WAIT_OBJECT_0,
            "the yield came back before the worker had run");
     gate_finish(&w, th);
     xbox_GuestMeterRestore(t, XBOX_GM_THREAD);
     g = gsnap();
-    EXPECT(g.yields == 1 && g.overruns == 0, "yield: yields=%lld overruns=%lld",
-           (long long)g.yields, (long long)g.overruns);
+    EXPECT(g.yields == rounds && g.overruns == 0, "yield: yields=%lld rounds=%d overruns=%lld",
+           (long long)g.yields, rounds, (long long)g.overruns);
 }
 
 int main(void)
