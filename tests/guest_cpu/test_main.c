@@ -639,6 +639,120 @@ static void dispatch_call(void)
     set_lock("0");
 }
 
+/* ── NtSuspendThread on a thread that is queued for, or holds, the CPU ── */
+
+#define SUSPEND_WATCHDOG_MS 2000
+
+static volatile LONG s_sq_a_ran, s_sq_b_ran;
+
+static DWORD WINAPI suspend_queued_a(LPVOID p)
+{
+    (void)p;
+    xbox_GuestCpuJoin();                /* queues behind the holder */
+    InterlockedExchange(&s_sq_a_ran, 1);
+    xbox_GuestCpuPart();
+    return 0;
+}
+
+static DWORD WINAPI suspend_queued_b(LPVOID p)
+{
+    (void)p;
+    xbox_GuestCpuJoin();                /* queues behind A */
+    InterlockedExchange(&s_sq_b_ran, 1);
+    xbox_GuestCpuPart();
+    return 0;
+}
+
+/* A queued waiter holds a ticket; suspended, it never takes its turn, the
+ * head never moves past it, and every guest thread behind it starves. */
+static void suspend_queued(void)
+{
+    HANDLE a, b;
+    ULONG prev = 0;
+    int b_ran, a_ran;
+
+    set_lock("1");
+    set_env("RECOMP_GUEST_QUANTUM", "0");
+    s_sq_a_ran = s_sq_b_ran = 0;
+    xbox_GuestCpuJoin();
+    a = CreateThread(NULL, 0, suspend_queued_a, NULL, 0, NULL);
+    check(wait_waiting(1, 5000), "suspend queued: A waits while this one runs");
+    check(xbox_NtSuspendThread(a, &prev) == STATUS_SUCCESS,
+          "suspend queued: NtSuspendThread(A) succeeds");
+    b = CreateThread(NULL, 0, suspend_queued_b, NULL, 0, NULL);
+    check(wait_waiting(2, 5000), "suspend queued: B waits behind A");
+    xbox_GuestCpuRelease(XBOX_GUEST_CPU_KERNEL, 238 /* NtYieldExecution */);
+    xbox_GuestCpuPart();
+
+    b_ran = wait_for(&s_sq_b_ran, 1, SUSPEND_WATCHDOG_MS);
+    check(b_ran, "a suspended waiter blocks the guest CPU");
+    if (!b_ran)
+        fprintf(stderr, "guest_cpu: suspend_queued: B never got the CPU"
+                " (a suspended waiter blocks the guest CPU)\n");
+
+    xbox_NtResumeThread(a, &prev);
+    a_ran = wait_for(&s_sq_a_ran, 1, SUSPEND_WATCHDOG_MS);
+    check(a_ran, "a resumed waiter gets the CPU");
+    /* Both finish once A has its turn; join bounds the wait. */
+    join(a);
+    join(b);
+    set_env("RECOMP_GUEST_QUANTUM", NULL);
+    set_lock("0");
+}
+
+static volatile LONG s_sh_a_holds, s_sh_stop, s_sh_a_done, s_sh_c_ran;
+
+static DWORD WINAPI suspend_holder_a(LPVOID p)
+{
+    (void)p;
+    xbox_GuestCpuJoin();                /* the CPU is free: A holds it */
+    InterlockedExchange(&s_sh_a_holds, 1);
+    /* Guest code that never reaches a preemption point or kernel call. */
+    while (!InterlockedCompareExchange(&s_sh_stop, 0, 0))
+        Sleep(0);
+    xbox_GuestCpuPart();
+    InterlockedExchange(&s_sh_a_done, 1);
+    return 0;
+}
+
+static DWORD WINAPI suspend_holder_c(LPVOID p)
+{
+    (void)p;
+    xbox_GuestCpuJoin();
+    InterlockedExchange(&s_sh_c_ran, 1);
+    xbox_GuestCpuPart();
+    return 0;
+}
+
+/* A suspended holder never lets go: the CPU is never freed. */
+static void suspend_holder(void)
+{
+    HANDLE a, c;
+    ULONG prev = 0;
+    int c_ran;
+
+    set_lock("1");
+    s_sh_a_holds = s_sh_stop = s_sh_a_done = s_sh_c_ran = 0;
+    a = CreateThread(NULL, 0, suspend_holder_a, NULL, 0, NULL);
+    check(wait_for(&s_sh_a_holds, 1, 5000), "suspend holder: A holds the CPU");
+    c = CreateThread(NULL, 0, suspend_holder_c, NULL, 0, NULL);
+    check(wait_waiting(1, 5000), "suspend holder: C waits while A holds");
+    check(xbox_NtSuspendThread(a, &prev) == STATUS_SUCCESS,
+          "suspend holder: NtSuspendThread(A) succeeds");
+
+    c_ran = wait_for(&s_sh_c_ran, 1, SUSPEND_WATCHDOG_MS);
+    check(c_ran, "a suspended holder blocks the guest CPU");
+    if (!c_ran)
+        fprintf(stderr, "guest_cpu: suspend_holder: C never got the CPU"
+                " (a suspended holder blocks the guest CPU)\n");
+
+    xbox_NtResumeThread(a, &prev);
+    InterlockedExchange(&s_sh_stop, 1);
+    join(a);
+    join(c);
+    set_lock("0");
+}
+
 int main(void)
 {
     HANDLE wd;
@@ -663,6 +777,8 @@ int main(void)
     wake();
     dispatch_call();
     callback();
+    suspend_queued();
+    suspend_holder();
 
     /* The dispatch case reset the counters last, so only it and the
      * callback case are in here. */
