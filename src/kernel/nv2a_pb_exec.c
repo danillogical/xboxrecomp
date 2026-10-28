@@ -2774,6 +2774,18 @@ static int fetch_texcoord(uint32_t index, float out[2])
  * Limitations: no specular, spot cones, back-face colours or skinning. The
  * per-vertex facing-away flip below remains a compatibility approximation. */
 #define NV_LIGHTS 8
+
+/* Is fixed-function lighting in force for this batch? Immediate-mode vertices
+ * are drawn as given (batch_is_ffp is false for them) and used to carry no
+ * normal, so lighting never reached them; every attribute now arrives as a
+ * float4, which must not change that. */
+static int lit_applies(void)
+{
+    if (s_gpu.inline_active && s_gpu.imm_count)
+        return 0;
+    return s_reg[0x0314 / 4] && s_gpu.attr[2].size;
+}
+
 static int lit_color(uint32_t index, float out[4])
 {
     const float *mv = (const float *)&s_reg[0x0480 / 4];
@@ -2782,12 +2794,7 @@ static int lit_color(uint32_t index, float out[4])
     uint32_t mask = s_reg[0x03BC / 4], colmat = s_reg[0x0298 / 4];
     int i, have_vc;
 
-    /* Immediate-mode vertices are drawn as given (batch_is_ffp is false for
-     * them) and used to carry no normal, so lighting never reached them; every
-     * attribute now arrives as a float4, which must not change that. */
-    if (s_gpu.inline_active && s_gpu.imm_count)
-        return 0;
-    if (!s_reg[0x0314 / 4] || !s_gpu.attr[2].size)
+    if (!lit_applies())
         return 0;
     if (!fetch_attr(&s_gpu.attr[0], index, pos) || !fetch_attr(&s_gpu.attr[2], index, nrm))
         return 0;
@@ -3108,12 +3115,28 @@ static const VertexAttr *texcoord_attr_stage(int st)
 /* The combiner inputs of one fixed-function vertex, as raw as the title gave
  * them. ponytail: no specular lighting and no fog (factor 1) on this path, as
  * on the CPU path, which does not compute either. */
+/* The fixed-function specular output (oD1) of one vertex. Lit, it starts at
+ * (0, 0, 0, attribute 4's alpha) and gains no per-light term: SET_SPECULAR_PARAMS
+ * (0x09E0) is not admitted, so the term is omitted (L87). SPECULAR_ENABLE (0x03B8)
+ * off forces (0, 0, 0, 1); on without SEPARATE_SPECULAR (0x0294 bit 0) oD1 is
+ * attribute 4 again, after its lit rgb (0) is added into oD0. */
+static void ff_specular(uint32_t index, float c[4])
+{
+    fetch_attr(&s_gpu.attr[4], index, c);         /* absent reads (0,0,0,1) */
+    if (!(s_reg[0x03B8 / 4] & 1)) {
+        c[0] = c[1] = c[2] = 0.0f;
+        c[3] = 1.0f;
+    } else if ((s_reg[0x0294 / 4] & 1) && lit_applies()) {
+        c[0] = c[1] = c[2] = 0.0f;
+    }
+}
+
 static void backend_vertex_extra(uint32_t index, Nv2aVertexExtra *out)
 {
     float c[4];
     int st;
 
-    fetch_attr(&s_gpu.attr[4], index, c);         /* absent reads (0,0,0,1) */
+    ff_specular(index, c);
     out->specular = pack_color(c);
     out->fog = 1.0f;
     for (st = 0; st < 4; st++)
