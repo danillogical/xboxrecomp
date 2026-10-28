@@ -28,6 +28,7 @@
  * the runtime's screen-space epilogue (RCC of R12.w, then a MAD into oPos).
  */
 #include "nv2a_vsh_interp.h"
+#include "../video/nv2a_vsh_hlsl.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -268,19 +269,11 @@ static void decode_program(void)
     s_dec_start = s_start_slot;
     while (s < NV2A_VSH_SLOTS) {
         const DecodedIns *d = &s_dec[s];
-        int uses[3];
 
         decode_ins(&s_dec[s], s_program[s]);
         for (i = 0; i < 4; i++)
             hash = (hash ^ s_program[s][i]) * 16777619u;
-        /* Sources an instruction reads: A for any MAC op, B for the two-operand
-         * ones, C for add/mad and every ILU op. Over-counting is safe. */
-        uses[0] = d->mac != 0;
-        uses[1] = d->mac >= 2 && d->mac <= 12 && d->mac != 3;
-        uses[2] = d->mac == 3 || d->mac == 4 || d->ilu != 0;
-        for (i = 0; i < 3; i++)
-            if (uses[i] && d->mux[i] == 2)
-                inputs |= 1u << d->in_idx;
+        inputs |= nv2a_vsh_ins_input_mask(s_program[s]);
         if (d->omask && !d->out_o)
             writes_c = 1;
         s++;

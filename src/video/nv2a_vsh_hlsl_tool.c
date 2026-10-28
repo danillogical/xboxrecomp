@@ -179,10 +179,8 @@ static int annotate(const char *in, uint32_t mask, Buf *out, const char **why)
     return 1;
 }
 
-/* The input mask the instructions themselves imply, by the rule
- * nv2a_vsh_program_info (kernel/nv2a_vsh_interp.c, decode_program) uses: a source
- * that reads an input (mux 2) makes that input live, whether or not the
- * instruction ends up using it, and the scan stops at the first FINAL. --mask
+/* The input mask the instructions themselves imply, by the rule every consumer shares
+ * (nv2a_vsh_ins_input_mask, nv2a_vsh_hlsl.h): the scan stops at the first FINAL. --mask
  * must agree with this, because it decides both the emitted vertex inputs and
  * the vertex input layout the back end bakes into the pipeline; a mask that
  * disagrees produces a shader no runtime batch can ever match. */
@@ -191,22 +189,8 @@ static uint32_t derived_mask(const uint32_t (*w)[4], uint32_t len)
     uint32_t mask = 0, n;
 
     for (n = 0; n < len; n++) {
-        const uint32_t *ins = w[n];
-        uint32_t mac = (ins[1] >> 21) & 0xF, ilu = (ins[1] >> 25) & 0x7;
-        uint32_t in_idx = (ins[1] >> 9) & 0xF;
-        uint32_t mux[3];
-        int uses[3], i;
-
-        mux[0] = (ins[2] >> 26) & 3;
-        mux[1] = (ins[2] >> 11) & 3;
-        mux[2] = (ins[3] >> 28) & 3;
-        uses[0] = mac != 0;
-        uses[1] = mac >= 2 && mac <= 12 && mac != 3;
-        uses[2] = mac == 3 || mac == 4 || ilu != 0;
-        for (i = 0; i < 3; i++)
-            if (uses[i] && mux[i] == 2)
-                mask |= 1u << in_idx;
-        if ((ins[3] >> 0) & 1u)
+        mask |= nv2a_vsh_ins_input_mask(w[n]);
+        if ((w[n][3] >> 0) & 1u)
             break;
     }
     return mask;

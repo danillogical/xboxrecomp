@@ -46,6 +46,29 @@ typedef struct {
 int nv2a_vsh_hlsl(const uint32_t (*program)[4], uint32_t len, uint32_t input_mask,
                   char *out, size_t cap);
 
+/* The input registers one instruction reads, as a bit mask over v0..v15. This is the single
+ * definition of the input-mask rule: kernel/nv2a_vsh_interp.c (nv2a_vsh_program_info) and the
+ * host tool (nv2a_vsh_hlsl_tool.c) both use it. A source with mux 2 makes the instruction's input
+ * live whether or not the unit uses it. Sources read: A for any MAC op, B for the two-operand
+ * ones, C for add/mad and every ILU op. Over-counting is safe. */
+static inline uint32_t nv2a_vsh_ins_input_mask(const uint32_t ins[4])
+{
+    uint32_t mac = (ins[1] >> 21) & 0xF, ilu = (ins[1] >> 25) & 0x7;
+    uint32_t mux[3];
+    int uses[3], i;
+
+    mux[0] = (ins[2] >> 26) & 3;
+    mux[1] = (ins[2] >> 11) & 3;
+    mux[2] = (ins[3] >> 28) & 3;
+    uses[0] = mac != 0;
+    uses[1] = mac >= 2 && mac <= 12 && mac != 3;
+    uses[2] = mac == 3 || mac == 4 || ilu != 0;
+    for (i = 0; i < 3; i++)
+        if (uses[i] && mux[i] == 2)
+            return 1u << ((ins[1] >> 9) & 0xF);
+    return 0;
+}
+
 #ifdef __cplusplus
 }
 #endif
