@@ -2769,14 +2769,15 @@ static int fetch_texcoord(uint32_t index, float out[2])
  *   colour = scene_ambient + sum_i atten_i * (ambient_i + diffuse_i * max(0, N.L_i))
  * with alpha from SET_MATERIAL_ALPHA. Everything is in eye space.
  *
- * ponytail: normals go through the model-view matrix itself rather than the
- * inverse transpose (exact for rotations and uniform scale), no specular, no
- * spot cones, no back-face colours, no skinning. Add them when a mesh looks
- * wrong rather than dark. */
+ * Normals use the inverse model-view rows, with normalization controlled by
+ * SET_NORMALIZATION_ENABLE; infinite-light directions are unit vectors.
+ * Limitations: no specular, spot cones, back-face colours or skinning. The
+ * per-vertex facing-away flip below remains a compatibility approximation. */
 #define NV_LIGHTS 8
 static int lit_color(uint32_t index, float out[4])
 {
     const float *mv = (const float *)&s_reg[0x0480 / 4];
+    const float *imv = (const float *)&s_reg[0x0580 / 4];
     float pos[4], nrm[4], vc[4], e[3], n[3], len;
     uint32_t mask = s_reg[0x03BC / 4], colmat = s_reg[0x0298 / 4];
     int i, have_vc;
@@ -2794,10 +2795,13 @@ static int lit_color(uint32_t index, float out[4])
 
     for (i = 0; i < 3; i++) {
         e[i] = mv[4 * i] * pos[0] + mv[4 * i + 1] * pos[1] + mv[4 * i + 2] * pos[2] + mv[4 * i + 3];
-        n[i] = mv[4 * i] * nrm[0] + mv[4 * i + 1] * nrm[1] + mv[4 * i + 2] * nrm[2];
+        n[i] = imv[4 * i] * nrm[0]
+             + imv[4 * i + 1] * nrm[1] + imv[4 * i + 2] * nrm[2];
     }
     len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-    if (len > 1e-8f) { n[0] /= len; n[1] /= len; n[2] /= len; }
+    if ((s_reg[0x03A4 / 4] & 1) && len > 1e-8f) {
+        n[0] /= len; n[1] /= len; n[2] /= len;
+    }
     /* Light the side the viewer sees. Some meshes carry normals that face
      * away from the camera (X-Men Legends' streets and sidewalks: authentic
      * file data, drawn with culling off), and lighting them as stored left
@@ -2820,6 +2824,8 @@ static int lit_color(uint32_t index, float out[4])
             continue;
         if (kind == 1) {                                    /* infinite */
             l[0] = reg_f(b + 0x34); l[1] = reg_f(b + 0x38); l[2] = reg_f(b + 0x3C);
+            len = sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+            if (len > 1e-8f) { l[0] /= len; l[1] /= len; l[2] /= len; }
         } else {                                            /* local / spot */
             float d;
             l[0] = reg_f(b + 0x5C) - e[0]; l[1] = reg_f(b + 0x60) - e[1]; l[2] = reg_f(b + 0x64) - e[2];
