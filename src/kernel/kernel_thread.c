@@ -360,9 +360,10 @@ NTSTATUS __stdcall xbox_NtSuspendThread(
      * SuspendThread returns the previous suspend count, or (DWORD)-1 on
      * failure. The Xbox call reports that count through an out-parameter, so
      * the two are not interchangeable: -1 must become an error status rather
-     * than a suspend count of 0xFFFFFFFF.
+     * than a suspend count of 0xFFFFFFFF. With the guest CPU lock on, a
+     * guest thread is suspended the lock's way (kernel_guest_cpu.c).
      */
-    prev = SuspendThread(ThreadHandle);
+    prev = xbox_GuestCpuSuspendThread(ThreadHandle);
     if (prev == (DWORD)-1) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
             "NtSuspendThread: SuspendThread failed (error %u)", GetLastError());
@@ -385,7 +386,7 @@ NTSTATUS __stdcall xbox_NtResumeThread(
     DWORD prev;
 
     /* Mirror of NtSuspendThread: (DWORD)-1 is failure, not a count. */
-    prev = ResumeThread(ThreadHandle);
+    prev = xbox_GuestCpuResumeThread(ThreadHandle);
     if (prev == (DWORD)-1) {
         xbox_log(XBOX_LOG_ERROR, XBOX_LOG_THREAD,
             "NtResumeThread: ResumeThread failed (error %u)", GetLastError());

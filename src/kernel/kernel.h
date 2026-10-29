@@ -838,6 +838,8 @@ int      xbox_GuestCpuEnterCallback(void);      /* 1 when it took the CPU */
 void     xbox_GuestCpuLeaveCallback(int took);
 unsigned long xbox_GuestCpuOwner(void);         /* the holder's tid, 0 when free */
 int      xbox_GuestCpuWaiting(void);            /* threads queued for it */
+DWORD    xbox_GuestCpuSuspendThread(HANDLE thread); /* SuspendThread, a guest thread the lock's way */
+DWORD    xbox_GuestCpuResumeThread(HANDLE thread);  /* ResumeThread, its mirror */
 /* Read by RECOMP_BACK_EDGE: a waiter has waited its quantum; the holder
  * hands over at its next loop back edge. Only ever accessed atomically: a
  * relaxed load in lifted code (templates/runtime/recomp_types.h), the

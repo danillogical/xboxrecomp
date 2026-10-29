@@ -43,6 +43,13 @@
  *    in it deadlocked.
  *  - NtYieldExecution and the thread's end hand over at once.
  *
+ * A suspended guest thread (NtSuspendThread) is counted, and the host does
+ * not stop it wherever it is: holding a ticket it would stop the queue
+ * behind it. It stops itself where it holds neither CPU nor ticket
+ * (guest_cpu_park), below DISPATCH as the console's suspend. One holding the
+ * CPU is stopped by the host where it is, a preemption, and the CPU goes to
+ * the queue; its resume wins the CPU back for it before it goes on.
+ *
  * RECOMP_GUEST_QUANTUM (ms, default 4) is the quantum; RECOMP_GUEST_CPU_TRACE
  * (ms) prints each turn held at least that long and where it ended.
  */
@@ -97,6 +104,22 @@ static XBOX_THREAD_LOCAL uint64_t t_turn_ns, t_soft_ns;
 static XBOX_THREAD_LOCAL int t_soft_kind;
 static XBOX_THREAD_LOCAL uint32_t t_soft_where;
 
+/* The guest threads the lock knows, from Join to Part, by host tid (0: a
+ * free slot); a thread past the table is suspended by the host, as off.
+ * Under s_lock: suspend is the suspend count; frozen, that the host
+ * suspended it once, holding the CPU, for the count; lent, that its CPU went
+ * to the queue meanwhile and the thread's own hold on it is stale. */
+#define GUEST_CPU_THREADS 64
+typedef struct {
+    DWORD tid;
+    volatile LONG suspend;
+    int frozen, lent;
+} guest_thread;
+static guest_thread s_threads[GUEST_CPU_THREADS];
+static CONDITION_VARIABLE s_resume_cv;      /* a suspend count back at 0 */
+static XBOX_THREAD_LOCAL guest_thread *t_rec;   /* this thread's slot */
+static XBOX_THREAD_LOCAL int t_resumed;     /* it parked: its next acquire queues */
+
 /* The window's counters (xbox_GuestCpuReport resets them). */
 static volatile LONG s_turns, s_releases, s_switches, s_waits, s_preempts;
 static volatile LONG s_max_turn_us, s_max_wait_us;
@@ -130,6 +153,7 @@ static BOOL CALLBACK guest_cpu_init(PINIT_ONCE o, PVOID p, PVOID *c)
     (void)o; (void)p; (void)c;
     InitializeCriticalSection(&s_lock);
     InitializeConditionVariable(&s_cv);
+    InitializeConditionVariable(&s_resume_cv);
     guest_cpu_config();
     return TRUE;
 }
@@ -207,6 +231,38 @@ static void turn_ended(uint64_t end_ns, int kind, uint32_t where)
     }
 }
 
+/* This thread's suspend count is above 0; read without s_lock at the
+ * thread's own preemption points. */
+static int guest_thread_suspended(void)
+{
+    return t_rec && InterlockedCompareExchange(&t_rec->suspend, 0, 0) > 0;
+}
+
+/* Under s_lock: the slot of the guest thread with this host tid, or NULL. */
+static guest_thread *guest_thread_find(DWORD tid)
+{
+    int i;
+
+    for (i = 0; tid && i < GUEST_CPU_THREADS; i++)
+        if (s_threads[i].tid == tid)
+            return &s_threads[i];
+    return NULL;
+}
+
+/* Under s_lock, holding no CPU and no ticket: a suspended thread waits here
+ * until resumed. Not at DISPATCH, where the console delivers no suspend and
+ * the thread holds the one-CPU gate: it parks at its next call below it. */
+static void guest_cpu_park(void)
+{
+    if (!t_rec || !t_rec->suspend || xbox_IrqlThisThreadBlocksDpcs())
+        return;
+    if (s_free && s_waiting)
+        WakeAllConditionVariable(&s_cv);
+    while (t_rec->suspend)
+        SleepConditionVariableCS(&s_resume_cv, &s_lock, INFINITE);
+    t_resumed = 1;
+}
+
 /* Take the CPU. barge: a returning caller (back from a kernel call or into
  * a callback) takes a free, ungranted CPU past the queue, and when the CPU
  * is held it asks for it now: its wait just completed, and the console's
@@ -214,13 +270,21 @@ static void turn_ended(uint64_t end_ns, int kind, uint32_t where)
  * completion's) above the thread it interrupted, so the woken thread runs
  * at once and the holder waits. A joining or handing-over thread (a
  * preemption) queues behind every waiter and asks only past the quantum,
- * the round robin of equal priorities. */
+ * the round robin of equal priorities. A thread back from a suspend queues
+ * too: a resume is no wait's completion and boosts nobody. */
 static void guest_cpu_acquire(int barge)
 {
     unsigned my;
     uint64_t t0 = 0;
 
     EnterCriticalSection(&s_lock);
+again:
+    guest_cpu_park();
+    if (t_resumed) {
+        t_resumed = 0;
+        barge = 0;
+        t0 = xbox_HostNowNs();          /* others ran: the open turn ended */
+    }
     if (s_free && !s_granted && (barge || !s_waiting)) {
         s_free = 0;
     } else {
@@ -235,10 +299,22 @@ static void guest_cpu_acquire(int barge)
              * (RECOMP_BACK_EDGE) or kernel call: a woken thread at once,
              * a queued one past the quantum (the console's timer tick).
              * The holder clears the flag when it cannot (at DISPATCH),
-             * and the waiter raises it again at its next poll. */
+             * and the waiter raises it again at its next poll. A
+             * suspended waiter asks for nothing. */
             if (!preempt_get() && !(s_free && my == s_head)
+                && !guest_thread_suspended()
                 && (barge || xbox_HostNowNs() - t0 >= s_quantum_ns))
                 preempt_set(1);
+        }
+        /* Suspended while queued: it passes its turn, and a grant with it,
+         * to the next waiter, then parks. */
+        if (guest_thread_suspended() && !xbox_IrqlThisThreadBlocksDpcs()) {
+            s_head++;
+            if (--s_waiting)
+                WakeAllConditionVariable(&s_cv);
+            else
+                s_granted = 0;
+            goto again;
         }
         s_free = 0;
         s_granted = 0;
@@ -266,6 +342,18 @@ static void guest_cpu_acquire(int barge)
     }
 }
 
+/* Under s_lock, letting go: a suspend lent this thread's CPU out and the
+ * host did not stop it (the POSIX shim stops only a thread that suspends
+ * itself), so the CPU is someone else's now and its stop comes at its next
+ * acquire. */
+static int guest_cpu_lent_away(void)
+{
+    if (!t_rec || !t_rec->lent)
+        return 0;
+    t_rec->lent = 0;
+    return 1;
+}
+
 /* Hand the CPU over: the oldest waiter is granted it, and nobody barges
  * until it has taken it. The turn ends here. */
 static void guest_cpu_handoff(int kind, uint32_t where)
@@ -273,6 +361,10 @@ static void guest_cpu_handoff(int kind, uint32_t where)
     t_held = 0;
     turn_ended(xbox_HostNowNs(), kind, where);
     EnterCriticalSection(&s_lock);
+    if (guest_cpu_lent_away()) {
+        LeaveCriticalSection(&s_lock);
+        return;
+    }
     preempt_set(0);                     /* the waiter's turn comes now */
     s_free = 1;
     InterlockedExchange(&s_owner_tid, 0);
@@ -295,6 +387,10 @@ static void guest_cpu_soft_release(int kind, uint32_t where, int wake)
     t_soft_kind = kind;
     t_soft_where = where;
     EnterCriticalSection(&s_lock);
+    if (guest_cpu_lent_away()) {
+        LeaveCriticalSection(&s_lock);
+        return;
+    }
     s_free = 1;
     InterlockedExchange(&s_owner_tid, 0);
     if (wake && s_waiting)
@@ -326,17 +422,56 @@ static int ordinal_may_block(uint32_t ordinal)
 
 /* ── The entry points (kernel.h) ─────────────────────────── */
 
+/* This thread's slot; a dead thread's of the same tid is taken over. */
+static void guest_thread_add(void)
+{
+    DWORD tid = GetCurrentThreadId();
+    int i;
+
+    EnterCriticalSection(&s_lock);
+    t_rec = guest_thread_find(tid);
+    for (i = 0; !t_rec && i < GUEST_CPU_THREADS; i++)
+        if (!s_threads[i].tid)
+            t_rec = &s_threads[i];
+    if (t_rec) {
+        t_rec->tid = tid;
+        t_rec->suspend = 0;
+        t_rec->frozen = t_rec->lent = 0;
+    }
+    LeaveCriticalSection(&s_lock);
+}
+
+/* The thread's end: a suspend that came first stops it here, then the slot
+ * is freed. */
+static void guest_thread_drop(void)
+{
+    if (!t_rec)
+        return;
+    EnterCriticalSection(&s_lock);
+    guest_cpu_park();
+    t_resumed = 0;
+    t_rec->suspend = 0;
+    t_rec->frozen = t_rec->lent = 0;
+    t_rec->tid = 0;
+    t_rec = NULL;
+    LeaveCriticalSection(&s_lock);
+}
+
 void xbox_GuestCpuJoin(void)
 {
     t_guest = 1;
-    if (xbox_GuestCpuOn() && !t_held)
+    if (xbox_GuestCpuOn() && !t_held) {
+        if (!t_rec)
+            guest_thread_add();
         guest_cpu_acquire(0);
+    }
 }
 
 void xbox_GuestCpuPart(void)
 {
     if (t_held)
         guest_cpu_handoff(XBOX_GUEST_CPU_EXIT, 0);
+    guest_thread_drop();
     t_guest = 0;
 }
 
@@ -355,8 +490,10 @@ int xbox_GuestCpuRelease(int kind, uint32_t where)
     if (!t_held)
         return 0;
     if (kind == XBOX_GUEST_CPU_KERNEL) {
-        if (where == 258 /* PsTerminateSystemThread: ExitThread, no return */)
+        if (where == 258 /* PsTerminateSystemThread: ExitThread, no return */) {
             guest_cpu_handoff(XBOX_GUEST_CPU_EXIT, where);
+            guest_thread_drop();
+        }
         /* Not at DISPATCH: the thunk gets here at every ordinal, KfLowerIrql
          * and KeReleaseSpinLock included, while the caller still holds the
          * one-CPU gate; a hand-off there queues the gate holder behind
@@ -431,6 +568,145 @@ void xbox_GuestCpuLeaveCallback(int took)
 {
     if (took && t_held)
         guest_cpu_soft_release(XBOX_GUEST_CPU_CALLBACK, 0, 0);
+}
+
+/* Under s_lock: the host stops a thread, and is waited for, so the thread
+ * stops outside s_lock (a guest thread not yet joined also holds no ticket);
+ * SuspendThread alone only asks. */
+static DWORD guest_cpu_host_suspend(HANDLE thread)
+{
+    DWORD prev = SuspendThread(thread);
+
+#ifdef _WIN32
+    if (prev != (DWORD)-1) {
+        CONTEXT c;
+        c.ContextFlags = CONTEXT_CONTROL;
+        GetThreadContext(thread, &c);
+    }
+#endif
+    return prev;
+}
+
+/* Under s_lock, by its resumer: the CPU back for a thread suspended holding
+ * it, before the host lets it go on, its turn through the queue as a
+ * resumed thread's. 0 when it was suspended again meanwhile or let its stale
+ * hold go itself (guest_cpu_lent_away): the turn passes on. */
+static int guest_cpu_return_lent(guest_thread *g, DWORD tid)
+{
+    unsigned my;
+    uint64_t t0 = xbox_HostNowNs();
+
+    if (!(s_free && !s_granted && !s_waiting)) {
+        my = s_next_ticket++;
+        s_waiting++;
+        while (!(s_free && my == s_head)) {
+            SleepConditionVariableCS(&s_cv, &s_lock, GUEST_CPU_POLL_MS);
+            if (!preempt_get() && !(s_free && my == s_head)
+                && xbox_HostNowNs() - t0 >= s_quantum_ns)
+                preempt_set(1);
+        }
+        s_head++;
+        if (g->tid != tid || !g->lent || g->suspend) {
+            if (--s_waiting)
+                WakeAllConditionVariable(&s_cv);
+            else
+                s_granted = 0;
+            return 0;
+        }
+        s_waiting--;
+    }
+    s_free = 0;
+    s_granted = 0;
+    g->lent = 0;
+    InterlockedExchange(&s_owner_tid, (LONG)tid);
+    return 1;
+}
+
+/* NtSuspendThread's SuspendThread, returning the previous count as it does.
+ * A guest thread the lock knows is counted: holding the CPU it is stopped by
+ * the host where it is (a preemption, as on the console) and its CPU goes to
+ * the queue; otherwise it stops itself where it holds neither CPU nor ticket
+ * (guest_cpu_park). Off, or any other thread, it is SuspendThread. */
+DWORD xbox_GuestCpuSuspendThread(HANDLE thread)
+{
+    DWORD tid, prev;
+    guest_thread *g;
+    int held;
+
+    if (!xbox_GuestCpuOn())
+        return SuspendThread(thread);
+    tid = GetThreadId(thread);
+    if (tid == GetCurrentThreadId() && !t_rec)
+        return SuspendThread(thread);   /* a host thread stopping itself: not under s_lock */
+    held = t_held;                      /* called holding it: let go, as the thunk does */
+    if (held)
+        guest_cpu_soft_release(XBOX_GUEST_CPU_KERNEL, 231, 1);
+    EnterCriticalSection(&s_lock);
+    g = guest_thread_find(tid);
+    if (!g) {
+        prev = guest_cpu_host_suspend(thread);
+    } else if ((LONG)tid == s_owner_tid && g != t_rec) {
+        prev = guest_cpu_host_suspend(thread);
+        if (prev != (DWORD)-1) {
+            prev = (DWORD)g->suspend;
+            InterlockedIncrement(&g->suspend);
+            g->frozen = g->lent = 1;
+            preempt_set(0);
+            s_free = 1;
+            InterlockedExchange(&s_owner_tid, 0);
+            if (s_waiting) {
+                s_granted = 1;
+                WakeAllConditionVariable(&s_cv);
+            }
+        }
+    } else {
+        prev = (DWORD)g->suspend;
+        InterlockedIncrement(&g->suspend);
+        if (g == t_rec)
+            guest_cpu_park();
+    }
+    LeaveCriticalSection(&s_lock);
+    if (held)
+        guest_cpu_acquire(1);
+    return prev;
+}
+
+/* NtResumeThread's ResumeThread: the count back at 0 lets the thread
+ * compete for the CPU again (one that had not parked yet never does), a
+ * thread stopped holding it with the CPU in its hands. A guest thread with
+ * no count of the lock's is the host's to resume. */
+DWORD xbox_GuestCpuResumeThread(HANDLE thread)
+{
+    DWORD tid, prev = 0;
+    guest_thread *g;
+    int held, frozen, host;
+
+    if (!xbox_GuestCpuOn())
+        return ResumeThread(thread);
+    tid = GetThreadId(thread);
+    held = t_held;
+    if (held)
+        guest_cpu_soft_release(XBOX_GUEST_CPU_KERNEL, 224, 1);
+    EnterCriticalSection(&s_lock);
+    g = guest_thread_find(tid);
+    if (g && (prev = (DWORD)g->suspend) != 0
+        && InterlockedDecrement(&g->suspend) == 0) {
+        frozen = g->frozen;
+        if (!g->lent || guest_cpu_return_lent(g, tid)
+            || g->tid != tid || !g->lent) {
+            if (g->tid == tid)
+                g->frozen = 0;
+            if (frozen)
+                ResumeThread(thread);
+            WakeAllConditionVariable(&s_resume_cv);
+        }
+    }
+    /* A count of 0 is the host's, unless the lock holds one of the host's. */
+    host = !prev && !(g && g->tid == tid && g->frozen);
+    LeaveCriticalSection(&s_lock);
+    if (held)
+        guest_cpu_acquire(1);
+    return host ? ResumeThread(thread) : prev;
 }
 
 unsigned long xbox_GuestCpuOwner(void)
